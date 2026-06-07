@@ -67,6 +67,7 @@ pub const Writer = struct {
         if (params.len > 64) return error.LocalProtocol;
         var i: usize = 0;
         for (params) |p| {
+            if (p[0] > std.math.maxInt(u16)) return error.LocalProtocol; // setting id is 16-bit
             std.mem.writeInt(u16, payload[i..][0..2], @intCast(p[0]), .big);
             std.mem.writeInt(u32, payload[i + 2 ..][0..4], p[1], .big);
             i += 6;
@@ -83,8 +84,11 @@ pub const Writer = struct {
     }
 
     pub fn sendWindowUpdate(self: *Writer, stream_id: u32, increment: u32) WriteError!void {
+        // A zero increment or one above the 31-bit window is invalid on the wire
+        // (RFC 9113 6.9); reject rather than silently mask it.
+        if (increment == 0 or increment > @as(u32, @intCast(constants.MAX_WINDOW_SIZE))) return error.LocalProtocol;
         var p: [4]u8 = undefined;
-        std.mem.writeInt(u32, &p, increment & 0x7FFF_FFFF, .big);
+        std.mem.writeInt(u32, &p, increment, .big);
         try self.writeFrame(.window_update, 0, stream_id, &p);
     }
 
@@ -109,7 +113,11 @@ pub const Writer = struct {
     /// first, in the canonical order, then the regular headers. Allocates a new
     /// odd stream id and returns it. `end_stream` marks a bodyless request.
     pub fn sendRequest(self: *Writer, method: []const u8, target: []const u8, scheme: []const u8, authority: []const u8, headers: []const Header, end_stream: bool) WriteError!u32 {
+        if (self.role != .client) return error.LocalProtocol; // only a client opens request streams
         const id = self.next_local_id;
+        // Stream ids are 31-bit; once exhausted the connection must be replaced
+        // (RFC 9113 5.1.1), not wrap around and reuse an id.
+        if (id > @as(u32, @intCast(constants.MAX_WINDOW_SIZE))) return error.LocalProtocol;
         self.next_local_id += 2;
         const pseudo = [_]Header{
             .{ .name = ":method", .value = method },
@@ -154,7 +162,7 @@ pub const Writer = struct {
     /// max frame size. END_HEADERS rides the last frame; END_STREAM (if any) rides
     /// the first HEADERS.
     fn frameHeaderBlock(self: *Writer, stream_id: u32, block: []const u8, end_stream: bool) WriteError!void {
-        const max = self.peer_max_frame;
+        const max = self.splitSize();
         var off: usize = 0;
         var first = true;
         while (true) {
@@ -175,8 +183,16 @@ pub const Writer = struct {
     /// Serialize body bytes as DATA, split to the peer's max frame size.
     /// END_STREAM rides the final frame when `end_stream` is set. (Flow-control
     /// accounting is the caller's concern; this frames what it is given.)
+    /// The frame-size split point. Floored at 1 so a peer_max_frame of 0 can
+    /// never wedge the splitters in an infinite zero-length loop. A SETTINGS-
+    /// negotiated value is always >= 16384 (settings.zig enforces the floor); a 0
+    /// here can only come from a caller setting the field directly.
+    fn splitSize(self: *const Writer) usize {
+        return @max(self.peer_max_frame, 1);
+    }
+
     pub fn sendData(self: *Writer, stream_id: u32, data: []const u8, end_stream: bool) WriteError!void {
-        const max = self.peer_max_frame;
+        const max = self.splitSize();
         if (data.len == 0) {
             if (end_stream) try self.writeFrame(.data, Flags.end_stream, stream_id, &.{});
             return;
@@ -213,13 +229,21 @@ fn validateField(h: Header) WriteError!void {
     for (forbidden) |f| {
         if (std.mem.eql(u8, h.name, f)) return error.LocalProtocol;
     }
+    // TE may only carry "trailers" in HTTP/2 (RFC 9113 8.2.2).
+    if (std.mem.eql(u8, h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) return error.LocalProtocol;
 }
 
-/// A field value must contain no control bytes (CR/LF/NUL/DEL), so a value can
-/// never inject a frame boundary or corrupt the decoded request line.
+/// A field value must contain no control bytes (CR/LF/NUL/DEL) and no leading or
+/// trailing whitespace (RFC 9113 8.2.1), so it can never inject a frame boundary,
+/// corrupt the decoded request line, or be silently re-trimmed by a peer.
 fn validateValue(value: []const u8) WriteError!void {
     for (value) |ch| {
         if (ch < 0x20 or ch == 0x7F) return error.InvalidField;
+    }
+    if (value.len > 0) {
+        const first = value[0];
+        const last = value[value.len - 1];
+        if (first == ' ' or first == '\t' or last == ' ' or last == '\t') return error.InvalidField;
     }
 }
 
@@ -256,6 +280,45 @@ test "a CRLF in a pseudo-header value (e.g. target) is rejected" {
     var w = Writer.init(testing.allocator, .client);
     defer w.deinit();
     try testing.expectError(error.InvalidField, w.sendRequest("GET", "/a\r\nX-Evil: y", "https", "h", &.{}, true));
+}
+
+test "a server writer cannot send a request" {
+    var w = Writer.init(testing.allocator, .server);
+    defer w.deinit();
+    try testing.expectError(error.LocalProtocol, w.sendRequest("GET", "/", "https", "h", &.{}, true));
+}
+
+test "sendWindowUpdate rejects zero and over-max increments" {
+    var w = Writer.init(testing.allocator, .server);
+    defer w.deinit();
+    try testing.expectError(error.LocalProtocol, w.sendWindowUpdate(1, 0));
+    try testing.expectError(error.LocalProtocol, w.sendWindowUpdate(1, 0x80000000));
+    try w.sendWindowUpdate(1, 1);
+}
+
+test "te with a non-trailers value is rejected" {
+    try testing.expectError(error.LocalProtocol, validateField(.{ .name = "te", .value = "gzip" }));
+    try validateField(.{ .name = "te", .value = "trailers" });
+}
+
+test "values with leading or trailing whitespace are rejected" {
+    try testing.expectError(error.InvalidField, validateValue(" x"));
+    try testing.expectError(error.InvalidField, validateValue("x "));
+    try validateValue("a b"); // internal space is fine
+}
+
+test "sendSettings rejects an id larger than 16 bits" {
+    var w = Writer.init(testing.allocator, .server);
+    defer w.deinit();
+    try testing.expectError(error.LocalProtocol, w.sendSettings(&[_][2]u32{.{ 0x1_0000, 1 }}));
+}
+
+test "sendData with peer_max_frame 0 does not hang" {
+    var w = Writer.init(testing.allocator, .server);
+    defer w.deinit();
+    w.peer_max_frame = 0;
+    try w.sendData(1, "abc", true); // must terminate
+    try testing.expect(w.pending().len > 0);
 }
 
 test "sendData splits at the peer max frame size" {
