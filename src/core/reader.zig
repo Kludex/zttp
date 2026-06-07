@@ -74,13 +74,11 @@ pub const Reader = struct {
     state: State = .head,
     /// Header storage for the message currently being reported. Cleared on reset.
     headers: std.ArrayList(Header) = .empty,
-    /// Backing copy of the head bytes (request line + headers) so the reported
-    /// event's slices stay valid after the input buffer is compacted/refilled.
-    head_store: std.ArrayList(u8) = .empty,
     trailers: std.ArrayList(Header) = .empty,
     /// Stable backing copy of the trailer field-lines, so trailer Header slices
-    /// survive buffer growth/compaction the same way head_store protects the
-    /// head. Trailers accrue incrementally and need their own buffer.
+    /// survive buffer growth/compaction. Unlike the head (which is parsed in
+    /// place and materialised within one nextEvent call), trailers accrue
+    /// incrementally across feeds and so must be copied to a buffer we own.
     trailer_store: std.ArrayList(u8) = .empty,
     trailer_ranges: std.ArrayList(TrailerRange) = .empty,
     trailer_bytes: usize = 0,
@@ -101,7 +99,6 @@ pub const Reader = struct {
     pub fn deinit(self: *Reader) void {
         self.buf.deinit(self.gpa);
         self.headers.deinit(self.gpa);
-        self.head_store.deinit(self.gpa);
         self.trailers.deinit(self.gpa);
         self.trailer_store.deinit(self.gpa);
         self.trailer_ranges.deinit(self.gpa);
@@ -134,7 +131,6 @@ pub const Reader = struct {
     pub fn reset(self: *Reader) void {
         self.state = .head;
         self.headers.clearRetainingCapacity();
-        self.head_store.clearRetainingCapacity();
         self.trailers.clearRetainingCapacity();
         self.trailer_store.clearRetainingCapacity();
         self.trailer_ranges.clearRetainingCapacity();
@@ -152,9 +148,11 @@ pub const Reader = struct {
         self.consumed = 0;
     }
 
-    /// Produce the next event, or `.need_data`. Slices in `request`/`response`
-    /// events point into `head_store` (stable); `data` events point into the
-    /// input buffer and are valid until the next `nextEvent`/`feed` call.
+    /// Produce the next event, or `.need_data`.
+    /// `request`/`response` events borrow slices from the input buffer; they are
+    /// materialised by the caller within this call (before any feed/compact), so
+    /// they are valid until nextEvent returns. `data` events likewise point into
+    /// the buffer and are valid until the next `nextEvent`/`feed` call.
     ///
     /// A parse error poisons the connection: it is latched, and every subsequent
     /// call re-raises it rather than resuming. This makes errors terminal (as
@@ -198,8 +196,8 @@ pub const Reader = struct {
         const region = self.avail();
         const maybe_head_end = findHeadEnd(region);
         // Enforce the head-size cap on BOTH the complete- and incomplete-head
-        // branches, before copying into head_store, so an oversized but complete
-        // head cannot be fully buffered and duplicated before the limit fires.
+        // branches, before committing to the head, so an oversized but complete
+        // head cannot be buffered without bound before the limit fires.
         const candidate_len = maybe_head_end orelse region.len;
         if (candidate_len > self.limits.max_header_bytes) return error.MessageTooLong;
         const head_len = maybe_head_end orelse {
@@ -210,10 +208,13 @@ pub const Reader = struct {
             return .need_data;
         };
 
-        // Copy the head into stable storage; the event slices reference this.
-        self.head_store.clearRetainingCapacity();
-        self.head_store.appendSlice(self.gpa, region[0..head_len]) catch return error.MessageTooLong;
-        const head = self.head_store.items;
+        // Parse the head in place, borrowing slices directly from the input
+        // buffer - no copy. This is safe because the produced request/response
+        // event is fully materialised into Python bytes within the same
+        // nextEvent call (before any feed/compact can move the buffer): the
+        // event's slices never outlive this call. Compaction only runs at the
+        // top of the NEXT dispatch, by which point the bytes are already copied.
+        const head = region[0..head_len];
         self.consumed += head_len;
 
         var sc = Scanner.init(head);
