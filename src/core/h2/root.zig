@@ -10,6 +10,7 @@ pub const huffman = @import("hpack/huffman.zig");
 pub const hpack_decoder = @import("hpack/decoder.zig");
 pub const settings = @import("settings.zig");
 pub const stream = @import("stream.zig");
+pub const connection = @import("connection.zig");
 
 test {
     _ = constants;
@@ -19,4 +20,5 @@ test {
     _ = hpack_decoder;
     _ = settings;
     _ = stream;
+    _ = connection;
 }

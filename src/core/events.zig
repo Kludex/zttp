@@ -16,12 +16,15 @@ pub const Header = struct {
 
 /// The start of a request: method, target, HTTP version, and the full header
 /// block. Emitted once, after the blank line that terminates the headers.
+/// `stream_id` is 0 for HTTP/1.1 (the field is omitted at every H1 construction
+/// site and never surfaced); HTTP/2 sets the stream the request arrived on.
 pub const Request = struct {
     method: []const u8,
     target: []const u8,
     /// The version number only, e.g. "1.1" or "1.0" (the "HTTP/" is stripped).
     http_version: []const u8,
     headers: []const Header,
+    stream_id: u32 = 0,
 };
 
 /// The start of a response (client role): status code, reason phrase, version,
@@ -31,18 +34,60 @@ pub const Response = struct {
     reason: []const u8,
     http_version: []const u8,
     headers: []const Header,
+    stream_id: u32 = 0,
 };
 
 /// A run of body bytes. For chunked bodies one Data event is emitted per chunk
 /// (or per buffered span); for Content-Length bodies, per fed span.
 pub const Data = struct {
     data: []const u8,
+    stream_id: u32 = 0,
 };
 
 /// The message body has ended. Carries any trailer headers seen after the final
 /// chunk of a chunked body (empty otherwise).
 pub const EndOfMessage = struct {
     trailers: []const Header = &.{},
+    stream_id: u32 = 0,
+};
+
+/// One peer setting (id, value), surfaced verbatim so the integrator can react
+/// (and knows an ACK is owed). HTTP/2 only.
+pub const SettingPair = struct {
+    id: u16,
+    value: u32,
+};
+
+/// A stream was reset by the peer (RFC 9113 6.4). HTTP/2 only.
+pub const RstStream = struct {
+    stream_id: u32,
+    error_code: u32,
+};
+
+/// The peer is shutting the connection down (RFC 9113 6.8). HTTP/2 only.
+pub const Goaway = struct {
+    last_stream_id: u32,
+    error_code: u32,
+    debug: []const u8 = &.{},
+};
+
+/// The peer announced its settings (RFC 9113 6.5); an ACK is owed. HTTP/2 only.
+pub const SettingsEvent = struct {
+    params: []const SettingPair,
+};
+
+/// A PING (RFC 9113 6.7); if `ack` is false a PING-ACK echoing `opaque_data` is
+/// owed. HTTP/2 only.
+pub const Ping = struct {
+    ack: bool,
+    opaque_data: [8]u8,
+};
+
+/// A flow-control window increment (RFC 9113 6.9). stream_id 0 is the connection
+/// window. HTTP/2 only.
+pub const WindowUpdate = struct {
+    stream_id: u32,
+    increment: u32,
 };
 
 /// The tagged union the state machine produces. `need_data` is the sentinel
@@ -58,6 +103,12 @@ pub const Event = union(enum) {
     connection_closed,
     /// Not enough buffered bytes to produce the next event yet.
     need_data,
+    // The remaining variants are produced only by the HTTP/2 engine.
+    rst_stream: RstStream,
+    goaway: Goaway,
+    settings: SettingsEvent,
+    ping: Ping,
+    window_update: WindowUpdate,
 };
 
 test "event union round-trips a request" {

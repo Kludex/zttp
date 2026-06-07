@@ -396,6 +396,8 @@ fn drainServer(input: []const u8) !struct { ev: std.ArrayList(EvTag), body: std.
                 try tags.append(t.allocator, .eom);
                 break;
             },
+            // The H1 reader never emits the HTTP/2-only control variants.
+            else => unreachable,
         }
     }
     return .{ .ev = tags, .body = body };
