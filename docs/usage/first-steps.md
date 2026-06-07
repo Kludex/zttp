@@ -4,7 +4,7 @@ icon: lucide/rocket
 
 # First steps
 
-zttp gives you one object: a **`Connection`**.
+zttp gives you one object: a [`Connection`][zttp.Connection].
 
 ```python
 import zttp
@@ -41,7 +41,7 @@ conn.receive_data(b"TP/1.1\r\n") # the rest of it
 
 Then call `next_event()` to get the next thing that happened:
 
-```python title="echo.py" hl_lines="11"
+```python title="echo.py" hl_lines="12"
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)

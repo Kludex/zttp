@@ -8,20 +8,25 @@ zttp is layered the same way [zloop](https://github.com/Kludex/zloop) is: a pure
 Zig core that knows nothing about Python, a thin C-API adapter at the edge, and a
 small Python package on top. Each layer depends only on the one below it.
 
-```text
-+-----------------------------------------------------------+
-|  zttp/__init__.py        the public Python API            |   Python edge
-+-----------------------------------------------------------+
-|  src/python/*.zig        CPython C-API adapter            |   adapter
-|    - Connection object (receive_data / next_event / send) |
-|    - Request / Response / Data / EndOfMessage events      |
-|    - ProtocolError / Remote / Local exceptions            |
-+-----------------------------------------------------------+
-|  src/core/*.zig          the sans-IO parser (no Python.h) |   domain
-|    - reader: the read-side state machine + buffering      |
-|    - writer: the serializer                               |
-|    - framing / chunked / headers / scanner                |
-+-----------------------------------------------------------+
+```mermaid
+flowchart TB
+    subgraph edge["Python edge &nbsp;·&nbsp; zttp/__init__.py"]
+        api["the public Python API"]
+    end
+    subgraph adapter["Adapter &nbsp;·&nbsp; src/python/*.zig &nbsp;·&nbsp; CPython C-API"]
+        conn["Connection<br/>receive_data · next_event · send_*"]
+        events["events<br/>Request · Response · Data · EndOfMessage"]
+        exc["exceptions<br/>Protocol · Remote · Local"]
+    end
+    subgraph domain["Domain &nbsp;·&nbsp; src/core/*.zig &nbsp;·&nbsp; sans-IO parser (no Python.h)"]
+        reader["reader<br/>read-side state machine + buffering"]
+        writer["writer<br/>serializer"]
+        prim["framing · chunked · headers · scanner"]
+    end
+
+    edge --> adapter --> domain
+    reader --> prim
+    writer --> prim
 ```
 
 ## The core (`src/core`)
