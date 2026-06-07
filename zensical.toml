@@ -32,7 +32,7 @@ nav = [
 
 [project.theme]
 language = "en"
-favicon = "assets/favicon.png"
+favicon = "assets/favicon.svg"
 features = [
   "announce.dismiss",
   "content.code.annotate",
