@@ -1,0 +1,15 @@
+.venv/
+.zig-cache/
+zig-out/
+zhttp/_zhttp*.so
+zhttp/_zhttp*.pyd
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+dist/
+build/
+*.egg-info/

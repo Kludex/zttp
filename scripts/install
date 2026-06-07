@@ -1,0 +1,11 @@
+#!/bin/sh -e
+
+# Create the virtual environment and install the dev + bench dependency groups.
+# `uv sync` builds the Zig extension through the hatchling build hook, so no
+# separate compile step is needed - it just needs `zig` on PATH.
+
+if [ -z "$GITHUB_ACTIONS" ]; then
+    set -x
+fi
+
+uv sync --all-groups

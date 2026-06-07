@@ -1,0 +1,257 @@
+//! Incremental decoder for the chunked transfer-coding (RFC 9112 7.1). Fed a
+//! Scanner positioned at the start of (more of) a chunked body, it yields body
+//! spans and signals when the body ends, surviving arbitrary fragmentation -
+//! a chunk size, the data, or a CRLF can each be split across feed boundaries.
+//! Trailer field-lines after the last chunk are returned to the caller to parse.
+
+const std = @import("std");
+const tables = @import("tables.zig");
+const Scanner = @import("scanner.zig").Scanner;
+const ParseError = @import("errors.zig").ParseError;
+
+const State = enum {
+    /// Reading the chunk-size hex digits (and any chunk extensions) up to CRLF.
+    size,
+    /// Inside a chunk's data; `remaining` bytes of payload are still expected.
+    data,
+    /// Expecting the CRLF that terminates a chunk's data.
+    data_crlf,
+    /// After the final 0-size chunk, reading trailer field-lines until a blank.
+    trailer,
+    /// Fully decoded; the terminating CRLF has been consumed.
+    done,
+};
+
+pub const Output = union(enum) {
+    /// A run of decoded body bytes (a slice into the fed buffer).
+    data: []const u8,
+    /// A single trailer field-line (raw, not yet split into name/value).
+    trailer_line: []const u8,
+    /// The body is complete.
+    done,
+    /// Not enough buffered bytes to make progress; feed more.
+    need_data,
+};
+
+pub const ChunkDecoder = struct {
+    state: State = .size,
+    /// Bytes left in the current chunk's data section.
+    remaining: u64 = 0,
+    /// Cap on the chunk-size line and each trailer line, to bound memory.
+    max_line: usize = 16 * 1024,
+
+    /// Pull the next output from `sc`. Call repeatedly until it returns
+    /// `need_data` or `done`. The scanner's cursor is advanced only past fully
+    /// consumed input, so a `need_data` leaves resumable state in the buffer.
+    pub fn next(self: *ChunkDecoder, sc: *Scanner) ParseError!Output {
+        switch (self.state) {
+            .size => {
+                const save = sc.pos;
+                const maybe = sc.line(self.max_line) catch return error.InvalidChunk;
+                const l = maybe orelse {
+                    sc.pos = save;
+                    return .need_data;
+                };
+                self.remaining = try parseChunkSize(l);
+                if (self.remaining == 0) {
+                    self.state = .trailer;
+                    return self.next(sc);
+                }
+                self.state = .data;
+                return self.next(sc);
+            },
+            .data => {
+                if (self.remaining == 0) {
+                    self.state = .data_crlf;
+                    return self.next(sc);
+                }
+                if (sc.isEmpty()) return .need_data;
+                const avail = sc.buf.len - sc.pos;
+                const take = @min(avail, self.remaining);
+                const span = sc.take(@intCast(take));
+                self.remaining -= take;
+                return .{ .data = span };
+            },
+            .data_crlf => {
+                if (!try consumeCrlf(sc)) return .need_data;
+                self.state = .size;
+                return self.next(sc);
+            },
+            .trailer => {
+                const save = sc.pos;
+                const maybe = sc.line(self.max_line) catch return error.InvalidChunk;
+                const l = maybe orelse {
+                    sc.pos = save;
+                    return .need_data;
+                };
+                if (l.len == 0) {
+                    self.state = .done;
+                    return .done;
+                }
+                return .{ .trailer_line = l };
+            },
+            .done => return .done,
+        }
+    }
+
+    pub fn isDone(self: *const ChunkDecoder) bool {
+        return self.state == .done;
+    }
+};
+
+/// Parse the chunk-size line: hex digits, then optional `;ext` chunk extensions
+/// which we accept and ignore. Rejects empty or overflowing sizes.
+fn parseChunkSize(line: []const u8) ParseError!u64 {
+    var n: u64 = 0;
+    var digits: usize = 0;
+    for (line, 0..) |ch, i| {
+        if (ch == ';') {
+            // Chunk extensions follow; ignore the remainder of the line.
+            if (digits == 0) return error.InvalidChunk;
+            return n;
+        }
+        const v = tables.hex_value[ch];
+        if (v == 0xFF) {
+            // Trailing whitespace before the (implicit) CRLF is tolerated.
+            if (ch == ' ' or ch == '\t') {
+                if (digits == 0) return error.InvalidChunk;
+                return validateAfterSize(line[i..], n);
+            }
+            return error.InvalidChunk;
+        }
+        if (digits >= 16) return error.InvalidChunk; // > 64 bits of hex
+        n = (n << 4) | v;
+        digits += 1;
+    }
+    if (digits == 0) return error.InvalidChunk;
+    return n;
+}
+
+fn validateAfterSize(rest: []const u8, n: u64) ParseError!u64 {
+    for (rest) |ch| {
+        if (ch == ';') return n;
+        if (ch != ' ' and ch != '\t') return error.InvalidChunk;
+    }
+    return n;
+}
+
+/// Consume a CRLF (or bare LF) at the cursor. Returns false (without advancing)
+/// if not enough bytes are buffered to decide.
+fn consumeCrlf(sc: *Scanner) ParseError!bool {
+    const r = sc.remaining();
+    if (r.len == 0) return false;
+    if (r[0] == '\n') {
+        _ = sc.take(1);
+        return true;
+    }
+    if (r[0] == '\r') {
+        if (r.len < 2) return false;
+        if (r[1] != '\n') return error.InvalidChunk;
+        _ = sc.take(2);
+        return true;
+    }
+    return error.InvalidChunk;
+}
+
+const t = std.testing;
+
+fn collect(input: []const u8) !struct { body: std.ArrayList(u8), trailers: usize, done: bool } {
+    var dec = ChunkDecoder{};
+    var sc = Scanner.init(input);
+    var body: std.ArrayList(u8) = .empty;
+    var trailers: usize = 0;
+    while (true) {
+        const out = try dec.next(&sc);
+        switch (out) {
+            .data => |d| try body.appendSlice(t.allocator, d),
+            .trailer_line => trailers += 1,
+            .done => return .{ .body = body, .trailers = trailers, .done = true },
+            .need_data => return .{ .body = body, .trailers = trailers, .done = false },
+        }
+    }
+}
+
+test "single chunk" {
+    var r = try collect("5\r\nhello\r\n0\r\n\r\n");
+    defer r.body.deinit(t.allocator);
+    try t.expect(r.done);
+    try t.expectEqualStrings("hello", r.body.items);
+}
+
+test "multiple chunks" {
+    var r = try collect("3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n");
+    defer r.body.deinit(t.allocator);
+    try t.expect(r.done);
+    try t.expectEqualStrings("abcde", r.body.items);
+}
+
+test "chunk extensions ignored" {
+    var r = try collect("5;name=value\r\nhello\r\n0\r\n\r\n");
+    defer r.body.deinit(t.allocator);
+    try t.expect(r.done);
+    try t.expectEqualStrings("hello", r.body.items);
+}
+
+test "hex chunk size" {
+    var r = try collect("a\r\n0123456789\r\n0\r\n\r\n");
+    defer r.body.deinit(t.allocator);
+    try t.expect(r.done);
+    try t.expectEqualStrings("0123456789", r.body.items);
+}
+
+test "trailers" {
+    var r = try collect("3\r\nabc\r\n0\r\nX-Trailer: v\r\nX-Other: w\r\n\r\n");
+    defer r.body.deinit(t.allocator);
+    try t.expect(r.done);
+    try t.expectEqualStrings("abc", r.body.items);
+    try t.expectEqual(@as(usize, 2), r.trailers);
+}
+
+test "streaming across boundaries" {
+    const full = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    var dec = ChunkDecoder{};
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(t.allocator);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(t.allocator);
+    var consumed: usize = 0;
+    var src: usize = 0;
+    var done = false;
+    while (!done) {
+        // Feed one more source byte into the working buffer.
+        if (src < full.len) {
+            try buf.append(t.allocator, full[src]);
+            src += 1;
+        }
+        var sc = Scanner.init(buf.items[consumed..]);
+        inner: while (true) {
+            const out = try dec.next(&sc);
+            switch (out) {
+                .data => |d| try body.appendSlice(t.allocator, d),
+                .trailer_line => {},
+                .done => {
+                    done = true;
+                    break :inner;
+                },
+                .need_data => break :inner,
+            }
+        }
+        consumed += sc.pos;
+        if (src >= full.len and !done and sc.pos == 0) break;
+    }
+    try t.expect(done);
+    try t.expectEqualStrings("Wikipedia", body.items);
+}
+
+test "bad chunk size rejected" {
+    var dec = ChunkDecoder{};
+    var sc = Scanner.init("xyz\r\n");
+    try t.expectError(error.InvalidChunk, dec.next(&sc));
+}
+
+test "empty chunk size rejected" {
+    var dec = ChunkDecoder{};
+    var sc = Scanner.init(";ext\r\n");
+    try t.expectError(error.InvalidChunk, dec.next(&sc));
+}

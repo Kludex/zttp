@@ -1,0 +1,12 @@
+#!/bin/sh -e
+
+# Compile the Zig core and the CPython extension.
+
+set -x
+
+# Pure-Zig core unit tests double as the core's build check.
+zig build test
+
+# Build the extension against the venv interpreter, then confirm it imports.
+./build_ext.sh "$(pwd)/.venv/bin/python"
+.venv/bin/python -c "import zhttp; print(zhttp.Connection(zhttp.SERVER))"
