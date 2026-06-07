@@ -8,6 +8,8 @@ pub const frame = @import("frame.zig");
 pub const static_table = @import("hpack/static_table.zig");
 pub const huffman = @import("hpack/huffman.zig");
 pub const hpack_decoder = @import("hpack/decoder.zig");
+pub const settings = @import("settings.zig");
+pub const stream = @import("stream.zig");
 
 test {
     _ = constants;
@@ -15,4 +17,6 @@ test {
     _ = static_table;
     _ = huffman;
     _ = hpack_decoder;
+    _ = settings;
+    _ = stream;
 }
