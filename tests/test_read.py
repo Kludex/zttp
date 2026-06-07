@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 import zhttp
-from tests.conftest import drain, parse_request
+from tests.conftest import drain, drain_all, parse_request
 
 
 def test_simple_get() -> None:
@@ -142,8 +142,16 @@ def test_malformed_raises_remote_protocol_error(bad: bytes) -> None:
     conn = zhttp.Connection(zhttp.SERVER)
     conn.receive_data(bad)
     with pytest.raises(zhttp.RemoteProtocolError):
-        while conn.next_event() is not zhttp.NEED_DATA:
-            pass
+        drain_all(conn)
+
+
+def test_drain_reaches_need_data_on_partial() -> None:
+    # Exercises the NEED_DATA exit paths of the drain helpers (a valid but
+    # incomplete request yields no events and stops at NEED_DATA).
+    conn = zhttp.Connection(zhttp.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\r\nHost: ")  # no terminating blank line
+    assert list(drain(conn)) == []
+    drain_all(conn)  # returns cleanly (NEED_DATA), no exception
 
 
 def test_invalid_role_rejected() -> None:

@@ -20,3 +20,10 @@ def parse_request(data: bytes) -> list[object]:
     conn = zhttp.Connection(zhttp.SERVER)
     conn.receive_data(data)
     return list(drain(conn))
+
+
+def drain_all(conn: zhttp.Connection) -> None:
+    """Pull events until NEED_DATA. Used by tests asserting an error is raised
+    before NEED_DATA is ever reached."""
+    while conn.next_event() is not zhttp.NEED_DATA:
+        pass

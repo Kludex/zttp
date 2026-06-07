@@ -23,7 +23,7 @@ def test_h2_synthesizing_sequence_headers_roundtrip() -> None:
             return self.n
 
         def __getitem__(self, i: int) -> tuple[bytes, bytes]:
-            if i >= self.n:
+            if i >= self.n:  # pragma: no cover - sequence-protocol guard, not hit via __len__-bounded access
                 raise IndexError
             return (b"Header-%02d" % i, b"value-%02d-%s" % (i, b"x" * 24))
 
@@ -64,8 +64,7 @@ def test_h4_trailer_flood_rejected() -> None:
     flood = b"".join(b"X-%d: y\r\n" % i for i in range(500))
     conn.receive_data(flood)
     with pytest.raises(zhttp.RemoteProtocolError):
-        while conn.next_event() is not zhttp.NEED_DATA:
-            pass
+        _drain_until_error_or_end(conn)
 
 
 def test_trailer_survives_large_followup_feed() -> None:
@@ -76,16 +75,9 @@ def test_trailer_survives_large_followup_feed() -> None:
     conn.receive_data(b"0\r\nX-Trailer: SECRET\r\n")
     assert conn.next_event() is zhttp.NEED_DATA
     conn.receive_data(b"\r\n")
-    eom = None
-    while True:
-        ev = conn.next_event()
-        if isinstance(ev, zhttp.EndOfMessage):
-            eom = ev
-            break
-        assert ev is not zhttp.NEED_DATA or eom is not None
-        if ev is zhttp.NEED_DATA:
-            break
-    assert eom is not None
+    events = _drain_until_error_or_end(conn)
+    eom = events[-1]
+    assert isinstance(eom, zhttp.EndOfMessage)
     assert eom.trailers == [(b"X-Trailer", b"SECRET")]
 
 
@@ -93,8 +85,7 @@ def test_bare_lf_request_rejected_by_default() -> None:
     conn = zhttp.Connection(zhttp.SERVER)
     conn.receive_data(b"GET / HTTP/1.1\nHost: x\n\n")
     with pytest.raises(zhttp.RemoteProtocolError):
-        while conn.next_event() is not zhttp.NEED_DATA:
-            pass
+        _drain_until_error_or_end(conn)
 
 
 @pytest.mark.parametrize(

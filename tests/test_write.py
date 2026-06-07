@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 import zhttp
+from tests.conftest import drain
 
 
 def test_send_response_content_length() -> None:
@@ -91,15 +92,11 @@ def test_round_trip_server_reads_client_output() -> None:
 
     server = zhttp.Connection(zhttp.SERVER)
     server.receive_data(wire)
-    req = server.next_event()
+    events = list(drain(server))
+    req = events[0]
     assert isinstance(req, zhttp.Request)
     assert req.method == b"POST"
     assert req.target == b"/x"
-    body = b""
-    while True:
-        ev = server.next_event()
-        if isinstance(ev, zhttp.Data):
-            body += ev.data
-        elif isinstance(ev, zhttp.EndOfMessage):
-            break
+    body = b"".join(e.data for e in events if isinstance(e, zhttp.Data))
     assert body == b"data"
+    assert isinstance(events[-1], zhttp.EndOfMessage)
