@@ -9,7 +9,7 @@ icon: lucide/zap
 </p>
 
 <p align="center">
-    <em>A sans-IO HTTP parser for Python with a Zig core.</em>
+    <em>A sans-IO HTTP parser for Python with a Zig core! ⚡</em>
 </p>
 
 ---
