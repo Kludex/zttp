@@ -24,7 +24,15 @@ def _zig_target_args() -> list[str]:
     if len(arches) != 1 or sys.platform != "darwin":
         return []
     target = _MACOS_ZIG_TARGET.get(arches[0])
-    return [f"-Dtarget={target}"] if target else []
+    if not target:
+        return []
+    # Pin the binary's minimum macOS version to the deployment target so it
+    # matches the wheel's platform tag; otherwise delocate rejects the wheel
+    # (e.g. a 13.0 binary in a macosx_10_13 wheel). Zig encodes it in the triple.
+    dep_target = os.environ.get("MACOSX_DEPLOYMENT_TARGET")
+    if dep_target:
+        target = f"{target}.{dep_target}"
+    return [f"-Dtarget={target}"]
 
 
 def _windows_python_link() -> dict[str, str]:

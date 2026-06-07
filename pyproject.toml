@@ -82,6 +82,11 @@ archs = ["auto"]
 
 [tool.cibuildwheel.macos]
 archs = ["arm64", "x86_64"]
+# Pin the deployment target so the wheel's platform tag matches the min-OS
+# version Zig stamps into the binary (hatch_build.py reads this and encodes it
+# in the Zig target triple). Without it the tag and binary disagree and
+# delocate rejects the wheel.
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
