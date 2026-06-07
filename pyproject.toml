@@ -67,7 +67,7 @@ optimize = "ReleaseSafe"
 
 [tool.hatch.build.targets.sdist]
 # Ship the sources needed to compile the extension from an sdist.
-include = ["zttp", "src", "tools", "build.zig", "THREAT_MODEL.md"]
+include = ["zttp", "src", "tools", "build.zig"]
 
 [tool.cibuildwheel]
 # Zig comes from the `ziglang` build requirement (build isolation), so no system
