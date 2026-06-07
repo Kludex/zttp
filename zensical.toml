@@ -33,7 +33,6 @@ nav = [
 [project.theme]
 language = "en"
 favicon = "assets/favicon.png"
-logo = "assets/logo.png"
 features = [
   "announce.dismiss",
   "content.code.annotate",
@@ -51,6 +50,9 @@ features = [
   "search.highlight",
   "toc.follow",
 ]
+
+[project.theme.icon]
+logo = "lucide/zap"
 
 [[project.theme.palette]]
 scheme = "default"
