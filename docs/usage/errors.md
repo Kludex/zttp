@@ -73,7 +73,7 @@ conn.send_data(b"x")  # no head was sent first
 ```python
 conn = zttp.Connection(zttp.SERVER)
 conn.send_response(b"1.1", 200, b"OK", [(b"X", b"a\r\nInjected: 1")], True)
-#> zttp.LocalProtocolError: field contains invalid bytes (CR/LF/control); refusing to serialize
+#> zttp.LocalProtocolError: invalid field: a header/method/target/version/reason was malformed or contained CR/LF/control bytes
 ```
 
 ## A robust server loop

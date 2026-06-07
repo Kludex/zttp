@@ -173,22 +173,123 @@ fn clearEom(o: ?*c.PyObject) callconv(.c) c_int {
     return 0;
 }
 
+// -- repr & equality ----------------------------------------------------------
+
+// Events get a dataclass-like repr (e.g. Request(method=b'GET', target=b'/',
+// http_version=b'1.1', headers=[...])) and value equality across all fields, so
+// they read well in a REPL and compare cleanly in tests - matching h11.
+
+/// The exposed object fields of an event type, as (python_name, struct_field).
+fn FieldInfo(comptime T: type) type {
+    return struct { name: []const u8, field: []const u8, _t: type = T };
+}
+
+fn reprFields(comptime T: type, comptime short_name: []const u8, comptime fields: anytype) fn (?*c.PyObject) callconv(.c) py.Object {
+    return struct {
+        fn repr(o: ?*c.PyObject) callconv(.c) py.Object {
+            const s: *T = @ptrCast(o.?);
+            var parts: py.Object = py.fromStr(short_name ++ "(");
+            if (parts == null) return null;
+            inline for (fields, 0..) |f, i| {
+                const sep = if (i == 0) f.name ++ "=" else ", " ++ f.name ++ "=";
+                appendStr(&parts, sep);
+                appendRepr(&parts, @field(s, f.field));
+            }
+            appendStr(&parts, ")");
+            return parts;
+        }
+    }.repr;
+}
+
+fn appendStr(acc: *py.Object, lit: []const u8) void {
+    if (acc.* == null) return;
+    const piece = py.fromStr(lit);
+    concatInto(acc, piece);
+}
+
+fn appendRepr(acc: *py.Object, field: py.Object) void {
+    if (acc.* == null) return;
+    const r = if (field == null) py.fromStr("None") else c.PyObject_Repr(field);
+    concatInto(acc, r);
+}
+
+fn concatInto(acc: *py.Object, piece: py.Object) void {
+    if (piece == null) {
+        py.clear(acc);
+        return;
+    }
+    const joined = c.PyUnicode_Concat(acc.*, piece);
+    py.decref(piece);
+    py.decref(acc.*);
+    acc.* = joined; // null on failure - propagated by the null guards above
+}
+
+fn richcompareFields(comptime T: type, comptime fields: anytype) fn (?*c.PyObject, ?*c.PyObject, c_int) callconv(.c) py.Object {
+    return struct {
+        fn cmp(a: ?*c.PyObject, b: ?*c.PyObject, op: c_int) callconv(.c) py.Object {
+            if (op != c.Py_EQ and op != c.Py_NE) return py.newRef(c.Py_NotImplemented());
+            // Only equal-typed events compare; otherwise defer (NotImplemented).
+            if (c.Py_TYPE(a) != c.Py_TYPE(b)) return py.newRef(c.Py_NotImplemented());
+            const sa: *T = @ptrCast(a.?);
+            const sb: *T = @ptrCast(b.?);
+            var equal = true;
+            inline for (fields) |f| {
+                const r = c.PyObject_RichCompareBool(@field(sa, f.field), @field(sb, f.field), c.Py_EQ);
+                if (r < 0) return null;
+                if (r == 0) {
+                    equal = false;
+                    break;
+                }
+            }
+            const result = if (op == c.Py_EQ) equal else !equal;
+            return py.boolean(result);
+        }
+    }.cmp;
+}
+
+const request_fields = .{
+    FieldInfo(RequestObject){ .name = "method", .field = "method" },
+    FieldInfo(RequestObject){ .name = "target", .field = "target" },
+    FieldInfo(RequestObject){ .name = "http_version", .field = "http_version" },
+    FieldInfo(RequestObject){ .name = "headers", .field = "headers" },
+};
+const response_fields = .{
+    FieldInfo(ResponseObject){ .name = "status_code", .field = "status_code" },
+    FieldInfo(ResponseObject){ .name = "reason", .field = "reason" },
+    FieldInfo(ResponseObject){ .name = "http_version", .field = "http_version" },
+    FieldInfo(ResponseObject){ .name = "headers", .field = "headers" },
+};
+const data_fields = .{FieldInfo(DataObject){ .name = "data", .field = "data" }};
+const eom_fields = .{FieldInfo(EndOfMessageObject){ .name = "trailers", .field = "trailers" }};
+
+const reprRequest = reprFields(RequestObject, "Request", request_fields);
+const reprResponse = reprFields(ResponseObject, "Response", response_fields);
+const reprData = reprFields(DataObject, "Data", data_fields);
+const reprEom = reprFields(EndOfMessageObject, "EndOfMessage", eom_fields);
+
+const cmpRequest = richcompareFields(RequestObject, request_fields);
+const cmpResponse = richcompareFields(ResponseObject, response_fields);
+const cmpData = richcompareFields(DataObject, data_fields);
+const cmpEom = richcompareFields(EndOfMessageObject, eom_fields);
+
 // -- specs --------------------------------------------------------------------
 
-fn slots(comptime dealloc: anytype, comptime members: anytype, comptime traverse: anytype, comptime clear_fn: anytype) [5]py.Slot {
+fn slots(comptime dealloc: anytype, comptime members: anytype, comptime traverse: anytype, comptime clear_fn: anytype, comptime repr: anytype, comptime cmp: anytype) [7]py.Slot {
     return .{
         .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&dealloc)) },
         .{ .slot = c.Py_tp_members, .pfunc = @ptrCast(members) },
         .{ .slot = c.Py_tp_traverse, .pfunc = @ptrCast(@constCast(&traverse)) },
         .{ .slot = c.Py_tp_clear, .pfunc = @ptrCast(@constCast(&clear_fn)) },
+        .{ .slot = c.Py_tp_repr, .pfunc = @ptrCast(@constCast(&repr)) },
+        .{ .slot = c.Py_tp_richcompare, .pfunc = @ptrCast(@constCast(&cmp)) },
         .{ .slot = 0, .pfunc = null },
     };
 }
 
-var request_slots = slots(deallocRequest, &request_members, traverseRequest, clearRequest);
-var response_slots = slots(deallocResponse, &response_members, traverseResponse, clearResponse);
-var data_slots = slots(deallocData, &data_members, traverseData, clearData);
-var eom_slots = slots(deallocEom, &eom_members, traverseEom, clearEom);
+var request_slots = slots(deallocRequest, &request_members, traverseRequest, clearRequest, reprRequest, cmpRequest);
+var response_slots = slots(deallocResponse, &response_members, traverseResponse, clearResponse, reprResponse, cmpResponse);
+var data_slots = slots(deallocData, &data_members, traverseData, clearData, reprData, cmpData);
+var eom_slots = slots(deallocEom, &eom_members, traverseEom, clearEom, reprEom, cmpEom);
 
 fn spec(comptime name: [*c]const u8, comptime size: usize, sl: anytype) py.Spec {
     return .{

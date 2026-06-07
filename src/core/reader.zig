@@ -41,6 +41,10 @@ const State = enum {
     done,
     /// The peer closed; no more messages.
     closed,
+    /// A parse error occurred. The connection is poisoned: every further
+    /// nextEvent re-raises rather than resuming, so a desynchronized byte
+    /// stream can never be parsed as if it were valid.
+    failed,
 };
 
 pub const Limits = struct {
@@ -87,6 +91,8 @@ pub const Reader = struct {
     /// etc. have no body whatever the headers say.
     next_bodyless: bool = false,
     eof_seen: bool = false,
+    /// The error that poisoned the connection, re-raised on every later call.
+    failed_with: ParseError = error.ProtocolError,
 
     pub fn init(gpa: std.mem.Allocator, role: Role) Reader {
         return .{ .gpa = gpa, .role = role };
@@ -116,6 +122,14 @@ pub const Reader = struct {
         self.buf.appendSlice(self.gpa, data) catch return error.MessageTooLong;
     }
 
+    /// Declare that the next message to be parsed has no body regardless of its
+    /// headers - the client-side rule for responses to HEAD and for 1xx / 204 /
+    /// 304 (RFC 9112 6.3). Call after `reset`/`start_next_cycle` and before the
+    /// head is parsed; only the caller knows the request method / interim status.
+    pub fn expectBodyless(self: *Reader) void {
+        self.next_bodyless = true;
+    }
+
     /// Prepare to read the next message on the same connection (keep-alive).
     pub fn reset(self: *Reader) void {
         self.state = .head;
@@ -141,7 +155,20 @@ pub const Reader = struct {
     /// Produce the next event, or `.need_data`. Slices in `request`/`response`
     /// events point into `head_store` (stable); `data` events point into the
     /// input buffer and are valid until the next `nextEvent`/`feed` call.
+    ///
+    /// A parse error poisons the connection: it is latched, and every subsequent
+    /// call re-raises it rather than resuming. This makes errors terminal (as
+    /// h11 does), so a desynchronized stream can never be silently re-parsed.
     pub fn nextEvent(self: *Reader) ParseError!Event {
+        if (self.state == .failed) return self.failed_with;
+        return self.dispatch() catch |e| {
+            self.state = .failed;
+            self.failed_with = e;
+            return e;
+        };
+    }
+
+    fn dispatch(self: *Reader) ParseError!Event {
         // Compact once the consumed prefix is both sizeable and a majority of the
         // buffer. The fraction test keeps total memmove work amortized O(n) over
         // a large drain rather than the O(n^2) a fixed threshold alone would give.
@@ -157,6 +184,7 @@ pub const Reader = struct {
             },
             .done => .need_data,
             .closed => .connection_closed,
+            .failed => self.failed_with,
         };
     }
 
@@ -247,7 +275,7 @@ pub const Reader = struct {
     fn readBodyLength(self: *Reader) ParseError!Event {
         if (self.body_remaining == 0) {
             self.state = .eom_pending;
-            return self.nextEvent();
+            return self.dispatch();
         }
         const region = self.avail();
         if (region.len == 0) {
@@ -273,7 +301,7 @@ pub const Reader = struct {
                 .done => {
                     self.materializeTrailers();
                     self.state = .eom_pending;
-                    return self.nextEvent();
+                    return self.dispatch();
                 },
                 .need_data => {
                     if (self.eof_seen) return error.ProtocolError;
@@ -318,7 +346,7 @@ pub const Reader = struct {
         }
         if (self.eof_seen) {
             self.state = .eom_pending;
-            return self.nextEvent();
+            return self.dispatch();
         }
         return .need_data;
     }

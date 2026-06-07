@@ -120,6 +120,30 @@ print(end.trailers)
 #> [(b'X-Checksum', b'900150983cd24fb0')]
 ```
 
+## Bodyless responses (client)
+
+Some responses have **no body no matter what their headers say** - the response to
+a `HEAD` request, and any `1xx` / `204` / `304`. A `HEAD` response, for instance,
+carries the `Content-Length` the `GET` *would* have had, but sends no bytes. Only
+you know the request method, so you tell the connection before parsing the head:
+
+```python hl_lines="4"
+import zttp
+
+conn = zttp.Connection(zttp.CLIENT)
+conn.expect_bodyless()  # (1)!
+conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n")
+
+print([type(e).__name__ for e in events(conn)])  # (2)!
+#> ['Response', 'EndOfMessage']
+```
+
+1.  Without this, the client would wait for 1234 body bytes that never come - and
+    on a keep-alive connection it would read the *next* response as this one's
+    body. `expect_bodyless()` applies to the next message only.
+
+2.  Using the `events()` helper from below.
+
 ## A reusable drain helper
 
 In practice you'll want a small helper that pulls events until it needs more

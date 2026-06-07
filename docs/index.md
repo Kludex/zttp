@@ -78,7 +78,7 @@ print(event.method, event.target)
 #> b'GET' b'/hello?name=you'
 
 print(conn.next_event())
-#> EndOfMessage event
+#> EndOfMessage(trailers=[])
 ```
 
 1.  A `Connection` is the one object you need. Tell it your role - `SERVER` (you
@@ -96,7 +96,7 @@ Run it:
 $ python parse.py
 
 b'GET' b'/hello?name=you'
-EndOfMessage event
+EndOfMessage(trailers=[])
 ```
 
 That's it. The buffering, the header parsing, the body framing - all Zig. 🎉

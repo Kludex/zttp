@@ -19,8 +19,9 @@ The one object you create. `role` is `zttp.SERVER` or `zttp.CLIENT`.
 | Method | Description |
 | --- | --- |
 | `receive_data(data: bytes) -> None` | Append received bytes. An empty `bytes` signals end of input (the peer closed). |
-| `next_event() -> Event` | Return the next event, or the `NEED_DATA` sentinel if more bytes are needed. |
+| `next_event() -> Event` | Return the next event, or the `NEED_DATA` sentinel if more bytes are needed. A parse error poisons the connection: every later call re-raises it. |
 | `start_next_cycle() -> None` | Reset to read the next message on a kept-alive connection (call after `EndOfMessage`). |
+| `expect_bodyless() -> None` | Declare that the next response has no body regardless of its headers - responses to `HEAD`, and `1xx` / `204` / `304`. Client role; call before parsing that response's head. |
 
 ### Write side
 

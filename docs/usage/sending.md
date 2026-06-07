@@ -104,7 +104,7 @@ import zttp
 
 conn = zttp.Connection(zttp.SERVER)
 conn.send_response(b"1.1", 200, b"OK", [(b"X-Evil", b"a\r\nInjected: yes")], True)
-#> zttp.LocalProtocolError: field contains invalid bytes (CR/LF/control); refusing to serialize
+#> zttp.LocalProtocolError: invalid field: a header/method/target/version/reason was malformed or contained CR/LF/control bytes
 ```
 
 !!! info "Local vs Remote"

@@ -37,6 +37,18 @@ fn validValue(value: []const u8) WriteError!void {
     }
 }
 
+/// Normalize a caller-supplied HTTP version into the bare number (e.g. "1.1"),
+/// accepting both "1.1" and "HTTP/1.1" so a value round-tripped from the read
+/// side (which yields the bare "1.1") cannot double-prefix into "HTTP/HTTP/1.1".
+/// The result must be exactly `DIGIT "." DIGIT`.
+fn normalizeVersion(version: []const u8) WriteError![]const u8 {
+    const v = if (version.len >= 5 and std.mem.eql(u8, version[0..5], "HTTP/")) version[5..] else version;
+    if (v.len != 3 or v[0] < '0' or v[0] > '9' or v[1] != '.' or v[2] < '0' or v[2] > '9') {
+        return error.InvalidField;
+    }
+    return v;
+}
+
 /// Request-line / status-line tokens (method, target, version, reason) must not
 /// carry CR/LF or controls. Reason allows SP; the others should not contain SP,
 /// but we only guard against the injection-relevant controls here.
@@ -104,13 +116,13 @@ pub const Writer = struct {
         if (self.state != .idle) return error.LocalProtocol;
         try validLineToken(method, false);
         try validLineToken(target, false);
-        try validLineToken(version, false);
+        const ver = try normalizeVersion(version);
         try validateHeaders(hdrs);
         try self.w(method);
         try self.w(" ");
         try self.w(target);
         try self.w(" HTTP/");
-        try self.w(version);
+        try self.w(ver);
         try self.w("\r\n");
         try self.writeHeaders(hdrs);
         self.state = bodyStateFor(hdrs);
@@ -119,11 +131,11 @@ pub const Writer = struct {
     /// Serialize a status-line + headers.
     pub fn sendResponse(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header, bodyless: bool) WriteError!void {
         if (self.state != .idle) return error.LocalProtocol;
-        try validLineToken(version, false);
+        const ver = try normalizeVersion(version);
         try validLineToken(reason, true); // reason-phrase may contain SP/HTAB
         try validateHeaders(hdrs);
         try self.w("HTTP/");
-        try self.w(version);
+        try self.w(ver);
         try self.w(" ");
         var buf: [3]u8 = undefined;
         buf[0] = '0' + @as(u8, @intCast((status / 100) % 10));
@@ -230,6 +242,23 @@ test "serialize a request" {
     try wr.sendRequest("GET", "/", "1.1", &hdrs);
     try wr.endMessage(&.{});
     try t.expectEqualStrings("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n", wr.pending());
+}
+
+test "version accepts both bare and HTTP/-prefixed forms" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try wr.sendRequest("GET", "/", "HTTP/1.1", &.{}); // round-tripped form
+    try wr.endMessage(&.{});
+    try t.expectEqualStrings("GET / HTTP/1.1\r\n\r\n", wr.pending());
+}
+
+test "invalid version rejected" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try t.expectError(error.InvalidField, wr.sendRequest("GET", "/", "1.1.1", &.{}));
+    var wr2 = Writer.init(t.allocator);
+    defer wr2.deinit();
+    try t.expectError(error.InvalidField, wr2.sendResponse("garbage", 200, "OK", &.{}, true));
 }
 
 test "chunked response framing" {

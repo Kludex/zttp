@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+import pytest
+
+import zttp
+from tests.conftest import drain, drain_all
+
+
+def test_request_repr() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET /p HTTP/1.1\r\nHost: x\r\n\r\n")
+    req = conn.next_event()
+    assert repr(req) == "Request(method=b'GET', target=b'/p', http_version=b'1.1', headers=[(b'Host', b'x')])"
+
+
+def test_endofmessage_and_data_repr() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi")
+    conn.next_event()  # Request
+    assert repr(conn.next_event()) == "Data(data=b'hi')"
+    assert repr(conn.next_event()) == "EndOfMessage(trailers=[])"
+
+
+def test_response_repr() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.receive_data(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+    resp = conn.next_event()
+    assert repr(resp) == (
+        "Response(status_code=404, reason=b'Not Found', http_version=b'1.1', headers=[(b'Content-Length', b'0')])"
+    )
+
+
+def test_events_compare_by_value() -> None:
+    def parse(data: bytes) -> object:
+        conn = zttp.Connection(zttp.SERVER)
+        conn.receive_data(data)
+        return conn.next_event()
+
+    a = parse(b"GET /p HTTP/1.1\r\nHost: x\r\n\r\n")
+    b = parse(b"GET /p HTTP/1.1\r\nHost: x\r\n\r\n")
+    c = parse(b"GET /other HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert a == b
+    assert a != c
+    assert a != "not an event"  # different type -> not equal, no error
+
+
+def test_parse_error_poisons_connection() -> None:
+    # After a malformed message, next_event must keep raising - never resume and
+    # parse the following bytes as a fresh (smuggled) request.
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\nX: 1\n\nGET /smuggled HTTP/1.1\r\nHost: y\r\n\r\n")
+    with pytest.raises(zttp.RemoteProtocolError):
+        drain_all(conn)
+    # The connection is poisoned: it re-raises rather than returning /smuggled.
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
+
+
+@pytest.mark.parametrize("version", [b"1.1", b"HTTP/1.1"])
+def test_send_version_accepts_bare_and_prefixed(version: bytes) -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(b"GET", b"/", version, [(b"Host", b"x")])
+    conn.end_message()
+    assert conn.data_to_send() == b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+
+
+@pytest.mark.parametrize("bad", [b"2", b"1.1.1", b"garbage", b""])
+def test_send_invalid_version_rejected(bad: bytes) -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.send_request(b"GET", b"/", bad, [])
+
+
+def test_head_response_is_bodyless() -> None:
+    # A response to HEAD carries Content-Length but no body. Without
+    # expect_bodyless the client would wait for / consume phantom body bytes.
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.expect_bodyless()
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n")
+    events = list(drain(conn))
+    assert [type(e).__name__ for e in events] == ["Response", "EndOfMessage"]
+
+
+def test_204_response_is_bodyless() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.expect_bodyless()
+    conn.receive_data(b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n")
+    events = list(drain(conn))
+    assert [type(e).__name__ for e in events] == ["Response", "EndOfMessage"]
+
+
+def test_bodyless_resets_after_cycle() -> None:
+    # expect_bodyless applies only to the next message; the following one frames
+    # its body normally again.
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.expect_bodyless()
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n")
+    assert [type(e).__name__ for e in drain(conn)] == ["Response", "EndOfMessage"]
+    conn.start_next_cycle()
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
+    body = b"".join(e.data for e in drain(conn) if isinstance(e, zttp.Data))
+    assert body == b"abc"
