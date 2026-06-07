@@ -40,8 +40,11 @@ var connection_type: py.Object = null;
 fn new(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
     var role_val: c_long = 0;
     var protocol_val: c_long = HTTP1;
-    var kwlist = [_:null]?[*:0]u8{ @constCast("role"), @constCast("protocol"), null };
-    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", &kwlist, &role_val, &protocol_val) == 0) return null;
+    // The kwlist parameter type differs across CPython versions (char** in 3.12,
+    // const char* const* in 3.13+), so build a plain C-pointer array and ptrCast
+    // it to whatever the translated signature expects.
+    var kwlist = [_][*c]u8{ @constCast("role"), @constCast("protocol"), null };
+    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", @ptrCast(&kwlist), &role_val, &protocol_val) == 0) return null;
     const role: Role = switch (role_val) {
         SERVER => .server,
         CLIENT => .client,
