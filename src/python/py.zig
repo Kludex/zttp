@@ -5,19 +5,13 @@
 
 const std = @import("std");
 
-pub const c = @cImport({
-    @cDefine("PY_SSIZE_T_CLEAN", "1");
-    // Windows/MSVC UCRT: stop the secure-CRT (_s) string functions from being
-    // declared. Zig 0.16 translate-c renders them as `extern_local_*` constants
-    // and then rejects them as unused, breaking the build. They reach us through
-    // the C++ secure overload macros, so disabling those (plus the secure-lib
-    // gate) removes the declarations entirely. CPython uses only the plain
-    // wcscpy/wcscat, so nothing is lost. All no-ops on glibc/macOS.
-    @cDefine("__STDC_WANT_SECURE_LIB__", "0");
-    @cDefine("_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES", "0");
-    @cDefine("_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES_COUNT", "0");
-    @cInclude("Python.h");
-});
+// The translated CPython C-API. build.zig translates Python.h (via the
+// `cimport.h` shim) to a Zig file, strips a couple of broken declarations that
+// Zig 0.16's translate-c emits on Windows (unused `extern_local_*_s` secure-CRT
+// constants), and wires the result in as the `pyc` module. Using @cImport
+// directly is not an option there: the generated unused constants are a hard
+// error and @cImport output can't be patched.
+pub const c = @import("pyc");
 
 pub const Object = [*c]c.PyObject;
 pub const ssize = c.Py_ssize_t;

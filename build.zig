@@ -45,6 +45,39 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // Translate the CPython C-API to Zig from a real header, then patch the
+    // result. Zig 0.16's translate-c emits the MSVC secure-CRT `_s` forwarders
+    // (wcscat_s/wcscpy_s) as unused local constants and rejects them; @cImport
+    // output can't be patched, but a translate-c file artifact can. `fix_cimport`
+    // strips those unused blocks; on glibc/macOS there are none and it's a no-op.
+    const translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/python/cimport.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate.addIncludePath(.{ .cwd_relative = py_include });
+
+    const fixer = b.addExecutable(.{
+        .name = "fix_cimport",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/fix_cimport.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const fix = b.addRunArtifact(fixer);
+    fix.addFileArg(translate.getOutput());
+    // The patched copy fix_cimport writes out, used as the `pyc` module source.
+    const pyc_file = fix.addOutputFileArg("cimport.zig");
+
+    const pyc_mod = b.createModule(.{
+        .root_source_file = pyc_file,
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    pyc_mod.addIncludePath(.{ .cwd_relative = py_include });
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/python/module.zig"),
         .target = target,
@@ -53,6 +86,7 @@ pub fn build(b: *std.Build) void {
     });
     mod.addIncludePath(.{ .cwd_relative = py_include });
     mod.addImport("core", core_mod);
+    mod.addImport("pyc", pyc_mod);
 
     const lib = b.addLibrary(.{
         .name = "_zttp",
