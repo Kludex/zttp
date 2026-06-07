@@ -3,7 +3,9 @@
 
 const py = @import("py.zig");
 const c = py.c;
-const ParseError = @import("core").errors.ParseError;
+const core = @import("core");
+const ParseError = core.errors.ParseError;
+const H2Error = core.h2.connection.H2Error;
 
 pub var ProtocolError: py.Object = null;
 pub var RemoteProtocolError: py.Object = null;
@@ -34,6 +36,21 @@ pub fn raiseParse(e: ParseError) py.Object {
         error.InvalidChunk => "malformed chunked encoding",
         error.MessageTooLong => "message exceeded configured size limit",
         error.ProtocolError => "unexpected end of data",
+    };
+    return py.raise(RemoteProtocolError, msg);
+}
+
+/// Map an HTTP/2 connection error onto RemoteProtocolError. Every H2Error is a
+/// peer-induced fault (a malformed frame, a flood, a desync), so they are all
+/// remote, mirroring raiseParse.
+pub fn raiseH2(e: H2Error) py.Object {
+    const msg: [*c]const u8 = switch (e) {
+        error.ProtocolError => "HTTP/2 protocol error",
+        error.FrameSizeError => "HTTP/2 frame size error",
+        error.CompressionError => "HPACK compression error",
+        error.FlowControlError => "HTTP/2 flow-control error",
+        error.MessageTooLong => "message exceeded configured size limit",
+        error.EnhanceYourCalm => "HTTP/2 flood detected (enhance your calm)",
     };
     return py.raise(RemoteProtocolError, msg);
 }

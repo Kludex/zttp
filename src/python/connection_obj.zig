@@ -14,33 +14,58 @@ const events = core.events;
 const events_obj = @import("events_obj.zig");
 const exceptions = @import("exceptions.zig");
 
+const H2Connection = core.h2.connection.Connection;
+const H2Role = core.h2.connection.Role;
+
 const gpa = std.heap.c_allocator;
 
 const SERVER: c_long = 1;
 const CLIENT: c_long = 2;
+const HTTP1: c_long = 1;
+const HTTP2: c_long = 2;
 
+// One Python Connection backs either an HTTP/1.1 Reader+Writer or an HTTP/2
+// engine, chosen by the `protocol` argument. The H1 path (reader/writer
+// non-null, h2 null) is byte-for-byte the original; H2 leaves reader/writer null
+// and drives `h2` instead. Methods dispatch on which is set.
 const ConnectionObject = extern struct {
     ob_base: c.PyObject,
     reader: ?*Reader,
     writer: ?*Writer,
+    h2: ?*H2Connection,
 };
 
 var connection_type: py.Object = null;
 
 fn new(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
-    _ = kwds;
     var role_val: c_long = 0;
-    if (c.PyArg_ParseTuple(args, "l", &role_val) == 0) return null;
+    var protocol_val: c_long = HTTP1;
+    var kwlist = [_:null]?[*:0]u8{ @constCast("role"), @constCast("protocol"), null };
+    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", &kwlist, &role_val, &protocol_val) == 0) return null;
     const role: Role = switch (role_val) {
         SERVER => .server,
         CLIENT => .client,
         else => return py.raiseValue("role must be zttp.SERVER or zttp.CLIENT"),
     };
+    if (protocol_val != HTTP1 and protocol_val != HTTP2) return py.raiseValue("protocol must be zttp.HTTP1 or zttp.HTTP2");
 
     const alloc = tp.?.tp_alloc.?;
     const obj = alloc(tp, 0);
     if (obj == null) return null;
     const self: *ConnectionObject = @ptrCast(obj);
+    self.reader = null;
+    self.writer = null;
+    self.h2 = null;
+
+    if (protocol_val == HTTP2) {
+        const h = gpa.create(H2Connection) catch {
+            py.decref(obj);
+            return c.PyErr_NoMemory();
+        };
+        h.* = H2Connection.init(gpa, if (role == .server) H2Role.server else H2Role.client);
+        self.h2 = h;
+        return obj;
+    }
 
     const r = gpa.create(Reader) catch {
         py.decref(obj);
@@ -68,19 +93,31 @@ fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
         wc.deinit();
         gpa.destroy(wc);
     }
+    if (self.h2) |h| {
+        h.deinit();
+        gpa.destroy(h);
+    }
     py.freeInstance(@ptrCast(self));
 }
 
 fn receive_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const r = self.reader orelse return py.raiseRuntime("connection is closed");
     const bytes = py.asBytes(arg) orelse return null;
+    if (self.h2) |h| {
+        h.feed(bytes) catch |e| return exceptions.raiseH2(e);
+        return py.none();
+    }
+    const r = self.reader orelse return py.raiseRuntime("connection is closed");
     r.feed(bytes) catch |e| return exceptions.raiseParse(e); // MessageTooLong -> RemoteProtocolError
     return py.none();
 }
 
 fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
+    if (self.h2) |h| {
+        const ev = h.nextEvent() catch |e| return exceptions.raiseH2(e);
+        return events_obj.fromEvent(ev);
+    }
     const r = self.reader orelse return py.raiseRuntime("connection is closed");
     const ev = r.nextEvent() catch |e| return exceptions.raiseParse(e);
     return events_obj.fromEvent(ev);
@@ -278,5 +315,7 @@ pub fn register(module: py.Object) bool {
     _ = c.PyModule_AddObjectRef(module, "Connection", connection_type);
     _ = c.PyModule_AddIntConstant(module, "SERVER", SERVER);
     _ = c.PyModule_AddIntConstant(module, "CLIENT", CLIENT);
+    _ = c.PyModule_AddIntConstant(module, "HTTP1", HTTP1);
+    _ = c.PyModule_AddIntConstant(module, "HTTP2", HTTP2);
     return true;
 }
