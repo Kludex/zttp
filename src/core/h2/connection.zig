@@ -147,15 +147,14 @@ pub const Connection = struct {
             }
         }
 
-        // Decode exactly one frame; it may push 0..PENDING_CAP events.
-        switch (try self.readFrame()) {
-            .need_data => return .need_data,
-            .progressed => {
-                if (self.pending_len > 0) return self.popPending();
-                // A frame that produced no event (e.g. SETTINGS-ACK we received):
-                // recurse to try the next frame.
-                return self.dispatch();
-            },
+        // Decode frames until one produces an event or the buffer runs dry. A run
+        // of no-event frames (SETTINGS-ACK, PRIORITY) is consumed in this loop
+        // rather than via recursion, so it cannot overflow the stack.
+        while (true) {
+            switch (try self.readFrame()) {
+                .need_data => return .need_data,
+                .progressed => if (self.pending_len > 0) return self.popPending(),
+            }
         }
     }
 
@@ -263,22 +262,36 @@ pub const Connection = struct {
     fn handleWindowUpdate(self: *Connection, f: frame_mod.Frame) H2Error!void {
         const increment = std.mem.readInt(u32, f.payload[0..4], .big) & 0x7FFF_FFFF;
         if (f.header.stream_id == 0) {
+            // Connection-level: a zero increment or an overflow is a CONNECTION
+            // error (RFC 9113 6.9 / 6.9.1).
             if (increment == 0) return error.ProtocolError;
             const sum = @as(i64, self.conn_send_window) + @as(i64, increment);
             if (sum > constants.MAX_WINDOW_SIZE) return error.FlowControlError;
             self.conn_send_window = @intCast(sum);
-        } else {
-            const s = self.streams.getPtr(f.header.stream_id) orelse return; // unknown/closed: ignore the credit
-            const t = s.creditSendWindow(increment);
-            if (t.action == .connection_error) return error.FlowControlError;
-            // A stream-level error here (zero increment / overflow) is surfaced as
-            // an RST_STREAM in the control-frame iteration; for now treat overflow
-            // as connection-fatal via FlowControlError and zero handled above.
-            if (t.action == .stream_error and t.code == .flow_control_error) {
-                self.push(.{ .rst_stream = .{ .stream_id = f.header.stream_id, .error_code = @intFromEnum(t.code) } });
-            }
+            self.push(.{ .window_update = .{ .stream_id = 0, .increment = increment } });
+            return;
         }
-        self.push(.{ .window_update = .{ .stream_id = f.header.stream_id, .increment = increment } });
+        const s = self.streams.getPtr(f.header.stream_id) orelse {
+            // No live stream: an id never opened (> highest seen) is idle, which
+            // is a connection PROTOCOL_ERROR; an id at/below the high-water mark
+            // is closed, and a stray WINDOW_UPDATE in its wake is ignored.
+            if (self.isIdle(f.header.stream_id)) return error.ProtocolError;
+            return;
+        };
+        // A stream-level violation (zero increment or window overflow) resets the
+        // stream; we do NOT also emit a window_update for the rejected frame.
+        const t = s.creditSendWindow(increment);
+        switch (t.action) {
+            .ok => self.push(.{ .window_update = .{ .stream_id = f.header.stream_id, .increment = increment } }),
+            .stream_error => self.push(.{ .rst_stream = .{ .stream_id = f.header.stream_id, .error_code = @intFromEnum(t.code) } }),
+            .connection_error => return error.FlowControlError,
+        }
+    }
+
+    /// Is `id` a peer-initiated stream that has never been opened (idle)? An id
+    /// above the highest one we have seen open is idle; at/below is closed.
+    fn isIdle(self: *const Connection, id: u32) bool {
+        return id > self.highest_peer_id;
     }
 
     fn handleData(self: *Connection, f: frame_mod.Frame) H2Error!void {
@@ -434,6 +447,58 @@ test "partial frame resumes across feeds" {
     try testing.expectEqual(Event.need_data, try c.nextEvent());
     try c.feed(input.items[split..]);
     try testing.expectEqual(std.meta.Tag(Event).settings, std.meta.activeTag(try c.nextEvent()));
+}
+
+fn handshook(c: *Connection, extra: []const u8) !void {
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    try input.appendSlice(testing.allocator, constants.CLIENT_PREFACE);
+    try frameBytes(&input, .settings, 0, 0, &.{});
+    try input.appendSlice(testing.allocator, extra);
+    try c.feed(input.items);
+    try testing.expectEqual(std.meta.Tag(Event).settings, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "WINDOW_UPDATE on an idle stream is a connection error" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var wu: std.ArrayList(u8) = .empty;
+    defer wu.deinit(testing.allocator);
+    try frameBytes(&wu, .window_update, 0, 7, &[_]u8{ 0x00, 0x00, 0x00, 0x10 }); // stream 7, never opened
+    try handshook(&c, wu.items);
+    try testing.expectError(error.ProtocolError, c.nextEvent());
+}
+
+test "WINDOW_UPDATE with a zero increment on an open stream resets it, no window_update event" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var wu: std.ArrayList(u8) = .empty;
+    defer wu.deinit(testing.allocator);
+    try frameBytes(&wu, .window_update, 0, 1, &[_]u8{ 0x00, 0x00, 0x00, 0x00 }); // zero increment
+    try handshook(&c, wu.items);
+    try c.openStreamForTest(1);
+    const ev = try c.nextEvent();
+    try testing.expectEqual(@as(u32, 1), ev.rst_stream.stream_id);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), ev.rst_stream.error_code);
+    try testing.expectEqual(Event.need_data, try c.nextEvent());
+}
+
+test "a long run of no-event frames does not overflow the stack" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    try input.appendSlice(testing.allocator, constants.CLIENT_PREFACE);
+    try frameBytes(&input, .settings, 0, 0, &.{});
+    // Thousands of PRIORITY frames (no event each) then a PING (an event).
+    var k: usize = 0;
+    while (k < 5000) : (k += 1) {
+        try frameBytes(&input, .priority, 0, 1, &[_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00 });
+    }
+    try frameBytes(&input, .ping, 0, 0, &[_]u8{0} ** 8);
+    try c.feed(input.items);
+    try testing.expectEqual(std.meta.Tag(Event).settings, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).ping, std.meta.activeTag(try c.nextEvent()));
 }
 
 fn driveConnection(input: []const u8) void {
