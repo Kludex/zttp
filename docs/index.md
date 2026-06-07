@@ -18,10 +18,6 @@ icon: lucide/zap
 
 ---
 
-!!! warning "Experimental"
-    zttp is experimental. The API and behaviour may change at any time, and it is
-    not yet ready for production use.
-
 zttp is a [sans-IO](https://sans-io.readthedocs.io/) HTTP/1.1 parser whose engine
 is written in [Zig](https://ziglang.org). It does **no I/O of its own**: you feed
 it bytes and pull out events, and you ask it for bytes to send. It never touches a
@@ -44,6 +40,10 @@ The key features are:
   event field.
 * **Tested**: a high-level test suite at **100% coverage**, plus the Zig core's
   own tests and an adversarial-input fuzz harness.
+
+!!! warning "Experimental"
+    zttp is experimental. The API and behaviour may change at any time, and it is
+    not yet ready for production use.
 
 !!! note "Requirements"
     zttp needs **CPython 3.12+** and runs on **Linux** and **macOS**.
