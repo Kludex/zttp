@@ -5,8 +5,14 @@
 
 pub const constants = @import("constants.zig");
 pub const frame = @import("frame.zig");
+pub const static_table = @import("hpack/static_table.zig");
+pub const huffman = @import("hpack/huffman.zig");
+pub const hpack_decoder = @import("hpack/decoder.zig");
 
 test {
     _ = constants;
     _ = frame;
+    _ = static_table;
+    _ = huffman;
+    _ = hpack_decoder;
 }
