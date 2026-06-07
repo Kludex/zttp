@@ -306,6 +306,71 @@ var response_spec = spec("zttp.Response", @sizeOf(ResponseObject), &response_slo
 var data_spec = spec("zttp.Data", @sizeOf(DataObject), &data_slots);
 var eom_spec = spec("zttp.EndOfMessage", @sizeOf(EndOfMessageObject), &eom_slots);
 
+// -- header-name interning ----------------------------------------------------
+
+// Building a fresh PyBytes for every header name is the single biggest per-
+// header cost. The common request header names are a small, fixed set, so we
+// pre-build one PyBytes each at module init and hand back a new reference when a
+// parsed name matches EXACTLY (wire casing included - so observable output is
+// unchanged; a differently-cased name simply misses the cache and allocates).
+const INTERNED_NAMES = [_][]const u8{
+    "Host",
+    "User-Agent",
+    "Accept",
+    "Accept-Encoding",
+    "Accept-Language",
+    "Connection",
+    "Content-Type",
+    "Content-Length",
+    "Cookie",
+    "Authorization",
+    "Referer",
+    "Cache-Control",
+    "Origin",
+    "Sec-Fetch-Site",
+    "Sec-Fetch-Mode",
+    "Sec-Fetch-Dest",
+    "Upgrade-Insecure-Requests",
+    "If-None-Match",
+    "If-Modified-Since",
+    "Range",
+    "Pragma",
+    "DNT",
+    "X-Requested-With",
+    "X-Forwarded-For",
+    "X-Forwarded-Proto",
+    "X-Real-IP",
+    "Transfer-Encoding",
+};
+
+var interned: [INTERNED_NAMES.len]py.Object = @splat(null);
+
+fn buildInternTable() bool {
+    inline for (INTERNED_NAMES, 0..) |name, i| {
+        interned[i] = py.fromBytes(name);
+        if (interned[i] == null) return false;
+    }
+    return true;
+}
+
+/// A new reference to the cached PyBytes for `name` if it matches an interned
+/// name exactly, else null (caller allocates a fresh one). Dispatches on length
+/// via a comptime switch, so each call compares only against the interned names
+/// that share `name`'s length - keeping both hit and miss paths cheap.
+fn internName(name: []const u8) ?py.Object {
+    switch (name.len) {
+        inline 3...25 => |L| {
+            inline for (INTERNED_NAMES, 0..) |cand, i| {
+                if (comptime cand.len == L) {
+                    if (name[0] == cand[0] and std.mem.eql(u8, name, cand)) return py.newRef(interned[i]);
+                }
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
 // -- header list materialisation ----------------------------------------------
 
 /// Build a Python list of (name, value) bytes tuples from the core headers.
@@ -313,7 +378,7 @@ fn buildHeaders(hdrs: []const events.Header) py.Object {
     const list = py.newList(@intCast(hdrs.len));
     if (list == null) return null;
     for (hdrs, 0..) |h, i| {
-        const name = py.fromBytes(h.name);
+        const name = internName(h.name) orelse py.fromBytes(h.name);
         const value = py.fromBytes(h.value);
         if (name == null or value == null) {
             py.xdecref(name);
@@ -417,6 +482,8 @@ pub fn register(module: py.Object) bool {
     need_data = makeSentinel("zttp.NeedDataType");
     connection_closed = makeSentinel("zttp.ConnectionClosedType");
     if (need_data == null or connection_closed == null) return false;
+
+    if (!buildInternTable()) return false;
 
     _ = c.PyModule_AddObjectRef(module, "Request", request_type);
     _ = c.PyModule_AddObjectRef(module, "Response", response_type);
