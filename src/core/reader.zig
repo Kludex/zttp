@@ -128,7 +128,10 @@ pub const Reader = struct {
     }
 
     /// Prepare to read the next message on the same connection (keep-alive).
+    /// A poisoned (`.failed`) connection stays poisoned: a parse error is
+    /// terminal, so reset cannot revive a desynchronized byte stream.
     pub fn reset(self: *Reader) void {
+        if (self.state == .failed) return;
         self.state = .head;
         self.headers.clearRetainingCapacity();
         self.trailers.clearRetainingCapacity();
@@ -487,6 +490,17 @@ test "keep-alive: two requests via reset" {
     r.reset();
     e = try r.nextEvent();
     try t.expectEqualStrings("/b", e.request.target);
+}
+
+test "reset cannot un-poison a failed connection" {
+    var r = Reader.init(t.allocator, .server);
+    defer r.deinit();
+    // A malformed request followed by a smuggled one; the error must be terminal.
+    try r.feed("GET / HTTP/1.1\nX: 1\n\nGET /smuggled HTTP/1.1\r\nHost: y\r\n\r\n");
+    try t.expectError(error.InvalidLine, r.nextEvent());
+    r.reset(); // an attacker-influenced caller trying to recover
+    // Still poisoned: it must NOT parse /smuggled as a fresh request.
+    try t.expectError(error.InvalidLine, r.nextEvent());
 }
 
 test "client response until close" {

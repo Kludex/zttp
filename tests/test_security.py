@@ -5,7 +5,7 @@ import gc
 import pytest
 
 import zttp
-from tests.conftest import drain
+from tests.conftest import drain, drain_all
 
 
 def _drain_until_error_or_end(conn: zttp.Connection) -> list[object]:
@@ -134,3 +134,54 @@ def test_event_types_are_gc_tracked() -> None:
     conn.receive_data(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
     ev = conn.next_event()
     assert gc.is_tracked(ev)
+
+
+# -- CVE-driven hardening regressions -----------------------------------------
+
+
+def test_start_next_cycle_cannot_unpoison_after_error() -> None:
+    # A parse error is terminal: start_next_cycle must not let a desynced
+    # connection resume and parse the following (smuggled) bytes as a request.
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\nX: 1\n\nGET /smuggled HTTP/1.1\r\nHost: y\r\n\r\n")
+    with pytest.raises(zttp.RemoteProtocolError):
+        drain_all(conn)
+    conn.start_next_cycle()
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [(b"Transfer-Encoding", b"chunked"), (b"Content-Length", b"5")],  # TE + CL
+        [(b"Content-Length", b"5"), (b"Content-Length", b"6")],  # conflicting dup CL
+        [(b"Content-Length", b"5x")],  # non-digit CL
+    ],
+)
+def test_send_rejects_ambiguous_framing(headers: list[tuple[bytes, bytes]]) -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.send_response(b"1.1", 200, b"OK", headers)
+
+
+@pytest.mark.parametrize("version", [b"GET / HTTP/2.0\r\n\r\n", b"GET / HTTP/0.9\r\n\r\n"])
+def test_non_http1x_version_rejected(version: bytes) -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(version)
+    with pytest.raises(zttp.RemoteProtocolError):
+        drain_all(conn)
+
+
+def test_oversized_feed_raises_remote_protocol_error() -> None:
+    # feed() past max_buffer is the peer's fault -> RemoteProtocolError, not MemoryError.
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.receive_data(b"Z" * (9 * 1024 * 1024))
+
+
+def test_response_reason_with_control_byte_rejected() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.receive_data(b"HTTP/1.1 200 O\x00K\r\nContent-Length: 0\r\n\r\n")
+    with pytest.raises(zttp.RemoteProtocolError):
+        drain_all(conn)

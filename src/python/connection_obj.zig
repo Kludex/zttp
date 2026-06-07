@@ -75,7 +75,7 @@ fn receive_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Objec
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const r = self.reader orelse return py.raiseRuntime("connection is closed");
     const bytes = py.asBytes(arg) orelse return null;
-    r.feed(bytes) catch return c.PyErr_NoMemory();
+    r.feed(bytes) catch |e| return exceptions.raiseParse(e); // MessageTooLong -> RemoteProtocolError
     return py.none();
 }
 

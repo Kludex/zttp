@@ -66,6 +66,37 @@ fn validateHeaders(hdrs: []const Header) WriteError!void {
         try validName(h.name);
         try validValue(h.value);
     }
+    try validateFraming(hdrs);
+}
+
+/// Refuse to serialize ambiguous framing - the send-side mirror of the reader's
+/// smuggling guards. A message carrying both Transfer-Encoding and
+/// Content-Length, or conflicting duplicate Content-Lengths, would let a
+/// downstream parser disagree about message boundaries (response splitting).
+fn validateFraming(hdrs: []const Header) WriteError!void {
+    var has_te = false;
+    var content_length: ?[]const u8 = null;
+    for (hdrs) |h| {
+        if (eqIgnoreCase(h.name, "transfer-encoding")) {
+            has_te = true;
+        } else if (eqIgnoreCase(h.name, "content-length")) {
+            const v = trimOws(h.value);
+            for (v) |ch| if (ch < '0' or ch > '9') return error.InvalidField; // digits only
+            if (content_length) |prev| {
+                if (!eqIgnoreCase(prev, v)) return error.InvalidField; // conflicting duplicate
+            }
+            content_length = v;
+        }
+    }
+    if (has_te and content_length != null) return error.InvalidField; // TE + CL
+}
+
+fn trimOws(s: []const u8) []const u8 {
+    var start: usize = 0;
+    var end = s.len;
+    while (start < end and (s[start] == ' ' or s[start] == '\t')) start += 1;
+    while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t')) end -= 1;
+    return s[start..end];
 }
 
 const State = enum {
@@ -354,4 +385,31 @@ test "send-path injection: CRLF in trailer rejected" {
     try wr.sendResponse("1.1", 200, "OK", &hdrs, false);
     const trailers = [_]Header{.{ .name = "X", .value = "v\r\nInjected: 1" }};
     try t.expectError(error.InvalidField, wr.endMessage(&trailers));
+}
+
+test "send rejects ambiguous framing (TE + CL)" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+        .{ .name = "Content-Length", .value = "5" },
+    };
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, false));
+}
+
+test "send rejects conflicting duplicate Content-Length" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{
+        .{ .name = "Content-Length", .value = "5" },
+        .{ .name = "Content-Length", .value = "6" },
+    };
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, false));
+}
+
+test "send rejects non-digit Content-Length" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "Content-Length", .value = "5x" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, false));
 }

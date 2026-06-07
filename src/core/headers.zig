@@ -63,18 +63,24 @@ pub fn parseStatusLine(line: []const u8) ParseError!StatusLine {
     } else if (!sc.isEmpty()) {
         return error.InvalidLine;
     }
+    // reason-phrase = *( HTAB / SP / VCHAR / obs-text ); reject other controls
+    // (CR/LF can't appear - it's a single line - but NUL and the rest can).
+    for (reason) |ch| {
+        if (ch != '\t' and ch < 0x20) return error.InvalidLine;
+        if (ch == 0x7F) return error.InvalidLine;
+    }
     return .{ .http_version = version, .status_code = code, .reason = reason };
 }
 
 /// Validate and strip the `HTTP/` prefix, returning just the version number
-/// (e.g. "1.1"). Only HTTP/1.x major versions reach this 1.1 parser; "1.0" and
-/// "1.1" are the expected values, but we accept any `1.DIGIT` and let the
-/// connection layer decide semantics.
+/// (e.g. "1.1"). This is an HTTP/1.x parser, so the major version must be `1`:
+/// accepting `HTTP/0.9` or `HTTP/2.0` here would be a version-confusion
+/// differential (the request would be framed by 1.1 rules under a wrong banner).
 fn parseVersion(tok: []const u8) ParseError![]const u8 {
     if (tok.len != 8) return error.InvalidLine;
     if (!std.mem.eql(u8, tok[0..5], "HTTP/")) return error.InvalidLine;
     const num = tok[5..];
-    if (num[0] < '0' or num[0] > '9' or num[1] != '.' or num[2] < '0' or num[2] > '9') {
+    if (num[0] != '1' or num[1] != '.' or num[2] < '0' or num[2] > '9') {
         return error.InvalidLine;
     }
     return num;
@@ -134,6 +140,22 @@ test "parseStatusLine empty reason" {
 test "parseStatusLine rejects bad code" {
     try std.testing.expectError(error.InvalidLine, parseStatusLine("HTTP/1.1 20 OK"));
     try std.testing.expectError(error.InvalidLine, parseStatusLine("HTTP/1.1 2xx OK"));
+}
+
+test "version restricted to HTTP/1.x" {
+    try std.testing.expectEqualStrings("1.0", (try parseRequestLine("GET / HTTP/1.0")).http_version);
+    try std.testing.expectEqualStrings("1.1", (try parseRequestLine("GET / HTTP/1.1")).http_version);
+    // non-1.x major versions are a version-confusion differential -> rejected
+    try std.testing.expectError(error.InvalidLine, parseRequestLine("GET / HTTP/0.9"));
+    try std.testing.expectError(error.InvalidLine, parseRequestLine("GET / HTTP/2.0"));
+    try std.testing.expectError(error.InvalidLine, parseStatusLine("HTTP/2.0 200 OK"));
+}
+
+test "reason phrase rejects control bytes" {
+    try std.testing.expectError(error.InvalidLine, parseStatusLine("HTTP/1.1 200 O\x00K"));
+    try std.testing.expectError(error.InvalidLine, parseStatusLine("HTTP/1.1 200 O\x07K"));
+    // SP and HTAB are allowed in the reason phrase
+    try std.testing.expectEqualStrings("O K\t", (try parseStatusLine("HTTP/1.1 200 O K\t")).reason);
 }
 
 test "parseHeaderLine" {
