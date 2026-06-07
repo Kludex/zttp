@@ -7,6 +7,15 @@ const std = @import("std");
 
 pub const c = @cImport({
     @cDefine("PY_SSIZE_T_CLEAN", "1");
+    // Windows/MSVC UCRT: stop the secure-CRT (_s) string functions from being
+    // declared. Zig 0.16 translate-c renders them as `extern_local_*` constants
+    // and then rejects them as unused, breaking the build. They reach us through
+    // the C++ secure overload macros, so disabling those (plus the secure-lib
+    // gate) removes the declarations entirely. CPython uses only the plain
+    // wcscpy/wcscat, so nothing is lost. All no-ops on glibc/macOS.
+    @cDefine("__STDC_WANT_SECURE_LIB__", "0");
+    @cDefine("_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES", "0");
+    @cDefine("_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES_COUNT", "0");
     @cInclude("Python.h");
 });
 

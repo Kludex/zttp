@@ -62,10 +62,10 @@ a callback parser: you give it a protocol object with `on_url`, `on_header`,
 `on_body`, ... and it calls them as it parses. It's fast, but the control flow is
 inverted into your callbacks, and the body gets copied per callback.
 
-zttp keeps the speed - it's written in Zig and is
-[faster than httptools](../reference/performance.md) - but gives you the cleaner
-pull API, and emits each body span as a single `Data` event instead of a stream
-of callbacks.
+zttp keeps the performance of a native engine - it's written in Zig (see
+[Performance](../reference/performance.md)) - but gives you the cleaner pull API,
+and emits each body span as a single `Data` event instead of a stream of
+callbacks.
 
 | | httptools | zttp |
 | --- | --- | --- |

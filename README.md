@@ -3,9 +3,8 @@
 A [sans-IO](https://sans-io.readthedocs.io/) HTTP parser for Python, with a core
 written in [Zig](https://ziglang.org). It is to [h11](https://github.com/python-hyper/h11)
 what [zloop](https://github.com/Kludex/zloop) is to asyncio: the same clean,
-event-based API, with a hand-written Zig engine underneath. The goal is to be
-faster than [httptools](https://github.com/MagicStack/httptools) - and usable as
-the HTTP/1.1 parser in [uvicorn](https://github.com/encode/uvicorn).
+event-based API, with a hand-written Zig engine underneath - fast enough to be
+usable as the HTTP/1.1 parser in [uvicorn](https://github.com/encode/uvicorn).
 
 ## Sans-IO
 

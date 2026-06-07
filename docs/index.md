@@ -5,7 +5,7 @@ icon: lucide/zap
 # zttp
 
 <p align="center">
-    <em>A sans-IO HTTP parser for Python with a Zig core - faster than httptools.</em>
+    <em>A sans-IO HTTP parser for Python with a Zig core.</em>
 </p>
 
 ---
@@ -34,9 +34,8 @@ The key features are:
 * **Sans-IO**: a clean, event-based API. Feed bytes with `receive_data`, pull
   `Request` / `Data` / `EndOfMessage` events with `next_event`. No callbacks, no
   sockets, no surprises.
-* **Fast**: faster than [httptools](https://github.com/MagicStack/httptools) (the
-  parser uvicorn uses) on the benchmarks we've run - see
-  [Performance](reference/performance.md).
+* **Fast**: a hand-written Zig engine with branch-light scanning and minimal
+  allocation - see [Performance](reference/performance.md) for the numbers.
 * **Safe**: strict by default. It defends against request smuggling, rejects bare
   `LF` line endings, bounds every buffer, and ships in Zig's safety-checked build.
 * **Typed**: a `py.typed` package with full type hints. Your editor knows every

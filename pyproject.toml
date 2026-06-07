@@ -10,7 +10,7 @@ license = "BSD-3-Clause"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 authors = [{ name = "Marcelo Trylesinski", email = "marcelotryle@gmail.com" }]
-keywords = ["http", "parser", "sans-io", "zig", "asgi", "h11", "httptools"]
+keywords = ["http", "parser", "sans-io", "zig", "asgi"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
