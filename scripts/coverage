@@ -4,5 +4,5 @@
 
 set -x
 
-.venv/bin/coverage combine
-.venv/bin/coverage report
+uv run --no-sync coverage combine
+uv run --no-sync coverage report

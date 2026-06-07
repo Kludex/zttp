@@ -8,4 +8,4 @@ fi
 
 set -x
 
-.venv/bin/coverage run -m pytest "$@"
+uv run --no-sync coverage run -m pytest "$@"

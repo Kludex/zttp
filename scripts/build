@@ -7,9 +7,10 @@ set -x
 # Pure-Zig core unit tests double as the core's build check.
 zig build test
 
-# Build the extension against the venv interpreter, then confirm it imports.
-./build_ext.sh "$(pwd)/.venv/bin/python"
-.venv/bin/python -c "import zttp; print(zttp.Connection(zttp.SERVER))"
+# Build the extension (via the hatchling hook) and confirm it imports. `uv sync`
+# resolves the venv interpreter on every OS, so this works on Windows too.
+uv sync --all-groups
+uv run --no-sync python -c "import zttp; print(zttp.Connection(zttp.SERVER))"
 
 # Build the docs so a broken site fails CI before it ever ships.
-.venv/bin/python -m zensical build
+uv run --no-sync python -m zensical build

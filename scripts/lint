@@ -6,6 +6,6 @@ export SOURCE_FILES="zttp tests bench.py"
 
 set -x
 
-.venv/bin/ruff format $SOURCE_FILES
-.venv/bin/ruff check --fix $SOURCE_FILES
+uv run --no-sync ruff format $SOURCE_FILES
+uv run --no-sync ruff check --fix $SOURCE_FILES
 zig fmt src build.zig

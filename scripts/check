@@ -8,9 +8,9 @@ export SOURCE_FILES="zttp tests bench.py"
 set -x
 
 # Python.
-.venv/bin/ruff format --check --diff $SOURCE_FILES
-.venv/bin/mypy zttp
-.venv/bin/ruff check $SOURCE_FILES
+uv run --no-sync ruff format --check --diff $SOURCE_FILES
+uv run --no-sync mypy zttp
+uv run --no-sync ruff check $SOURCE_FILES
 
 # Zig.
 zig fmt --check src build.zig
