@@ -338,7 +338,7 @@ test "sendData splits at the peer max frame size" {
 
 test "a written request round-trips through a Connection" {
     const Connection = @import("connection.zig").Connection;
-    const Event = @import("../events.zig").Event;
+    const Event = @import("../events.zig").H2Event;
 
     // Client writes the preface + SETTINGS + a request; a server Connection
     // parses it back to the same logical request.
@@ -371,7 +371,7 @@ test "a written request round-trips through a Connection" {
 
 test "a HEADERS block larger than the peer max frame splits into CONTINUATION and round-trips" {
     const Connection = @import("connection.zig").Connection;
-    const Event = @import("../events.zig").Event;
+    const Event = @import("../events.zig").H2Event;
 
     var w = Writer.init(testing.allocator, .client);
     defer w.deinit();

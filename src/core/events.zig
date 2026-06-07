@@ -90,20 +90,32 @@ pub const WindowUpdate = struct {
     increment: u32,
 };
 
-/// The tagged union the state machine produces. `need_data` is the sentinel
-/// meaning "no complete event is available; feed more bytes" - it is a real
-/// variant here rather than an optional so the Python adapter can map it onto
-/// the NEED_DATA singleton without an extra branch.
-pub const Event = union(enum) {
+/// The events the HTTP/1.1 state machine produces. The payload structs above are
+/// shared with HTTP/2, but each protocol has its OWN event union so a consumer's
+/// type is exactly as wide as that protocol's reality - an H1 connection can
+/// never yield a `ping`, and the type system says so (no `unreachable` arms).
+/// `need_data` is the sentinel meaning "no complete event yet; feed more bytes" -
+/// a real variant rather than an optional so the adapter maps it onto the
+/// NEED_DATA singleton without an extra branch.
+pub const H1Event = union(enum) {
     request: Request,
     response: Response,
     data: Data,
     end_of_message: EndOfMessage,
     /// The peer closed the connection (half-close on the read side).
     connection_closed,
-    /// Not enough buffered bytes to produce the next event yet.
     need_data,
-    // The remaining variants are produced only by the HTTP/2 engine.
+};
+
+/// The events the HTTP/2 engine produces. It shares the request/response/data/
+/// end-of-message payloads with H1 but adds the connection- and stream-control
+/// frames, and has no `connection_closed` (HTTP/2 signals shutdown with goaway).
+pub const H2Event = union(enum) {
+    request: Request,
+    response: Response,
+    data: Data,
+    end_of_message: EndOfMessage,
+    need_data,
     rst_stream: RstStream,
     goaway: Goaway,
     settings: SettingsEvent,
@@ -111,9 +123,9 @@ pub const Event = union(enum) {
     window_update: WindowUpdate,
 };
 
-test "event union round-trips a request" {
+test "H1 event union round-trips a request" {
     const hdrs = [_]Header{.{ .name = "Host", .value = "example.com" }};
-    const ev = Event{ .request = .{
+    const ev = H1Event{ .request = .{
         .method = "GET",
         .target = "/",
         .http_version = "1.1",
@@ -121,4 +133,15 @@ test "event union round-trips a request" {
     } };
     try std.testing.expectEqualStrings("GET", ev.request.method);
     try std.testing.expectEqualStrings("example.com", ev.request.headers[0].value);
+}
+
+test "H2 event union carries a stream-tagged request" {
+    const ev = H2Event{ .request = .{
+        .method = "GET",
+        .target = "/",
+        .http_version = "2",
+        .headers = &.{},
+        .stream_id = 3,
+    } };
+    try std.testing.expectEqual(@as(u32, 3), ev.request.stream_id);
 }

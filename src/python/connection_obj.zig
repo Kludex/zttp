@@ -119,11 +119,11 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     if (self.h2) |h| {
         const ev = h.nextEvent() catch |e| return exceptions.raiseH2(e);
-        return events_obj.fromEvent(ev);
+        return events_obj.fromH2Event(ev);
     }
     const r = self.reader orelse return py.raiseRuntime("connection is closed");
     const ev = r.nextEvent() catch |e| return exceptions.raiseParse(e);
-    return events_obj.fromEvent(ev);
+    return events_obj.fromH1Event(ev);
 }
 
 /// Headers borrowed (zero-copy) from a Python sequence of (name, value) bytes

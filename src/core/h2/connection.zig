@@ -8,7 +8,7 @@
 //! next frame. One frame fans out into at most PENDING_CAP events. This keeps the
 //! one-event-per-call contract and - together with the HPACK decoder clearing its
 //! out_store at the start of each block - keeps a not-yet-drained Request's header
-//! slices valid (see docs/architecture/http2-design.md).
+//! slices valid (see docs/architecture/overview.md).
 
 const std = @import("std");
 const constants = @import("constants.zig");
@@ -19,7 +19,7 @@ const decoder_mod = @import("hpack/decoder.zig");
 const events = @import("../events.zig");
 const tables = @import("../tables.zig");
 
-const Event = events.Event;
+const Event = events.H2Event;
 const FrameType = constants.FrameType;
 const ErrorCode = constants.ErrorCode;
 const Flags = constants.Flags;
@@ -990,7 +990,7 @@ fn driveConnection(input: []const u8) void {
     c.feed(input) catch return;
     for (0..input.len + 8) |_| {
         const ev = c.nextEvent() catch break;
-        if (ev == .need_data or ev == .connection_closed) break;
+        if (ev == .need_data) break;
     }
 }
 

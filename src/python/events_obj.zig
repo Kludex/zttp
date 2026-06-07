@@ -635,7 +635,7 @@ fn buildHeaders(hdrs: []const events.Header) py.Object {
 
 // -- constructors from core events --------------------------------------------
 
-pub fn fromEvent(ev: events.Event) py.Object {
+pub fn fromH1Event(ev: events.H1Event) py.Object {
     return switch (ev) {
         .request => |r| makeRequest(r),
         .response => |r| makeResponse(r),
@@ -643,6 +643,16 @@ pub fn fromEvent(ev: events.Event) py.Object {
         .end_of_message => |e| makeEom(e),
         .need_data => py.newRef(need_data),
         .connection_closed => py.newRef(connection_closed),
+    };
+}
+
+pub fn fromH2Event(ev: events.H2Event) py.Object {
+    return switch (ev) {
+        .request => |r| makeRequest(r),
+        .response => |r| makeResponse(r),
+        .data => |d| makeData(d),
+        .end_of_message => |e| makeEom(e),
+        .need_data => py.newRef(need_data),
         .rst_stream => |r| makeRstStream(r),
         .goaway => |g| makeGoaway(g),
         .settings => |s| makeSettings(s),
