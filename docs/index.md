@@ -5,7 +5,11 @@ icon: lucide/zap
 # zttp
 
 <p align="center">
-    <em>A sans-IO HTTP parser for Python with a Zig core.</em>
+    <img src="assets/logo.png" alt="zttp" width="400">
+</p>
+
+<p align="center">
+    <em>A sans-IO HTTP parser for Python with a Zig core! ⚡</em>
 </p>
 
 ---
@@ -13,10 +17,6 @@ icon: lucide/zap
 **Source Code**: <a href="https://github.com/Kludex/zttp" target="_blank">https://github.com/Kludex/zttp</a>
 
 ---
-
-!!! warning "Experimental"
-    zttp is experimental. The API and behaviour may change at any time, and it is
-    not yet ready for production use.
 
 zttp is a [sans-IO](https://sans-io.readthedocs.io/) HTTP/1.1 parser whose engine
 is written in [Zig](https://ziglang.org). It does **no I/O of its own**: you feed
@@ -40,6 +40,10 @@ The key features are:
   event field.
 * **Tested**: a high-level test suite at **100% coverage**, plus the Zig core's
   own tests and an adversarial-input fuzz harness.
+
+!!! warning "Experimental"
+    zttp is experimental. The API and behaviour may change at any time, and it is
+    not yet ready for production use.
 
 !!! note "Requirements"
     zttp needs **CPython 3.12+** and runs on **Linux** and **macOS**.

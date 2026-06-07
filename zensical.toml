@@ -52,7 +52,7 @@ features = [
 ]
 
 [project.theme.icon]
-logo = "lucide/arrow-left-right"
+logo = "lucide/zap"
 
 [[project.theme.palette]]
 scheme = "default"
