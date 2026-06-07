@@ -84,7 +84,11 @@ integrator is responsible for.
   (reject body bytes after a `close`, enforce request/response pairing).
 - **uvicorn integration** - an `HttpToolsProtocol`-style adapter so uvicorn can
   use zttp unchanged.
-- **HTTP/2** - HPACK + frame layer in the Zig core, same event API.
+- **HTTP/2** - HPACK, the frame layer, and the multiplexed connection state
+  machine in the Zig core, surfaced through the same event API
+  (`Connection(role, protocol=zttp.HTTP2)`); events carry a `stream_id`. The
+  server read path (prior-knowledge) is implemented; client responses and the
+  Python write side are next. *(in progress)*
 - **HTTP/3** - QPACK + the QUIC-side framing, same event API.
 
 ## Status
