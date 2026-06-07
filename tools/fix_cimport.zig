@@ -51,6 +51,12 @@ pub fn main(init: std.process.Init) !void {
             try out.appendSlice(gpa, "// removed by fix_cimport: unused translate-c secure-CRT block\n");
             continue;
         }
+        if (isTargetDiscard(line)) {
+            // translate-c also emits a `_ = &extern_local_<name>_s;` discard for
+            // each block; drop it too, or it dangles once the block is gone.
+            try out.appendSlice(gpa, "// removed by fix_cimport: discard of stripped secure-CRT block\n");
+            continue;
+        }
         try out.appendSlice(gpa, line);
         try out.append(gpa, '\n');
     }
@@ -71,5 +77,17 @@ fn isTargetStart(line: []const u8) bool {
     const name_start = "const extern_local_".len;
     const eq = std.mem.indexOfScalar(u8, trimmed[name_start..], ' ') orelse return false;
     const name = trimmed[name_start .. name_start + eq];
+    return std.mem.endsWith(u8, name, "_s");
+}
+
+/// The discard translate-c pairs with each block, e.g.
+/// `    _ = &extern_local___mingw_call_memcpy_s;`. Strip the ones whose
+/// referenced name ends in `_s` - exactly the blocks isTargetStart removes - so
+/// the discard never outlives its (now-deleted) definition.
+fn isTargetDiscard(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    const prefix = "_ = &extern_local_";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return false;
+    const name = std.mem.trimEnd(u8, trimmed[prefix.len..], ";");
     return std.mem.endsWith(u8, name, "_s");
 }
