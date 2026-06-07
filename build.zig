@@ -1,7 +1,17 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // On Windows default to the GNU (mingw-w64) ABI rather than MSVC. Zig's
+    // translate-c chokes on the MSVC UCRT secure-CRT (_s) declarations that
+    // Python.h transitively pulls in (it emits them as unused locals and then
+    // rejects them); the mingw-w64 headers Zig bundles don't declare those
+    // functions at all. A GNU-ABI .pyd still loads into the MSVC-built CPython
+    // for a C-API extension like this one. An explicit -Dtarget still overrides.
+    const default_query: std.Target.Query = if (@import("builtin").os.tag == .windows)
+        .{ .os_tag = .windows, .abi = .gnu }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_query });
     const optimize = b.standardOptimizeOption(.{});
 
     // Pure-Zig unit tests for the parser core. Defined first so `zig build test`

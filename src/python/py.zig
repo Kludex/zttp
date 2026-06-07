@@ -7,12 +7,6 @@ const std = @import("std");
 
 pub const c = @cImport({
     @cDefine("PY_SSIZE_T_CLEAN", "1");
-    // Windows/MSVC: suppress the secure-CRT (_s) declarations. They are gated
-    // behind this macro in the UCRT headers, and Zig's translate-c emits them as
-    // unused local constants it then rejects (wcscat_s/wcscpy_s). CPython itself
-    // only uses the plain wcscpy/wcscat, so dropping the _s decls is safe. No-op
-    // on glibc/macOS, so the POSIX builds are unaffected.
-    @cDefine("__STDC_WANT_SECURE_LIB__", "0");
     @cInclude("Python.h");
 });
 
