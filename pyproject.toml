@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling", "uv-dynamic-versioning>=0.8.0", "ziglang==0.16.0"]
+requires = ["hatchling", "hatch-ziglang>=0.2", "uv-dynamic-versioning>=0.8.0", "ziglang==0.16.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -61,12 +61,13 @@ fallback-version = "0.0.0"
 packages = ["zttp"]
 artifacts = ["zttp/*.so"]
 
-[tool.hatch.build.targets.wheel.hooks.custom]
-path = "hatch_build.py"
+[tool.hatch.build.targets.wheel.hooks.zig]
+package = "zttp"
+optimize = "ReleaseSafe"
 
 [tool.hatch.build.targets.sdist]
 # Ship the sources needed to compile the extension from an sdist.
-include = ["zttp", "src", "tools", "build.zig", "build_ext.sh", "hatch_build.py", "THREAT_MODEL.md"]
+include = ["zttp", "src", "tools", "build.zig", "THREAT_MODEL.md"]
 
 [tool.cibuildwheel]
 # Zig comes from the `ziglang` build requirement (build isolation), so no system
@@ -84,7 +85,7 @@ archs = ["auto"]
 [tool.cibuildwheel.macos]
 archs = ["arm64", "x86_64"]
 # Pin the deployment target so the wheel's platform tag matches the min-OS
-# version Zig stamps into the binary (hatch_build.py reads this and encodes it
+# version Zig stamps into the binary (hatch-ziglang reads this and encodes it
 # in the Zig target triple). Without it the tag and binary disagree and
 # delocate rejects the wheel.
 environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
