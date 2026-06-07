@@ -67,9 +67,11 @@ serializer rejects CR/LF/control bytes to prevent response splitting. The build
 defaults to Zig's safety-checked `ReleaseSafe` mode. Malformed input raises
 `RemoteProtocolError`; misusing the send API raises `LocalProtocolError`.
 
-The parser has been through an adversarial security audit (see the `tests/` and
-the in-tree `test "fuzz: ..."` property test); `zig build fuzz` runs the
-adversarial-input net over the core.
+The parser has been through two adversarial security audits (a code review and a
+CVE-driven review against real HTTP-parser CVEs across Node, Go, Python, Rust, and
+C servers); `zig build fuzz` runs the adversarial-input net over the core. See
+[THREAT_MODEL.md](THREAT_MODEL.md) for what zttp defends against and what the
+integrator is responsible for.
 
 ## Roadmap
 
