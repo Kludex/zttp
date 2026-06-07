@@ -76,6 +76,7 @@ var eom_members = [_]py.MemberDef{
 
 fn deallocRequest(o: ?*c.PyObject) callconv(.c) void {
     const s: *RequestObject = @ptrCast(o.?);
+    py.gcUntrack(s);
     py.xdecref(s.method);
     py.xdecref(s.target);
     py.xdecref(s.http_version);
@@ -84,6 +85,7 @@ fn deallocRequest(o: ?*c.PyObject) callconv(.c) void {
 }
 fn deallocResponse(o: ?*c.PyObject) callconv(.c) void {
     const s: *ResponseObject = @ptrCast(o.?);
+    py.gcUntrack(s);
     py.xdecref(s.status_code);
     py.xdecref(s.reason);
     py.xdecref(s.http_version);
@@ -92,32 +94,110 @@ fn deallocResponse(o: ?*c.PyObject) callconv(.c) void {
 }
 fn deallocData(o: ?*c.PyObject) callconv(.c) void {
     const s: *DataObject = @ptrCast(o.?);
+    py.gcUntrack(s);
     py.xdecref(s.data);
     py.freeInstance(@ptrCast(s));
 }
 fn deallocEom(o: ?*c.PyObject) callconv(.c) void {
     const s: *EndOfMessageObject = @ptrCast(o.?);
+    py.gcUntrack(s);
     py.xdecref(s.trailers);
     py.freeInstance(@ptrCast(s));
 }
 
+// -- GC support ---------------------------------------------------------------
+
+// The event types hold strong references to Python objects (and Request/
+// Response/EndOfMessage expose mutable header/trailer lists), so they must be
+// GC types with traverse/clear; otherwise a cycle through them leaks. tp_alloc
+// (PyType_GenericAlloc) already GC-tracks a HAVE_GC instance on creation, so we
+// only untrack in dealloc; no explicit track is needed (and double-tracking
+// trips an assertion in a debug build).
+
+fn visitObj(obj: py.Object, visit: c.visitproc, arg: ?*anyopaque) c_int {
+    if (obj != null) {
+        const r = visit.?(obj, arg);
+        if (r != 0) return r;
+    }
+    return 0;
+}
+
+fn traverseRequest(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const s: *RequestObject = @ptrCast(o.?);
+    inline for (.{ s.method, s.target, s.http_version, s.headers }) |f| {
+        const r = visitObj(f, visit, arg);
+        if (r != 0) return r;
+    }
+    return 0;
+}
+fn clearRequest(o: ?*c.PyObject) callconv(.c) c_int {
+    const s: *RequestObject = @ptrCast(o.?);
+    py.clear(&s.method);
+    py.clear(&s.target);
+    py.clear(&s.http_version);
+    py.clear(&s.headers);
+    return 0;
+}
+fn traverseResponse(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const s: *ResponseObject = @ptrCast(o.?);
+    inline for (.{ s.status_code, s.reason, s.http_version, s.headers }) |f| {
+        const r = visitObj(f, visit, arg);
+        if (r != 0) return r;
+    }
+    return 0;
+}
+fn clearResponse(o: ?*c.PyObject) callconv(.c) c_int {
+    const s: *ResponseObject = @ptrCast(o.?);
+    py.clear(&s.status_code);
+    py.clear(&s.reason);
+    py.clear(&s.http_version);
+    py.clear(&s.headers);
+    return 0;
+}
+fn traverseData(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const s: *DataObject = @ptrCast(o.?);
+    return visitObj(s.data, visit, arg);
+}
+fn clearData(o: ?*c.PyObject) callconv(.c) c_int {
+    const s: *DataObject = @ptrCast(o.?);
+    py.clear(&s.data);
+    return 0;
+}
+fn traverseEom(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const s: *EndOfMessageObject = @ptrCast(o.?);
+    return visitObj(s.trailers, visit, arg);
+}
+fn clearEom(o: ?*c.PyObject) callconv(.c) c_int {
+    const s: *EndOfMessageObject = @ptrCast(o.?);
+    py.clear(&s.trailers);
+    return 0;
+}
+
 // -- specs --------------------------------------------------------------------
 
-fn slots(comptime dealloc: anytype, comptime members: anytype) [3]py.Slot {
+fn slots(comptime dealloc: anytype, comptime members: anytype, comptime traverse: anytype, comptime clear_fn: anytype) [5]py.Slot {
     return .{
         .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&dealloc)) },
         .{ .slot = c.Py_tp_members, .pfunc = @ptrCast(members) },
+        .{ .slot = c.Py_tp_traverse, .pfunc = @ptrCast(@constCast(&traverse)) },
+        .{ .slot = c.Py_tp_clear, .pfunc = @ptrCast(@constCast(&clear_fn)) },
         .{ .slot = 0, .pfunc = null },
     };
 }
 
-var request_slots = slots(deallocRequest, &request_members);
-var response_slots = slots(deallocResponse, &response_members);
-var data_slots = slots(deallocData, &data_members);
-var eom_slots = slots(deallocEom, &eom_members);
+var request_slots = slots(deallocRequest, &request_members, traverseRequest, clearRequest);
+var response_slots = slots(deallocResponse, &response_members, traverseResponse, clearResponse);
+var data_slots = slots(deallocData, &data_members, traverseData, clearData);
+var eom_slots = slots(deallocEom, &eom_members, traverseEom, clearEom);
 
 fn spec(comptime name: [*c]const u8, comptime size: usize, sl: anytype) py.Spec {
-    return .{ .name = name, .basicsize = @intCast(size), .itemsize = 0, .flags = c.Py_TPFLAGS_DEFAULT, .slots = sl };
+    return .{
+        .name = name,
+        .basicsize = @intCast(size),
+        .itemsize = 0,
+        .flags = c.Py_TPFLAGS_DEFAULT | c.Py_TPFLAGS_HAVE_GC,
+        .slots = sl,
+    };
 }
 
 var request_spec = spec("zhttp.Request", @sizeOf(RequestObject), &request_slots);

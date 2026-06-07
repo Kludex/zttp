@@ -66,19 +66,24 @@ pub const Scanner = struct {
         return null;
     }
 
+    pub const LineError = error{ MessageTooLong, BareLf };
+
     /// Read one CRLF-terminated line (excluding the terminator), advancing past
-    /// the terminator. A bare LF is tolerated (and the optional preceding CR is
-    /// stripped) to match what real servers accept. Returns null when no full
-    /// line is buffered yet - the cursor is left untouched so a later feed can
-    /// retry. Lines longer than `max_len` return error.MessageTooLong.
-    pub fn line(self: *Scanner, max_len: usize) error{MessageTooLong}!?[]const u8 {
+    /// the terminator. When `strict`, a bare LF (LF not preceded by CR) is
+    /// rejected with error.BareLf - the secure default, since a CRLF-strict
+    /// front-end and an LF-lenient backend disagreeing on line boundaries is a
+    /// classic request-smuggling vector. Returns null when no full line is
+    /// buffered yet - the cursor is left untouched so a later feed can retry.
+    /// Lines longer than `max_len` return error.MessageTooLong.
+    pub fn line(self: *Scanner, max_len: usize, strict: bool) LineError!?[]const u8 {
         const lf = self.indexOfLf() orelse {
             if (self.buf.len - self.pos > max_len) return error.MessageTooLong;
             return null;
         };
         if (lf - self.pos > max_len) return error.MessageTooLong;
-        var end = lf;
-        if (end > self.pos and self.buf[end - 1] == '\r') end -= 1;
+        const has_cr = lf > self.pos and self.buf[lf - 1] == '\r';
+        if (strict and !has_cr) return error.BareLf;
+        const end = if (has_cr) lf - 1 else lf;
         const out = self.buf[self.pos..end];
         self.pos = lf + 1;
         return out;
@@ -124,27 +129,32 @@ test "indexOfLf returns null when absent" {
 
 test "line splits CRLF and advances" {
     var sc = Scanner.init("GET / HTTP/1.1\r\nHost: x\r\n");
-    const l1 = try sc.line(1024);
+    const l1 = try sc.line(1024, true);
     try std.testing.expectEqualStrings("GET / HTTP/1.1", l1.?);
-    const l2 = try sc.line(1024);
+    const l2 = try sc.line(1024, true);
     try std.testing.expectEqualStrings("Host: x", l2.?);
 }
 
-test "line tolerates bare LF" {
+test "line rejects bare LF when strict" {
     var sc = Scanner.init("abc\ndef\n");
-    try std.testing.expectEqualStrings("abc", (try sc.line(1024)).?);
-    try std.testing.expectEqualStrings("def", (try sc.line(1024)).?);
+    try std.testing.expectError(error.BareLf, sc.line(1024, true));
+}
+
+test "line tolerates bare LF when lenient" {
+    var sc = Scanner.init("abc\ndef\n");
+    try std.testing.expectEqualStrings("abc", (try sc.line(1024, false)).?);
+    try std.testing.expectEqualStrings("def", (try sc.line(1024, false)).?);
 }
 
 test "line returns null on partial without consuming" {
     var sc = Scanner.init("partial line no terminator");
-    try std.testing.expectEqual(@as(?[]const u8, null), try sc.line(1024));
+    try std.testing.expectEqual(@as(?[]const u8, null), try sc.line(1024, true));
     try std.testing.expectEqual(@as(usize, 0), sc.pos);
 }
 
 test "line enforces max length" {
     var sc = Scanner.init("way too long for the limit\r\n");
-    try std.testing.expectError(error.MessageTooLong, sc.line(5));
+    try std.testing.expectError(error.MessageTooLong, sc.line(5, true));
 }
 
 test "span slices a token run" {

@@ -17,6 +17,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run pure-Zig core unit tests");
     test_step.dependOn(&run_core_tests.step);
 
+    // The parser-core property test ("fuzz: reader never panics ...") runs as
+    // part of `zig build test`; `zig build fuzz` is an alias that runs the same
+    // suite, kept as an explicit entry point for the adversarial-input net.
+    const fuzz_step = b.step("fuzz", "Run the parser-core adversarial-input property test");
+    fuzz_step.dependOn(&run_core_tests.step);
+
     // Python build configuration is discovered by build_ext.sh and passed in as
     // -D options or environment variables. Resolved lazily so the test step
     // above never requires a Python toolchain.

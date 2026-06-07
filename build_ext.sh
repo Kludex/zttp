@@ -12,6 +12,8 @@ read -r INCLUDE SUFFIX < <("$PY" -c \
 export ZHTTP_PYTHON_INCLUDE="$INCLUDE"
 export ZHTTP_EXT_SUFFIX="$SUFFIX"
 
-MODE="${ZHTTP_BUILD_MODE:-ReleaseFast}"
+# ReleaseSafe by default: this parser ingests untrusted bytes, so keeping
+# bounds/overflow checks on turns a would-be UB/crash into a trapped panic.
+MODE="${ZHTTP_BUILD_MODE:-ReleaseSafe}"
 zig build "-Doptimize=$MODE" "$@" 2>/dev/null || zig build "-Doptimize=$MODE"
 echo "built zhttp/_zhttp$SUFFIX against $("$PY" --version) ($INCLUDE)"

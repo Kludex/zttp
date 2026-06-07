@@ -39,6 +39,8 @@ pub const ChunkDecoder = struct {
     remaining: u64 = 0,
     /// Cap on the chunk-size line and each trailer line, to bound memory.
     max_line: usize = 16 * 1024,
+    /// Require CRLF (reject bare LF) for chunk framing - the secure default.
+    strict: bool = true,
 
     /// Pull the next output from `sc`. Call repeatedly until it returns
     /// `need_data` or `done`. The scanner's cursor is advanced only past fully
@@ -47,7 +49,7 @@ pub const ChunkDecoder = struct {
         switch (self.state) {
             .size => {
                 const save = sc.pos;
-                const maybe = sc.line(self.max_line) catch return error.InvalidChunk;
+                const maybe = sc.line(self.max_line, self.strict) catch return error.InvalidChunk;
                 const l = maybe orelse {
                     sc.pos = save;
                     return .need_data;
@@ -73,13 +75,13 @@ pub const ChunkDecoder = struct {
                 return .{ .data = span };
             },
             .data_crlf => {
-                if (!try consumeCrlf(sc)) return .need_data;
+                if (!try consumeCrlf(sc, self.strict)) return .need_data;
                 self.state = .size;
                 return self.next(sc);
             },
             .trailer => {
                 const save = sc.pos;
-                const maybe = sc.line(self.max_line) catch return error.InvalidChunk;
+                const maybe = sc.line(self.max_line, self.strict) catch return error.InvalidChunk;
                 const l = maybe orelse {
                     sc.pos = save;
                     return .need_data;
@@ -99,26 +101,21 @@ pub const ChunkDecoder = struct {
     }
 };
 
-/// Parse the chunk-size line: hex digits, then optional `;ext` chunk extensions
-/// which we accept and ignore. Rejects empty or overflowing sizes.
+/// Parse the chunk-size line: strictly `1*HEXDIG`, then an optional `;ext` chunk
+/// extension which we accept and ignore. Per RFC 9112 7.1 no whitespace is
+/// permitted before `;` or the line terminator; tolerating it is a framing
+/// differential, so any non-hex, non-`;` byte is rejected.
 fn parseChunkSize(line: []const u8) ParseError!u64 {
     var n: u64 = 0;
     var digits: usize = 0;
-    for (line, 0..) |ch, i| {
+    for (line) |ch| {
         if (ch == ';') {
             // Chunk extensions follow; ignore the remainder of the line.
             if (digits == 0) return error.InvalidChunk;
             return n;
         }
         const v = tables.hex_value[ch];
-        if (v == 0xFF) {
-            // Trailing whitespace before the (implicit) CRLF is tolerated.
-            if (ch == ' ' or ch == '\t') {
-                if (digits == 0) return error.InvalidChunk;
-                return validateAfterSize(line[i..], n);
-            }
-            return error.InvalidChunk;
-        }
+        if (v == 0xFF) return error.InvalidChunk;
         if (digits >= 16) return error.InvalidChunk; // > 64 bits of hex
         n = (n << 4) | v;
         digits += 1;
@@ -127,20 +124,13 @@ fn parseChunkSize(line: []const u8) ParseError!u64 {
     return n;
 }
 
-fn validateAfterSize(rest: []const u8, n: u64) ParseError!u64 {
-    for (rest) |ch| {
-        if (ch == ';') return n;
-        if (ch != ' ' and ch != '\t') return error.InvalidChunk;
-    }
-    return n;
-}
-
-/// Consume a CRLF (or bare LF) at the cursor. Returns false (without advancing)
-/// if not enough bytes are buffered to decide.
-fn consumeCrlf(sc: *Scanner) ParseError!bool {
+/// Consume a CRLF at the cursor (a bare LF too when not strict). Returns false
+/// (without advancing) if not enough bytes are buffered to decide.
+fn consumeCrlf(sc: *Scanner, strict: bool) ParseError!bool {
     const r = sc.remaining();
     if (r.len == 0) return false;
     if (r[0] == '\n') {
+        if (strict) return error.InvalidChunk; // bare LF rejected
         _ = sc.take(1);
         return true;
     }
@@ -254,4 +244,38 @@ test "empty chunk size rejected" {
     var dec = ChunkDecoder{};
     var sc = Scanner.init(";ext\r\n");
     try t.expectError(error.InvalidChunk, dec.next(&sc));
+}
+
+test "L-2: chunk size with trailing whitespace rejected" {
+    var dec = ChunkDecoder{};
+    var sc = Scanner.init("5 \r\nhello\r\n0\r\n\r\n");
+    try t.expectError(error.InvalidChunk, dec.next(&sc));
+}
+
+test "M-2: bare LF chunk framing rejected when strict" {
+    var dec = ChunkDecoder{}; // strict by default
+    var sc = Scanner.init("5\nhello\n0\n\n");
+    try t.expectError(error.InvalidChunk, dec.next(&sc));
+}
+
+test "M-2: bare LF chunk framing accepted when lenient" {
+    var r = try collect2("5\nhello\n0\n\n", false);
+    defer r.body.deinit(t.allocator);
+    try t.expect(r.done);
+    try t.expectEqualStrings("hello", r.body.items);
+}
+
+fn collect2(input: []const u8, strict: bool) !struct { body: std.ArrayList(u8), done: bool } {
+    var dec = ChunkDecoder{ .strict = strict };
+    var sc = Scanner.init(input);
+    var body: std.ArrayList(u8) = .empty;
+    while (true) {
+        const out = try dec.next(&sc);
+        switch (out) {
+            .data => |d| try body.appendSlice(t.allocator, d),
+            .trailer_line => {},
+            .done => return .{ .body = body, .done = true },
+            .need_data => return .{ .body = body, .done = false },
+        }
+    }
 }

@@ -173,3 +173,12 @@ pub fn freeInstance(self: Object) void {
 pub fn newException(name: [*c]const u8, base: Object) Object {
     return c.PyErr_NewException(name, base, null);
 }
+
+// -- cyclic GC (for container types that hold PyObject references) -------------
+
+pub inline fn gcTrack(o: anytype) void {
+    c.PyObject_GC_Track(@ptrCast(o));
+}
+pub inline fn gcUntrack(o: anytype) void {
+    c.PyObject_GC_UnTrack(@ptrCast(o));
+}

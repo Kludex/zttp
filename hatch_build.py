@@ -63,7 +63,10 @@ class ZigBuildHook(BuildHookInterface):
         if not include or not ext_suffix:
             raise RuntimeError("could not resolve platinclude / EXT_SUFFIX from the building interpreter")
 
-        mode = os.environ.get("ZHTTP_BUILD_MODE", "ReleaseFast")
+        # ReleaseSafe by default: the parser ingests untrusted bytes, so keeping
+        # Zig's bounds/overflow checks on trades a little speed for turning any
+        # reachable UB into a trapped panic instead of memory corruption.
+        mode = os.environ.get("ZHTTP_BUILD_MODE", "ReleaseSafe")
         env = {**os.environ, "ZHTTP_PYTHON_INCLUDE": include, "ZHTTP_EXT_SUFFIX": ext_suffix}
         subprocess.run(
             [*_zig_command(), "build", f"-Doptimize={mode}", *_zig_target_args()],

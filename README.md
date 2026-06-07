@@ -55,12 +55,22 @@ Run it yourself: `uv run --group bench python bench.py`.
 - The header list is built directly in Zig as `list[tuple[bytes, bytes]]`, with
   no per-header Python callback.
 
-## Correctness
+## Correctness & security
 
-The core enforces the framing rules of RFC 9112 §6, including the
-Content-Length / Transfer-Encoding conflict and duplicate-Content-Length checks
-that defend against request smuggling. Malformed input raises
+The core enforces the framing rules of RFC 9112 §6 against request smuggling:
+the Content-Length / Transfer-Encoding conflict, duplicate-Content-Length checks,
+and combining multiple `Transfer-Encoding` field-lines into one ordered list so
+`chunked` must be the sole, final coding. Line endings are strict CRLF by default
+(bare LF is rejected), chunk-size is strictly `1*HEXDIG`, and obsolete line
+folding is rejected. Header blocks, trailers, and the receive buffer are all
+bounded (`Limits`) so a malicious peer cannot exhaust memory, and the outbound
+serializer rejects CR/LF/control bytes to prevent response splitting. The build
+defaults to Zig's safety-checked `ReleaseSafe` mode. Malformed input raises
 `RemoteProtocolError`; misusing the send API raises `LocalProtocolError`.
+
+The parser has been through an adversarial security audit (see the `tests/` and
+the in-tree `test "fuzz: ..."` property test); `zig build fuzz` runs the
+adversarial-input net over the core.
 
 ## Roadmap
 

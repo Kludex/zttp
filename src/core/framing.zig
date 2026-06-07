@@ -29,26 +29,35 @@ fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-/// True if the comma-separated `Transfer-Encoding` value list ends in `chunked`
-/// (the only coding RFC 9112 lets us frame). A `chunked` that is not final is a
-/// framing error.
-fn transferEncodingChunked(value: []const u8) ParseError!bool {
-    var last: []const u8 = "";
-    var saw_chunked_not_last = false;
-    var it = std.mem.splitScalar(u8, value, ',');
-    while (it.next()) |raw| {
-        const coding = std.mem.trim(u8, raw, " \t");
-        if (coding.len == 0) continue;
-        if (saw_chunked_not_last) return error.InvalidFraming;
-        if (eqIgnoreCase(coding, "chunked")) {
-            saw_chunked_not_last = true;
-        } else {
-            saw_chunked_not_last = false;
+/// Accumulates Transfer-Encoding codings across (possibly multiple) field-lines,
+/// which RFC 9112 6.1 requires to be treated as a single ordered comma list. The
+/// only framing we accept is `chunked` appearing exactly once and as the final
+/// coding overall; anything else (chunked not last, chunked twice, an unknown
+/// coding after chunked) is a framing error - the request-smuggling guard.
+const TransferEncoding = struct {
+    saw_chunked: bool = false,
+    /// True once any coding has been seen after a `chunked` coding (illegal).
+    coding_after_chunked: bool = false,
+
+    /// Fold one field-line value's comma-separated codings into the accumulator.
+    fn add(self: *TransferEncoding, value: []const u8) void {
+        var it = std.mem.splitScalar(u8, value, ',');
+        while (it.next()) |raw| {
+            const coding = std.mem.trim(u8, raw, " \t");
+            if (coding.len == 0) continue;
+            if (self.saw_chunked) self.coding_after_chunked = true;
+            if (eqIgnoreCase(coding, "chunked")) self.saw_chunked = true;
         }
-        last = coding;
     }
-    return eqIgnoreCase(last, "chunked");
-}
+
+    /// Resolve to chunked framing, or reject. Only valid when chunked is present
+    /// once and last; a non-chunked-terminated TE is unframeable -> reject.
+    fn resolve(self: TransferEncoding) ParseError!bool {
+        if (!self.saw_chunked) return error.InvalidFraming;
+        if (self.coding_after_chunked) return error.InvalidFraming;
+        return true;
+    }
+};
 
 fn parseContentLength(value: []const u8) ParseError!u64 {
     const v = std.mem.trim(u8, value, " \t");
@@ -74,14 +83,14 @@ pub const FramingOptions = struct {
 /// Inspect the parsed headers and return the body framing. Enforces the
 /// CL/TE conflict and duplicate-Content-Length rules.
 pub fn determine(headers: []const Header, opts: FramingOptions) ParseError!Framing {
-    var te_chunked = false;
+    var te = TransferEncoding{};
     var has_te = false;
     var content_length: ?u64 = null;
 
     for (headers) |h| {
         if (eqIgnoreCase(h.name, "transfer-encoding")) {
             has_te = true;
-            if (try transferEncodingChunked(h.value)) te_chunked = true;
+            te.add(h.value); // fold every TE field-line into one ordered list
         } else if (eqIgnoreCase(h.name, "content-length")) {
             const n = try parseContentLength(h.value);
             if (content_length) |prev| {
@@ -98,9 +107,9 @@ pub fn determine(headers: []const Header, opts: FramingOptions) ParseError!Frami
     if (opts.bodyless) return .none;
 
     if (has_te) {
-        // A Transfer-Encoding that is not (or does not end in) chunked is
-        // unframeable for a request; treat as error to avoid smuggling.
-        if (!te_chunked) return error.InvalidFraming;
+        // chunked must be the sole/final coding across ALL field-lines; resolve
+        // rejects non-final or unframeable Transfer-Encodings to avoid smuggling.
+        _ = try te.resolve();
         return .chunked;
     }
     if (content_length) |n| {
@@ -167,6 +176,43 @@ test "non-final chunked rejected" {
 test "te without chunked rejected for request" {
     const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip" }};
     try std.testing.expectError(error.InvalidFraming, determine(&h, .{}));
+}
+
+test "H-3: split TE chunked then identity rejected" {
+    const h = [_]Header{
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+        .{ .name = "Transfer-Encoding", .value = "identity" },
+    };
+    try std.testing.expectError(error.InvalidFraming, determine(&h, .{}));
+}
+
+test "H-3: split TE chunked then gzip rejected" {
+    const h = [_]Header{
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+        .{ .name = "Transfer-Encoding", .value = "gzip" },
+    };
+    try std.testing.expectError(error.InvalidFraming, determine(&h, .{}));
+}
+
+test "H-3: split TE gzip then chunked accepted as chunked" {
+    const h = [_]Header{
+        .{ .name = "Transfer-Encoding", .value = "gzip" },
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+    };
+    try std.testing.expectEqual(Framing.chunked, try determine(&h, .{}));
+}
+
+test "H-3: split TE chunked twice rejected" {
+    const h = [_]Header{
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+    };
+    try std.testing.expectError(error.InvalidFraming, determine(&h, .{}));
+}
+
+test "H-3: single line gzip, chunked still accepted" {
+    const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip, chunked" }};
+    try std.testing.expectEqual(Framing.chunked, try determine(&h, .{}));
 }
 
 test "bad content-length rejected" {

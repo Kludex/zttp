@@ -86,48 +86,72 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     return events_obj.fromEvent(ev);
 }
 
-/// Borrow a list/tuple of (name, value) bytes pairs into a Zig Header slice.
-/// The returned headers point into the Python bytes objects, which the caller's
-/// sequence keeps alive for the duration of the send call. Caller frees `out`.
-fn borrowHeaders(seq: py.Object, out: *[]events.Header) bool {
+/// Headers borrowed (zero-copy) from a Python sequence of (name, value) bytes
+/// pairs. The Header slices point into the name/value bytes objects, whose
+/// references are HELD in `refs` until `deinit` - so they cannot be freed out
+/// from under the writer even if the sequence synthesizes fresh bytes per
+/// __getitem__ (the borrowed-pointer use-after-free guard).
+const BorrowedHeaders = struct {
+    headers: []events.Header,
+    refs: []py.Object, // owned: 2 per header (name, value), decref'd on deinit
+
+    fn deinit(self: *BorrowedHeaders) void {
+        for (self.refs) |r| py.xdecref(r);
+        gpa.free(self.refs);
+        gpa.free(self.headers);
+    }
+};
+
+/// Borrow a list/tuple of (name, value) bytes pairs. On failure sets a Python
+/// error and returns null. The caller MUST call deinit() after the writer call
+/// that consumes the slices returns.
+fn borrowHeaders(seq: py.Object) ?BorrowedHeaders {
     const n = c.PySequence_Size(seq);
     if (n < 0) {
         _ = py.raiseType("headers must be a sequence of (name, value) pairs");
-        return false;
+        return null;
     }
-    const slice = gpa.alloc(events.Header, @intCast(n)) catch {
+    const count: usize = @intCast(n);
+    const slice = gpa.alloc(events.Header, count) catch {
         _ = c.PyErr_NoMemory();
-        return false;
+        return null;
     };
-    var i: c.Py_ssize_t = 0;
-    while (i < n) : (i += 1) {
-        const item = c.PySequence_GetItem(seq, i); // new ref
+    const refs = gpa.alloc(py.Object, count * 2) catch {
+        gpa.free(slice);
+        _ = c.PyErr_NoMemory();
+        return null;
+    };
+    @memset(refs, null);
+    var result = BorrowedHeaders{ .headers = slice, .refs = refs };
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const item = c.PySequence_GetItem(seq, @intCast(i)); // new ref
         if (item == null) {
-            gpa.free(slice);
-            return false;
+            result.deinit();
+            return null;
         }
-        defer py.decref(item);
         const name = c.PySequence_GetItem(item, 0);
         const value = c.PySequence_GetItem(item, 1);
-        defer py.xdecref(name);
-        defer py.xdecref(value);
+        py.decref(item); // the pair tuple itself is not needed past this point
+        refs[i * 2] = name; // held (may be null; xdecref-safe) so the buffer survives
+        refs[i * 2 + 1] = value;
         if (name == null or value == null) {
-            gpa.free(slice);
             _ = py.raiseType("each header must be a (name, value) pair");
-            return false;
+            result.deinit();
+            return null;
         }
         const nb = py.asBytes(name) orelse {
-            gpa.free(slice);
-            return false;
+            result.deinit();
+            return null;
         };
         const vb = py.asBytes(value) orelse {
-            gpa.free(slice);
-            return false;
+            result.deinit();
+            return null;
         };
-        slice[@intCast(i)] = .{ .name = nb, .value = vb };
+        slice[i] = .{ .name = nb, .value = vb };
     }
-    out.* = slice;
-    return true;
+    return result;
 }
 
 fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
@@ -141,10 +165,9 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
     const mb = py.asBytes(method) orelse return null;
     const tb = py.asBytes(target) orelse return null;
     const vb = py.asBytes(version) orelse return null;
-    var hdrs: []events.Header = undefined;
-    if (!borrowHeaders(hdrs_seq, &hdrs)) return null;
-    defer gpa.free(hdrs);
-    wc.sendRequest(mb, tb, vb, hdrs) catch |e| return raiseWrite(e);
+    var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+    defer hdrs.deinit();
+    wc.sendRequest(mb, tb, vb, hdrs.headers) catch |e| return raiseWrite(e);
     return py.none();
 }
 
@@ -160,10 +183,9 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     if (status < 0 or status > 999) return py.raiseValue("status code out of range");
     const vb = py.asBytes(version) orelse return null;
     const rb = py.asBytes(reason) orelse return null;
-    var hdrs: []events.Header = undefined;
-    if (!borrowHeaders(hdrs_seq, &hdrs)) return null;
-    defer gpa.free(hdrs);
-    wc.sendResponse(vb, @intCast(status), rb, hdrs, bodyless != 0) catch |e| return raiseWrite(e);
+    var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+    defer hdrs.deinit();
+    wc.sendResponse(vb, @intCast(status), rb, hdrs.headers, bodyless != 0) catch |e| return raiseWrite(e);
     return py.none();
 }
 
@@ -183,10 +205,9 @@ fn end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Objec
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
         wc.endMessage(&.{}) catch |e| return raiseWrite(e);
     } else {
-        var hdrs: []events.Header = undefined;
-        if (!borrowHeaders(hdrs_seq, &hdrs)) return null;
-        defer gpa.free(hdrs);
-        wc.endMessage(hdrs) catch |e| return raiseWrite(e);
+        var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+        defer hdrs.deinit();
+        wc.endMessage(hdrs.headers) catch |e| return raiseWrite(e);
     }
     return py.none();
 }
@@ -204,6 +225,7 @@ fn raiseWrite(e: core.writer.WriteError) py.Object {
     return switch (e) {
         error.OutOfMemory => c.PyErr_NoMemory(),
         error.LocalProtocol => py.raise(exceptions.LocalProtocolError, "invalid send for current connection state"),
+        error.InvalidField => py.raise(exceptions.LocalProtocolError, "field contains invalid bytes (CR/LF/control); refusing to serialize"),
     };
 }
 

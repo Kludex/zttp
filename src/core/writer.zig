@@ -14,8 +14,47 @@ pub const WriteError = error{
     /// A send was attempted in a state that does not allow it (e.g. data before
     /// the head, or a second head before the first message ended).
     LocalProtocol,
+    /// A field (method/target/version/reason/header) contained bytes that would
+    /// break the wire grammar - CR, LF, NUL or other controls. Serializing them
+    /// verbatim would allow header/response-splitting injection.
+    InvalidField,
     OutOfMemory,
 };
+
+/// A header field-name must be a non-empty token (RFC 9110 5.6.2).
+fn validName(name: []const u8) WriteError!void {
+    if (name.len == 0) return error.InvalidField;
+    for (name) |ch| {
+        if (!tables.is_tchar[ch]) return error.InvalidField;
+    }
+}
+
+/// A header field-value may not contain CR, LF, NUL or other controls (except
+/// HTAB). Matches the parser's field-vchar acceptance.
+fn validValue(value: []const u8) WriteError!void {
+    for (value) |ch| {
+        if (!tables.is_field_vchar[ch]) return error.InvalidField;
+    }
+}
+
+/// Request-line / status-line tokens (method, target, version, reason) must not
+/// carry CR/LF or controls. Reason allows SP; the others should not contain SP,
+/// but we only guard against the injection-relevant controls here.
+fn validLineToken(s: []const u8, allow_sp: bool) WriteError!void {
+    for (s) |ch| {
+        if (ch == '\r' or ch == '\n' or ch == 0) return error.InvalidField;
+        if (ch < 0x20 and !(allow_sp and ch == '\t')) return error.InvalidField;
+        if (ch == 0x7F) return error.InvalidField;
+        if (!allow_sp and ch == ' ') return error.InvalidField;
+    }
+}
+
+fn validateHeaders(hdrs: []const Header) WriteError!void {
+    for (hdrs) |h| {
+        try validName(h.name);
+        try validValue(h.value);
+    }
+}
 
 const State = enum {
     /// No message in flight; the next send must be a head.
@@ -63,6 +102,10 @@ pub const Writer = struct {
     /// Serialize a request-line + headers. `framing` decides body handling.
     pub fn sendRequest(self: *Writer, method: []const u8, target: []const u8, version: []const u8, hdrs: []const Header) WriteError!void {
         if (self.state != .idle) return error.LocalProtocol;
+        try validLineToken(method, false);
+        try validLineToken(target, false);
+        try validLineToken(version, false);
+        try validateHeaders(hdrs);
         try self.w(method);
         try self.w(" ");
         try self.w(target);
@@ -76,6 +119,9 @@ pub const Writer = struct {
     /// Serialize a status-line + headers.
     pub fn sendResponse(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header, bodyless: bool) WriteError!void {
         if (self.state != .idle) return error.LocalProtocol;
+        try validLineToken(version, false);
+        try validLineToken(reason, true); // reason-phrase may contain SP/HTAB
+        try validateHeaders(hdrs);
         try self.w("HTTP/");
         try self.w(version);
         try self.w(" ");
@@ -123,6 +169,7 @@ pub const Writer = struct {
     pub fn endMessage(self: *Writer, trailers: []const Header) WriteError!void {
         switch (self.state) {
             .body_chunked => {
+                try validateHeaders(trailers);
                 try self.w("0\r\n");
                 for (trailers) |tr| {
                     try self.w(tr.name);
@@ -243,4 +290,39 @@ test "take transfers ownership and empties" {
     defer t.allocator.free(owned);
     try t.expectEqualStrings("HTTP/1.1 204 No Content\r\n\r\n", owned);
     try t.expectEqual(@as(usize, 0), wr.pending().len);
+}
+
+test "send-path injection: CRLF in reason rejected" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK\r\nX-Evil: 1", &.{}, true));
+}
+
+test "send-path injection: CRLF in header value rejected" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "X", .value = "a\r\nInjected: yes" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, true));
+}
+
+test "send-path injection: bad header name rejected" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "Bad Name", .value = "x" }};
+    try t.expectError(error.InvalidField, wr.sendRequest("GET", "/", "1.1", &h));
+}
+
+test "send-path injection: CRLF in target rejected" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try t.expectError(error.InvalidField, wr.sendRequest("GET", "/ HTTP/1.1\r\nX: y", "1.1", &.{}));
+}
+
+test "send-path injection: CRLF in trailer rejected" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, false);
+    const trailers = [_]Header{.{ .name = "X", .value = "v\r\nInjected: 1" }};
+    try t.expectError(error.InvalidField, wr.endMessage(&trailers));
 }

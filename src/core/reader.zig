@@ -24,6 +24,8 @@ const COMPACT_THRESHOLD: usize = 64 * 1024;
 
 pub const Role = enum { server, client };
 
+const TrailerRange = struct { off: usize, len: usize };
+
 const State = enum {
     /// Waiting for the request/status line + headers of a new message.
     head,
@@ -45,6 +47,16 @@ pub const Limits = struct {
     max_line: usize = 16 * 1024,
     max_headers: usize = 100,
     max_header_bytes: usize = 64 * 1024,
+    /// Caps on the chunked trailer section, mirroring the head limits so a
+    /// trailer flood cannot exhaust memory or recurse the stack.
+    max_trailers: usize = 100,
+    max_trailer_bytes: usize = 64 * 1024,
+    /// Hard cap on bytes buffered but not yet consumed. Bounds the worst-case
+    /// memory a peer can force and the cost of compaction. 0 disables the cap.
+    max_buffer: usize = 8 * 1024 * 1024,
+    /// Require CRLF line endings; reject a bare LF. Strict by default to avoid
+    /// request-smuggling differentials with CRLF-strict intermediaries.
+    strict_crlf: bool = true,
 };
 
 pub const Reader = struct {
@@ -62,6 +74,12 @@ pub const Reader = struct {
     /// event's slices stay valid after the input buffer is compacted/refilled.
     head_store: std.ArrayList(u8) = .empty,
     trailers: std.ArrayList(Header) = .empty,
+    /// Stable backing copy of the trailer field-lines, so trailer Header slices
+    /// survive buffer growth/compaction the same way head_store protects the
+    /// head. Trailers accrue incrementally and need their own buffer.
+    trailer_store: std.ArrayList(u8) = .empty,
+    trailer_ranges: std.ArrayList(TrailerRange) = .empty,
+    trailer_bytes: usize = 0,
 
     body_remaining: u64 = 0,
     chunk: chunked_mod.ChunkDecoder = .{},
@@ -79,15 +97,23 @@ pub const Reader = struct {
         self.headers.deinit(self.gpa);
         self.head_store.deinit(self.gpa);
         self.trailers.deinit(self.gpa);
+        self.trailer_store.deinit(self.gpa);
+        self.trailer_ranges.deinit(self.gpa);
     }
 
     /// Append received bytes. An empty slice signals end of input (peer close).
-    pub fn feed(self: *Reader, data: []const u8) !void {
+    /// Rejects input that would push the unconsumed buffer past `max_buffer`,
+    /// bounding peer-forced memory and compaction cost.
+    pub fn feed(self: *Reader, data: []const u8) ParseError!void {
         if (data.len == 0) {
             self.eof_seen = true;
             return;
         }
-        try self.buf.appendSlice(self.gpa, data);
+        if (self.limits.max_buffer != 0) {
+            const unconsumed = self.buf.items.len - self.consumed;
+            if (unconsumed + data.len > self.limits.max_buffer) return error.MessageTooLong;
+        }
+        self.buf.appendSlice(self.gpa, data) catch return error.MessageTooLong;
     }
 
     /// Prepare to read the next message on the same connection (keep-alive).
@@ -96,6 +122,9 @@ pub const Reader = struct {
         self.headers.clearRetainingCapacity();
         self.head_store.clearRetainingCapacity();
         self.trailers.clearRetainingCapacity();
+        self.trailer_store.clearRetainingCapacity();
+        self.trailer_ranges.clearRetainingCapacity();
+        self.trailer_bytes = 0;
         self.body_remaining = 0;
         self.chunk = .{};
         self.next_bodyless = false;
@@ -113,7 +142,10 @@ pub const Reader = struct {
     /// events point into `head_store` (stable); `data` events point into the
     /// input buffer and are valid until the next `nextEvent`/`feed` call.
     pub fn nextEvent(self: *Reader) ParseError!Event {
-        if (self.consumed >= COMPACT_THRESHOLD) self.compact();
+        // Compact once the consumed prefix is both sizeable and a majority of the
+        // buffer. The fraction test keeps total memmove work amortized O(n) over
+        // a large drain rather than the O(n^2) a fixed threshold alone would give.
+        if (self.consumed >= COMPACT_THRESHOLD and self.consumed * 2 >= self.buf.items.len) self.compact();
         return switch (self.state) {
             .head => self.readHead(),
             .body_length => self.readBodyLength(),
@@ -136,8 +168,13 @@ pub const Reader = struct {
         // Find the blank line that ends the header block before committing, so a
         // partial head leaves the buffer untouched.
         const region = self.avail();
-        const head_len = findHeadEnd(region) orelse {
-            if (region.len > self.limits.max_header_bytes) return error.MessageTooLong;
+        const maybe_head_end = findHeadEnd(region);
+        // Enforce the head-size cap on BOTH the complete- and incomplete-head
+        // branches, before copying into head_store, so an oversized but complete
+        // head cannot be fully buffered and duplicated before the limit fires.
+        const candidate_len = maybe_head_end orelse region.len;
+        if (candidate_len > self.limits.max_header_bytes) return error.MessageTooLong;
+        const head_len = maybe_head_end orelse {
             if (self.eof_seen and region.len == 0) {
                 self.state = .closed;
                 return .connection_closed;
@@ -152,11 +189,12 @@ pub const Reader = struct {
         self.consumed += head_len;
 
         var sc = Scanner.init(head);
-        const first = (sc.line(self.limits.max_line) catch return error.InvalidLine).?;
+        const strict = self.limits.strict_crlf;
+        const first = (sc.line(self.limits.max_line, strict) catch return error.InvalidLine).?;
 
         self.headers.clearRetainingCapacity();
         var header_bytes: usize = 0;
-        while (sc.line(self.limits.max_line) catch return error.InvalidHeader) |hl| {
+        while (sc.line(self.limits.max_line, strict) catch return error.InvalidHeader) |hl| {
             if (hl.len == 0) break;
             header_bytes += hl.len;
             if (self.headers.items.len >= self.limits.max_headers or header_bytes > self.limits.max_header_bytes) {
@@ -199,7 +237,7 @@ pub const Reader = struct {
                 self.state = .body_length;
             },
             .chunked => {
-                self.chunk = .{ .max_line = self.limits.max_line };
+                self.chunk = .{ .max_line = self.limits.max_line, .strict = self.limits.strict_crlf };
                 self.state = .body_chunked;
             },
             .until_close => self.state = .body_until_close,
@@ -224,25 +262,52 @@ pub const Reader = struct {
     }
 
     fn readBodyChunked(self: *Reader) ParseError!Event {
-        var sc = Scanner.init(self.avail());
-        const out = try self.chunk.next(&sc);
-        self.consumed += sc.pos;
-        return switch (out) {
-            .data => |d| .{ .data = .{ .data = d } },
-            .trailer_line => |l| {
-                const h = try headers_mod.parseHeaderLine(l);
-                self.trailers.append(self.gpa, h) catch return error.MessageTooLong;
-                return self.readBodyChunked();
-            },
-            .done => blk: {
-                self.state = .eom_pending;
-                break :blk self.nextEvent();
-            },
-            .need_data => blk: {
-                if (self.eof_seen) break :blk error.ProtocolError;
-                break :blk .need_data;
-            },
-        };
+        // Loop (not recursion) so a trailer flood cannot grow the stack.
+        while (true) {
+            var sc = Scanner.init(self.avail());
+            const out = try self.chunk.next(&sc);
+            self.consumed += sc.pos;
+            switch (out) {
+                .data => |d| return .{ .data = .{ .data = d } },
+                .trailer_line => |l| try self.storeTrailer(l),
+                .done => {
+                    self.materializeTrailers();
+                    self.state = .eom_pending;
+                    return self.nextEvent();
+                },
+                .need_data => {
+                    if (self.eof_seen) return error.ProtocolError;
+                    return .need_data;
+                },
+            }
+        }
+    }
+
+    /// Copy a trailer field-line into stable storage and remember its offset, so
+    /// the parsed Header slices survive buffer growth/compaction (H-1) and are
+    /// bounded in count and bytes (H-4). The slice itself is resolved later, in
+    /// `materializeTrailers`, once `trailer_store` can no longer move.
+    fn storeTrailer(self: *Reader, line: []const u8) ParseError!void {
+        if (self.trailers.items.len >= self.limits.max_trailers) return error.MessageTooLong;
+        self.trailer_bytes += line.len;
+        if (self.trailer_bytes > self.limits.max_trailer_bytes) return error.MessageTooLong;
+        const start = self.trailer_store.items.len;
+        self.trailer_store.appendSlice(self.gpa, line) catch return error.MessageTooLong;
+        // Validate now (cheap, surfaces errors early) but record only the range;
+        // the borrowed slice would dangle if trailer_store reallocs on a later line.
+        _ = try headers_mod.parseHeaderLine(self.trailer_store.items[start..]);
+        self.trailers.append(self.gpa, .{ .name = "", .value = "" }) catch return error.MessageTooLong;
+        self.trailer_ranges.append(self.gpa, .{ .off = start, .len = line.len }) catch return error.MessageTooLong;
+    }
+
+    /// Re-parse the stored trailer lines into Header slices into `trailer_store`,
+    /// which is now stable (no further appends). Called exactly once at `.done`.
+    fn materializeTrailers(self: *Reader) void {
+        for (self.trailer_ranges.items, 0..) |r, i| {
+            const line = self.trailer_store.items[r.off .. r.off + r.len];
+            // parseHeaderLine already succeeded in storeTrailer, so it cannot fail here.
+            self.trailers.items[i] = headers_mod.parseHeaderLine(line) catch unreachable;
+        }
     }
 
     fn readBodyUntilClose(self: *Reader) ParseError!Event {
@@ -416,4 +481,186 @@ test "truncated content-length body errors at EOF" {
     _ = try r.nextEvent(); // "short"
     try r.feed("");
     try t.expectError(error.ProtocolError, r.nextEvent());
+}
+
+// -- security regression tests ------------------------------------------------
+
+test "H-1: trailer survives buffer realloc across feeds" {
+    // Store a trailer while awaiting the terminating blank line, then feed a
+    // large payload that forces buf to grow/realloc before EndOfMessage. The
+    // trailer must still read back correctly (was a use-after-free).
+    var r = Reader.init(t.allocator, .server);
+    defer r.deinit();
+    try r.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+    try expectTag(.request, try r.nextEvent());
+    try r.feed("0\r\nX-Trailer: SECRET\r\n");
+    try expectTag(.need_data, try r.nextEvent()); // trailer stored, no blank line yet
+    const padding = "\r\n" ++ ("Z" ** (256 * 1024));
+    try r.feed(padding);
+    const eom = try r.nextEvent();
+    try t.expectEqual(@as(usize, 1), eom.end_of_message.trailers.len);
+    try t.expectEqualStrings("X-Trailer", eom.end_of_message.trailers[0].name);
+    try t.expectEqualStrings("SECRET", eom.end_of_message.trailers[0].value);
+}
+
+test "H-1: multiple trailers survive trailer_store growth" {
+    var r = Reader.init(t.allocator, .server);
+    defer r.deinit();
+    try r.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+    try expectTag(.request, try r.nextEvent());
+    try r.feed("A: 1\r\nBee: 22\r\nCee: 333\r\n\r\n");
+    var eom: Event = undefined;
+    while (true) {
+        const e = try r.nextEvent();
+        if (e == .end_of_message) {
+            eom = e;
+            break;
+        }
+        try t.expect(e == .need_data); // no body data in this message
+    }
+    const tr = eom.end_of_message.trailers;
+    try t.expectEqual(@as(usize, 3), tr.len);
+    try t.expectEqualStrings("A", tr[0].name);
+    try t.expectEqualStrings("1", tr[0].value);
+    try t.expectEqualStrings("Bee", tr[1].name);
+    try t.expectEqualStrings("22", tr[1].value);
+    try t.expectEqualStrings("Cee", tr[2].name);
+    try t.expectEqualStrings("333", tr[2].value);
+}
+
+test "H-4: trailer count cap rejected" {
+    var r = Reader.init(t.allocator, .server);
+    r.limits.max_trailers = 4;
+    defer r.deinit();
+    try r.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+    _ = try r.nextEvent();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(t.allocator);
+    for (0..10) |i| {
+        try buf.appendSlice(t.allocator, "X: ");
+        try buf.append(t.allocator, @intCast('0' + i));
+        try buf.appendSlice(t.allocator, "\r\n");
+    }
+    try r.feed(buf.items);
+    try t.expectError(error.MessageTooLong, r.nextEvent());
+}
+
+test "H-4: trailer byte cap rejected" {
+    var r = Reader.init(t.allocator, .server);
+    r.limits.max_trailer_bytes = 32;
+    defer r.deinit();
+    try r.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+    _ = try r.nextEvent();
+    try r.feed("X-Long-Trailer-Header: aaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+    try t.expectError(error.MessageTooLong, r.nextEvent());
+}
+
+test "M-1: oversized complete head rejected before full copy" {
+    var r = Reader.init(t.allocator, .server);
+    r.limits.max_header_bytes = 1024;
+    defer r.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(t.allocator);
+    try buf.appendSlice(t.allocator, "GET / HTTP/1.1\r\n");
+    while (buf.items.len < 4096) try buf.appendSlice(t.allocator, "X-Pad: aaaaaaaaaaaaaaaa\r\n");
+    try buf.appendSlice(t.allocator, "\r\n"); // complete head, but oversized
+    try r.feed(buf.items);
+    try t.expectError(error.MessageTooLong, r.nextEvent());
+}
+
+test "feed rejects input past max_buffer" {
+    var r = Reader.init(t.allocator, .server);
+    r.limits.max_buffer = 1024;
+    defer r.deinit();
+    const big = "Z" ** 2048;
+    try t.expectError(error.MessageTooLong, r.feed(big));
+}
+
+test "M-2: bare LF request rejected when strict" {
+    var r = Reader.init(t.allocator, .server);
+    defer r.deinit();
+    try r.feed("GET / HTTP/1.1\nHost: x\n\n");
+    try t.expectError(error.InvalidLine, r.nextEvent());
+}
+
+test "M-2: bare LF request accepted when lenient" {
+    var r = Reader.init(t.allocator, .server);
+    r.limits.strict_crlf = false;
+    defer r.deinit();
+    try r.feed("GET / HTTP/1.1\nHost: x\n\n");
+    const e = try r.nextEvent();
+    try t.expectEqualStrings("GET", e.request.method);
+    try t.expectEqualStrings("x", e.request.headers[0].value);
+}
+
+// -- fuzzing ------------------------------------------------------------------
+
+/// Drive the reader with arbitrary input split at an arbitrary boundary, then
+/// pull events to completion. The only acceptable outcomes are a clean event
+/// stream or a ParseError - never a panic, OOB, or hang. Run with `zig build
+/// fuzz`. The split exercises partial-data resumption, where the trailer/
+/// compaction lifetime bugs lived.
+fn driveReader(input: []const u8) void {
+    inline for (.{ Role.server, Role.client }) |role| {
+        var r = Reader.init(t.allocator, role);
+        defer r.deinit();
+        // Tight limits so fuzzing stays fast and exercises the caps.
+        r.limits = .{ .max_buffer = 1 << 20, .max_header_bytes = 64 * 1024, .max_trailer_bytes = 64 * 1024 };
+        const split = if (input.len == 0) 0 else input[0] % @as(u8, @intCast(@min(input.len, 255)));
+        const feeds = [_][]const u8{ input[0..split], input[split..], "" };
+        outer: for (feeds) |chunk| {
+            r.feed(chunk) catch break;
+            for (0..input.len + 4) |_| {
+                const ev = r.nextEvent() catch continue :outer;
+                switch (ev) {
+                    .need_data, .connection_closed => break,
+                    .end_of_message => {
+                        r.reset();
+                        break;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+}
+
+// A deterministic property test: run many adversarial and pseudo-random inputs
+// through driveReader and assert it never panics. This is the always-on
+// regression net; coverage-guided fuzzing (`zig build fuzz`) layers on top.
+test "fuzz: reader never panics on adversarial inputs" {
+    const seeds = [_][]const u8{
+        "",
+        "\n",
+        "\r\n\r\n",
+        "GET",
+        "GET / HTTP/1.1\r\n\r\n",
+        "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n",
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffffff\r\n",
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++ ("0\r\nX: y\r\n" ** 3),
+        "HTTP/1.1 200\r\n\r\n",
+        "GET / HTTP/1.1\r\n" ++ ("A: b\r\n" ** 50) ++ "\r\n",
+        "\x00\x01\x02\x03 / HTTP/1.1\r\n\r\n",
+        "GET /\xff\xfe HTTP/1.1\r\nHost:\x00\r\n\r\n",
+    };
+    for (seeds) |s| driveReader(s);
+
+    // Pseudo-random bytes derived from a fixed seed (Math.random is unavailable
+    // and would be non-deterministic anyway). Splice in HTTP-ish tokens to reach
+    // deeper states than purely random noise would.
+    var prng = std.Random.DefaultPrng.init(0x7a68747470);
+    const rand = prng.random();
+    var buf: [512]u8 = undefined;
+    for (0..2000) |_| {
+        const len = rand.intRangeAtMost(usize, 0, buf.len);
+        for (buf[0..len]) |*b| {
+            b.* = switch (rand.intRangeAtMost(u8, 0, 4)) {
+                0 => '\r',
+                1 => '\n',
+                2 => rand.intRangeAtMost(u8, 'a', 'z'),
+                else => rand.int(u8),
+            };
+        }
+        driveReader(buf[0..len]);
+    }
 }
