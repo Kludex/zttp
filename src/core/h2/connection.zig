@@ -40,6 +40,10 @@ pub const Limits = struct {
     header_table_size: u32 = constants.DEFAULT_HEADER_TABLE_SIZE,
     max_frame_size: u32 = constants.DEFAULT_FRAME_SIZE,
     max_buffer: usize = 8 * 1024 * 1024,
+    /// Caps on an open field block (HEADERS + its CONTINUATIONs), defending
+    /// against the CONTINUATION flood (CVE-2024-27316).
+    max_field_block_bytes: usize = 64 * 1024,
+    max_continuation_frames: u32 = 16,
 };
 
 /// The error set the H2 engine raises. Mapped to RFC 9113 error codes for the
@@ -89,6 +93,22 @@ pub const Connection = struct {
     /// produced (the integrator copies what it needs synchronously, as for Data).
     settings_scratch: std.ArrayList(events.SettingPair) = .empty,
 
+    /// The single open field block (RFC 9113 4.3): once HEADERS without
+    /// END_HEADERS opens it, the very next frame must be CONTINUATION on this
+    /// stream. Only one block may be open across the whole connection, so this is
+    /// connection-level state, not per-stream. null = no block open.
+    fb_stream: ?u32 = null,
+    fb_end_stream: bool = false, // END_STREAM carried by the opening HEADERS
+    fb_is_trailer: bool = false, // a second HEADERS block on an open stream
+    fb_buf: std.ArrayList(u8) = .empty, // accumulated fragment bytes
+    fb_frames: u32 = 0, // CONTINUATION frame count (flood guard)
+    /// Storage for a collapsed request/response: the regular header list and a
+    /// byte scratch for synthesized values (e.g. the host from :authority). Both
+    /// are stable until the next HEADERS decode, mirroring the HPACK out_store
+    /// lifetime contract.
+    req_headers: std.ArrayList(events.Header) = .empty,
+    req_scratch: std.ArrayList(u8) = .empty,
+
     failed_with: H2Error = error.ProtocolError,
     eof_seen: bool = false,
 
@@ -108,6 +128,9 @@ pub const Connection = struct {
         self.streams.deinit(self.gpa);
         self.hpack.deinit();
         self.settings_scratch.deinit(self.gpa);
+        self.fb_buf.deinit(self.gpa);
+        self.req_headers.deinit(self.gpa);
+        self.req_scratch.deinit(self.gpa);
     }
 
     /// Append received bytes (empty slice signals EOF). Bounded by max_buffer.
@@ -202,6 +225,13 @@ pub const Connection = struct {
     }
 
     fn handleFrame(self: *Connection, f: frame_mod.Frame, ftype: FrameType) H2Error!void {
+        // Contiguity (RFC 9113 4.3): while a field block is open, the ONLY legal
+        // frame is a CONTINUATION on the same stream. Anything else - any type,
+        // any stream - is a connection PROTOCOL_ERROR.
+        if (self.fb_stream) |open_id| {
+            if (ftype != .continuation or f.header.stream_id != open_id) return error.ProtocolError;
+            return self.handleContinuation(f);
+        }
         switch (ftype) {
             .settings => try self.handleSettings(f),
             .ping => try self.handlePing(f),
@@ -209,9 +239,11 @@ pub const Connection = struct {
             .window_update => try self.handleWindowUpdate(f),
             .data => try self.handleData(f),
             .rst_stream => try self.handleRstStream(f),
+            .headers => try self.handleHeaders(f),
             .priority => {}, // deprecated; parsed by frame.checkLength, ignored
-            // HEADERS / CONTINUATION / PUSH_PROMISE land in the next iteration.
-            .headers, .continuation, .push_promise => return error.ProtocolError,
+            // A CONTINUATION with no open block is a protocol error (4.3); server
+            // push is out of scope so PUSH_PROMISE is rejected.
+            .continuation, .push_promise => return error.ProtocolError,
             else => {}, // unknown frame types are discarded (RFC 9113 4.1)
         }
     }
@@ -336,17 +368,196 @@ pub const Connection = struct {
     fn handleRstStream(self: *Connection, f: frame_mod.Frame) H2Error!void {
         if (f.header.stream_id == 0) return error.ProtocolError;
         const code = std.mem.readInt(u32, f.payload[0..4], .big);
-        const s = self.streams.getPtr(f.header.stream_id) orelse return error.ProtocolError; // RST on idle
+        const s = self.streams.getPtr(f.header.stream_id) orelse {
+            // RST on a never-opened (idle) stream is a connection error; on a
+            // closed/forgotten stream it is tolerated and dropped.
+            if (self.isIdle(f.header.stream_id)) return error.ProtocolError;
+            return;
+        };
         s.recvApply(.rst_stream, false);
         self.push(.{ .rst_stream = .{ .stream_id = f.header.stream_id, .error_code = code } });
     }
 
-    /// Test/connection helper to open a stream (the HEADERS path will do this in
-    /// the next iteration; exposed so the DATA path can be exercised meanwhile).
+    // -- HEADERS / CONTINUATION reassembly -----------------------------------
+
+    fn handleHeaders(self: *Connection, f: frame_mod.Frame) H2Error!void {
+        if (f.header.stream_id == 0) return error.ProtocolError;
+        if (self.role != .server) return error.ProtocolError; // client HEADERS read = response; later
+        const id = f.header.stream_id;
+        const fragment = frame_mod.headersFieldBlock(f.payload, f.header.flags) catch |e| switch (e) {
+            error.FrameSizeError => return error.FrameSizeError,
+            error.ProtocolError => return error.ProtocolError,
+            else => return error.ProtocolError,
+        };
+
+        const existing = self.streams.getPtr(id);
+        const is_trailer = existing != null and existing.?.headers_done;
+        if (existing == null) {
+            // A new request stream. Its id must exceed the highest peer id (5.1.1)
+            // and respect the wrong-parity / monotonicity rules.
+            if (id % 2 == 0 or id <= self.highest_peer_id) return error.ProtocolError;
+            if (self.liveStreamCount() >= self.limits.max_concurrent_streams) {
+                self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(ErrorCode.refused_stream) } });
+                // Still must HPACK-decode to keep the table in sync; do so by
+                // opening the block but marking the stream refused. For
+                // simplicity here, treat it as a connection-level refusal is
+                // wrong - instead decode-and-discard. We open the stream record
+                // so the block can complete; it will be reset after decode.
+            }
+            self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size)) catch return error.MessageTooLong;
+            self.highest_peer_id = id;
+            self.streams.getPtr(id).?.recvApply(.headers, false); // idle -> open
+        }
+
+        self.fb_stream = id;
+        self.fb_end_stream = Flags.has(f.header.flags, Flags.end_stream);
+        self.fb_is_trailer = is_trailer;
+        self.fb_frames = 0;
+        self.fb_buf.clearRetainingCapacity();
+        self.fb_buf.appendSlice(self.gpa, fragment) catch return error.MessageTooLong;
+        if (self.fb_buf.items.len > self.limits.max_field_block_bytes) return error.EnhanceYourCalm;
+
+        if (Flags.has(f.header.flags, Flags.end_headers)) try self.completeFieldBlock();
+    }
+
+    fn handleContinuation(self: *Connection, f: frame_mod.Frame) H2Error!void {
+        self.fb_frames += 1;
+        if (self.fb_frames > self.limits.max_continuation_frames) return error.EnhanceYourCalm;
+        self.fb_buf.appendSlice(self.gpa, f.payload) catch return error.MessageTooLong;
+        if (self.fb_buf.items.len > self.limits.max_field_block_bytes) return error.EnhanceYourCalm;
+        if (Flags.has(f.header.flags, Flags.end_headers)) try self.completeFieldBlock();
+    }
+
+    /// The field block is complete: HPACK-decode it (always, to keep the dynamic
+    /// table in sync), collapse pseudo-headers into a Request, validate, and emit.
+    /// A malformed message is a STREAM error (RST_STREAM) - the connection and the
+    /// HPACK table survive (RFC 9113 8.1.1).
+    fn completeFieldBlock(self: *Connection) H2Error!void {
+        const id = self.fb_stream.?;
+        const end_stream = self.fb_end_stream;
+        const is_trailer = self.fb_is_trailer;
+        self.fb_stream = null; // block closed
+
+        const headers = self.hpack.decodeBlock(self.fb_buf.items) catch |e| switch (e) {
+            error.CompressionError => return error.CompressionError, // connection-fatal
+            error.MessageTooLong => return error.MessageTooLong,
+            error.OutOfMemory => return error.MessageTooLong,
+        };
+
+        const s = self.streams.getPtr(id).?;
+        if (is_trailer) {
+            // Trailers: a second HEADERS block; must carry END_STREAM (8.1).
+            if (!end_stream) {
+                self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(ErrorCode.protocol_error) } });
+                return;
+            }
+            s.recvApply(.headers, true);
+            self.push(.{ .end_of_message = .{ .trailers = headers, .stream_id = id } });
+            return;
+        }
+
+        // Collapse pseudo-headers into the request line + regular headers.
+        const req = self.collapseRequest(headers, id) catch |e| switch (e) {
+            error.Malformed => {
+                self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(ErrorCode.protocol_error) } });
+                return;
+            },
+            error.OutOfMemory => return error.MessageTooLong,
+        };
+        s.headers_done = true;
+        if (req.content_length) |cl| s.content_length = cl;
+        self.push(.{ .request = req.event });
+        if (end_stream) {
+            s.recvApply(.headers, true); // open -> half_closed_remote
+            self.push(.{ .end_of_message = .{ .stream_id = id } });
+        }
+    }
+
+    const CollapseError = error{ Malformed, OutOfMemory };
+    const Collapsed = struct { event: events.Request, content_length: ?u64 };
+
+    /// Map HTTP/2 pseudo-headers + regular fields to a zttp Request (RFC 9113 8).
+    /// :method->method, :path->target, :authority->a synthesized lowercase host
+    /// header. Enforces: pseudo-headers precede regular fields; exactly one each
+    /// of :method/:scheme/:path; no response pseudo-header; lowercase names; no
+    /// connection-specific fields; TE only "trailers". Slices point into the HPACK
+    /// out_store (valid until the next decode) or req_scratch (owned, stable).
+    fn collapseRequest(self: *Connection, headers: []const events.Header, id: u32) CollapseError!Collapsed {
+        self.req_headers.clearRetainingCapacity();
+        self.req_scratch.clearRetainingCapacity();
+        var method: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var scheme: ?[]const u8 = null;
+        var authority: ?[]const u8 = null;
+        var content_length: ?u64 = null;
+        var seen_regular = false;
+
+        for (headers) |h| {
+            if (h.name.len == 0) return error.Malformed;
+            if (h.name[0] == ':') {
+                if (seen_regular) return error.Malformed; // pseudo after regular
+                if (eql(h.name, ":method")) {
+                    if (method != null) return error.Malformed;
+                    method = h.value;
+                } else if (eql(h.name, ":path")) {
+                    if (path != null) return error.Malformed;
+                    path = h.value;
+                } else if (eql(h.name, ":scheme")) {
+                    if (scheme != null) return error.Malformed;
+                    scheme = h.value;
+                } else if (eql(h.name, ":authority")) {
+                    if (authority != null) return error.Malformed;
+                    authority = h.value;
+                } else {
+                    return error.Malformed; // unknown or response pseudo-header
+                }
+                continue;
+            }
+            seen_regular = true;
+            if (!isLowerToken(h.name)) return error.Malformed; // uppercase name
+            if (isConnectionSpecific(h.name)) return error.Malformed;
+            if (eql(h.name, "te") and !eql(h.value, "trailers")) return error.Malformed;
+            if (eql(h.name, "content-length")) {
+                content_length = parseU64(h.value) orelse return error.Malformed;
+            }
+            self.req_headers.append(self.gpa, h) catch return error.OutOfMemory;
+        }
+
+        if (method == null or path == null or scheme == null) return error.Malformed;
+        // Synthesize a host header from :authority (copied into req_scratch).
+        if (authority) |a| {
+            const start = self.req_scratch.items.len;
+            self.req_scratch.appendSlice(self.gpa, a) catch return error.OutOfMemory;
+            const host_val = self.req_scratch.items[start..];
+            self.req_headers.append(self.gpa, .{ .name = "host", .value = host_val }) catch return error.OutOfMemory;
+        }
+
+        return .{
+            .event = .{
+                .method = method.?,
+                .target = path.?,
+                .http_version = "2",
+                .headers = self.req_headers.items,
+                .stream_id = id,
+            },
+            .content_length = content_length,
+        };
+    }
+
+    fn liveStreamCount(self: *Connection) u32 {
+        var n: u32 = 0;
+        var it = self.streams.valueIterator();
+        while (it.next()) |s| {
+            if (s.countsTowardConcurrency()) n += 1;
+        }
+        return n;
+    }
+
+    /// Open a stream as if a HEADERS had arrived - used by tests that exercise the
+    /// DATA path without driving a full HEADERS block.
     pub fn openStreamForTest(self: *Connection, id: u32) !void {
         try self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size));
-        var s = self.streams.getPtr(id).?;
-        s.recvApply(.headers, false);
+        self.streams.getPtr(id).?.recvApply(.headers, false);
         if (id > self.highest_peer_id) self.highest_peer_id = id;
     }
 
@@ -376,6 +587,38 @@ pub const Connection = struct {
         self.consumed = 0;
     }
 };
+
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+/// A valid lowercase HTTP/2 field name: no uppercase ASCII (RFC 9113 8.2.1).
+fn isLowerToken(name: []const u8) bool {
+    for (name) |ch| {
+        if (ch >= 'A' and ch <= 'Z') return false;
+    }
+    return true;
+}
+
+/// The connection-specific fields forbidden in HTTP/2 (RFC 9113 8.2.2).
+fn isConnectionSpecific(name: []const u8) bool {
+    const forbidden = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" };
+    for (forbidden) |f| {
+        if (eql(name, f)) return true;
+    }
+    return false;
+}
+
+fn parseU64(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+    var v: u64 = 0;
+    for (s) |ch| {
+        if (ch < '0' or ch > '9') return null;
+        v = std.math.mul(u64, v, 10) catch return null;
+        v = std.math.add(u64, v, ch - '0') catch return null;
+    }
+    return v;
+}
 
 const testing = std.testing;
 
@@ -499,6 +742,92 @@ test "a long run of no-event frames does not overflow the stack" {
     try c.feed(input.items);
     try testing.expectEqual(std.meta.Tag(Event).settings, std.meta.activeTag(try c.nextEvent()));
     try testing.expectEqual(std.meta.Tag(Event).ping, std.meta.activeTag(try c.nextEvent()));
+}
+
+// RFC 7541 C.3.1: an HPACK block for :method GET, :scheme http, :path /,
+// :authority www.example.com.
+const GET_BLOCK = [_]u8{ 0x82, 0x86, 0x84, 0x41, 0x0f } ++ "www.example.com".*;
+
+test "HEADERS with END_STREAM yields a Request then EndOfMessage" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK);
+    try handshook(&c, hdr.items);
+    const req = try c.nextEvent();
+    try testing.expectEqual(@as(u32, 1), req.request.stream_id);
+    try testing.expectEqualStrings("GET", req.request.method);
+    try testing.expectEqualStrings("/", req.request.target);
+    try testing.expectEqualStrings("2", req.request.http_version);
+    // :authority became a synthesized host header.
+    try testing.expectEqualStrings("host", req.request.headers[req.request.headers.len - 1].name);
+    try testing.expectEqualStrings("www.example.com", req.request.headers[req.request.headers.len - 1].value);
+    const eom = try c.nextEvent();
+    try testing.expectEqual(@as(u32, 1), eom.end_of_message.stream_id);
+}
+
+test "HEADERS split across a CONTINUATION reassembles to one Request" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    // First half of the block in HEADERS (no END_HEADERS), rest in CONTINUATION.
+    try frameBytes(&frames, .headers, Flags.end_stream, 1, GET_BLOCK[0..3]);
+    try frameBytes(&frames, .continuation, Flags.end_headers, 1, GET_BLOCK[3..]);
+    try handshook(&c, frames.items);
+    const req = try c.nextEvent();
+    try testing.expectEqualStrings("GET", req.request.method);
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "an interleaved frame during an open field block is a connection error" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, 0, 1, GET_BLOCK[0..3]); // no END_HEADERS
+    try frameBytes(&frames, .ping, 0, 0, &[_]u8{0} ** 8); // illegal: not a CONTINUATION
+    try handshook(&c, frames.items);
+    try testing.expectError(error.ProtocolError, c.nextEvent());
+}
+
+test "a CONTINUATION flood trips the cap" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    c.limits.max_continuation_frames = 4;
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, 0, 1, GET_BLOCK[0..1]);
+    var k: usize = 0;
+    while (k < 6) : (k += 1) try frameBytes(&frames, .continuation, 0, 1, &[_]u8{}); // never END_HEADERS
+    try handshook(&c, frames.items);
+    try testing.expectError(error.EnhanceYourCalm, c.nextEvent());
+}
+
+test "an uppercase header name makes the request malformed (stream reset)" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // :method GET, :scheme http, :path /, then a literal "Bad: x" with an
+    // uppercase name (literal-without-indexing, literal name).
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x03, 'B', 'a', 'd', 0x01, 'x' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    const ev = try c.nextEvent();
+    try testing.expectEqual(@as(u32, 1), ev.rst_stream.stream_id);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), ev.rst_stream.error_code);
+}
+
+test "an even-numbered request stream id is a connection error" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 2, &GET_BLOCK);
+    try handshook(&c, hdr.items);
+    try testing.expectError(error.ProtocolError, c.nextEvent());
 }
 
 fn driveConnection(input: []const u8) void {

@@ -15,7 +15,9 @@ const std = @import("std");
 const static_table = @import("static_table.zig");
 const huffman = @import("huffman.zig");
 
-const Header = struct { name: []const u8, value: []const u8 };
+/// The decoder emits the shared core Header so its output drops straight into
+/// the event model with no conversion.
+const Header = @import("../../events.zig").Header;
 
 /// Per-entry overhead added to name+value length for dynamic-table accounting
 /// (RFC 7541 4.1).
