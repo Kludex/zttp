@@ -17,6 +17,7 @@ const settings_mod = @import("settings.zig");
 const stream_mod = @import("stream.zig");
 const decoder_mod = @import("hpack/decoder.zig");
 const events = @import("../events.zig");
+const tables = @import("../tables.zig");
 
 const Event = events.Event;
 const FrameType = constants.FrameType;
@@ -100,6 +101,7 @@ pub const Connection = struct {
     fb_stream: ?u32 = null,
     fb_end_stream: bool = false, // END_STREAM carried by the opening HEADERS
     fb_is_trailer: bool = false, // a second HEADERS block on an open stream
+    fb_refused: bool = false, // over the concurrency cap: decode for HPACK sync, then discard
     fb_buf: std.ArrayList(u8) = .empty, // accumulated fragment bytes
     fb_frames: u32 = 0, // CONTINUATION frame count (flood guard)
     /// Storage for a collapsed request/response: the regular header list and a
@@ -391,27 +393,37 @@ pub const Connection = struct {
         };
 
         const existing = self.streams.getPtr(id);
-        const is_trailer = existing != null and existing.?.headers_done;
-        if (existing == null) {
-            // A new request stream. Its id must exceed the highest peer id (5.1.1)
-            // and respect the wrong-parity / monotonicity rules.
-            if (id % 2 == 0 or id <= self.highest_peer_id) return error.ProtocolError;
-            if (self.liveStreamCount() >= self.limits.max_concurrent_streams) {
-                self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(ErrorCode.refused_stream) } });
-                // Still must HPACK-decode to keep the table in sync; do so by
-                // opening the block but marking the stream refused. For
-                // simplicity here, treat it as a connection-level refusal is
-                // wrong - instead decode-and-discard. We open the stream record
-                // so the block can complete; it will be reset after decode.
+        var is_trailer = false;
+        var refused = false;
+        if (existing) |s| {
+            // A second HEADERS block is a trailer ONLY while the stream is still
+            // open (body not yet ended). A HEADERS after the peer's END_STREAM
+            // (half-closed-remote) or on a closed stream is a protocol error.
+            if (s.headers_done and s.state == .open) {
+                is_trailer = true;
+            } else {
+                return error.ProtocolError;
             }
-            self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size)) catch return error.MessageTooLong;
+        } else {
+            // A new request stream. Its id must be odd and exceed the highest peer
+            // id (5.1.1: parity + monotonicity).
+            if (id % 2 == 0 or id <= self.highest_peer_id) return error.ProtocolError;
+            // Over the concurrency cap: still HPACK-decode the block to keep the
+            // connection-global dynamic table in sync, but refuse the request
+            // (RST_STREAM REFUSED_STREAM) and never surface it. No stream record
+            // is inserted, so the map cannot grow under a refused-stream flood.
+            refused = self.liveStreamCount() >= self.limits.max_concurrent_streams;
+            if (!refused) {
+                self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size)) catch return error.MessageTooLong;
+                self.streams.getPtr(id).?.recvApply(.headers, false); // idle -> open
+            }
             self.highest_peer_id = id;
-            self.streams.getPtr(id).?.recvApply(.headers, false); // idle -> open
         }
 
         self.fb_stream = id;
         self.fb_end_stream = Flags.has(f.header.flags, Flags.end_stream);
         self.fb_is_trailer = is_trailer;
+        self.fb_refused = refused;
         self.fb_frames = 0;
         self.fb_buf.clearRetainingCapacity();
         self.fb_buf.appendSlice(self.gpa, fragment) catch return error.MessageTooLong;
@@ -421,8 +433,8 @@ pub const Connection = struct {
     }
 
     fn handleContinuation(self: *Connection, f: frame_mod.Frame) H2Error!void {
+        if (self.fb_frames == self.limits.max_continuation_frames) return error.EnhanceYourCalm;
         self.fb_frames += 1;
-        if (self.fb_frames > self.limits.max_continuation_frames) return error.EnhanceYourCalm;
         self.fb_buf.appendSlice(self.gpa, f.payload) catch return error.MessageTooLong;
         if (self.fb_buf.items.len > self.limits.max_field_block_bytes) return error.EnhanceYourCalm;
         if (Flags.has(f.header.flags, Flags.end_headers)) try self.completeFieldBlock();
@@ -436,19 +448,30 @@ pub const Connection = struct {
         const id = self.fb_stream.?;
         const end_stream = self.fb_end_stream;
         const is_trailer = self.fb_is_trailer;
+        const refused = self.fb_refused;
         self.fb_stream = null; // block closed
 
+        // Always decode (even when refused/malformed) to keep the dynamic table
+        // in sync; a decode failure is connection-fatal COMPRESSION_ERROR.
         const headers = self.hpack.decodeBlock(self.fb_buf.items) catch |e| switch (e) {
-            error.CompressionError => return error.CompressionError, // connection-fatal
+            error.CompressionError => return error.CompressionError,
             error.MessageTooLong => return error.MessageTooLong,
             error.OutOfMemory => return error.MessageTooLong,
         };
 
+        if (refused) {
+            // Decoded for HPACK sync; the request is not surfaced and no stream
+            // record exists, so nothing to close.
+            self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(ErrorCode.refused_stream) } });
+            return;
+        }
+
         const s = self.streams.getPtr(id).?;
         if (is_trailer) {
-            // Trailers: a second HEADERS block; must carry END_STREAM (8.1).
-            if (!end_stream) {
-                self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(ErrorCode.protocol_error) } });
+            // Trailers: a second HEADERS block; must carry END_STREAM (8.1) and
+            // must not contain pseudo-headers or otherwise-invalid fields.
+            if (!end_stream or !validTrailers(headers)) {
+                self.resetStream(s, id, .protocol_error);
                 return;
             }
             s.recvApply(.headers, true);
@@ -459,7 +482,7 @@ pub const Connection = struct {
         // Collapse pseudo-headers into the request line + regular headers.
         const req = self.collapseRequest(headers, id) catch |e| switch (e) {
             error.Malformed => {
-                self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(ErrorCode.protocol_error) } });
+                self.resetStream(s, id, .protocol_error);
                 return;
             },
             error.OutOfMemory => return error.MessageTooLong,
@@ -471,6 +494,13 @@ pub const Connection = struct {
             s.recvApply(.headers, true); // open -> half_closed_remote
             self.push(.{ .end_of_message = .{ .stream_id = id } });
         }
+    }
+
+    /// Reset a stream for a stream error: emit RST_STREAM and move its state to
+    /// closed so later frames on it are no longer treated as open.
+    fn resetStream(self: *Connection, s: *Stream, id: u32, code: ErrorCode) void {
+        s.recvApply(.rst_stream, false); // -> closed
+        self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(code) } });
     }
 
     const CollapseError = error{ Malformed, OutOfMemory };
@@ -514,11 +544,15 @@ pub const Connection = struct {
                 continue;
             }
             seen_regular = true;
-            if (!isLowerToken(h.name)) return error.Malformed; // uppercase name
+            if (!isValidFieldName(h.name)) return error.Malformed; // uppercase / non-token byte
             if (isConnectionSpecific(h.name)) return error.Malformed;
             if (eql(h.name, "te") and !eql(h.value, "trailers")) return error.Malformed;
             if (eql(h.name, "content-length")) {
-                content_length = parseU64(h.value) orelse return error.Malformed;
+                const cl = parseU64(h.value) orelse return error.Malformed;
+                // A repeated content-length is malformed unless it agrees (RFC 9110).
+                if (content_length) |prev| {
+                    if (prev != cl) return error.Malformed;
+                } else content_length = cl;
             }
             self.req_headers.append(self.gpa, h) catch return error.OutOfMemory;
         }
@@ -592,10 +626,25 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-/// A valid lowercase HTTP/2 field name: no uppercase ASCII (RFC 9113 8.2.1).
-fn isLowerToken(name: []const u8) bool {
+/// A valid HTTP/2 field name: a non-empty RFC 9110 token (so no SP, NUL, ':',
+/// or other separators) with no uppercase ASCII (RFC 9113 8.2.1). `:` is
+/// excluded here, so this is only applied to regular (non-pseudo) names.
+fn isValidFieldName(name: []const u8) bool {
+    if (name.len == 0) return false;
     for (name) |ch| {
         if (ch >= 'A' and ch <= 'Z') return false;
+        if (!tables.is_tchar[ch]) return false;
+    }
+    return true;
+}
+
+/// Trailers (RFC 9113 8.1): no pseudo-header may appear, and every name must be
+/// a valid lowercase field name. Connection-specific fields are likewise barred.
+fn validTrailers(headers: []const events.Header) bool {
+    for (headers) |h| {
+        if (h.name.len == 0 or h.name[0] == ':') return false;
+        if (!isValidFieldName(h.name)) return false;
+        if (isConnectionSpecific(h.name)) return false;
     }
     return true;
 }
@@ -828,6 +877,110 @@ test "an even-numbered request stream id is a connection error" {
     try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 2, &GET_BLOCK);
     try handshook(&c, hdr.items);
     try testing.expectError(error.ProtocolError, c.nextEvent());
+}
+
+test "a field name with a space byte is malformed" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // :method GET, :scheme http, :path /, then literal "ba d: x" (space in name).
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x04, 'b', 'a', ' ', 'd', 0x01, 'x' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "conflicting duplicate content-length is malformed" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // :method GET, :scheme http, :path /, content-length: 1, content-length: 2.
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x0e } ++ "content-length".* ++ [_]u8{ 0x01, '1', 0x00, 0x0e } ++ "content-length".* ++ [_]u8{ 0x01, '2' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "a malformed request closes the stream so later DATA does not reopen it" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    const bad = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x03, 'B', 'a', 'd', 0x01, 'x' }; // uppercase name
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &bad); // no END_STREAM
+    try frameBytes(&frames, .data, Flags.end_stream, 1, "x"); // DATA on the reset stream
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+    // The stream is closed; DATA on it is a stream error, not a Data event.
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "over the concurrency cap, a request is refused not surfaced" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    c.limits.max_concurrent_streams = 1;
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    // Stream 1 opens (no END_STREAM, so it stays open and counts). Stream 3 is
+    // over the cap of 1 -> refused.
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &GET_BLOCK);
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 3, &GET_BLOCK);
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent())); // stream 1
+    const refused = try c.nextEvent();
+    try testing.expectEqual(@as(u32, 3), refused.rst_stream.stream_id);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.refused_stream)), refused.rst_stream.error_code);
+    // The refused stream left no record, so only stream 1 is tracked.
+    try testing.expectEqual(@as(u32, 1), c.liveStreamCount());
+}
+
+test "HEADERS after END_STREAM (not a trailer) is a connection error" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK); // ends the stream
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK); // illegal second HEADERS
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectError(error.ProtocolError, c.nextEvent());
+}
+
+test "valid trailers flow into EndOfMessage.trailers" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &GET_BLOCK); // open, no END_STREAM
+    try frameBytes(&frames, .data, 0, 1, "body");
+    // Trailer block: a single literal "x-checksum: abc" (literal name+value).
+    const trailer = [_]u8{ 0x00, 0x0a } ++ "x-checksum".* ++ [_]u8{0x03} ++ "abc".*;
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &trailer);
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).data, std.meta.activeTag(try c.nextEvent()));
+    const eom = try c.nextEvent();
+    try testing.expectEqual(@as(usize, 1), eom.end_of_message.trailers.len);
+    try testing.expectEqualStrings("x-checksum", eom.end_of_message.trailers[0].name);
+}
+
+test "a pseudo-header in trailers is rejected" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &GET_BLOCK);
+    try frameBytes(&frames, .data, 0, 1, "body");
+    // Trailer with an illegal pseudo-header ":x: y".
+    const trailer = [_]u8{ 0x00, 0x02 } ++ ":x".* ++ [_]u8{0x01} ++ "y".*;
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &trailer);
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).data, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
 }
 
 fn driveConnection(input: []const u8) void {
