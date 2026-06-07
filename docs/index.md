@@ -5,6 +5,10 @@ icon: lucide/zap
 # zttp
 
 <p align="center">
+    <img src="assets/logo.png" alt="zttp" width="400">
+</p>
+
+<p align="center">
     <em>A sans-IO HTTP parser for Python with a Zig core.</em>
 </p>
 
