@@ -1,5 +1,8 @@
 # zttp
 
+> [!WARNING]
+> zttp is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
+
 A [sans-IO](https://sans-io.readthedocs.io/) HTTP parser for Python, with a core
 written in [Zig](https://ziglang.org). It is to [h11](https://github.com/python-hyper/h11)
 what [zloop](https://github.com/Kludex/zloop) is to asyncio: the same clean,
