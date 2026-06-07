@@ -33,7 +33,7 @@ safety-checked (`ReleaseSafe`) build.
 The benchmark lives in `bench.py` and compares all three parsers:
 
 ```console
-$ uv run --group bench python bench.py
+uv run --group bench python bench.py
 ```
 
 It feeds each parser identical bytes and verifies they extract identical data

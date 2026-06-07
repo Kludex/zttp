@@ -6,25 +6,21 @@ icon: lucide/download
 
 zttp ships as a wheel with the Zig core already compiled, so installing it is just:
 
-<!-- termynal -->
-
 ```console
-$ pip install zttp
-
----> 100%
+pip install zttp
 ```
 
 That's all you need. There's nothing else to configure. ✨
 
 !!! note "Requirements"
-    zttp needs **CPython 3.12+** and runs on **Linux** and **macOS**.
+    zttp needs **CPython 3.12+** and runs on **Linux**, **macOS**, and **Windows**.
 
 ## With uv
 
 If you use [uv](https://docs.astral.sh/uv/) (we do):
 
 ```console
-$ uv add zttp
+uv add zttp
 ```
 
 ## Building from source
@@ -34,7 +30,7 @@ source distribution builds the Zig extension on install - you only need a Zig
 toolchain, and even that comes along automatically:
 
 ```console
-$ pip install --no-binary zttp zttp
+pip install --no-binary zttp zttp
 ```
 
 The build pulls in the [`ziglang`](https://pypi.org/project/ziglang/) wheel as a

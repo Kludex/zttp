@@ -45,6 +45,7 @@ bench = [
 ]
 docs = [
     "zensical",
+    "mkdocstrings[python]",
 ]
 
 [tool.hatch.version]

@@ -32,6 +32,7 @@ nav = [
 
 [project.theme]
 language = "en"
+favicon = "assets/favicon.svg"
 features = [
   "announce.dismiss",
   "content.code.annotate",
@@ -51,7 +52,7 @@ features = [
 ]
 
 [project.theme.icon]
-logo = "lucide/zap"
+logo = "lucide/arrow-left-right"
 
 [[project.theme.palette]]
 scheme = "default"
@@ -70,6 +71,33 @@ toggle.name = "Switch to light mode"
 [[project.extra.social]]
 icon = "fontawesome/brands/github"
 link = "https://github.com/Kludex/zttp"
+
+# Auto-generate the API reference from the package + its type stubs (the public
+# surface is a Zig C-extension, so Griffe reads zttp/_zttp.pyi for signatures).
+# Enables `::: zttp.X` blocks and [`zttp.X`][zttp.X] cross-references.
+[project.plugins.mkdocstrings.config]
+default_handler = "python"
+
+[project.plugins.mkdocstrings.config.handlers.python]
+paths = ["."]
+
+[project.plugins.mkdocstrings.config.handlers.python.options]
+show_source = false
+show_root_heading = true
+show_symbol_type_heading = true
+show_symbol_type_toc = true
+members_order = "source"
+separate_signature = true
+docstring_style = "google"
+filters = []
+inherited_members = true
+# The .pyi stub carries signatures but not docstrings, so members would
+# otherwise be hidden; show them on signature alone.
+show_if_no_docstring = true
+# The public API is a Zig C-extension; force static analysis so Griffe reads
+# the signatures from zttp/_zttp.pyi rather than inspecting the opaque .so.
+allow_inspection = false
+force_inspection = false
 
 [project.markdown_extensions.abbr]
 [project.markdown_extensions.admonition]

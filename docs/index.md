@@ -10,8 +10,6 @@ icon: lucide/zap
 
 ---
 
-**Documentation**: you are reading it 🙂
-
 **Source Code**: <a href="https://github.com/Kludex/zttp" target="_blank">https://github.com/Kludex/zttp</a>
 
 ---
@@ -48,12 +46,8 @@ The key features are:
 
 ## Installation
 
-<!-- termynal -->
-
 ```console
-$ pip install zttp
-
----> 100%
+pip install zttp
 ```
 
 ## Example
@@ -61,7 +55,7 @@ $ pip install zttp
 Let's parse an HTTP request. You play the **server**: bytes come in, events come
 out.
 
-```python title="parse.py" hl_lines="3 6"
+```python title="parse.py" hl_lines="3 9"
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)  # (1)!
