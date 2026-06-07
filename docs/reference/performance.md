@@ -58,5 +58,5 @@ right one for this library.
 
 !!! tip
     If you have a workload where the last 10% matters and you trust your input,
-    you can build the extension from source with `ZTTP_BUILD_MODE=ReleaseFast`.
+    you can build the extension from source with `HATCH_ZIG_BUILD_MODE=ReleaseFast`.
     For almost everyone, the default is the right call.
