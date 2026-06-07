@@ -68,19 +68,23 @@ path = "hatch_build.py"
 include = ["zttp", "src", "build.zig", "build_ext.sh", "hatch_build.py"]
 
 [tool.cibuildwheel]
-# Zig comes from the `ziglang` build requirement (build isolation), so no
-# system toolchain install is needed. Skip 32-bit, musl, and PyPy: the Zig core
-# targets glibc/macOS and CPython only.
+# Zig comes from the `ziglang` build requirement (build isolation), so no system
+# toolchain install is needed. The sans-IO core has no OS dependencies, so it
+# builds for glibc, musl, macOS, and Windows alike. Skip only 32-bit and PyPy.
 build = "cp312-* cp313-* cp314-*"
-skip = "*-win* *_i686 *-musllinux_*"
+skip = "*_i686 *-pp*"
 build-frontend = "build[uv]"
 test-command = 'python -c "import zttp; c = zttp.Connection(zttp.SERVER); c.receive_data(b\"GET / HTTP/1.1\r\n\r\n\"); assert type(c.next_event()).__name__ == \"Request\""'
 
 [tool.cibuildwheel.linux]
+# Both glibc (manylinux) and musl (musllinux) on each native arch.
 archs = ["auto"]
 
 [tool.cibuildwheel.macos]
 archs = ["arm64", "x86_64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
 
 [tool.pytest.ini_options]
 addopts = "-rxXs --strict-config --strict-markers"

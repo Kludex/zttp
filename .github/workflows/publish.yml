@@ -19,9 +19,10 @@ jobs:
       fail-fast: false
       matrix:
         # Zig cross-compiles, but cibuildwheel still needs a native runner per OS
-        # to build the manylinux containers and the macOS wheels. aarch64 Linux
-        # uses the native ARM runner; macOS arm64 + x86_64 build on the arm runner.
-        os: ["ubuntu-latest", "ubuntu-24.04-arm", "macos-latest"]
+        # to build the manylinux/musllinux containers and the macOS/Windows
+        # wheels. aarch64 Linux uses the native ARM runner; macOS arm64 + x86_64
+        # build on the arm runner; Windows builds amd64.
+        os: ["ubuntu-latest", "ubuntu-24.04-arm", "macos-latest", "windows-latest"]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:

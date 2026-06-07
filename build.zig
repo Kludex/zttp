@@ -30,6 +30,13 @@ pub fn build(b: *std.Build) void {
         (b.graph.environ_map.get("ZTTP_PYTHON_INCLUDE") orelse return);
     const ext_suffix = b.option([]const u8, "ext-suffix", "Extension module suffix") orelse
         (b.graph.environ_map.get("ZTTP_EXT_SUFFIX") orelse return);
+    // Windows only: the directory holding pythonXY.lib (the import library the
+    // .pyd must link against). On POSIX, interpreter symbols resolve at load.
+    const py_libdir = b.option([]const u8, "python-libdir", "Path to the CPython libs dir (Windows)") orelse
+        b.graph.environ_map.get("ZTTP_PYTHON_LIBDIR");
+    // Windows only: the import library to link, e.g. "python314" (no extension).
+    const py_lib = b.option([]const u8, "python-lib", "CPython import library name (Windows)") orelse
+        b.graph.environ_map.get("ZTTP_PYTHON_LIB");
 
     const core_mod = b.createModule(.{
         .root_source_file = b.path("src/core/root.zig"),
@@ -53,10 +60,19 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
     });
 
-    // CPython extensions resolve interpreter symbols at load time. On macOS this
-    // requires undefined symbols to be allowed; on Linux they are global.
-    if (target.result.os.tag == .macos) {
-        lib.linker_allow_shlib_undefined = true;
+    switch (target.result.os.tag) {
+        // macOS: interpreter symbols resolve at load time; allow them undefined.
+        .macos => lib.linker_allow_shlib_undefined = true,
+        // Windows: a .pyd must resolve Py* symbols at link time against the
+        // interpreter's import library (pythonXY.lib in the `libs` dir).
+        .windows => {
+            const libdir = py_libdir orelse @panic("python-libdir / ZTTP_PYTHON_LIBDIR is required on Windows");
+            const libname = py_lib orelse @panic("python-lib / ZTTP_PYTHON_LIB is required on Windows");
+            mod.addLibraryPath(.{ .cwd_relative = libdir });
+            mod.linkSystemLibrary(libname, .{});
+        },
+        // Linux/BSD: interpreter symbols are global at load; nothing extra.
+        else => {},
     }
 
     // Install the shared object into the python package directory under the name

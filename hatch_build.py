@@ -27,6 +27,19 @@ def _zig_target_args() -> list[str]:
     return [f"-Dtarget={target}"] if target else []
 
 
+def _windows_python_link() -> dict[str, str]:
+    """On Windows, the .pyd must link the interpreter's import library
+    (pythonXY.lib), which lives in `<base>/libs`. Return the env vars build.zig
+    needs: the libs dir and the bare lib name (e.g. python314)."""
+    if sys.platform != "win32":
+        return {}
+    libdir = os.path.join(sys.base_prefix, "libs")
+    # e.g. (3, 14) -> "python314"; free-threaded builds use "python314t".
+    abiflags = sysconfig.get_config_var("abiflags") or ""
+    libname = f"python{sys.version_info.major}{sys.version_info.minor}{abiflags}"
+    return {"ZTTP_PYTHON_LIBDIR": libdir, "ZTTP_PYTHON_LIB": libname}
+
+
 def _zig_command() -> list[str]:
     """Resolve how to invoke Zig: a `zig` on PATH, else the `ziglang` pip package.
 
@@ -67,7 +80,7 @@ class ZigBuildHook(BuildHookInterface):
         # Zig's bounds/overflow checks on trades a little speed for turning any
         # reachable UB into a trapped panic instead of memory corruption.
         mode = os.environ.get("ZTTP_BUILD_MODE", "ReleaseSafe")
-        env = {**os.environ, "ZTTP_PYTHON_INCLUDE": include, "ZTTP_EXT_SUFFIX": ext_suffix}
+        env = {**os.environ, "ZTTP_PYTHON_INCLUDE": include, "ZTTP_EXT_SUFFIX": ext_suffix, **_windows_python_link()}
         subprocess.run(
             [*_zig_command(), "build", f"-Doptimize={mode}", *_zig_target_args()],
             cwd=ROOT,
