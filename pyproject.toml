@@ -42,6 +42,9 @@ bench = [
     "httptools",
     "h11",
 ]
+docs = [
+    "zensical",
+]
 
 [tool.hatch.version]
 source = "uv-dynamic-versioning"

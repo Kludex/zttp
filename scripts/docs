@@ -1,0 +1,11 @@
+#!/bin/sh -e
+
+# Render the documentation site into ./site without compiling the Zig extension,
+# so it can run on a docs-only runner.
+
+if [ -z "$GITHUB_ACTIONS" ]; then
+    set -x
+fi
+
+uv sync --frozen --only-group docs --no-install-project
+uv run --no-sync zensical build

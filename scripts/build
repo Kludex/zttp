@@ -1,6 +1,6 @@
 #!/bin/sh -e
 
-# Compile the Zig core and the CPython extension.
+# Compile the Zig core, the CPython extension, and the documentation site.
 
 set -x
 
@@ -10,3 +10,6 @@ zig build test
 # Build the extension against the venv interpreter, then confirm it imports.
 ./build_ext.sh "$(pwd)/.venv/bin/python"
 .venv/bin/python -c "import zttp; print(zttp.Connection(zttp.SERVER))"
+
+# Build the docs so a broken site fails CI before it ever ships.
+.venv/bin/python -m zensical build
