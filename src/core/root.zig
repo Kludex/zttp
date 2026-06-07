@@ -9,6 +9,7 @@ pub const framing = @import("framing.zig");
 pub const chunked = @import("chunked.zig");
 pub const reader = @import("reader.zig");
 pub const writer = @import("writer.zig");
+pub const h2 = @import("h2/root.zig");
 
 test {
     _ = tables;
@@ -20,4 +21,5 @@ test {
     _ = chunked;
     _ = reader;
     _ = writer;
+    _ = h2;
 }
