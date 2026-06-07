@@ -38,6 +38,13 @@ const DynEntry = struct {
     size: usize,
 };
 
+/// A decoded header as offsets into `out_store`. Resolved to a `Header` (with
+/// live slices) only after the whole block is decoded and `out_store` is stable.
+const OutRange = struct { name_off: usize, name_len: usize, value_off: usize, value_len: usize };
+
+/// A staged (offset, length) span within `out_store`.
+const Span = struct { off: usize, len: usize };
+
 pub const Decoder = struct {
     gpa: std.mem.Allocator,
     /// Backing bytes for dynamic-table entries (names + values), append-only
@@ -48,15 +55,28 @@ pub const Decoder = struct {
     /// The cap WE advertise (SETTINGS_HEADER_TABLE_SIZE). A dynamic-table-size
     /// update may shrink the effective max below this but never above it.
     max_table_size: usize,
-    /// Backing bytes for the CURRENT block's decoded names/values (Huffman or
-    /// raw literals). Lifetime: cleared at the start of each decodeBlock.
+    /// The current effective cap: max_table_size, or smaller after a dynamic-
+    /// table-size-update (RFC 7541 6.3). Drives eviction and insertion.
+    effective_max: usize,
+    /// Backing bytes for the CURRENT block's decoded names/values. EVERY emitted
+    /// name/value is copied here (static, dynamic, or literal) so the resolved
+    /// Header slices have one uniform, stable lifetime. Cleared at the start of
+    /// each decodeBlock; the resolved slices are valid until the next call.
     out_store: std.ArrayList(u8) = .empty,
-    out: std.ArrayList(Header) = .empty,
+    out: std.ArrayList(OutRange) = .empty,
+    /// Materialized Header slices for the current block (rebuilt from `out` once
+    /// out_store is stable). The return value of decodeBlock.
+    out_headers: std.ArrayList(Header) = .empty,
     /// Decoded-size cap for the current block (sum of name+value+overhead).
     max_header_list_size: usize,
 
     pub fn init(gpa: std.mem.Allocator, max_table_size: usize, max_header_list_size: usize) Decoder {
-        return .{ .gpa = gpa, .max_table_size = max_table_size, .max_header_list_size = max_header_list_size };
+        return .{
+            .gpa = gpa,
+            .max_table_size = max_table_size,
+            .effective_max = max_table_size,
+            .max_header_list_size = max_header_list_size,
+        };
     }
 
     pub fn deinit(self: *Decoder) void {
@@ -64,53 +84,87 @@ pub const Decoder = struct {
         self.entries.deinit(self.gpa);
         self.out_store.deinit(self.gpa);
         self.out.deinit(self.gpa);
+        self.out_headers.deinit(self.gpa);
     }
 
-    /// Decode a complete field block into `self.out`. The returned slice is valid
-    /// until the NEXT decodeBlock call (see the lifetime invariant above).
+    /// Decode a complete field block. The returned slice (and the bytes it points
+    /// into) is valid until the NEXT decodeBlock call (see the lifetime invariant
+    /// at the top of this file).
     pub fn decodeBlock(self: *Decoder, block: []const u8) HpackError![]const Header {
         self.out_store.clearRetainingCapacity();
         self.out.clearRetainingCapacity();
+        self.out_headers.clearRetainingCapacity();
         var list_size: usize = 0;
+        // A dynamic-table-size-update may only appear before any header field
+        // representation in the block (RFC 7541 4.2); once a field is seen, an
+        // update is a CompressionError.
+        var fields_seen = false;
 
         var p = Parser{ .buf = block };
-        // A dynamic-table-size-update (if present) must come first in the block;
-        // it is also legal mid-block per RFC 7541 4.2, so we accept it anywhere.
         while (!p.eof()) {
             const first = p.peek();
             if (first & 0x80 != 0) {
                 // 1xxxxxxx: indexed header field (RFC 7541 6.1).
                 const idx = try p.integer(7);
-                const h = try self.resolveIndex(idx);
-                try self.emit(h, &list_size);
+                try self.emitIndexed(idx, &list_size);
+                fields_seen = true;
             } else if (first & 0x40 != 0) {
                 // 01xxxxxx: literal with incremental indexing (6.2.1).
-                const h = try self.literal(&p, 6);
-                try self.addDynamic(h);
-                try self.emit(h, &list_size);
+                try self.literal(&p, 6, true, &list_size);
+                fields_seen = true;
             } else if (first & 0x20 != 0) {
                 // 001xxxxx: dynamic table size update (6.3).
+                if (fields_seen) return error.CompressionError;
                 const new_size = try p.integer(5);
                 if (new_size > self.max_table_size) return error.CompressionError;
-                self.evictTo(new_size);
+                self.effective_max = new_size;
+                try self.evictTo(new_size);
             } else {
                 // 0000xxxx (never indexed, 6.2.3) or 0001xxxx (without indexing,
                 // 6.2.2): both decode the same; neither touches the dynamic table.
-                const h = try self.literal(&p, 4);
-                try self.emit(h, &list_size);
+                try self.literal(&p, 4, false, &list_size);
+                fields_seen = true;
             }
         }
-        return self.out.items;
+        // out_store is now stable; resolve every range to a live slice.
+        try self.out_headers.ensureTotalCapacity(self.gpa, self.out.items.len);
+        for (self.out.items) |r| {
+            self.out_headers.appendAssumeCapacity(.{
+                .name = self.out_store.items[r.name_off .. r.name_off + r.name_len],
+                .value = self.out_store.items[r.value_off .. r.value_off + r.value_len],
+            });
+        }
+        return self.out_headers.items;
     }
 
-    fn emit(self: *Decoder, h: Header, list_size: *usize) HpackError!void {
-        list_size.* += h.name.len + h.value.len + ENTRY_OVERHEAD;
+    /// Append bytes to out_store, returning their (offset, len) - the one place a
+    /// decoded name/value is staged before resolution.
+    fn stage(self: *Decoder, bytes: []const u8) HpackError!Span {
+        const off = self.out_store.items.len;
+        self.out_store.appendSlice(self.gpa, bytes) catch return error.OutOfMemory;
+        return .{ .off = off, .len = bytes.len };
+    }
+
+    fn account(self: *Decoder, list_size: *usize, name_len: usize, value_len: usize) HpackError!void {
+        const entry = std.math.add(usize, name_len, value_len) catch return error.MessageTooLong;
+        const with_overhead = std.math.add(usize, entry, ENTRY_OVERHEAD) catch return error.MessageTooLong;
+        list_size.* = std.math.add(usize, list_size.*, with_overhead) catch return error.MessageTooLong;
         if (list_size.* > self.max_header_list_size) return error.MessageTooLong;
-        try self.out.append(self.gpa, h);
     }
 
-    /// Resolve an index against the static then dynamic table. Slices point into
-    /// the static table (static lifetime) or `store` (decoder-owned).
+    /// An indexed header field: copy the resolved name+value into out_store and
+    /// record the range.
+    fn emitIndexed(self: *Decoder, index: usize, list_size: *usize) HpackError!void {
+        const h = try self.resolveIndex(index);
+        const n = try self.stage(h.name);
+        const v = try self.stage(h.value);
+        try self.account(list_size, n.len, v.len);
+        try self.out.append(self.gpa, .{ .name_off = n.off, .name_len = n.len, .value_off = v.off, .value_len = v.len });
+    }
+
+    /// Resolve an index against the static then dynamic table. Returns slices
+    /// into the static table or `store`; the caller MUST copy them into out_store
+    /// before any mutation of `store` (eviction/insertion).
     fn resolveIndex(self: *Decoder, index: usize) HpackError!Header {
         if (index == 0) return error.CompressionError;
         if (static_table.lookup(index)) |e| return .{ .name = e.name, .value = e.value };
@@ -125,98 +179,112 @@ pub const Decoder = struct {
     }
 
     /// Decode a literal representation: an indexed-or-literal name followed by a
-    /// literal value. `prefix` is the name-index prefix width (6, 4). The
-    /// returned slices live in `out_store` (or the static table for an indexed
-    /// name) and are stable for the rest of this block.
-    fn literal(self: *Decoder, p: *Parser, prefix: u4) HpackError!Header {
+    /// literal value. Both are staged into out_store FIRST, so the subsequent
+    /// addDynamic (which may evict/compact `store`) can never read freed bytes -
+    /// resolve-before-evict is structural, not incidental. `prefix` is the
+    /// name-index prefix width (6 or 4); `index_it` adds the entry to the table.
+    fn literal(self: *Decoder, p: *Parser, prefix: u4, index_it: bool, list_size: *usize) HpackError!void {
         const name_index = try p.integer(prefix);
-        var name: []const u8 = undefined;
-        if (name_index != 0) {
-            name = (try self.resolveIndex(name_index)).name;
-        } else {
-            name = try self.string(p);
+        const n = if (name_index != 0) blk: {
+            const h = try self.resolveIndex(name_index);
+            break :blk try self.stage(h.name);
+        } else try self.stageString(p);
+        const v = try self.stageString(p);
+        try self.account(list_size, n.len, v.len);
+        try self.out.append(self.gpa, .{ .name_off = n.off, .name_len = n.len, .value_off = v.off, .value_len = v.len });
+        if (index_it) {
+            const name = self.out_store.items[n.off .. n.off + n.len];
+            const value = self.out_store.items[v.off .. v.off + v.len];
+            try self.addDynamic(name, value);
         }
-        const value = try self.string(p);
-        return .{ .name = name, .value = value };
     }
 
-    /// Decode a length-prefixed string literal into `out_store`, returning a
-    /// stable slice. Handles the Huffman (H) bit.
-    fn string(self: *Decoder, p: *Parser) HpackError![]const u8 {
+    /// Decode a length-prefixed string literal directly into out_store, returning
+    /// its (offset, len). Handles the Huffman (H) bit.
+    fn stageString(self: *Decoder, p: *Parser) HpackError!Span {
         if (p.eof()) return error.CompressionError;
         const huff = p.peek() & 0x80 != 0;
         const len = try p.integer(7);
         const raw = try p.take(len);
-        if (!huff) {
-            const start = self.out_store.items.len;
-            self.out_store.appendSlice(self.gpa, raw) catch return error.OutOfMemory;
-            return self.out_store.items[start..];
-        }
+        if (!huff) return self.stage(raw);
         const out_len = huffman.decodedLen(raw) catch return error.CompressionError;
-        const start = self.out_store.items.len;
-        self.out_store.resize(self.gpa, start + out_len) catch return error.OutOfMemory;
-        _ = huffman.decode(raw, self.out_store.items[start..]) catch return error.CompressionError;
-        return self.out_store.items[start..];
+        const off = self.out_store.items.len;
+        self.out_store.resize(self.gpa, off + out_len) catch return error.OutOfMemory;
+        _ = huffman.decode(raw, self.out_store.items[off..]) catch return error.CompressionError;
+        return .{ .off = off, .len = out_len };
     }
 
-    /// Insert a new dynamic-table entry (RFC 7541 4.4). Resolve-before-evict: the
-    /// name/value bytes are already materialized in `out_store` (or the static
-    /// table) by the time we get here, so eviction compacting `store` cannot
-    /// invalidate them. An entry larger than max_table_size empties the table and
-    /// is not inserted (still a valid decoded header - already emitted).
-    fn addDynamic(self: *Decoder, h: Header) HpackError!void {
-        const entry_size = h.name.len + h.value.len + ENTRY_OVERHEAD;
-        if (entry_size > self.max_table_size) {
+    /// Insert a new dynamic-table entry (RFC 7541 4.4). `name` and `value` point
+    /// into out_store (the caller staged them first), so eviction compacting
+    /// `store` cannot invalidate them. An entry larger than the effective max
+    /// empties the table and is not inserted (it was still emitted).
+    fn addDynamic(self: *Decoder, name: []const u8, value: []const u8) HpackError!void {
+        const entry_size = name.len + value.len + ENTRY_OVERHEAD;
+        if (entry_size > self.effective_max) {
             self.entries.clearRetainingCapacity();
             self.store.clearRetainingCapacity();
             self.table_size = 0;
             return;
         }
-        self.evictTo(self.max_table_size - entry_size);
+        try self.evictTo(self.effective_max - entry_size);
+        // Reserve all capacity first so the appends below cannot fail partway and
+        // leave orphaned bytes in `store` or a name without its entry.
+        self.store.ensureUnusedCapacity(self.gpa, name.len + value.len) catch return error.OutOfMemory;
+        self.entries.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
         const name_off = self.store.items.len;
-        self.store.appendSlice(self.gpa, h.name) catch return error.OutOfMemory;
+        self.store.appendSliceAssumeCapacity(name);
         const value_off = self.store.items.len;
-        self.store.appendSlice(self.gpa, h.value) catch return error.OutOfMemory;
-        self.entries.append(self.gpa, .{
+        self.store.appendSliceAssumeCapacity(value);
+        self.entries.appendAssumeCapacity(.{
             .name_off = name_off,
-            .name_len = h.name.len,
+            .name_len = name.len,
             .value_off = value_off,
-            .value_len = h.value.len,
+            .value_len = value.len,
             .size = entry_size,
-        }) catch return error.OutOfMemory;
+        });
         self.table_size += entry_size;
     }
 
     /// Evict oldest entries until table_size <= target. After eviction, compact
     /// `store` so offsets stay bounded (the surviving entries are rewritten to
-    /// the front). Oldest entries are at the FRONT of `entries`.
-    fn evictTo(self: *Decoder, target: usize) void {
+    /// the front). Oldest entries are at the FRONT of `entries`. Returns
+    /// OutOfMemory rather than leaving the table half-compacted.
+    fn evictTo(self: *Decoder, target: usize) HpackError!void {
         if (self.table_size <= target) return;
         var keep_from: usize = 0;
-        while (keep_from < self.entries.items.len and self.table_size > target) {
-            self.table_size -= self.entries.items[keep_from].size;
+        var freed: usize = 0;
+        while (keep_from < self.entries.items.len and self.table_size - freed > target) {
+            freed += self.entries.items[keep_from].size;
             keep_from += 1;
         }
         if (keep_from == 0) return;
-        // Compact: rewrite the surviving entries' bytes to the front of `store`.
         const survivors = self.entries.items[keep_from..];
+        // Build a fresh store and rewrite offsets into a scratch buffer; commit
+        // both (and the reduced table_size) only after everything succeeds, so an
+        // OOM mid-compaction leaves the table exactly as it was.
         var new_store: std.ArrayList(u8) = .empty;
-        for (survivors) |*e| {
+        errdefer new_store.deinit(self.gpa);
+        const new_offsets = self.gpa.alloc([2]usize, survivors.len) catch return error.OutOfMemory;
+        defer self.gpa.free(new_offsets);
+        for (survivors, 0..) |e, i| {
             const nm = self.store.items[e.name_off .. e.name_off + e.name_len];
             const vl = self.store.items[e.value_off .. e.value_off + e.value_len];
-            const no = new_store.items.len;
-            new_store.appendSlice(self.gpa, nm) catch return; // compaction OOM: keep old store
-            const vo = new_store.items.len;
-            new_store.appendSlice(self.gpa, vl) catch return;
-            e.name_off = no;
-            e.value_off = vo;
+            new_offsets[i][0] = new_store.items.len;
+            new_store.appendSlice(self.gpa, nm) catch return error.OutOfMemory;
+            new_offsets[i][1] = new_store.items.len;
+            new_store.appendSlice(self.gpa, vl) catch return error.OutOfMemory;
+        }
+        // Past the last fallible step: commit.
+        for (survivors, 0..) |*e, i| {
+            e.name_off = new_offsets[i][0];
+            e.value_off = new_offsets[i][1];
         }
         self.store.deinit(self.gpa);
         self.store = new_store;
-        // Drop the evicted entries from the front.
         const n = survivors.len;
         std.mem.copyForwards(DynEntry, self.entries.items[0..n], survivors);
         self.entries.shrinkRetainingCapacity(n);
+        self.table_size -= freed;
     }
 };
 
@@ -236,7 +304,8 @@ const Parser = struct {
     }
 
     fn take(self: *Parser, n: usize) HpackError![]const u8 {
-        if (self.pos + n > self.buf.len) return error.CompressionError;
+        // Subtraction form: `self.pos + n` could wrap for a crafted huge n.
+        if (n > self.buf.len - self.pos) return error.CompressionError;
         const s = self.buf[self.pos .. self.pos + n];
         self.pos += n;
         return s;
@@ -250,17 +319,15 @@ const Parser = struct {
         var value: usize = self.buf[self.pos] & max_prefix;
         self.pos += 1;
         if (value < max_prefix) return value;
-        var shift: u6 = 0;
-        // At most ceil(64/7) = 10 continuation octets fit a usize; reject more.
-        var octets: u8 = 0;
+        var shift: u32 = 0; // wide enough that `shift += 7` never overflows
         while (true) {
             if (self.eof()) return error.CompressionError;
             const b = self.buf[self.pos];
             self.pos += 1;
-            octets += 1;
-            if (octets > 10) return error.CompressionError;
+            // A shift of 64+ bits, or any result exceeding usize, is malformed.
+            if (shift >= @bitSizeOf(usize)) return error.CompressionError;
             const add = @as(usize, b & 0x7f);
-            const shifted = std.math.shlExact(usize, add, shift) catch return error.CompressionError;
+            const shifted = std.math.shlExact(usize, add, @intCast(shift)) catch return error.CompressionError;
             value = std.math.add(usize, value, shifted) catch return error.CompressionError;
             if (b & 0x80 == 0) break;
             shift += 7;
@@ -338,17 +405,63 @@ test "decode C.4 Huffman-coded request" {
 }
 
 test "oversized entry empties the table but still emits the header" {
-    var d = Decoder.init(testing.allocator, 64, 1 << 20); // tiny table
+    var d = Decoder.init(testing.allocator, 40, 1 << 20); // table fits one 34-byte entry
     defer d.deinit();
-    // First seed a normal small entry.
-    const seed = [_]u8{ 0x40, 0x01, 'a', 0x01, 'b' }; // a: b -> size 34
-    _ = try d.decodeBlock(&seed);
+    // Seed a 34-byte entry (a: b).
+    _ = try d.decodeBlock(&[_]u8{ 0x40, 0x01, 'a', 0x01, 'b' });
     try testing.expectEqual(@as(usize, 1), d.entries.items.len);
-    // Now a literal-with-indexing whose size (name+value+32) exceeds 64.
-    const big = [_]u8{ 0x40, 0x05, 'b', 'i', 'g', 'g', 'y', 0x04, 'v', 'a', 'l', 's' }; // 5+4+32=41 ... still < 64
-    _ = try d.decodeBlock(&big);
-    // 41 <= 64, so it inserts and may evict the seed. Confirm table stayed valid.
-    try testing.expect(d.table_size <= 64);
+    // A literal-with-indexing whose size (5+4+32 = 41) exceeds the 40-byte max:
+    // the table is emptied and the entry is NOT inserted, but the header is still
+    // emitted (RFC 7541 4.4).
+    const big = [_]u8{ 0x40, 0x05, 'b', 'i', 'g', 'g', 'y', 0x04, 'v', 'a', 'l', 's' };
+    const out = try d.decodeBlock(&big);
+    try expectHeader(out[0], "biggy", "vals");
+    try testing.expectEqual(@as(usize, 0), d.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), d.table_size);
+}
+
+test "an indexed dynamic header survives a later insert that evicts it" {
+    // Codex caught this: a header that resolves through the dynamic table must not
+    // dangle when a subsequent insert in the SAME block evicts/compacts the store.
+    // With the offset-into-out_store design, the emitted bytes are copied before
+    // any table mutation, so they stay valid.
+    var d = Decoder.init(testing.allocator, 70, 1 << 20); // room for ~2 small entries
+    defer d.deinit();
+    // Seed entry index 62: "k": "v1" (size 35).
+    _ = try d.decodeBlock(&[_]u8{ 0x40, 0x01, 'k', 0x02, 'v', '1' });
+    // One block: reference index 62 (the dynamic entry), THEN add a new entry big
+    // enough to evict it. The first header must still read "k"/"v1".
+    const block = [_]u8{ 0xbe, 0x40, 0x01, 'm', 0x20 } ++ [_]u8{'z'} ** 32; // index 62, then m: zzz... (size 33+32)
+    const out = try d.decodeBlock(&block);
+    try expectHeader(out[0], "k", "v1"); // the evicted entry's bytes, still valid
+    try testing.expectEqualStrings("m", out[1].name);
+}
+
+test "dynamic table size update to zero clears the table and blocks reinsertion" {
+    var d = Decoder.init(testing.allocator, 4096, 1 << 20);
+    defer d.deinit();
+    _ = try d.decodeBlock(&[_]u8{ 0x40, 0x01, 'a', 0x01, 'b' });
+    try testing.expectEqual(@as(usize, 1), d.entries.items.len);
+    // 0x20 = dynamic-table-size-update to 0: clears the table; a following literal
+    // with indexing cannot reinsert (its size exceeds the now-zero effective max).
+    const block = [_]u8{ 0x20, 0x40, 0x01, 'c', 0x01, 'd' };
+    _ = try d.decodeBlock(&block);
+    try testing.expectEqual(@as(usize, 0), d.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), d.table_size);
+}
+
+test "dynamic table size update after a field is a compression error" {
+    var d = Decoder.init(testing.allocator, 4096, 1 << 20);
+    defer d.deinit();
+    // An indexed field (0x82) followed by a size update (0x20) - illegal order.
+    try testing.expectError(error.CompressionError, d.decodeBlock(&[_]u8{ 0x82, 0x20 }));
+}
+
+test "string length past the end is a compression error, not a panic" {
+    var d = Decoder.init(testing.allocator, 4096, 1 << 20);
+    defer d.deinit();
+    // Literal with literal name, claimed name length 10 but only 2 bytes follow.
+    try testing.expectError(error.CompressionError, d.decodeBlock(&[_]u8{ 0x00, 0x0a, 'a', 'b' }));
 }
 
 test "indexed zero is a compression error" {
