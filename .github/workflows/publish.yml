@@ -88,4 +88,7 @@ jobs:
           merge-multiple: true
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d # v1.14.0
+        # Pinned by release tag, not bare SHA: this is a Docker action and the
+        # runner resolves its published image by the release ref. A SHA pin makes
+        # it look up ghcr.io/...:<sha>, which has no manifest ("manifest unknown").
+        uses: pypa/gh-action-pypi-publish@release/v1
