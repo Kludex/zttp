@@ -136,7 +136,13 @@ pub const Writer = struct {
     fn sendHeaderBlock(self: *Writer, stream_id: u32, pseudo: []const Header, headers: []const Header, end_stream: bool) WriteError!void {
         var block: std.ArrayList(u8) = .empty;
         defer block.deinit(self.gpa);
-        for (pseudo) |h| encoder.encodeHeader(&block, self.gpa, h) catch return error.OutOfMemory;
+        for (pseudo) |h| {
+            // The pseudo-header NAMES are fixed and known-good, but their VALUES
+            // come from the caller (:path, :authority, :method, :status). Reject
+            // control bytes so a CR/LF cannot be smuggled into the request line.
+            try validateValue(h.value);
+            encoder.encodeHeader(&block, self.gpa, h) catch return error.OutOfMemory;
+        }
         for (headers) |h| {
             try validateField(h);
             encoder.encodeHeader(&block, self.gpa, h) catch return error.OutOfMemory;
@@ -202,12 +208,18 @@ fn validateField(h: Header) WriteError!void {
         if (ch >= 'A' and ch <= 'Z') return error.InvalidField;
         if (!is_tchar(ch)) return error.InvalidField;
     }
-    for (h.value) |ch| {
-        if (ch < 0x20 or ch == 0x7F) return error.InvalidField; // CTL (incl CR/LF/NUL)
-    }
+    try validateValue(h.value);
     const forbidden = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" };
     for (forbidden) |f| {
         if (std.mem.eql(u8, h.name, f)) return error.LocalProtocol;
+    }
+}
+
+/// A field value must contain no control bytes (CR/LF/NUL/DEL), so a value can
+/// never inject a frame boundary or corrupt the decoded request line.
+fn validateValue(value: []const u8) WriteError!void {
+    for (value) |ch| {
+        if (ch < 0x20 or ch == 0x7F) return error.InvalidField;
     }
 }
 
@@ -238,6 +250,12 @@ test "validateField rejects uppercase, control bytes, and connection-specific fi
     try testing.expectError(error.InvalidField, validateField(.{ .name = "ok", .value = "a\r\nb" }));
     try testing.expectError(error.LocalProtocol, validateField(.{ .name = "connection", .value = "close" }));
     try validateField(.{ .name = "content-type", .value = "text/plain" });
+}
+
+test "a CRLF in a pseudo-header value (e.g. target) is rejected" {
+    var w = Writer.init(testing.allocator, .client);
+    defer w.deinit();
+    try testing.expectError(error.InvalidField, w.sendRequest("GET", "/a\r\nX-Evil: y", "https", "h", &.{}, true));
 }
 
 test "sendData splits at the peer max frame size" {
