@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from zhttp._zhttp import (
+from zttp._zttp import (
     CLIENT,
     NEED_DATA,
     SERVER,

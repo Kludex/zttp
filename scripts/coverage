@@ -1,0 +1,8 @@
+#!/bin/sh -e
+
+# Combine the per-run coverage data and enforce the 100% gate.
+
+set -x
+
+.venv/bin/coverage combine
+.venv/bin/coverage report

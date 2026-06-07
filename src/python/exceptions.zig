@@ -10,12 +10,12 @@ pub var RemoteProtocolError: py.Object = null;
 pub var LocalProtocolError: py.Object = null;
 
 pub fn register(module: py.Object) bool {
-    ProtocolError = py.newException("zhttp.ProtocolError", null);
+    ProtocolError = py.newException("zttp.ProtocolError", null);
     if (ProtocolError == null) return false;
     // Remote: the peer sent something malformed. Local: we were misused.
-    RemoteProtocolError = py.newException("zhttp.RemoteProtocolError", ProtocolError);
+    RemoteProtocolError = py.newException("zttp.RemoteProtocolError", ProtocolError);
     if (RemoteProtocolError == null) return false;
-    LocalProtocolError = py.newException("zhttp.LocalProtocolError", ProtocolError);
+    LocalProtocolError = py.newException("zttp.LocalProtocolError", ProtocolError);
     if (LocalProtocolError == null) return false;
 
     _ = c.PyModule_AddObjectRef(module, "ProtocolError", ProtocolError);

@@ -4,11 +4,11 @@ import gc
 
 import pytest
 
-import zhttp
+import zttp
 from tests.conftest import drain
 
 
-def _drain_until_error_or_end(conn: zhttp.Connection) -> list[object]:
+def _drain_until_error_or_end(conn: zttp.Connection) -> list[object]:
     return list(drain(conn))
 
 
@@ -28,15 +28,15 @@ def test_h2_synthesizing_sequence_headers_roundtrip() -> None:
             return (b"Header-%02d" % i, b"value-%02d-%s" % (i, b"x" * 24))
 
     n = 40
-    client = zhttp.Connection(zhttp.CLIENT)
+    client = zttp.Connection(zttp.CLIENT)
     client.send_request(b"GET", b"/", b"1.1", Synth(n))
     client.end_message()
     wire = client.data_to_send()
 
-    server = zhttp.Connection(zhttp.SERVER)
+    server = zttp.Connection(zttp.SERVER)
     server.receive_data(wire)
     req = server.next_event()
-    assert isinstance(req, zhttp.Request)
+    assert isinstance(req, zttp.Request)
     got = dict(req.headers)
     for i in range(n):
         assert got[b"Header-%02d" % i] == b"value-%02d-%s" % (i, b"x" * 24)
@@ -51,40 +51,40 @@ def test_h2_synthesizing_sequence_headers_roundtrip() -> None:
     ],
 )
 def test_h3_split_transfer_encoding_rejected(headers: bytes) -> None:
-    conn = zhttp.Connection(zhttp.SERVER)
+    conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"POST / HTTP/1.1\r\nHost: x\r\n" + headers + b"\r\n5\r\nhello\r\n0\r\n\r\n")
-    with pytest.raises(zhttp.RemoteProtocolError):
+    with pytest.raises(zttp.RemoteProtocolError):
         _drain_until_error_or_end(conn)
 
 
 def test_h4_trailer_flood_rejected() -> None:
-    conn = zhttp.Connection(zhttp.SERVER)
+    conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n")
-    assert isinstance(conn.next_event(), zhttp.Request)
+    assert isinstance(conn.next_event(), zttp.Request)
     flood = b"".join(b"X-%d: y\r\n" % i for i in range(500))
     conn.receive_data(flood)
-    with pytest.raises(zhttp.RemoteProtocolError):
+    with pytest.raises(zttp.RemoteProtocolError):
         _drain_until_error_or_end(conn)
 
 
 def test_trailer_survives_large_followup_feed() -> None:
     # H-1: store a trailer, then force a buffer realloc before EndOfMessage.
-    conn = zhttp.Connection(zhttp.SERVER)
+    conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
-    assert isinstance(conn.next_event(), zhttp.Request)
+    assert isinstance(conn.next_event(), zttp.Request)
     conn.receive_data(b"0\r\nX-Trailer: SECRET\r\n")
-    assert conn.next_event() is zhttp.NEED_DATA
+    assert conn.next_event() is zttp.NEED_DATA
     conn.receive_data(b"\r\n")
     events = _drain_until_error_or_end(conn)
     eom = events[-1]
-    assert isinstance(eom, zhttp.EndOfMessage)
+    assert isinstance(eom, zttp.EndOfMessage)
     assert eom.trailers == [(b"X-Trailer", b"SECRET")]
 
 
 def test_bare_lf_request_rejected_by_default() -> None:
-    conn = zhttp.Connection(zhttp.SERVER)
+    conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"GET / HTTP/1.1\nHost: x\n\n")
-    with pytest.raises(zhttp.RemoteProtocolError):
+    with pytest.raises(zttp.RemoteProtocolError):
         _drain_until_error_or_end(conn)
 
 
@@ -98,8 +98,8 @@ def test_bare_lf_request_rejected_by_default() -> None:
     ],
 )
 def test_send_path_injection_rejected(call) -> None:  # type: ignore[no-untyped-def]
-    conn = zhttp.Connection(zhttp.SERVER)
-    with pytest.raises(zhttp.LocalProtocolError):
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(zttp.LocalProtocolError):
         call(conn)
 
 
@@ -114,7 +114,7 @@ def test_event_cycle_is_collectable() -> None:
             Canary.n -= 1
 
     def make_cycle() -> None:
-        c = zhttp.Connection(zhttp.SERVER)
+        c = zttp.Connection(zttp.SERVER)
         c.receive_data(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
         e = c.next_event()
         can = Canary()
@@ -130,7 +130,7 @@ def test_event_cycle_is_collectable() -> None:
 
 
 def test_event_types_are_gc_tracked() -> None:
-    conn = zhttp.Connection(zhttp.SERVER)
+    conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
     ev = conn.next_event()
     assert gc.is_tracked(ev)

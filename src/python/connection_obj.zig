@@ -34,7 +34,7 @@ fn new(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c
     const role: Role = switch (role_val) {
         SERVER => .server,
         CLIENT => .client,
-        else => return py.raiseValue("role must be zhttp.SERVER or zhttp.CLIENT"),
+        else => return py.raiseValue("role must be zttp.SERVER or zttp.CLIENT"),
     };
 
     const alloc = tp.?.tp_alloc.?;
@@ -257,7 +257,7 @@ var slots = [_]py.Slot{
 };
 
 var spec = py.Spec{
-    .name = "zhttp.Connection",
+    .name = "zttp.Connection",
     .basicsize = @sizeOf(ConnectionObject),
     .itemsize = 0,
     .flags = c.Py_TPFLAGS_DEFAULT,

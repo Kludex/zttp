@@ -6,17 +6,17 @@ const events_obj = @import("events_obj.zig");
 const exceptions = @import("exceptions.zig");
 
 comptime {
-    @export(&PyInit__zhttp, .{ .name = "PyInit__zhttp", .linkage = .strong });
+    @export(&PyInit__zttp, .{ .name = "PyInit__zttp", .linkage = .strong });
 }
 
 var module_def = c.PyModuleDef{
-    .m_name = "_zhttp",
-    .m_doc = "zhttp: a sans-IO HTTP parser with a Zig core.",
+    .m_name = "_zttp",
+    .m_doc = "zttp: a sans-IO HTTP parser with a Zig core.",
     .m_size = -1,
     .m_methods = null,
 };
 
-fn PyInit__zhttp() callconv(.c) ?*c.PyObject {
+fn PyInit__zttp() callconv(.c) ?*c.PyObject {
     const m = c.PyModule_Create(&module_def);
     if (m == null) return null;
 

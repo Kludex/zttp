@@ -9,4 +9,4 @@ zig build test
 
 # Build the extension against the venv interpreter, then confirm it imports.
 ./build_ext.sh "$(pwd)/.venv/bin/python"
-.venv/bin/python -c "import zhttp; print(zhttp.Connection(zhttp.SERVER))"
+.venv/bin/python -c "import zttp; print(zttp.Connection(zttp.SERVER))"

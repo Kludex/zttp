@@ -9,5 +9,3 @@ fi
 set -x
 
 .venv/bin/coverage run -m pytest "$@"
-.venv/bin/coverage combine
-.venv/bin/coverage report

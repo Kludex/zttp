@@ -200,10 +200,10 @@ fn spec(comptime name: [*c]const u8, comptime size: usize, sl: anytype) py.Spec 
     };
 }
 
-var request_spec = spec("zhttp.Request", @sizeOf(RequestObject), &request_slots);
-var response_spec = spec("zhttp.Response", @sizeOf(ResponseObject), &response_slots);
-var data_spec = spec("zhttp.Data", @sizeOf(DataObject), &data_slots);
-var eom_spec = spec("zhttp.EndOfMessage", @sizeOf(EndOfMessageObject), &eom_slots);
+var request_spec = spec("zttp.Request", @sizeOf(RequestObject), &request_slots);
+var response_spec = spec("zttp.Response", @sizeOf(ResponseObject), &response_slots);
+var data_spec = spec("zttp.Data", @sizeOf(DataObject), &data_slots);
+var eom_spec = spec("zttp.EndOfMessage", @sizeOf(EndOfMessageObject), &eom_slots);
 
 // -- header list materialisation ----------------------------------------------
 
@@ -313,8 +313,8 @@ pub fn register(module: py.Object) bool {
     }
 
     // NEED_DATA / ConnectionClosed are unique sentinel instances of bare types.
-    need_data = makeSentinel("zhttp.NeedDataType");
-    connection_closed = makeSentinel("zhttp.ConnectionClosedType");
+    need_data = makeSentinel("zttp.NeedDataType");
+    connection_closed = makeSentinel("zttp.ConnectionClosedType");
     if (need_data == null or connection_closed == null) return false;
 
     _ = c.PyModule_AddObjectRef(module, "Request", request_type);

@@ -1,8 +1,8 @@
 .venv/
 .zig-cache/
 zig-out/
-zhttp/_zhttp*.so
-zhttp/_zhttp*.pyd
+zttp/_zttp*.so
+zttp/_zttp*.pyd
 __pycache__/
 *.pyc
 .pytest_cache/

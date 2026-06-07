@@ -3,13 +3,13 @@
 # Run every read-only check the CI enforces: formatting, types, and linting -
 # for both the Python package and the Zig core.
 
-export SOURCE_FILES="zhttp tests bench.py"
+export SOURCE_FILES="zttp tests bench.py"
 
 set -x
 
 # Python.
 .venv/bin/ruff format --check --diff $SOURCE_FILES
-.venv/bin/mypy zhttp
+.venv/bin/mypy zttp
 .venv/bin/ruff check $SOURCE_FILES
 
 # Zig.

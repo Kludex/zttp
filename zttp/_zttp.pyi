@@ -1,4 +1,4 @@
-"""Type stubs for the Zig-backed `_zhttp` extension module."""
+"""Type stubs for the Zig-backed `_zttp` extension module."""
 
 from __future__ import annotations
 

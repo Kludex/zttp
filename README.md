@@ -1,4 +1,4 @@
-# zhttp
+# zttp
 
 A [sans-IO](https://sans-io.readthedocs.io/) HTTP parser for Python, with a core
 written in [Zig](https://ziglang.org). It is to [h11](https://github.com/python-hyper/h11)
@@ -9,13 +9,13 @@ the HTTP/1.1 parser in [uvicorn](https://github.com/encode/uvicorn).
 
 ## Sans-IO
 
-zhttp does no I/O. You feed it bytes and pull out events; you ask it for bytes to
+zttp does no I/O. You feed it bytes and pull out events; you ask it for bytes to
 send. It never touches a socket. This is the h11 model:
 
 ```python
-import zhttp
+import zttp
 
-conn = zhttp.Connection(zhttp.SERVER)
+conn = zttp.Connection(zttp.SERVER)
 conn.receive_data(b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
 
 conn.next_event()   # Request(method=b'GET', target=b'/path?q=1', http_version=b'1.1', headers=[(b'Host', b'example.com')])
@@ -39,7 +39,7 @@ chunked) for you.
 Against httptools and h11 on the same requests (macOS arm64, CPython 3.14,
 `ReleaseFast`), all three verified to extract identical data:
 
-| Workload          | zhttp        | httptools    | h11        | zhttp vs httptools |
+| Workload          | zttp        | httptools    | h11        | zttp vs httptools |
 | ----------------- | -----------: | -----------: | ---------: | -----------------: |
 | Simple GET        | ~1.25M req/s | ~880k req/s  | ~57k req/s | **1.41x**          |
 | POST + JSON body  | ~6.7M req/s  | ~1.84M req/s | ~616k req/s| **3.62x**          |
@@ -79,7 +79,7 @@ adversarial-input net over the core.
 - **Connection state policy** - h11-parity state machine guards on the read side
   (reject body bytes after a `close`, enforce request/response pairing).
 - **uvicorn integration** - an `HttpToolsProtocol`-style adapter so uvicorn can
-  use zhttp unchanged.
+  use zttp unchanged.
 - **HTTP/2** - HPACK + frame layer in the Zig core, same event API.
 - **HTTP/3** - QPACK + the QUIC-side framing, same event API.
 

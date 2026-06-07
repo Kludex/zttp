@@ -1,4 +1,4 @@
-"""Compare zhttp against httptools and h11 on request parsing throughput.
+"""Compare zttp against httptools and h11 on request parsing throughput.
 
 Each parser consumes the same raw bytes and is driven to extract the same
 information (method, headers, body) so the comparison reflects real work, not
@@ -12,7 +12,7 @@ import time
 import h11
 import httptools
 
-import zhttp
+import zttp
 
 # A typical small request with a handful of headers and no body.
 SIMPLE = (
@@ -77,11 +77,11 @@ def run_h11(data: bytes, n: int) -> None:
                 break
 
 
-def run_zhttp(data: bytes, n: int) -> None:
-    NEED_DATA = zhttp.NEED_DATA
-    EndOfMessage = zhttp.EndOfMessage
-    Connection = zhttp.Connection
-    SERVER = zhttp.SERVER
+def run_zttp(data: bytes, n: int) -> None:
+    NEED_DATA = zttp.NEED_DATA
+    EndOfMessage = zttp.EndOfMessage
+    Connection = zttp.Connection
+    SERVER = zttp.SERVER
     for _ in range(n):
         conn = Connection(SERVER)
         conn.receive_data(data)
@@ -106,13 +106,13 @@ def timed(fn, data: bytes, n: int) -> float:
 def bench(name: str, data: bytes, n: int) -> None:
     print(f"\n== {name} ({n:,} iterations) ==")
     results = {}
-    for label, fn in (("zhttp", run_zhttp), ("httptools", run_httptools), ("h11", run_h11)):
+    for label, fn in (("zttp", run_zttp), ("httptools", run_httptools), ("h11", run_h11)):
         dt = time_it(fn, data, n)
         rate = n / dt
         results[label] = rate
         print(f"  {label:>10}: {dt * 1e3:8.2f} ms  {rate:12,.0f} req/s")
     base = results["httptools"]
-    print(f"  -> zhttp is {results['zhttp'] / base:.2f}x httptools, {results['zhttp'] / results['h11']:.2f}x h11")
+    print(f"  -> zttp is {results['zttp'] / base:.2f}x httptools, {results['zttp'] / results['h11']:.2f}x h11")
 
 
 if __name__ == "__main__":

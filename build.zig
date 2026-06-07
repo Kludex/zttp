@@ -27,9 +27,9 @@ pub fn build(b: *std.Build) void {
     // -D options or environment variables. Resolved lazily so the test step
     // above never requires a Python toolchain.
     const py_include = b.option([]const u8, "python-include", "Path to the CPython include dir") orelse
-        (b.graph.environ_map.get("ZHTTP_PYTHON_INCLUDE") orelse return);
+        (b.graph.environ_map.get("ZTTP_PYTHON_INCLUDE") orelse return);
     const ext_suffix = b.option([]const u8, "ext-suffix", "Extension module suffix") orelse
-        (b.graph.environ_map.get("ZHTTP_EXT_SUFFIX") orelse return);
+        (b.graph.environ_map.get("ZTTP_EXT_SUFFIX") orelse return);
 
     const core_mod = b.createModule(.{
         .root_source_file = b.path("src/core/root.zig"),
@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("core", core_mod);
 
     const lib = b.addLibrary(.{
-        .name = "_zhttp",
+        .name = "_zttp",
         .root_module = mod,
         .linkage = .dynamic,
     });
@@ -60,8 +60,8 @@ pub fn build(b: *std.Build) void {
     }
 
     // Install the shared object into the python package directory under the name
-    // CPython expects so it imports as `zhttp._zhttp`.
-    const out_name = b.fmt("_zhttp{s}", .{ext_suffix});
-    const install = b.addInstallFileWithDir(lib.getEmittedBin(), .{ .custom = "../zhttp" }, out_name);
+    // CPython expects so it imports as `zttp._zttp`.
+    const out_name = b.fmt("_zttp{s}", .{ext_suffix});
+    const install = b.addInstallFileWithDir(lib.getEmittedBin(), .{ .custom = "../zttp" }, out_name);
     b.getInstallStep().dependOn(&install.step);
 }

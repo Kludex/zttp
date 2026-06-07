@@ -49,7 +49,7 @@ class ZigBuildHook(BuildHookInterface):
 
     This makes `uv build` / `pip wheel` / cibuildwheel produce a correct, platform-tagged
     wheel with no out-of-band step: the `.so` is built here, against `sys.executable`, and
-    `build.zig` installs it into the `zhttp/` package as `_zhttp<EXT_SUFFIX>`.
+    `build.zig` installs it into the `zttp/` package as `_zttp<EXT_SUFFIX>`.
     """
 
     PLUGIN_NAME = "custom"
@@ -66,8 +66,8 @@ class ZigBuildHook(BuildHookInterface):
         # ReleaseSafe by default: the parser ingests untrusted bytes, so keeping
         # Zig's bounds/overflow checks on trades a little speed for turning any
         # reachable UB into a trapped panic instead of memory corruption.
-        mode = os.environ.get("ZHTTP_BUILD_MODE", "ReleaseSafe")
-        env = {**os.environ, "ZHTTP_PYTHON_INCLUDE": include, "ZHTTP_EXT_SUFFIX": ext_suffix}
+        mode = os.environ.get("ZTTP_BUILD_MODE", "ReleaseSafe")
+        env = {**os.environ, "ZTTP_PYTHON_INCLUDE": include, "ZTTP_EXT_SUFFIX": ext_suffix}
         subprocess.run(
             [*_zig_command(), "build", f"-Doptimize={mode}", *_zig_target_args()],
             cwd=ROOT,
@@ -75,7 +75,7 @@ class ZigBuildHook(BuildHookInterface):
             check=True,
         )
 
-        artifact = f"zhttp/_zhttp{ext_suffix}"
+        artifact = f"zttp/_zttp{ext_suffix}"
         if not (ROOT / artifact).exists():
             raise RuntimeError(f"zig build did not produce {artifact}")
 
@@ -85,8 +85,8 @@ class ZigBuildHook(BuildHookInterface):
         build_data["artifacts"].append(artifact)
 
     def clean(self, versions: list[str]) -> None:
-        for path in ROOT.glob("zhttp/_zhttp*.so"):
+        for path in ROOT.glob("zttp/_zttp*.so"):
             path.unlink()
-        for path in ROOT.glob("zhttp/_zhttp*.pyd"):
+        for path in ROOT.glob("zttp/_zttp*.pyd"):
             path.unlink()
         print(f"removed compiled extensions; building Zig core via {sys.executable}", file=sys.stderr)
