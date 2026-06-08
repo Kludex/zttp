@@ -8,6 +8,8 @@ pub const constants = @import("constants.zig");
 pub const frame = @import("frame.zig");
 pub const packet = @import("packet.zig");
 pub const crypto = @import("crypto.zig");
+pub const congestion = @import("congestion.zig");
+pub const recovery = @import("recovery.zig");
 
 test {
     _ = varint;
@@ -15,4 +17,6 @@ test {
     _ = frame;
     _ = packet;
     _ = crypto;
+    _ = congestion;
+    _ = recovery;
 }
