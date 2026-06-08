@@ -384,7 +384,6 @@ pub const Connection = struct {
 
     fn handleHeaders(self: *Connection, f: frame_mod.Frame) H2Error!void {
         if (f.header.stream_id == 0) return error.ProtocolError;
-        if (self.role != .server) return error.ProtocolError; // client HEADERS read = response; later
         const id = f.header.stream_id;
         const fragment = frame_mod.headersFieldBlock(f.payload, f.header.flags) catch |e| switch (e) {
             error.FrameSizeError => return error.FrameSizeError,
@@ -401,9 +400,21 @@ pub const Connection = struct {
             // (half-closed-remote) or on a closed stream is a protocol error.
             if (s.headers_done and s.state == .open) {
                 is_trailer = true;
+            } else if (self.role == .client and !s.headers_done and s.state == .open) {
+                // A client stream that is open but whose head is not done yet: an
+                // interim (1xx) response already arrived and this is the next
+                // response head (another interim, or the final). Accept it.
             } else {
                 return error.ProtocolError;
             }
+        } else if (self.role == .client) {
+            // A client reads HEADERS as a response on a stream IT opened: the id
+            // must be odd (client-initiated, 5.1.1) and not server-pushed (push is
+            // out of scope). The stream is created here for the response if the
+            // send side has not already (the H2 write path opens it on request).
+            if (id % 2 == 0) return error.ProtocolError;
+            self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size)) catch return error.MessageTooLong;
+            self.streams.getPtr(id).?.recvApply(.headers, false); // idle -> open
         } else {
             // A new request stream. Its id must be odd and exceed the highest peer
             // id (5.1.1: parity + monotonicity).
@@ -476,6 +487,31 @@ pub const Connection = struct {
             }
             s.recvApply(.headers, true);
             self.push(.{ .end_of_message = .{ .trailers = headers, .stream_id = id } });
+            return;
+        }
+
+        if (self.role == .client) {
+            // Collapse the response pseudo-header (:status) + regular fields.
+            const resp = self.collapseResponse(headers, id) catch |e| switch (e) {
+                error.Malformed => {
+                    self.resetStream(s, id, .protocol_error);
+                    return;
+                },
+                error.OutOfMemory => return error.MessageTooLong,
+            };
+            // A 1xx interim response is informational: it carries no body and the
+            // stream stays open for the final response (RFC 9110 15.2).
+            if (resp.event.status_code >= 100 and resp.event.status_code < 200) {
+                self.push(.{ .response = resp.event });
+                return;
+            }
+            s.headers_done = true;
+            if (resp.content_length) |cl| s.content_length = cl;
+            self.push(.{ .response = resp.event });
+            if (end_stream) {
+                s.recvApply(.headers, true); // open -> half_closed_remote
+                self.push(.{ .end_of_message = .{ .stream_id = id } });
+            }
             return;
         }
 
@@ -576,6 +612,60 @@ pub const Connection = struct {
                 .target = target,
                 .path = req_path,
                 .query = req_query,
+                .http_version = "2",
+                .headers = self.req_headers.items,
+                .stream_id = id,
+            },
+            .content_length = content_length,
+        };
+    }
+
+    const CollapsedResponse = struct { event: events.Response, content_length: ?u64 };
+
+    /// Map HTTP/2 response pseudo-headers + regular fields to a zttp Response
+    /// (RFC 9113 8.3.2). The only valid pseudo-header is :status (a 3-digit code);
+    /// request pseudo-headers (:method/:path/:scheme/:authority) are malformed in a
+    /// response. Same field-validity rules as a request: pseudo precede regular,
+    /// lowercase names, no connection-specific fields. The reason phrase does not
+    /// exist in HTTP/2, so it is empty. Slices point into the HPACK out_store.
+    fn collapseResponse(self: *Connection, headers: []const events.Header, id: u32) CollapseError!CollapsedResponse {
+        self.req_headers.clearRetainingCapacity();
+        var status: ?u16 = null;
+        var content_length: ?u64 = null;
+        var seen_regular = false;
+
+        for (headers) |h| {
+            if (h.name.len == 0) return error.Malformed;
+            if (h.name[0] == ':') {
+                if (seen_regular) return error.Malformed; // pseudo after regular
+                if (!eql(h.name, ":status")) return error.Malformed; // request pseudo or unknown
+                if (status != null) return error.Malformed;
+                if (h.value.len != 3) return error.Malformed;
+                var code: u16 = 0;
+                for (h.value) |d| {
+                    if (d < '0' or d > '9') return error.Malformed;
+                    code = code * 10 + (d - '0');
+                }
+                status = code;
+                continue;
+            }
+            seen_regular = true;
+            if (!isValidFieldName(h.name)) return error.Malformed;
+            if (isConnectionSpecific(h.name)) return error.Malformed;
+            if (eql(h.name, "content-length")) {
+                const cl = parseU64(h.value) orelse return error.Malformed;
+                if (content_length) |prev| {
+                    if (prev != cl) return error.Malformed;
+                } else content_length = cl;
+            }
+            self.req_headers.append(self.gpa, h) catch return error.OutOfMemory;
+        }
+
+        if (status == null) return error.Malformed;
+        return .{
+            .event = .{
+                .status_code = status.?,
+                .reason = "",
                 .http_version = "2",
                 .headers = self.req_headers.items,
                 .stream_id = id,
@@ -940,6 +1030,88 @@ test "over the concurrency cap, a request is refused not surfaced" {
     try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.refused_stream)), refused.rst_stream.error_code);
     // The refused stream left no record, so only stream 1 is tracked.
     try testing.expectEqual(@as(u32, 1), c.liveStreamCount());
+}
+
+// A client's inbound handshake is just the server's SETTINGS - no preface to
+// consume - so it differs from the server `handshook` helper.
+fn clientHandshook(c: *Connection, extra: []const u8) !void {
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    try frameBytes(&input, .settings, 0, 0, &.{});
+    try input.appendSlice(testing.allocator, extra);
+    try c.feed(input.items);
+    try testing.expectEqual(std.meta.Tag(Event).settings, std.meta.activeTag(try c.nextEvent()));
+}
+
+// HPACK static index 8 is exactly ":status: 200", so a one-byte indexed field
+// (0x80 | 8) is a complete response head.
+const STATUS_200_BLOCK = [_]u8{0x88};
+
+test "client reads a HEADERS response with END_STREAM" {
+    var c = Connection.init(testing.allocator, .client);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &STATUS_200_BLOCK);
+    try clientHandshook(&c, frames.items);
+    const resp = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).response, std.meta.activeTag(resp));
+    try testing.expectEqual(@as(u16, 200), resp.response.status_code);
+    try testing.expectEqual(@as(u32, 1), resp.response.stream_id);
+    try testing.expectEqualStrings("2", resp.response.http_version);
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "client reads a response head then a DATA body" {
+    var c = Connection.init(testing.allocator, .client);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &STATUS_200_BLOCK); // open, no END_STREAM
+    try frameBytes(&frames, .data, Flags.end_stream, 1, "hi");
+    try clientHandshook(&c, frames.items);
+    try testing.expectEqual(@as(u16, 200), (try c.nextEvent()).response.status_code);
+    const d = try c.nextEvent();
+    try testing.expectEqualStrings("hi", d.data.data);
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "client reads a 1xx interim response then the final response" {
+    var c = Connection.init(testing.allocator, .client);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    // A literal ":status: 100" (no static-table code for interim responses):
+    // literal-name(len 7) ":status", value(len 3) "100".
+    const interim = [_]u8{ 0x00, 0x07 } ++ ":status".* ++ [_]u8{0x03} ++ "100".*;
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &interim);
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &STATUS_200_BLOCK);
+    try clientHandshook(&c, frames.items);
+    try testing.expectEqual(@as(u16, 100), (try c.nextEvent()).response.status_code);
+    try testing.expectEqual(@as(u16, 200), (try c.nextEvent()).response.status_code);
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "a request pseudo-header in a response resets the stream" {
+    var c = Connection.init(testing.allocator, .client);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    // :method GET (static index 2 = 0x82) is illegal in a response.
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &[_]u8{0x82});
+    try clientHandshook(&c, frames.items);
+    const ev = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(ev));
+}
+
+test "an even response stream id is a connection error for a client" {
+    var c = Connection.init(testing.allocator, .client);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 2, &STATUS_200_BLOCK);
+    try clientHandshook(&c, frames.items);
+    try testing.expectError(error.ProtocolError, c.nextEvent());
 }
 
 test "HEADERS after END_STREAM (not a trailer) is a connection error" {
