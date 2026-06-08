@@ -93,7 +93,14 @@ integrator is responsible for.
   (`Connection(role, protocol=zttp.HTTP2)`); events carry a `stream_id`. The
   server read path (prior-knowledge) is implemented; client responses and the
   Python write side are next. *(in progress)*
-- **HTTP/3** - QPACK + the QUIC-side framing, same event API.
+- **HTTP/3** - a from-scratch QUIC transport in the Zig core (packets, RFC 9001
+  packet protection on `std.crypto`, loss recovery, NewReno congestion control,
+  flow control, and stream reassembly) plus the HTTP/3 framing and QPACK, surfaced
+  through the same event API (`Connection(role, protocol=zttp.HTTP3)`); events carry
+  a `stream_id`. The server read path is implemented and tested end-to-end in the
+  core (a real client Initial is decrypted and a GET/POST decoded into events); the
+  TLS 1.3 handshake driver, the QPACK dynamic table, and the Python adapter are
+  next. *(in progress)*
 
 ## Status
 
