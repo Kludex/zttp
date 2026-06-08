@@ -15,6 +15,8 @@ const Header = events.Header;
 pub const RequestLine = struct {
     method: []const u8,
     target: []const u8,
+    path: []const u8,
+    query: []const u8,
     http_version: []const u8,
 };
 
@@ -37,7 +39,10 @@ pub fn parseRequestLine(line: []const u8) ParseError!RequestLine {
     _ = sc.take(1);
 
     const version = try parseVersion(sc.remaining());
-    return .{ .method = method, .target = target, .http_version = version };
+    const q = std.mem.indexOfScalar(u8, target, '?');
+    const path = if (q) |i| target[0..i] else target;
+    const query = if (q) |i| target[i + 1 ..] else target[target.len..];
+    return .{ .method = method, .target = target, .path = path, .query = query, .http_version = version };
 }
 
 /// Parse the status-line `HTTP-version SP status-code SP [ reason-phrase ]`.
@@ -110,7 +115,21 @@ test "parseRequestLine" {
     const r = try parseRequestLine("GET /path?q=1 HTTP/1.1");
     try std.testing.expectEqualStrings("GET", r.method);
     try std.testing.expectEqualStrings("/path?q=1", r.target);
+    try std.testing.expectEqualStrings("/path", r.path);
+    try std.testing.expectEqualStrings("q=1", r.query);
     try std.testing.expectEqualStrings("1.1", r.http_version);
+}
+
+test "parseRequestLine splits target with no query" {
+    const r = try parseRequestLine("GET /path HTTP/1.1");
+    try std.testing.expectEqualStrings("/path", r.path);
+    try std.testing.expectEqualStrings("", r.query);
+}
+
+test "parseRequestLine empty query after bare question mark" {
+    const r = try parseRequestLine("GET /path? HTTP/1.1");
+    try std.testing.expectEqualStrings("/path", r.path);
+    try std.testing.expectEqualStrings("", r.query);
 }
 
 test "parseRequestLine rejects malformed" {

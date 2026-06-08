@@ -82,7 +82,7 @@ A server connection yields these, in order, per request:
 
 | Event | When | Useful fields |
 | --- | --- | --- |
-| `Request` | The request line + all headers are parsed | `.method`, `.target`, `.http_version`, `.headers`, `.expect_continue` |
+| `Request` | The request line + all headers are parsed | `.method`, `.target`, `.path`, `.query`, `.http_version`, `.headers`, `.expect_continue` |
 | `Data` | A chunk of the body is available | `.data` |
 | `EndOfMessage` | The body (and any trailers) finished | `.trailers` |
 | `NEED_DATA` | No complete event yet - feed more | *(it's a sentinel)* |
@@ -95,6 +95,9 @@ A server connection yields these, in order, per request:
     if event is zttp.NEED_DATA:
         ...
     ```
+
+`.target` is the raw request-target; `.path` and `.query` are it split at the
+first `?` (both verbatim - zttp doesn't percent-decode, that's yours to do).
 
 A client connection is the mirror image: you get `Response` (with `.status_code`,
 `.reason`, `.http_version`, `.headers`) instead of `Request`, then the same

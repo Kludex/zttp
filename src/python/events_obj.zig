@@ -13,6 +13,8 @@ const RequestObject = extern struct {
     ob_base: c.PyObject,
     method: py.Object,
     target: py.Object,
+    path: py.Object,
+    query: py.Object,
     http_version: py.Object,
     headers: py.Object,
     expect_continue: c_char,
@@ -53,6 +55,8 @@ fn member(comptime name: [*c]const u8, comptime offset: usize) py.MemberDef {
 var request_members = [_]py.MemberDef{
     member("method", @offsetOf(RequestObject, "method")),
     member("target", @offsetOf(RequestObject, "target")),
+    member("path", @offsetOf(RequestObject, "path")),
+    member("query", @offsetOf(RequestObject, "query")),
     member("http_version", @offsetOf(RequestObject, "http_version")),
     member("headers", @offsetOf(RequestObject, "headers")),
     .{ .name = "expect_continue", .type = c.Py_T_BOOL, .offset = @intCast(@offsetOf(RequestObject, "expect_continue")), .flags = c.Py_READONLY, .doc = null },
@@ -81,6 +85,8 @@ fn deallocRequest(o: ?*c.PyObject) callconv(.c) void {
     py.gcUntrack(s);
     py.xdecref(s.method);
     py.xdecref(s.target);
+    py.xdecref(s.path);
+    py.xdecref(s.query);
     py.xdecref(s.http_version);
     py.xdecref(s.headers);
     py.freeInstance(@ptrCast(s));
@@ -126,7 +132,7 @@ fn visitObj(obj: py.Object, visit: c.visitproc, arg: ?*anyopaque) c_int {
 
 fn traverseRequest(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const s: *RequestObject = @ptrCast(o.?);
-    inline for (.{ s.method, s.target, s.http_version, s.headers }) |f| {
+    inline for (.{ s.method, s.target, s.path, s.query, s.http_version, s.headers }) |f| {
         const r = visitObj(f, visit, arg);
         if (r != 0) return r;
     }
@@ -136,6 +142,8 @@ fn clearRequest(o: ?*c.PyObject) callconv(.c) c_int {
     const s: *RequestObject = @ptrCast(o.?);
     py.clear(&s.method);
     py.clear(&s.target);
+    py.clear(&s.path);
+    py.clear(&s.query);
     py.clear(&s.http_version);
     py.clear(&s.headers);
     return 0;
@@ -255,6 +263,8 @@ const request_fields = .{
     FieldInfo(RequestObject){ .name = "http_version", .field = "http_version" },
     FieldInfo(RequestObject){ .name = "headers", .field = "headers" },
 };
+// path/query are derived from target, so they're excluded from repr/eq to keep
+// the repr concise and equality non-redundant.
 const response_fields = .{
     FieldInfo(ResponseObject){ .name = "status_code", .field = "status_code" },
     FieldInfo(ResponseObject){ .name = "reason", .field = "reason" },
@@ -421,10 +431,12 @@ fn makeRequest(r: events.Request) py.Object {
     const s: *RequestObject = @ptrCast(o);
     s.method = py.fromBytes(r.method);
     s.target = py.fromBytes(r.target);
+    s.path = py.fromBytes(r.path);
+    s.query = py.fromBytes(r.query);
     s.http_version = py.fromBytes(r.http_version);
     s.headers = buildHeaders(r.headers);
     s.expect_continue = @intFromBool(r.expect_continue);
-    if (s.method == null or s.target == null or s.http_version == null or s.headers == null) {
+    if (s.method == null or s.target == null or s.path == null or s.query == null or s.http_version == null or s.headers == null) {
         py.decref(o);
         return null;
     }
