@@ -74,8 +74,11 @@ include = ["zttp", "src", "tools", "build.zig"]
 # Zig comes from the `ziglang` build requirement (build isolation), so no system
 # toolchain install is needed. The sans-IO core has no OS dependencies, so it
 # builds for glibc, musl, macOS, and Windows alike. Skip only 32-bit and PyPy.
-build = "cp312-* cp313-* cp314-*"
-skip = "*_i686 *-pp*"
+# cp314t is the free-threaded build; the extension declares Py_MOD_GIL_NOT_USED.
+# Windows is skipped for cp314t: its pyconfig.h doesn't self-define Py_GIL_DISABLED
+# (POSIX does), so translate-c would compile against the GIL ABI and mismatch.
+build = "cp312-* cp313-* cp314-* cp314t-*"
+skip = "*_i686 *-pp* cp314t-win*"
 build-frontend = "build[uv]"
 test-command = 'python -c "import zttp; c = zttp.Connection(zttp.SERVER); c.receive_data(b\"GET / HTTP/1.1\r\n\r\n\"); assert type(c.next_event()).__name__ == \"Request\""'
 
