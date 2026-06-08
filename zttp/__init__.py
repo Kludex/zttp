@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from zttp._zttp import (
     CLIENT,
+    CONNECTION_CLOSED,
     NEED_DATA,
     SERVER,
     Connection,
@@ -20,6 +21,7 @@ Event = Request | Response | Data | EndOfMessage | NeedData | ConnectionClosed
 
 __all__ = [
     "CLIENT",
+    "CONNECTION_CLOSED",
     "SERVER",
     "NEED_DATA",
     "Connection",

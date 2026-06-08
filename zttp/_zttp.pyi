@@ -32,6 +32,7 @@ class NeedData: ...
 class ConnectionClosed: ...
 
 NEED_DATA: Final[NeedData]
+CONNECTION_CLOSED: Final[ConnectionClosed]
 
 Event = Request | Response | Data | EndOfMessage | NeedData | ConnectionClosed
 
