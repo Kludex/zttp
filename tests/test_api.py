@@ -6,6 +6,15 @@ import zttp
 from tests.conftest import drain, drain_all
 
 
+def test_event_is_public() -> None:
+    # next_event()'s return type is importable from the package, not zttp._zttp.
+    assert "Event" in zttp.__all__
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    ev: zttp.Event = conn.next_event()
+    assert isinstance(ev, zttp.Request)
+
+
 def test_request_repr() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"GET /p HTTP/1.1\r\nHost: x\r\n\r\n")
