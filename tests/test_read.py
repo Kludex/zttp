@@ -123,7 +123,7 @@ def test_response_until_close() -> None:
 def test_eof_on_empty_connection_yields_closed() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"")
-    assert conn.next_event() is zttp.ConnectionClosed
+    assert isinstance(conn.next_event(), zttp.ConnectionClosed)
 
 
 @pytest.mark.parametrize(

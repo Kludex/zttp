@@ -38,13 +38,18 @@ const EndOfMessageObject = extern struct {
     trailers: py.Object,
 };
 
+const ConnectionClosedObject = extern struct {
+    ob_base: c.PyObject,
+};
+
 var request_type: py.Object = null;
 var response_type: py.Object = null;
 var data_type: py.Object = null;
 var end_of_message_type: py.Object = null;
-/// Singletons returned when no event is ready / read side is paused.
+var connection_closed_type: py.Object = null;
+var need_data_type: py.Object = null;
+/// Singleton returned when no event is ready.
 pub var need_data: py.Object = null;
-pub var connection_closed: py.Object = null;
 
 // -- members (read-only attribute exposure) -----------------------------------
 
@@ -111,6 +116,9 @@ fn deallocEom(o: ?*c.PyObject) callconv(.c) void {
     py.gcUntrack(s);
     py.xdecref(s.trailers);
     py.freeInstance(@ptrCast(s));
+}
+fn deallocConnectionClosed(o: ?*c.PyObject) callconv(.c) void {
+    py.freeInstance(o);
 }
 
 // -- GC support ---------------------------------------------------------------
@@ -274,15 +282,19 @@ const response_fields = .{
 const data_fields = .{FieldInfo(DataObject){ .name = "data", .field = "data" }};
 const eom_fields = .{FieldInfo(EndOfMessageObject){ .name = "trailers", .field = "trailers" }};
 
+const connection_closed_fields = .{};
+
 const reprRequest = reprFields(RequestObject, "Request", request_fields);
 const reprResponse = reprFields(ResponseObject, "Response", response_fields);
 const reprData = reprFields(DataObject, "Data", data_fields);
 const reprEom = reprFields(EndOfMessageObject, "EndOfMessage", eom_fields);
+const reprConnectionClosed = reprFields(ConnectionClosedObject, "ConnectionClosed", connection_closed_fields);
 
 const cmpRequest = richcompareFields(RequestObject, request_fields);
 const cmpResponse = richcompareFields(ResponseObject, response_fields);
 const cmpData = richcompareFields(DataObject, data_fields);
 const cmpEom = richcompareFields(EndOfMessageObject, eom_fields);
+const cmpConnectionClosed = richcompareFields(ConnectionClosedObject, connection_closed_fields);
 
 // -- specs --------------------------------------------------------------------
 
@@ -303,6 +315,15 @@ var response_slots = slots(deallocResponse, &response_members, traverseResponse,
 var data_slots = slots(deallocData, &data_members, traverseData, clearData, reprData, cmpData);
 var eom_slots = slots(deallocEom, &eom_members, traverseEom, clearEom, reprEom, cmpEom);
 
+// ConnectionClosed has no object fields, so no GC (traverse/clear/members):
+// just dealloc, repr and value equality.
+var connection_closed_slots = [_]py.Slot{
+    .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&deallocConnectionClosed)) },
+    .{ .slot = c.Py_tp_repr, .pfunc = @ptrCast(@constCast(&reprConnectionClosed)) },
+    .{ .slot = c.Py_tp_richcompare, .pfunc = @ptrCast(@constCast(&cmpConnectionClosed)) },
+    .{ .slot = 0, .pfunc = null },
+};
+
 fn spec(comptime name: [*c]const u8, comptime size: usize, sl: anytype) py.Spec {
     return .{
         .name = name,
@@ -317,6 +338,13 @@ var request_spec = spec("zttp.Request", @sizeOf(RequestObject), &request_slots);
 var response_spec = spec("zttp.Response", @sizeOf(ResponseObject), &response_slots);
 var data_spec = spec("zttp.Data", @sizeOf(DataObject), &data_slots);
 var eom_spec = spec("zttp.EndOfMessage", @sizeOf(EndOfMessageObject), &eom_slots);
+var connection_closed_spec = py.Spec{
+    .name = "zttp.ConnectionClosed",
+    .basicsize = @sizeOf(ConnectionClosedObject),
+    .itemsize = 0,
+    .flags = c.Py_TPFLAGS_DEFAULT,
+    .slots = &connection_closed_slots,
+};
 
 // -- header-name interning ----------------------------------------------------
 
@@ -421,7 +449,7 @@ pub fn fromEvent(ev: events.Event) py.Object {
         .data => |d| makeData(d),
         .end_of_message => |e| makeEom(e),
         .need_data => py.newRef(need_data),
-        .connection_closed => py.newRef(connection_closed),
+        .connection_closed => py.allocInstance(connection_closed_type),
     };
 }
 
@@ -489,14 +517,17 @@ pub fn register(module: py.Object) bool {
     response_type = py.typeFromSpec(&response_spec);
     data_type = py.typeFromSpec(&data_spec);
     end_of_message_type = py.typeFromSpec(&eom_spec);
-    if (request_type == null or response_type == null or data_type == null or end_of_message_type == null) {
+    connection_closed_type = py.typeFromSpec(&connection_closed_spec);
+    if (request_type == null or response_type == null or data_type == null or end_of_message_type == null or connection_closed_type == null) {
         return false;
     }
 
-    // NEED_DATA / ConnectionClosed are unique sentinel instances of bare types.
-    need_data = makeSentinel("zttp.NeedDataType");
-    connection_closed = makeSentinel("zttp.ConnectionClosedType");
-    if (need_data == null or connection_closed == null) return false;
+    // NEED_DATA is a unique sentinel instance of a bare type; we keep both the
+    // instance (NEED_DATA, compared with `is`) and its type (NeedData).
+    need_data_type = py.typeFromSpec(&need_data_spec);
+    if (need_data_type == null) return false;
+    need_data = py.allocInstance(need_data_type);
+    if (need_data == null) return false;
 
     if (!buildInternTable()) return false;
 
@@ -505,16 +536,10 @@ pub fn register(module: py.Object) bool {
     _ = c.PyModule_AddObjectRef(module, "Data", data_type);
     _ = c.PyModule_AddObjectRef(module, "EndOfMessage", end_of_message_type);
     _ = c.PyModule_AddObjectRef(module, "NEED_DATA", need_data);
-    _ = c.PyModule_AddObjectRef(module, "ConnectionClosed", connection_closed);
+    _ = c.PyModule_AddObjectRef(module, "NeedData", need_data_type);
+    _ = c.PyModule_AddObjectRef(module, "ConnectionClosed", connection_closed_type);
     return true;
 }
 
-var sentinel_slots = [_]py.Slot{.{ .slot = 0, .pfunc = null }};
-
-fn makeSentinel(comptime name: [*c]const u8) py.Object {
-    var sp = py.Spec{ .name = name, .basicsize = @sizeOf(c.PyObject), .itemsize = 0, .flags = c.Py_TPFLAGS_DEFAULT, .slots = &sentinel_slots };
-    const tp = py.typeFromSpec(&sp);
-    if (tp == null) return null;
-    defer py.decref(tp);
-    return py.allocInstance(tp);
-}
+var need_data_slots = [_]py.Slot{.{ .slot = 0, .pfunc = null }};
+var need_data_spec = py.Spec{ .name = "zttp.NeedData", .basicsize = @sizeOf(c.PyObject), .itemsize = 0, .flags = c.Py_TPFLAGS_DEFAULT, .slots = &need_data_slots };

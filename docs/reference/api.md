@@ -35,7 +35,8 @@ A `Connection`'s role is fixed at construction:
 | Value | Meaning |
 | --- | --- |
 | `zttp.NEED_DATA` | No complete event yet - feed more bytes. Compare with `is`. |
-| `zttp.ConnectionClosed` | The peer closed the connection. |
+
+`zttp.ConnectionClosed` is an event class: `next_event()` returns a fresh instance when the peer closed the connection. Check it with `isinstance`.
 
 ## Exceptions
 
