@@ -261,7 +261,7 @@ test "serialize a simple response" {
         .{ .name = "Content-Type", .value = "text/plain" },
         .{ .name = "Content-Length", .value = "5" },
     };
-    try wr.sendResponse("1.1", 200, "OK", &hdrs, "");
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     try wr.sendData("hello");
     try wr.endMessage(&.{});
     try t.expectEqualStrings(
@@ -293,14 +293,14 @@ test "invalid version rejected" {
     try t.expectError(error.InvalidField, wr.sendRequest("GET", "/", "1.1.1", &.{}));
     var wr2 = Writer.init(t.allocator);
     defer wr2.deinit();
-    try t.expectError(error.InvalidField, wr2.sendResponse("garbage", 200, "OK", &.{}, ""));
+    try t.expectError(error.InvalidField, wr2.sendResponse("garbage", 200, "OK", &.{}, "GET"));
 }
 
 test "chunked response framing" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
-    try wr.sendResponse("1.1", 200, "OK", &hdrs, "");
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     try wr.sendData("Wiki");
     try wr.sendData("pedia");
     try wr.endMessage(&.{});
@@ -315,7 +315,7 @@ test "chunked with trailers" {
     defer wr.deinit();
     const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
     const trailers = [_]Header{.{ .name = "X-Checksum", .value = "abc" }};
-    try wr.sendResponse("1.1", 200, "OK", &hdrs, "");
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     try wr.sendData("data");
     try wr.endMessage(&trailers);
     try t.expectEqualStrings(
@@ -327,7 +327,7 @@ test "chunked with trailers" {
 test "status code formatting" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    try wr.sendResponse("1.1", 404, "Not Found", &.{}, "");
+    try wr.sendResponse("1.1", 404, "Not Found", &.{}, "GET");
     try wr.endMessage(&.{});
     try t.expectEqualStrings("HTTP/1.1 404 Not Found\r\n\r\n", wr.pending());
 }
@@ -351,14 +351,14 @@ test "data before head is rejected" {
 test "two heads without ending is rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    try wr.sendResponse("1.1", 200, "OK", &.{}, "");
-    try t.expectError(error.LocalProtocol, wr.sendResponse("1.1", 200, "OK", &.{}, ""));
+    try wr.sendResponse("1.1", 200, "OK", &.{}, "GET");
+    try t.expectError(error.LocalProtocol, wr.sendResponse("1.1", 200, "OK", &.{}, "GET"));
 }
 
 test "take transfers ownership and empties" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    try wr.sendResponse("1.1", 204, "No Content", &.{}, "");
+    try wr.sendResponse("1.1", 204, "No Content", &.{}, "GET");
     try wr.endMessage(&.{});
     const owned = wr.take();
     defer t.allocator.free(owned);
@@ -369,14 +369,14 @@ test "take transfers ownership and empties" {
 test "send-path injection: CRLF in reason rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK\r\nX-Evil: 1", &.{}, ""));
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK\r\nX-Evil: 1", &.{}, "GET"));
 }
 
 test "send-path injection: CRLF in header value rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     const h = [_]Header{.{ .name = "X", .value = "a\r\nInjected: yes" }};
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, ""));
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }
 
 test "send-path injection: bad header name rejected" {
@@ -396,7 +396,7 @@ test "send-path injection: CRLF in trailer rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
-    try wr.sendResponse("1.1", 200, "OK", &hdrs, "");
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     const trailers = [_]Header{.{ .name = "X", .value = "v\r\nInjected: 1" }};
     try t.expectError(error.InvalidField, wr.endMessage(&trailers));
 }
@@ -408,7 +408,7 @@ test "send rejects ambiguous framing (TE + CL)" {
         .{ .name = "Transfer-Encoding", .value = "chunked" },
         .{ .name = "Content-Length", .value = "5" },
     };
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, ""));
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }
 
 test "send rejects conflicting duplicate Content-Length" {
@@ -418,12 +418,12 @@ test "send rejects conflicting duplicate Content-Length" {
         .{ .name = "Content-Length", .value = "5" },
         .{ .name = "Content-Length", .value = "6" },
     };
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, ""));
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }
 
 test "send rejects non-digit Content-Length" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     const h = [_]Header{.{ .name = "Content-Length", .value = "5x" }};
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, ""));
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }
