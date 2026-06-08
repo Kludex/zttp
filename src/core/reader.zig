@@ -245,31 +245,31 @@ pub const Reader = struct {
 
         if (self.role == .server) {
             const rl = try headers_mod.parseRequestLine(first);
-            const f = try framing_mod.determine(self.headers.items, .{
-                .until_close_default = false,
-            });
-            self.enterBody(f);
+            try self.frameBody(.{ .until_close_default = false });
             return .{ .request = .{
                 .method = rl.method,
                 .target = rl.target,
                 .http_version = rl.http_version,
                 .headers = self.headers.items,
             } };
-        } else {
-            const st = try headers_mod.parseStatusLine(first);
-            const method = self.request_method[0..self.request_method_len];
-            const f = try framing_mod.determine(self.headers.items, .{
-                .bodyless = framing_mod.responseIsBodyless(method, st.status_code),
-                .until_close_default = true,
-            });
-            self.enterBody(f);
-            return .{ .response = .{
-                .status_code = st.status_code,
-                .reason = st.reason,
-                .http_version = st.http_version,
-                .headers = self.headers.items,
-            } };
         }
+
+        const st = try headers_mod.parseStatusLine(first);
+        const method = self.request_method[0..self.request_method_len];
+        try self.frameBody(.{
+            .bodyless = framing_mod.responseIsBodyless(method, st.status_code),
+            .until_close_default = true,
+        });
+        return .{ .response = .{
+            .status_code = st.status_code,
+            .reason = st.reason,
+            .http_version = st.http_version,
+            .headers = self.headers.items,
+        } };
+    }
+
+    fn frameBody(self: *Reader, opts: framing_mod.FramingOptions) ParseError!void {
+        self.enterBody(try framing_mod.determine(self.headers.items, opts));
     }
 
     fn enterBody(self: *Reader, f: Framing) void {
