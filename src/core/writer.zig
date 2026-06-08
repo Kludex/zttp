@@ -13,9 +13,20 @@ const Header = events.Header;
 const responseIsBodyless = framing.responseIsBodyless;
 
 pub const WriteError = error{
-    /// A send was attempted in a state that does not allow it (e.g. data before
-    /// the head, or a second head before the first message ended).
-    LocalProtocol,
+    /// A head was sent while a message was still in progress.
+    MessageNotEnded,
+    /// Body bytes were sent when none can be: before a head, or on a message
+    /// whose framing carries no body.
+    NoBodyAllowed,
+    /// More body bytes were sent than the declared Content-Length allows.
+    BodyTooLong,
+    /// The message was ended before the declared Content-Length was reached.
+    BodyTooShort,
+    /// Trailers were passed to a message that cannot carry them - only a chunked
+    /// body has a place for trailers on the wire.
+    TrailersNotAllowed,
+    /// The message was ended when none was in progress.
+    NoMessageInProgress,
     /// A field (method/target/version/reason/header) contained bytes that would
     /// break the wire grammar - CR, LF, NUL or other controls. Serializing them
     /// verbatim would allow header/response-splitting injection.
@@ -150,7 +161,7 @@ pub const Writer = struct {
 
     /// Serialize a request-line + headers. `framing` decides body handling.
     pub fn sendRequest(self: *Writer, method: []const u8, target: []const u8, version: []const u8, hdrs: []const Header) WriteError!void {
-        if (self.state != .idle) return error.LocalProtocol;
+        if (self.state != .idle) return error.MessageNotEnded;
         try validLineToken(method, false);
         try validLineToken(target, false);
         const ver = try normalizeVersion(version);
@@ -171,7 +182,7 @@ pub const Writer = struct {
     /// response answers; together with the status it decides whether the response
     /// is bodyless (RFC 9112 6.3), so the caller never tracks framing by hand.
     pub fn sendResponse(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header, request_method: []const u8) WriteError!void {
-        if (self.state != .idle) return error.LocalProtocol;
+        if (self.state != .idle) return error.MessageNotEnded;
         const ver = try normalizeVersion(version);
         try validLineToken(reason, true); // reason-phrase may contain SP/HTAB
         try validateHeaders(hdrs);
@@ -212,7 +223,7 @@ pub const Writer = struct {
     pub fn sendData(self: *Writer, data: []const u8) WriteError!void {
         switch (self.state) {
             .body_length => {
-                if (data.len > self.body_remaining) return error.LocalProtocol; // over Content-Length
+                if (data.len > self.body_remaining) return error.BodyTooLong;
                 try self.w(data);
                 self.body_remaining -= data.len;
             },
@@ -224,7 +235,7 @@ pub const Writer = struct {
                 try self.w(data);
                 try self.w("\r\n");
             },
-            else => return error.LocalProtocol,
+            else => return error.NoBodyAllowed,
         }
     }
 
@@ -246,13 +257,13 @@ pub const Writer = struct {
                 try self.w("\r\n");
             },
             .body_length => {
-                if (self.body_remaining != 0) return error.LocalProtocol; // under Content-Length
-                if (trailers.len != 0) return error.LocalProtocol; // Content-Length and trailers don't mix
+                if (self.body_remaining != 0) return error.BodyTooShort;
+                if (trailers.len != 0) return error.TrailersNotAllowed;
             },
             .body_none => {
-                if (trailers.len != 0) return error.LocalProtocol; // no body, nowhere for trailers
+                if (trailers.len != 0) return error.TrailersNotAllowed;
             },
-            .idle => return error.LocalProtocol,
+            .idle => return error.NoMessageInProgress,
         }
         self.state = .idle;
     }
@@ -377,7 +388,7 @@ test "HEAD response is bodyless despite Content-Length" {
     defer wr.deinit();
     const hdrs = [_]Header{.{ .name = "Content-Length", .value = "1234" }};
     try wr.sendResponse("1.1", 200, "OK", &hdrs, "HEAD");
-    try t.expectError(error.LocalProtocol, wr.sendData("x")); // no body allowed
+    try t.expectError(error.NoBodyAllowed, wr.sendData("x"));
     try wr.endMessage(&.{});
     try t.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n", wr.pending());
 }
@@ -385,7 +396,7 @@ test "HEAD response is bodyless despite Content-Length" {
 test "data before head is rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    try t.expectError(error.LocalProtocol, wr.sendData("x"));
+    try t.expectError(error.NoBodyAllowed, wr.sendData("x"));
 }
 
 test "oversized body rejected against Content-Length" {
@@ -393,7 +404,7 @@ test "oversized body rejected against Content-Length" {
     defer wr.deinit();
     const hdrs = [_]Header{.{ .name = "Content-Length", .value = "5" }};
     try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
-    try t.expectError(error.LocalProtocol, wr.sendData("abcdef")); // 6 > 5
+    try t.expectError(error.BodyTooLong, wr.sendData("abcdef")); // 6 > 5
 }
 
 test "oversized body rejected across multiple writes" {
@@ -402,7 +413,7 @@ test "oversized body rejected across multiple writes" {
     const hdrs = [_]Header{.{ .name = "Content-Length", .value = "5" }};
     try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     try wr.sendData("abc");
-    try t.expectError(error.LocalProtocol, wr.sendData("def")); // 3 + 3 > 5
+    try t.expectError(error.BodyTooLong, wr.sendData("def")); // 3 + 3 > 5
 }
 
 test "undersized body rejected at end_message" {
@@ -411,7 +422,7 @@ test "undersized body rejected at end_message" {
     const hdrs = [_]Header{.{ .name = "Content-Length", .value = "5" }};
     try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     try wr.sendData("abc");
-    try t.expectError(error.LocalProtocol, wr.endMessage(&.{})); // 2 bytes still owed
+    try t.expectError(error.BodyTooShort, wr.endMessage(&.{})); // 2 bytes still owed
 }
 
 test "exact-length body is accepted" {
@@ -432,7 +443,7 @@ test "trailers rejected on a Content-Length body" {
     try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     try wr.sendData("abc");
     const trailers = [_]Header{.{ .name = "X-Checksum", .value = "abc" }};
-    try t.expectError(error.LocalProtocol, wr.endMessage(&trailers));
+    try t.expectError(error.TrailersNotAllowed, wr.endMessage(&trailers));
 }
 
 test "trailers rejected on a bodyless message" {
@@ -440,14 +451,20 @@ test "trailers rejected on a bodyless message" {
     defer wr.deinit();
     try wr.sendResponse("1.1", 204, "No Content", &.{}, "GET");
     const trailers = [_]Header{.{ .name = "X-Checksum", .value = "abc" }};
-    try t.expectError(error.LocalProtocol, wr.endMessage(&trailers));
+    try t.expectError(error.TrailersNotAllowed, wr.endMessage(&trailers));
 }
 
 test "two heads without ending is rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     try wr.sendResponse("1.1", 200, "OK", &.{}, "GET");
-    try t.expectError(error.LocalProtocol, wr.sendResponse("1.1", 200, "OK", &.{}, "GET"));
+    try t.expectError(error.MessageNotEnded, wr.sendResponse("1.1", 200, "OK", &.{}, "GET"));
+}
+
+test "end_message with no message in progress is rejected" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try t.expectError(error.NoMessageInProgress, wr.endMessage(&.{}));
 }
 
 test "take transfers ownership and empties" {

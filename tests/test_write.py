@@ -17,7 +17,7 @@ def test_send_response_content_length() -> None:
 def test_oversized_body_rejected() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"5")])
-    with pytest.raises(zttp.LocalProtocolError):
+    with pytest.raises(zttp.LocalProtocolError, match="more body than the declared Content-Length"):
         conn.send_data(b"too long")
 
 
@@ -33,7 +33,7 @@ def test_undersized_body_rejected_at_end() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"5")])
     conn.send_data(b"abc")
-    with pytest.raises(zttp.LocalProtocolError):
+    with pytest.raises(zttp.LocalProtocolError, match="ended before the declared Content-Length"):
         conn.end_message()
 
 
@@ -50,15 +50,33 @@ def test_trailers_rejected_on_content_length_body() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"3")])
     conn.send_data(b"abc")
-    with pytest.raises(zttp.LocalProtocolError):
+    with pytest.raises(zttp.LocalProtocolError, match="trailers can only follow a chunked body"):
         conn.end_message([(b"X-Checksum", b"abc")])
 
 
 def test_trailers_rejected_on_bodyless_message() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(b"1.1", 204, b"No Content", [])
-    with pytest.raises(zttp.LocalProtocolError):
+    with pytest.raises(zttp.LocalProtocolError, match="trailers can only follow a chunked body"):
         conn.end_message([(b"X-Checksum", b"abc")])
+
+
+@pytest.mark.parametrize(
+    ("misuse", "message"),
+    [
+        (lambda c: c.send_data(b"x"), "send a head first"),
+        (
+            lambda c: (c.send_response(b"1.1", 200, b"OK", []), c.send_response(b"1.1", 200, b"OK", [])),
+            "a message is already in progress",
+        ),
+        (lambda c: c.end_message(), "no message is in progress to end"),
+    ],
+)
+def test_send_misuse_raises_specific_message(misuse, message: str) -> None:  # type: ignore[no-untyped-def]
+    # Distinct, actionable messages - all catchable by the one base class.
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(zttp.ProtocolError, match=message):
+        misuse(conn)
 
 
 def test_send_request() -> None:
