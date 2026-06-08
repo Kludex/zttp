@@ -22,6 +22,9 @@ pub const Request = struct {
     /// The version number only, e.g. "1.1" or "1.0" (the "HTTP/" is stripped).
     http_version: []const u8,
     headers: []const Header,
+    /// Whether the request carried `Expect: 100-continue`. Per-request (a stream
+    /// property under HTTP/2), so it rides the event rather than the connection.
+    expect_continue: bool = false,
 };
 
 /// The start of a response (client role): status code, reason phrase, version,

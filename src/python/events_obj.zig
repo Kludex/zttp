@@ -15,6 +15,7 @@ const RequestObject = extern struct {
     target: py.Object,
     http_version: py.Object,
     headers: py.Object,
+    expect_continue: c_char,
 };
 
 const ResponseObject = extern struct {
@@ -54,6 +55,7 @@ var request_members = [_]py.MemberDef{
     member("target", @offsetOf(RequestObject, "target")),
     member("http_version", @offsetOf(RequestObject, "http_version")),
     member("headers", @offsetOf(RequestObject, "headers")),
+    .{ .name = "expect_continue", .type = c.Py_T_BOOL, .offset = @intCast(@offsetOf(RequestObject, "expect_continue")), .flags = c.Py_READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var response_members = [_]py.MemberDef{
@@ -421,6 +423,7 @@ fn makeRequest(r: events.Request) py.Object {
     s.target = py.fromBytes(r.target);
     s.http_version = py.fromBytes(r.http_version);
     s.headers = buildHeaders(r.headers);
+    s.expect_continue = @intFromBool(r.expect_continue);
     if (s.method == null or s.target == null or s.http_version == null or s.headers == null) {
         py.decref(o);
         return null;

@@ -28,6 +28,10 @@ const ConnectionObject = extern struct {
     /// bodyless framing. Cleared per cycle by start_next_cycle.
     req_method: [16]u8,
     req_method_len: usize,
+    /// Connection signals for the last parsed request, captured at event time so
+    /// they outlive the head buffer. `upgrade_obj` is held Python bytes (or null).
+    should_close: bool,
+    upgrade_obj: py.Object,
 };
 
 var connection_type: py.Object = null;
@@ -61,6 +65,8 @@ fn new(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c
     wctx.* = Writer.init(gpa);
     self.writer = wctx;
     self.req_method_len = 0;
+    self.should_close = false;
+    self.upgrade_obj = null;
     return obj;
 }
 
@@ -74,6 +80,7 @@ fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
         wc.deinit();
         gpa.destroy(wc);
     }
+    py.xdecref(self.upgrade_obj);
     py.freeInstance(@ptrCast(self));
 }
 
@@ -98,7 +105,12 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const r = self.reader orelse return py.raiseRuntime("connection is closed");
     const ev = r.nextEvent() catch |e| return exceptions.raiseParse(e);
-    if (ev == .request) rememberMethod(self, ev.request.method);
+    if (ev == .request) {
+        rememberMethod(self, ev.request.method);
+        self.should_close = r.shouldClose();
+        py.xdecref(self.upgrade_obj);
+        self.upgrade_obj = if (r.upgrade()) |u| py.fromBytes(u) else null;
+    }
     return events_obj.fromEvent(ev);
 }
 
@@ -253,7 +265,22 @@ fn next_message(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     const r = self.reader orelse return py.raiseRuntime("connection is closed");
     r.reset();
     self.req_method_len = 0;
+    self.should_close = false;
+    py.xdecref(self.upgrade_obj);
+    self.upgrade_obj = null;
     return py.none();
+}
+
+fn should_close(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    return py.boolean(self.should_close);
+}
+
+fn upgrade(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const obj = self.upgrade_obj orelse return py.none();
+    py.incref(obj);
+    return obj;
 }
 
 var methods = [_]py.MethodDef{
@@ -265,6 +292,8 @@ var methods = [_]py.MethodDef{
     .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
     .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
+    .{ .ml_name = "should_close", .ml_meth = should_close, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request (Connection: close / HTTP/1.0)." },
+    .{ .ml_name = "upgrade", .ml_meth = upgrade, .ml_flags = c.METH_NOARGS, .ml_doc = "The last request's Upgrade value if it asked to upgrade (Connection: upgrade), else None." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
