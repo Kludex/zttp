@@ -24,7 +24,7 @@ conn.receive_data(
     b"hello world"
 )
 
-body = b""
+body = bytearray()  # (1)!
 while True:
     event = conn.next_event()
     if isinstance(event, zttp.Data):
@@ -34,9 +34,12 @@ while True:
     elif event is zttp.NEED_DATA:
         break
 
-print(body)
+print(bytes(body))
 #> b'hello world'
 ```
+
+1.  Accumulate into a `bytearray`, not `b""`. Appending to `bytes` reallocates the
+    whole buffer on every `Data` event (quadratic); a `bytearray` grows in place.
 
 !!! tip
     Each `Data` event's `.data` is a real `bytes` object, copied out of the parse
@@ -79,7 +82,7 @@ conn.receive_data(
     b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"  # (1)!
 )
 
-body = b""
+body = bytearray()
 while True:
     event = conn.next_event()
     if isinstance(event, zttp.Data):
@@ -89,7 +92,7 @@ while True:
     elif event is zttp.NEED_DATA:
         break
 
-print(body)
+print(bytes(body))
 #> b'hello world'
 ```
 
@@ -124,25 +127,26 @@ print(end.trailers)
 
 Some responses have **no body no matter what their headers say** - the response to
 a `HEAD` request, and any `1xx` / `204` / `304`. A `HEAD` response, for instance,
-carries the `Content-Length` the `GET` *would* have had, but sends no bytes. Only
-you know the request method, so you tell the connection before parsing the head:
+carries the `Content-Length` the `GET` *would* have had, but sends no bytes.
 
-```python hl_lines="4"
+You don't track this. Because you sent the request through the same connection, it
+remembers the method and frames the response correctly on its own:
+
+```python
 import zttp
 
 conn = zttp.Connection(zttp.CLIENT)
-conn.expect_bodyless()  # (1)!
+conn.send_request(b"HEAD", b"/", b"1.1", [(b"Host", b"example.com")])
+conn.data_to_send()
 conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n")
 
-print([type(e).__name__ for e in events(conn)])  # (2)!
+print([type(e).__name__ for e in events(conn)])  # (1)!
 #> ['Response', 'EndOfMessage']
 ```
 
-1.  Without this, the client would wait for 1234 body bytes that never come - and
-    on a keep-alive connection it would read the *next* response as this one's
-    body. `expect_bodyless()` applies to the next message only.
-
-2.  Using the `events()` helper from below.
+1.  Using the `events()` helper from below. The connection saw the `HEAD`, so it
+    yields `EndOfMessage` straight after the head instead of waiting for 1234 body
+    bytes that never come.
 
 ## A reusable drain helper
 

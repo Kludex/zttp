@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from zttp._zttp import (
     CLIENT,
+    CONNECTION_CLOSED,
     HTTP1,
     HTTP2,
     NEED_DATA,
@@ -12,6 +13,7 @@ from zttp._zttp import (
     EndOfMessage,
     Goaway,
     LocalProtocolError,
+    NeedData,
     Ping,
     ProtocolError,
     RemoteProtocolError,
@@ -22,8 +24,23 @@ from zttp._zttp import (
     WindowUpdate,
 )
 
+Event = (
+    Request
+    | Response
+    | Data
+    | EndOfMessage
+    | RstStream
+    | Goaway
+    | Settings
+    | Ping
+    | WindowUpdate
+    | NeedData
+    | ConnectionClosed
+)
+
 __all__ = [
     "CLIENT",
+    "CONNECTION_CLOSED",
     "SERVER",
     "HTTP1",
     "HTTP2",
@@ -32,8 +49,10 @@ __all__ = [
     "ConnectionClosed",
     "Data",
     "EndOfMessage",
+    "Event",
     "Goaway",
     "LocalProtocolError",
+    "NeedData",
     "Ping",
     "ProtocolError",
     "RemoteProtocolError",

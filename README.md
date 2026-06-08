@@ -1,5 +1,9 @@
 # zttp
 
+<p align="center">
+  <img src="docs/assets/logo.png" alt="zttp" width="400">
+</p>
+
 > [!WARNING]
 > zttp is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
 

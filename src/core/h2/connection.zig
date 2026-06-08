@@ -558,6 +558,10 @@ pub const Connection = struct {
         }
 
         if (method == null or path == null or scheme == null) return error.Malformed;
+        const target = path.?;
+        const q = std.mem.indexOfScalar(u8, target, '?');
+        const req_path = if (q) |i| target[0..i] else target;
+        const req_query = if (q) |i| target[i + 1 ..] else target[target.len..];
         // Synthesize a host header from :authority (copied into req_scratch).
         if (authority) |a| {
             const start = self.req_scratch.items.len;
@@ -569,7 +573,9 @@ pub const Connection = struct {
         return .{
             .event = .{
                 .method = method.?,
-                .target = path.?,
+                .target = target,
+                .path = req_path,
+                .query = req_query,
                 .http_version = "2",
                 .headers = self.req_headers.items,
                 .stream_id = id,

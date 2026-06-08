@@ -82,7 +82,7 @@ A server connection yields these, in order, per request:
 
 | Event | When | Useful fields |
 | --- | --- | --- |
-| `Request` | The request line + all headers are parsed | `.method`, `.target`, `.http_version`, `.headers` |
+| `Request` | The request line + all headers are parsed | `.method`, `.target`, `.path`, `.query`, `.http_version`, `.headers`, `.expect_continue` |
 | `Data` | A chunk of the body is available | `.data` |
 | `EndOfMessage` | The body (and any trailers) finished | `.trailers` |
 | `NEED_DATA` | No complete event yet - feed more | *(it's a sentinel)* |
@@ -96,6 +96,9 @@ A server connection yields these, in order, per request:
         ...
     ```
 
+`.target` is the raw request-target; `.path` and `.query` are it split at the
+first `?` (both verbatim - zttp doesn't percent-decode, that's yours to do).
+
 A client connection is the mirror image: you get `Response` (with `.status_code`,
 `.reason`, `.http_version`, `.headers`) instead of `Request`, then the same
 `Data` / `EndOfMessage`.
@@ -103,11 +106,32 @@ A client connection is the mirror image: you get `Response` (with `.status_code`
 ## Keep-alive
 
 HTTP/1.1 connections are reused. After you've pulled `EndOfMessage` for one
-message, tell the connection to start the next one:
+message, tell the connection to start the next one - unless the peer asked to
+close. zttp works that out from the head it parsed, so you don't scan headers:
 
 ```python
-conn.start_next_cycle()  # ready to parse the next request on the same connection
+if conn.should_close():  # Connection: close, or HTTP/1.0 without keep-alive
+    transport.close()
+else:
+    conn.start_next_cycle()  # parse the next request on the same connection
 ```
+
+## Upgrades and 100-continue
+
+Two more signals zttp derives from the request so you don't have to:
+
+```python
+if conn.upgrade() == b"websocket":  # Connection: upgrade + Upgrade: websocket
+    ...  # hand the socket to your WebSocket stack
+
+if request.expect_continue:  # the client sent Expect: 100-continue
+    conn.send_response(b"1.1", 100, b"Continue", [])
+    conn.end_message()
+```
+
+`conn.upgrade()` returns the `Upgrade` value only when `Connection` lists the
+`upgrade` token, else `None`. `request.expect_continue` is a per-request flag on
+the `Request` event.
 
 ## Where to go next
 

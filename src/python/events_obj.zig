@@ -18,9 +18,12 @@ const RequestObject = extern struct {
     ob_base: c.PyObject,
     method: py.Object,
     target: py.Object,
+    path: py.Object,
+    query: py.Object,
     http_version: py.Object,
     headers: py.Object,
     stream_id: py.Object,
+    expect_continue: c_char,
 };
 
 const ResponseObject = extern struct {
@@ -85,7 +88,11 @@ var goaway_type: py.Object = null;
 var settings_type: py.Object = null;
 var ping_type: py.Object = null;
 var window_update_type: py.Object = null;
-/// Singletons returned when no event is ready / read side is paused.
+/// The two terminal sentinels: NEED_DATA (no event yet) and CONNECTION_CLOSED
+/// (the peer closed). Each is a unique instance compared with `is`; its bare
+/// type (NeedData / ConnectionClosed) is exposed so the Event union can name it.
+var need_data_type: py.Object = null;
+var connection_closed_type: py.Object = null;
 pub var need_data: py.Object = null;
 pub var connection_closed: py.Object = null;
 
@@ -98,9 +105,12 @@ fn member(comptime name: [*c]const u8, comptime offset: usize) py.MemberDef {
 var request_members = [_]py.MemberDef{
     member("method", @offsetOf(RequestObject, "method")),
     member("target", @offsetOf(RequestObject, "target")),
+    member("path", @offsetOf(RequestObject, "path")),
+    member("query", @offsetOf(RequestObject, "query")),
     member("http_version", @offsetOf(RequestObject, "http_version")),
     member("headers", @offsetOf(RequestObject, "headers")),
     member("stream_id", @offsetOf(RequestObject, "stream_id")),
+    .{ .name = "expect_continue", .type = c.Py_T_BOOL, .offset = @intCast(@offsetOf(RequestObject, "expect_continue")), .flags = c.Py_READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var response_members = [_]py.MemberDef{
@@ -154,6 +164,8 @@ fn deallocRequest(o: ?*c.PyObject) callconv(.c) void {
     py.gcUntrack(s);
     py.xdecref(s.method);
     py.xdecref(s.target);
+    py.xdecref(s.path);
+    py.xdecref(s.query);
     py.xdecref(s.http_version);
     py.xdecref(s.headers);
     py.xdecref(s.stream_id);
@@ -238,7 +250,7 @@ fn visitObj(obj: py.Object, visit: c.visitproc, arg: ?*anyopaque) c_int {
 
 fn traverseRequest(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const s: *RequestObject = @ptrCast(o.?);
-    inline for (.{ s.method, s.target, s.http_version, s.headers, s.stream_id }) |f| {
+    inline for (.{ s.method, s.target, s.path, s.query, s.http_version, s.headers, s.stream_id }) |f| {
         const r = visitObj(f, visit, arg);
         if (r != 0) return r;
     }
@@ -248,6 +260,8 @@ fn clearRequest(o: ?*c.PyObject) callconv(.c) c_int {
     const s: *RequestObject = @ptrCast(o.?);
     py.clear(&s.method);
     py.clear(&s.target);
+    py.clear(&s.path);
+    py.clear(&s.query);
     py.clear(&s.http_version);
     py.clear(&s.headers);
     py.clear(&s.stream_id);
@@ -445,6 +459,8 @@ const request_fields = .{
     FieldInfo(RequestObject){ .name = "http_version", .field = "http_version" },
     FieldInfo(RequestObject){ .name = "headers", .field = "headers" },
 };
+// path/query are derived from target, so they're excluded from repr/eq to keep
+// the repr concise and equality non-redundant.
 const response_fields = .{
     FieldInfo(ResponseObject){ .name = "status_code", .field = "status_code" },
     FieldInfo(ResponseObject){ .name = "reason", .field = "reason" },
@@ -671,10 +687,13 @@ fn makeRequest(r: events.Request) py.Object {
     const s: *RequestObject = @ptrCast(o);
     s.method = py.fromBytes(r.method);
     s.target = py.fromBytes(r.target);
+    s.path = py.fromBytes(r.path);
+    s.query = py.fromBytes(r.query);
     s.http_version = py.fromBytes(r.http_version);
     s.headers = buildHeaders(r.headers);
     s.stream_id = u32Obj(r.stream_id);
-    if (s.method == null or s.target == null or s.http_version == null or s.headers == null or s.stream_id == null) {
+    s.expect_continue = @intFromBool(r.expect_continue);
+    if (s.method == null or s.target == null or s.path == null or s.query == null or s.http_version == null or s.headers == null or s.stream_id == null) {
         py.decref(o);
         return null;
     }
@@ -824,9 +843,14 @@ pub fn register(module: py.Object) bool {
         return false;
     }
 
-    // NEED_DATA / ConnectionClosed are unique sentinel instances of bare types.
-    need_data = makeSentinel("zttp.NeedDataType");
-    connection_closed = makeSentinel("zttp.ConnectionClosedType");
+    // NEED_DATA / CONNECTION_CLOSED are unique sentinel instances of bare types;
+    // we keep both the instance (compared with `is`) and the type so the Event
+    // union can name it.
+    need_data_type = py.typeFromSpec(&need_data_spec);
+    connection_closed_type = py.typeFromSpec(&connection_closed_spec);
+    if (need_data_type == null or connection_closed_type == null) return false;
+    need_data = py.allocInstance(need_data_type);
+    connection_closed = py.allocInstance(connection_closed_type);
     if (need_data == null or connection_closed == null) return false;
 
     if (!buildInternTable()) return false;
@@ -841,16 +865,13 @@ pub fn register(module: py.Object) bool {
     _ = c.PyModule_AddObjectRef(module, "Ping", ping_type);
     _ = c.PyModule_AddObjectRef(module, "WindowUpdate", window_update_type);
     _ = c.PyModule_AddObjectRef(module, "NEED_DATA", need_data);
-    _ = c.PyModule_AddObjectRef(module, "ConnectionClosed", connection_closed);
+    _ = c.PyModule_AddObjectRef(module, "NeedData", need_data_type);
+    _ = c.PyModule_AddObjectRef(module, "CONNECTION_CLOSED", connection_closed);
+    _ = c.PyModule_AddObjectRef(module, "ConnectionClosed", connection_closed_type);
     return true;
 }
 
-var sentinel_slots = [_]py.Slot{.{ .slot = 0, .pfunc = null }};
-
-fn makeSentinel(comptime name: [*c]const u8) py.Object {
-    var sp = py.Spec{ .name = name, .basicsize = @sizeOf(c.PyObject), .itemsize = 0, .flags = c.Py_TPFLAGS_DEFAULT, .slots = &sentinel_slots };
-    const tp = py.typeFromSpec(&sp);
-    if (tp == null) return null;
-    defer py.decref(tp);
-    return py.allocInstance(tp);
-}
+var need_data_slots = [_]py.Slot{.{ .slot = 0, .pfunc = null }};
+var need_data_spec = py.Spec{ .name = "zttp.NeedData", .basicsize = @sizeOf(c.PyObject), .itemsize = 0, .flags = c.Py_TPFLAGS_DEFAULT, .slots = &need_data_slots };
+var connection_closed_slots = [_]py.Slot{.{ .slot = 0, .pfunc = null }};
+var connection_closed_spec = py.Spec{ .name = "zttp.ConnectionClosed", .basicsize = @sizeOf(c.PyObject), .itemsize = 0, .flags = c.Py_TPFLAGS_DEFAULT, .slots = &connection_closed_slots };

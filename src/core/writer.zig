@@ -7,13 +7,26 @@
 const std = @import("std");
 const tables = @import("tables.zig");
 const events = @import("events.zig");
+const framing = @import("framing.zig");
 
 const Header = events.Header;
+const responseIsBodyless = framing.responseIsBodyless;
 
 pub const WriteError = error{
-    /// A send was attempted in a state that does not allow it (e.g. data before
-    /// the head, or a second head before the first message ended).
-    LocalProtocol,
+    /// A head was sent while a message was still in progress.
+    MessageNotEnded,
+    /// Body bytes were sent when none can be: before a head, or on a message
+    /// whose framing carries no body.
+    NoBodyAllowed,
+    /// More body bytes were sent than the declared Content-Length allows.
+    BodyTooLong,
+    /// The message was ended before the declared Content-Length was reached.
+    BodyTooShort,
+    /// Trailers were passed to a message that cannot carry them - only a chunked
+    /// body has a place for trailers on the wire.
+    TrailersNotAllowed,
+    /// The message was ended when none was in progress.
+    NoMessageInProgress,
     /// A field (method/target/version/reason/header) contained bytes that would
     /// break the wire grammar - CR, LF, NUL or other controls. Serializing them
     /// verbatim would allow header/response-splitting injection.
@@ -114,6 +127,10 @@ pub const Writer = struct {
     gpa: std.mem.Allocator,
     out: std.ArrayList(u8) = .empty,
     state: State = .idle,
+    /// Bytes still owed under a fixed Content-Length. Sending more than declared,
+    /// or ending the message with bytes still owed, is a local protocol error -
+    /// it would put a malformed message on the wire.
+    body_remaining: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator) Writer {
         return .{ .gpa = gpa };
@@ -144,7 +161,7 @@ pub const Writer = struct {
 
     /// Serialize a request-line + headers. `framing` decides body handling.
     pub fn sendRequest(self: *Writer, method: []const u8, target: []const u8, version: []const u8, hdrs: []const Header) WriteError!void {
-        if (self.state != .idle) return error.LocalProtocol;
+        if (self.state != .idle) return error.MessageNotEnded;
         try validLineToken(method, false);
         try validLineToken(target, false);
         const ver = try normalizeVersion(version);
@@ -156,12 +173,16 @@ pub const Writer = struct {
         try self.w(ver);
         try self.w("\r\n");
         try self.writeHeaders(hdrs);
-        self.state = bodyStateFor(hdrs);
+        const framing_ = bodyStateFor(hdrs);
+        self.state = framing_.state;
+        self.body_remaining = framing_.length;
     }
 
-    /// Serialize a status-line + headers.
-    pub fn sendResponse(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header, bodyless: bool) WriteError!void {
-        if (self.state != .idle) return error.LocalProtocol;
+    /// Serialize a status-line + headers. `request_method` is the method this
+    /// response answers; together with the status it decides whether the response
+    /// is bodyless (RFC 9112 6.3), so the caller never tracks framing by hand.
+    pub fn sendResponse(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header, request_method: []const u8) WriteError!void {
+        if (self.state != .idle) return error.MessageNotEnded;
         const ver = try normalizeVersion(version);
         try validLineToken(reason, true); // reason-phrase may contain SP/HTAB
         try validateHeaders(hdrs);
@@ -177,7 +198,14 @@ pub const Writer = struct {
         try self.w(reason);
         try self.w("\r\n");
         try self.writeHeaders(hdrs);
-        self.state = if (bodyless) .body_none else bodyStateFor(hdrs);
+        if (responseIsBodyless(request_method, status)) {
+            self.state = .body_none;
+            self.body_remaining = 0;
+        } else {
+            const framing_ = bodyStateFor(hdrs);
+            self.state = framing_.state;
+            self.body_remaining = framing_.length;
+        }
     }
 
     fn writeHeaders(self: *Writer, hdrs: []const Header) WriteError!void {
@@ -194,7 +222,11 @@ pub const Writer = struct {
     /// chunked transfer-coding.
     pub fn sendData(self: *Writer, data: []const u8) WriteError!void {
         switch (self.state) {
-            .body_length => try self.w(data),
+            .body_length => {
+                if (data.len > self.body_remaining) return error.BodyTooLong;
+                try self.w(data);
+                self.body_remaining -= data.len;
+            },
             .body_chunked => {
                 if (data.len == 0) return; // empty write is not a terminator
                 var size_buf: [18]u8 = undefined;
@@ -203,12 +235,14 @@ pub const Writer = struct {
                 try self.w(data);
                 try self.w("\r\n");
             },
-            else => return error.LocalProtocol,
+            else => return error.NoBodyAllowed,
         }
     }
 
     /// Finish the message. For chunked, writes the terminating 0-chunk and any
-    /// trailers; otherwise just resets to idle for the next message.
+    /// trailers; otherwise just resets to idle for the next message. Trailers are
+    /// only framable after a chunked body, so passing them with any other framing
+    /// is a local protocol error - there is nowhere on the wire to put them.
     pub fn endMessage(self: *Writer, trailers: []const Header) WriteError!void {
         switch (self.state) {
             .body_chunked => {
@@ -222,8 +256,14 @@ pub const Writer = struct {
                 }
                 try self.w("\r\n");
             },
-            .body_length, .body_none => {},
-            .idle => return error.LocalProtocol,
+            .body_length => {
+                if (self.body_remaining != 0) return error.BodyTooShort;
+                if (trailers.len != 0) return error.TrailersNotAllowed;
+            },
+            .body_none => {
+                if (trailers.len != 0) return error.TrailersNotAllowed;
+            },
+            .idle => return error.NoMessageInProgress,
         }
         self.state = .idle;
     }
@@ -235,17 +275,32 @@ fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+const BodyFraming = struct { state: State, length: u64 = 0 };
+
 /// Pick the body state from the headers the caller supplied: chunked if
 /// Transfer-Encoding is present, else length if Content-Length is present, else
-/// none. The caller is trusted to provide consistent framing headers.
-fn bodyStateFor(hdrs: []const Header) State {
+/// none. For a fixed length, also returns the declared count so the writer can
+/// hold the caller to it. The caller is trusted to provide consistent framing
+/// headers (validateFraming already rejected the ambiguous combinations).
+fn bodyStateFor(hdrs: []const Header) BodyFraming {
     for (hdrs) |h| {
-        if (eqIgnoreCase(h.name, "transfer-encoding")) return .body_chunked;
+        if (eqIgnoreCase(h.name, "transfer-encoding")) return .{ .state = .body_chunked };
     }
     for (hdrs) |h| {
-        if (eqIgnoreCase(h.name, "content-length")) return .body_length;
+        if (eqIgnoreCase(h.name, "content-length")) {
+            const n = parseLength(trimOws(h.value));
+            return if (n == 0) .{ .state = .body_none } else .{ .state = .body_length, .length = n };
+        }
     }
-    return .body_none;
+    return .{ .state = .body_none };
+}
+
+/// Parse a digits-only Content-Length. validateFraming already rejected
+/// non-digit and conflicting values, so this only sees valid input.
+fn parseLength(v: []const u8) u64 {
+    var n: u64 = 0;
+    for (v) |ch| n = n * 10 + (ch - '0');
+    return n;
 }
 
 const t = std.testing;
@@ -257,7 +312,7 @@ test "serialize a simple response" {
         .{ .name = "Content-Type", .value = "text/plain" },
         .{ .name = "Content-Length", .value = "5" },
     };
-    try wr.sendResponse("1.1", 200, "OK", &hdrs, false);
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     try wr.sendData("hello");
     try wr.endMessage(&.{});
     try t.expectEqualStrings(
@@ -289,14 +344,14 @@ test "invalid version rejected" {
     try t.expectError(error.InvalidField, wr.sendRequest("GET", "/", "1.1.1", &.{}));
     var wr2 = Writer.init(t.allocator);
     defer wr2.deinit();
-    try t.expectError(error.InvalidField, wr2.sendResponse("garbage", 200, "OK", &.{}, true));
+    try t.expectError(error.InvalidField, wr2.sendResponse("garbage", 200, "OK", &.{}, "GET"));
 }
 
 test "chunked response framing" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
-    try wr.sendResponse("1.1", 200, "OK", &hdrs, false);
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     try wr.sendData("Wiki");
     try wr.sendData("pedia");
     try wr.endMessage(&.{});
@@ -311,7 +366,7 @@ test "chunked with trailers" {
     defer wr.deinit();
     const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
     const trailers = [_]Header{.{ .name = "X-Checksum", .value = "abc" }};
-    try wr.sendResponse("1.1", 200, "OK", &hdrs, false);
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     try wr.sendData("data");
     try wr.endMessage(&trailers);
     try t.expectEqualStrings(
@@ -323,28 +378,99 @@ test "chunked with trailers" {
 test "status code formatting" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    try wr.sendResponse("1.1", 404, "Not Found", &.{}, true);
+    try wr.sendResponse("1.1", 404, "Not Found", &.{}, "GET");
     try wr.endMessage(&.{});
     try t.expectEqualStrings("HTTP/1.1 404 Not Found\r\n\r\n", wr.pending());
+}
+
+test "HEAD response is bodyless despite Content-Length" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "1234" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "HEAD");
+    try t.expectError(error.NoBodyAllowed, wr.sendData("x"));
+    try wr.endMessage(&.{});
+    try t.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n", wr.pending());
 }
 
 test "data before head is rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    try t.expectError(error.LocalProtocol, wr.sendData("x"));
+    try t.expectError(error.NoBodyAllowed, wr.sendData("x"));
+}
+
+test "oversized body rejected against Content-Length" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "5" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+    try t.expectError(error.BodyTooLong, wr.sendData("abcdef")); // 6 > 5
+}
+
+test "oversized body rejected across multiple writes" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "5" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+    try wr.sendData("abc");
+    try t.expectError(error.BodyTooLong, wr.sendData("def")); // 3 + 3 > 5
+}
+
+test "undersized body rejected at end_message" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "5" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+    try wr.sendData("abc");
+    try t.expectError(error.BodyTooShort, wr.endMessage(&.{})); // 2 bytes still owed
+}
+
+test "exact-length body is accepted" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "5" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+    try wr.sendData("ab");
+    try wr.sendData("cde");
+    try wr.endMessage(&.{});
+    try t.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde", wr.pending());
+}
+
+test "trailers rejected on a Content-Length body" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "3" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+    try wr.sendData("abc");
+    const trailers = [_]Header{.{ .name = "X-Checksum", .value = "abc" }};
+    try t.expectError(error.TrailersNotAllowed, wr.endMessage(&trailers));
+}
+
+test "trailers rejected on a bodyless message" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try wr.sendResponse("1.1", 204, "No Content", &.{}, "GET");
+    const trailers = [_]Header{.{ .name = "X-Checksum", .value = "abc" }};
+    try t.expectError(error.TrailersNotAllowed, wr.endMessage(&trailers));
 }
 
 test "two heads without ending is rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    try wr.sendResponse("1.1", 200, "OK", &.{}, true);
-    try t.expectError(error.LocalProtocol, wr.sendResponse("1.1", 200, "OK", &.{}, true));
+    try wr.sendResponse("1.1", 200, "OK", &.{}, "GET");
+    try t.expectError(error.MessageNotEnded, wr.sendResponse("1.1", 200, "OK", &.{}, "GET"));
+}
+
+test "end_message with no message in progress is rejected" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try t.expectError(error.NoMessageInProgress, wr.endMessage(&.{}));
 }
 
 test "take transfers ownership and empties" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    try wr.sendResponse("1.1", 204, "No Content", &.{}, true);
+    try wr.sendResponse("1.1", 204, "No Content", &.{}, "GET");
     try wr.endMessage(&.{});
     const owned = wr.take();
     defer t.allocator.free(owned);
@@ -355,14 +481,14 @@ test "take transfers ownership and empties" {
 test "send-path injection: CRLF in reason rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK\r\nX-Evil: 1", &.{}, true));
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK\r\nX-Evil: 1", &.{}, "GET"));
 }
 
 test "send-path injection: CRLF in header value rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     const h = [_]Header{.{ .name = "X", .value = "a\r\nInjected: yes" }};
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, true));
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }
 
 test "send-path injection: bad header name rejected" {
@@ -382,7 +508,7 @@ test "send-path injection: CRLF in trailer rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
-    try wr.sendResponse("1.1", 200, "OK", &hdrs, false);
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     const trailers = [_]Header{.{ .name = "X", .value = "v\r\nInjected: 1" }};
     try t.expectError(error.InvalidField, wr.endMessage(&trailers));
 }
@@ -394,7 +520,7 @@ test "send rejects ambiguous framing (TE + CL)" {
         .{ .name = "Transfer-Encoding", .value = "chunked" },
         .{ .name = "Content-Length", .value = "5" },
     };
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, false));
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }
 
 test "send rejects conflicting duplicate Content-Length" {
@@ -404,12 +530,12 @@ test "send rejects conflicting duplicate Content-Length" {
         .{ .name = "Content-Length", .value = "5" },
         .{ .name = "Content-Length", .value = "6" },
     };
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, false));
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }
 
 test "send rejects non-digit Content-Length" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     const h = [_]Header{.{ .name = "Content-Length", .value = "5x" }};
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, false));
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }

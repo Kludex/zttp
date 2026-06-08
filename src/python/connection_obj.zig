@@ -33,6 +33,15 @@ const ConnectionObject = extern struct {
     reader: ?*Reader,
     writer: ?*Writer,
     h2: ?*H2Connection,
+    /// The method of the message the next response answers (server: the parsed
+    /// request; client: the request we sent), so the connection auto-derives
+    /// bodyless framing. Cleared per cycle by start_next_cycle.
+    req_method: [16]u8,
+    req_method_len: usize,
+    /// Connection signals for the last parsed request, captured at event time so
+    /// they outlive the head buffer. `upgrade_obj` is held Python bytes (or null).
+    should_close: bool,
+    upgrade_obj: py.Object,
 };
 
 var connection_type: py.Object = null;
@@ -59,6 +68,9 @@ fn new(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c
     self.reader = null;
     self.writer = null;
     self.h2 = null;
+    self.req_method_len = 0;
+    self.should_close = false;
+    self.upgrade_obj = null;
 
     if (protocol_val == HTTP2) {
         const h = gpa.create(H2Connection) catch {
@@ -100,6 +112,7 @@ fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
         h.deinit();
         gpa.destroy(h);
     }
+    py.xdecref(self.upgrade_obj);
     py.freeInstance(@ptrCast(self));
 }
 
@@ -115,6 +128,15 @@ fn receive_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Objec
     return py.none();
 }
 
+fn rememberMethod(self: *ConnectionObject, method: []const u8) void {
+    if (method.len > self.req_method.len) {
+        self.req_method_len = 0;
+        return;
+    }
+    @memcpy(self.req_method[0..method.len], method);
+    self.req_method_len = method.len;
+}
+
 fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     if (self.h2) |h| {
@@ -123,6 +145,12 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     }
     const r = self.reader orelse return py.raiseRuntime("connection is closed");
     const ev = r.nextEvent() catch |e| return exceptions.raiseParse(e);
+    if (ev == .request) {
+        rememberMethod(self, ev.request.method);
+        self.should_close = r.shouldClose();
+        py.xdecref(self.upgrade_obj);
+        self.upgrade_obj = if (r.upgrade()) |u| py.fromBytes(u) else null;
+    }
     return events_obj.fromH1Event(ev);
 }
 
@@ -208,6 +236,8 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
     var hdrs = borrowHeaders(hdrs_seq) orelse return null;
     defer hdrs.deinit();
     wc.sendRequest(mb, tb, vb, hdrs.headers) catch |e| return raiseWrite(e);
+    rememberMethod(self, mb);
+    if (self.reader) |r| r.setRequestMethod(mb);
     return py.none();
 }
 
@@ -218,14 +248,14 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     var status: c_long = 0;
     var reason: ?*c.PyObject = null;
     var hdrs_seq: ?*c.PyObject = null;
-    var bodyless: c_int = 0;
-    if (c.PyArg_ParseTuple(args, "OlOO|p", &version, &status, &reason, &hdrs_seq, &bodyless) == 0) return null;
+    if (c.PyArg_ParseTuple(args, "OlOO", &version, &status, &reason, &hdrs_seq) == 0) return null;
     if (status < 0 or status > 999) return py.raiseValue("status code out of range");
     const vb = py.asBytes(version) orelse return null;
     const rb = py.asBytes(reason) orelse return null;
     var hdrs = borrowHeaders(hdrs_seq) orelse return null;
     defer hdrs.deinit();
-    wc.sendResponse(vb, @intCast(status), rb, hdrs.headers, bodyless != 0) catch |e| return raiseWrite(e);
+    const method = self.req_method[0..self.req_method_len];
+    wc.sendResponse(vb, @intCast(status), rb, hdrs.headers, method) catch |e| return raiseWrite(e);
     return py.none();
 }
 
@@ -262,10 +292,16 @@ fn data_to_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
 }
 
 fn raiseWrite(e: core.writer.WriteError) py.Object {
+    const local = exceptions.LocalProtocolError;
     return switch (e) {
         error.OutOfMemory => c.PyErr_NoMemory(),
-        error.LocalProtocol => py.raise(exceptions.LocalProtocolError, "invalid send for current connection state"),
-        error.InvalidField => py.raise(exceptions.LocalProtocolError, "invalid field: a header/method/target/version/reason was malformed or contained CR/LF/control bytes"),
+        error.MessageNotEnded => py.raise(local, "a message is already in progress: end it before sending another head"),
+        error.NoBodyAllowed => py.raise(local, "cannot send body data now: send a head first, or this message takes no body"),
+        error.BodyTooLong => py.raise(local, "sent more body than the declared Content-Length"),
+        error.BodyTooShort => py.raise(local, "the message ended before the declared Content-Length was reached"),
+        error.TrailersNotAllowed => py.raise(local, "trailers can only follow a chunked body"),
+        error.NoMessageInProgress => py.raise(local, "no message is in progress to end"),
+        error.InvalidField => py.raise(local, "invalid field: a header/method/target/version/reason was malformed or contained CR/LF/control bytes"),
     };
 }
 
@@ -274,26 +310,36 @@ fn next_message(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const r = self.reader orelse return py.raiseRuntime("connection is closed");
     r.reset();
+    self.req_method_len = 0;
+    self.should_close = false;
+    py.xdecref(self.upgrade_obj);
+    self.upgrade_obj = null;
     return py.none();
 }
 
-fn expect_bodyless(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+fn should_close(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const r = self.reader orelse return py.raiseRuntime("connection is closed");
-    r.expectBodyless();
-    return py.none();
+    return py.boolean(self.should_close);
+}
+
+fn upgrade(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const obj = self.upgrade_obj orelse return py.none();
+    py.incref(obj);
+    return obj;
 }
 
 var methods = [_]py.MethodDef{
     .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
     .{ .ml_name = "next_event", .ml_meth = next_event, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the next parse event, or NEED_DATA." },
     .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
-    .{ .ml_name = "expect_bodyless", .ml_meth = expect_bodyless, .ml_flags = c.METH_NOARGS, .ml_doc = "Declare the next response has no body (HEAD / 1xx / 204 / 304); call before parsing its head." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
-    .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(version, status, reason, headers, bodyless=False)." },
+    .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(version, status, reason, headers). Bodyless framing (HEAD / 1xx / 204 / 304) is derived automatically." },
     .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
     .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
+    .{ .ml_name = "should_close", .ml_meth = should_close, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request (Connection: close / HTTP/1.0)." },
+    .{ .ml_name = "upgrade", .ml_meth = upgrade, .ml_flags = c.METH_NOARGS, .ml_doc = "The last request's Upgrade value if it asked to upgrade (Connection: upgrade), else None." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

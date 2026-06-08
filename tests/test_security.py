@@ -91,8 +91,8 @@ def test_bare_lf_request_rejected_by_default() -> None:
 @pytest.mark.parametrize(
     "call",
     [
-        lambda c: c.send_response(b"1.1", 200, b"OK\r\nX-Evil: 1", [], True),
-        lambda c: c.send_response(b"1.1", 200, b"OK", [(b"X", b"a\r\nInjected: 1")], True),
+        lambda c: c.send_response(b"1.1", 200, b"OK\r\nX-Evil: 1", []),
+        lambda c: c.send_response(b"1.1", 200, b"OK", [(b"X", b"a\r\nInjected: 1")]),
         lambda c: c.send_request(b"GET", b"/ HTTP/1.1\r\nX: y", b"1.1", []),
         lambda c: c.send_request(b"GET", b"/", b"1.1", [(b"Bad Name", b"x")]),
     ],

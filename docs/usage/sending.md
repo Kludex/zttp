@@ -12,7 +12,7 @@ would corrupt the wire.
 There are four building blocks, plus one call to collect the output:
 
 * `send_request(method, target, version, headers)` - a request head.
-* `send_response(version, status, reason, headers, bodyless=False)` - a response head.
+* `send_response(version, status, reason, headers)` - a response head.
 * `send_data(data)` - a run of body bytes.
 * `end_message(trailers=None)` - finish the message.
 * `data_to_send()` - take and clear the bytes produced so far.
@@ -21,7 +21,7 @@ There are four building blocks, plus one call to collect the output:
 
 As a **server**, you answer a request:
 
-```python title="respond.py" hl_lines="12"
+```python title="respond.py" hl_lines="5 9 10"
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)
@@ -85,14 +85,37 @@ print(conn.data_to_send())
 ## Bodyless responses
 
 Some responses have no body no matter what (a `204`, a `304`, the reply to a
-`HEAD`). Pass `bodyless=True` so the framing stays correct:
+`HEAD`). You don't flag this - zttp derives it from the response status and the
+request method it parsed, so the framing stays correct on its own:
 
 ```python
-conn.send_response(b"1.1", 204, b"No Content", [], bodyless=True)
+conn.send_response(b"1.1", 204, b"No Content", [])
 conn.end_message()
 print(conn.data_to_send())
 #> b'HTTP/1.1 204 No Content\r\n\r\n'
 ```
+
+A `HEAD` response is the subtle case: it carries the `Content-Length` the `GET`
+would have, but no bytes. Because the connection remembers the request was a
+`HEAD`, `send_data` is refused and no body is framed - you don't track it.
+
+## It holds you to the Content-Length
+
+When you declare a `Content-Length`, zttp counts the body bytes you send against
+it. Sending more than you promised, or ending the message with bytes still owed,
+is refused - either would put a malformed message on the wire:
+
+```python
+import zttp
+
+conn = zttp.Connection(zttp.SERVER)
+conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"5")])
+conn.send_data(b"too long")
+#> zttp.LocalProtocolError: invalid send for current connection state
+```
+
+For a body of unknown length, use `Transfer-Encoding: chunked` instead - then
+`send_data` frames each run for you and there's nothing to count.
 
 ## It won't let you split the response
 
@@ -103,7 +126,7 @@ reason phrase, or target - the classic response-splitting trick - is refused:
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)
-conn.send_response(b"1.1", 200, b"OK", [(b"X-Evil", b"a\r\nInjected: yes")], True)
+conn.send_response(b"1.1", 200, b"OK", [(b"X-Evil", b"a\r\nInjected: yes")])
 #> zttp.LocalProtocolError: invalid field: a header/method/target/version/reason was malformed or contained CR/LF/control bytes
 ```
 

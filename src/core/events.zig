@@ -21,10 +21,18 @@ pub const Header = struct {
 pub const Request = struct {
     method: []const u8,
     target: []const u8,
+    /// The target split at the first `?`: `path` excludes it, `query` excludes the
+    /// `?` (empty when absent). Both verbatim - no percent-decoding. For the usual
+    /// origin-form target (`/p?x=1`) this is the only split a consumer needs.
+    path: []const u8,
+    query: []const u8,
     /// The version number only, e.g. "1.1" or "1.0" (the "HTTP/" is stripped).
     http_version: []const u8,
     headers: []const Header,
     stream_id: u32 = 0,
+    /// Whether the request carried `Expect: 100-continue`. Per-request (a stream
+    /// property under HTTP/2), so it rides the event rather than the connection.
+    expect_continue: bool = false,
 };
 
 /// The start of a response (client role): status code, reason phrase, version,
@@ -128,6 +136,8 @@ test "H1 event union round-trips a request" {
     const ev = H1Event{ .request = .{
         .method = "GET",
         .target = "/",
+        .path = "/",
+        .query = "",
         .http_version = "1.1",
         .headers = &hdrs,
     } };
@@ -139,6 +149,8 @@ test "H2 event union carries a stream-tagged request" {
     const ev = H2Event{ .request = .{
         .method = "GET",
         .target = "/",
+        .path = "/",
+        .query = "",
         .http_version = "2",
         .headers = &.{},
         .stream_id = 3,
