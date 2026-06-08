@@ -257,8 +257,9 @@ const testing = std.testing;
 
 // Build one Initial packet the way a peer would, so the connection can decrypt
 // it: frame the payload, seal it with the sender's Initial keys, and apply header
-// protection. Returns an owned datagram the caller frees.
-fn buildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
+// protection. Returns an owned datagram the caller frees. Exposed (test-only) so
+// the HTTP/3 layer's tests can drive a request through the real transport.
+pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
     const keys = blk: {
         const ik = crypto.InitialKeys.derive(dcid);
         break :blk if (sender == .client) ik.client else ik.server;
@@ -298,7 +299,7 @@ test "server decrypts a client Initial and reassembles a stream" {
     // A CRYPTO-less payload: a STREAM frame (type 0x0b = OFF=0,LEN,FIN) on stream
     // 0 carrying "hi". 0x0a actually = LEN|FIN with no OFF; id=0,len=2,"hi".
     const frames = [_]u8{ 0x0b, 0x00, 0x02, 'h', 'i' }; // 0x0b = base|LEN|FIN
-    const dgram = try buildInitial(gpa, &dcid, .client, 0, &frames);
+    const dgram = try testBuildInitial(gpa, &dcid, .client, 0, &frames);
     defer gpa.free(dgram);
 
     try conn.receiveDatagram(dgram, 1000);
@@ -313,7 +314,7 @@ test "a tampered Initial is dropped, not fatal" {
     defer conn.deinit();
     // PING then PADDING so the packet is long enough for the 16-octet HP sample.
     const frames = [_]u8{ 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    const dgram = try buildInitial(gpa, &dcid, .client, 0, &frames);
+    const dgram = try testBuildInitial(gpa, &dcid, .client, 0, &frames);
     defer gpa.free(dgram);
     dgram[dgram.len - 1] ^= 0xff; // corrupt the tag
     try conn.receiveDatagram(dgram, 1000); // does not raise
@@ -326,7 +327,7 @@ test "consume re-grants connection flow-control credit" {
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
     const frames = [_]u8{ 0x0a, 0x00, 0x03, 'a', 'b', 'c' }; // STREAM id0 LEN, "abc", no FIN
-    const dgram = try buildInitial(gpa, &dcid, .client, 0, &frames);
+    const dgram = try testBuildInitial(gpa, &dcid, .client, 0, &frames);
     defer gpa.free(dgram);
     try conn.receiveDatagram(dgram, 1000);
     try testing.expectEqualStrings("abc", conn.streamData(0));

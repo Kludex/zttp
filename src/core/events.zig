@@ -131,6 +131,22 @@ pub const H2Event = union(enum) {
     window_update: WindowUpdate,
 };
 
+/// The events the HTTP/3 engine produces. It shares the request/response/data/
+/// end-of-message payloads with H1 and H2, and like H2 has its own union: HTTP/3
+/// keeps only the control events it actually has (`settings`, `goaway`) - flow
+/// control, PING, and RST live down in QUIC, not in the HTTP/3 framing. The
+/// `stream_id` on the shared payloads carries the QUIC request-stream id
+/// (truncated to the shared u32 field; widening it to u64 is a follow-up).
+pub const H3Event = union(enum) {
+    request: Request,
+    response: Response,
+    data: Data,
+    end_of_message: EndOfMessage,
+    need_data,
+    settings: SettingsEvent,
+    goaway: Goaway,
+};
+
 test "H1 event union round-trips a request" {
     const hdrs = [_]Header{.{ .name = "Host", .value = "example.com" }};
     const ev = H1Event{ .request = .{

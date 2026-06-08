@@ -15,7 +15,7 @@ const std = @import("std");
 const static_table = @import("static_table.zig");
 const huffman = @import("../../h2/hpack/huffman.zig");
 
-pub const Header = struct { name: []const u8, value: []const u8 };
+pub const Header = @import("../../events.zig").Header;
 
 pub const Error = error{
     /// The block is truncated, an integer overflows, or a Huffman string is
