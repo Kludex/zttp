@@ -4,7 +4,13 @@
 //! build step. Built bottom-up; modules are added here as each layer lands.
 
 pub const varint = @import("varint.zig");
+pub const constants = @import("constants.zig");
+pub const frame = @import("frame.zig");
+pub const packet = @import("packet.zig");
 
 test {
     _ = varint;
+    _ = constants;
+    _ = frame;
+    _ = packet;
 }
