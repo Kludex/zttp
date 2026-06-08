@@ -11,6 +11,7 @@ pub const connection = @import("connection.zig");
 pub const reader = @import("reader.zig");
 pub const writer = @import("writer.zig");
 pub const h2 = @import("h2/root.zig");
+pub const quic = @import("quic/root.zig");
 
 test {
     _ = tables;
@@ -24,4 +25,5 @@ test {
     _ = reader;
     _ = writer;
     _ = h2;
+    _ = quic;
 }
