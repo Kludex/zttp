@@ -46,6 +46,21 @@ def test_exact_length_body_accepted() -> None:
     assert conn.data_to_send() == b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde"
 
 
+def test_trailers_rejected_on_content_length_body() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"3")])
+    conn.send_data(b"abc")
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.end_message([(b"X-Checksum", b"abc")])
+
+
+def test_trailers_rejected_on_bodyless_message() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.send_response(b"1.1", 204, b"No Content", [])
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.end_message([(b"X-Checksum", b"abc")])
+
+
 def test_send_request() -> None:
     conn = zttp.Connection(zttp.CLIENT)
     conn.send_request(b"GET", b"/", b"1.1", [(b"Host", b"example.com")])

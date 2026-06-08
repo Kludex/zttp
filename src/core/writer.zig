@@ -229,7 +229,9 @@ pub const Writer = struct {
     }
 
     /// Finish the message. For chunked, writes the terminating 0-chunk and any
-    /// trailers; otherwise just resets to idle for the next message.
+    /// trailers; otherwise just resets to idle for the next message. Trailers are
+    /// only framable after a chunked body, so passing them with any other framing
+    /// is a local protocol error - there is nowhere on the wire to put them.
     pub fn endMessage(self: *Writer, trailers: []const Header) WriteError!void {
         switch (self.state) {
             .body_chunked => {
@@ -245,8 +247,11 @@ pub const Writer = struct {
             },
             .body_length => {
                 if (self.body_remaining != 0) return error.LocalProtocol; // under Content-Length
+                if (trailers.len != 0) return error.LocalProtocol; // Content-Length and trailers don't mix
             },
-            .body_none => {},
+            .body_none => {
+                if (trailers.len != 0) return error.LocalProtocol; // no body, nowhere for trailers
+            },
             .idle => return error.LocalProtocol,
         }
         self.state = .idle;
@@ -418,6 +423,24 @@ test "exact-length body is accepted" {
     try wr.sendData("cde");
     try wr.endMessage(&.{});
     try t.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde", wr.pending());
+}
+
+test "trailers rejected on a Content-Length body" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "3" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+    try wr.sendData("abc");
+    const trailers = [_]Header{.{ .name = "X-Checksum", .value = "abc" }};
+    try t.expectError(error.LocalProtocol, wr.endMessage(&trailers));
+}
+
+test "trailers rejected on a bodyless message" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try wr.sendResponse("1.1", 204, "No Content", &.{}, "GET");
+    const trailers = [_]Header{.{ .name = "X-Checksum", .value = "abc" }};
+    try t.expectError(error.LocalProtocol, wr.endMessage(&trailers));
 }
 
 test "two heads without ending is rejected" {
