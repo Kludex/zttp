@@ -10,6 +10,8 @@ pub const packet = @import("packet.zig");
 pub const crypto = @import("crypto.zig");
 pub const congestion = @import("congestion.zig");
 pub const recovery = @import("recovery.zig");
+pub const flow = @import("flow.zig");
+pub const stream = @import("stream.zig");
 
 test {
     _ = varint;
@@ -19,4 +21,6 @@ test {
     _ = crypto;
     _ = congestion;
     _ = recovery;
+    _ = flow;
+    _ = stream;
 }
