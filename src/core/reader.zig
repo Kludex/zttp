@@ -88,6 +88,11 @@ pub const Reader = struct {
     /// Set by the connection layer before headers are parsed: responses to HEAD
     /// etc. have no body whatever the headers say.
     next_bodyless: bool = false,
+    /// The method the client sent for the in-flight request, so the reader can
+    /// auto-frame the matching response as bodyless (HEAD/CONNECT) without the
+    /// caller calling `expectBodyless`. Empty when unknown. Server-side unused.
+    request_method: [16]u8 = undefined,
+    request_method_len: usize = 0,
     eof_seen: bool = false,
     /// The error that poisoned the connection, re-raised on every later call.
     failed_with: ParseError = error.ProtocolError,
@@ -127,6 +132,19 @@ pub const Reader = struct {
         self.next_bodyless = true;
     }
 
+    /// Remember the method the client just sent, so the reader frames the
+    /// matching response as bodyless for HEAD/CONNECT (RFC 9112 6.3) without an
+    /// explicit `expectBodyless`. A method longer than the buffer simply does not
+    /// trigger the method-based rule; the status-based rule still applies.
+    pub fn setRequestMethod(self: *Reader, method: []const u8) void {
+        if (method.len > self.request_method.len) {
+            self.request_method_len = 0;
+            return;
+        }
+        @memcpy(self.request_method[0..method.len], method);
+        self.request_method_len = method.len;
+    }
+
     /// Prepare to read the next message on the same connection (keep-alive).
     /// A poisoned (`.failed`) connection stays poisoned: a parse error is
     /// terminal, so reset cannot revive a desynchronized byte stream.
@@ -141,6 +159,7 @@ pub const Reader = struct {
         self.body_remaining = 0;
         self.chunk = .{};
         self.next_bodyless = false;
+        self.request_method_len = 0;
     }
 
     fn compact(self: *Reader) void {
@@ -236,14 +255,13 @@ pub const Reader = struct {
             self.headers.append(self.gpa, h) catch return error.MessageTooLong;
         }
 
-        const f = try framing_mod.determine(self.headers.items, .{
-            .bodyless = self.next_bodyless,
-            .until_close_default = self.role == .client,
-        });
-        self.enterBody(f);
-
         if (self.role == .server) {
             const rl = try headers_mod.parseRequestLine(first);
+            const f = try framing_mod.determine(self.headers.items, .{
+                .bodyless = self.next_bodyless,
+                .until_close_default = false,
+            });
+            self.enterBody(f);
             return .{ .request = .{
                 .method = rl.method,
                 .target = rl.target,
@@ -252,6 +270,13 @@ pub const Reader = struct {
             } };
         } else {
             const st = try headers_mod.parseStatusLine(first);
+            const method = self.request_method[0..self.request_method_len];
+            const bodyless = self.next_bodyless or framing_mod.responseIsBodyless(method, st.status_code);
+            const f = try framing_mod.determine(self.headers.items, .{
+                .bodyless = bodyless,
+                .until_close_default = true,
+            });
+            self.enterBody(f);
             return .{ .response = .{
                 .status_code = st.status_code,
                 .reason = st.reason,
@@ -513,6 +538,35 @@ test "client response until close" {
     try t.expectEqualStrings("body bytes here", d.data.data);
     try expectTag(.need_data, try r.nextEvent());
     try r.feed(""); // EOF
+    try expectTag(.end_of_message, try r.nextEvent());
+}
+
+test "client auto-frames HEAD response as bodyless" {
+    var r = Reader.init(t.allocator, .client);
+    defer r.deinit();
+    r.setRequestMethod("HEAD");
+    try r.feed("HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n");
+    try expectTag(.response, try r.nextEvent());
+    try expectTag(.end_of_message, try r.nextEvent());
+}
+
+test "client auto-frames 304 response as bodyless" {
+    var r = Reader.init(t.allocator, .client);
+    defer r.deinit();
+    r.setRequestMethod("GET");
+    try r.feed("HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n");
+    try expectTag(.response, try r.nextEvent());
+    try expectTag(.end_of_message, try r.nextEvent());
+}
+
+test "client still frames a normal GET response body" {
+    var r = Reader.init(t.allocator, .client);
+    defer r.deinit();
+    r.setRequestMethod("GET");
+    try r.feed("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    try expectTag(.response, try r.nextEvent());
+    const d = try r.nextEvent();
+    try t.expectEqualStrings("hello", d.data.data);
     try expectTag(.end_of_message, try r.nextEvent());
 }
 

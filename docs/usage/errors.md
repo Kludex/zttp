@@ -72,7 +72,7 @@ conn.send_data(b"x")  # no head was sent first
 
 ```python
 conn = zttp.Connection(zttp.SERVER)
-conn.send_response(b"1.1", 200, b"OK", [(b"X", b"a\r\nInjected: 1")], True)
+conn.send_response(b"1.1", 200, b"OK", [(b"X", b"a\r\nInjected: 1")])
 #> zttp.LocalProtocolError: invalid field: a header/method/target/version/reason was malformed or contained CR/LF/control bytes
 ```
 
@@ -96,7 +96,7 @@ def handle(conn, raw_bytes):
                 conn.start_next_cycle()
     except zttp.RemoteProtocolError:
         # the peer misbehaved: send a 400 and close the connection
-        conn.send_response(b"1.1", 400, b"Bad Request", [(b"Content-Length", b"0")], True)
+        conn.send_response(b"1.1", 400, b"Bad Request", [(b"Content-Length", b"0")])
         conn.end_message()
         ...
 ```

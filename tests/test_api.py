@@ -100,3 +100,43 @@ def test_bodyless_resets_after_cycle() -> None:
     conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
     body = b"".join(e.data for e in drain(conn) if isinstance(e, zttp.Data))
     assert body == b"abc"
+
+
+def test_client_auto_derives_head_response_bodyless() -> None:
+    # No expect_bodyless: sending the HEAD makes the connection frame the response.
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(b"HEAD", b"/", b"1.1", [(b"Host", b"x")])
+    conn.end_message()
+    conn.data_to_send()
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n")
+    assert [type(e).__name__ for e in drain(conn)] == ["Response", "EndOfMessage"]
+
+
+def test_client_auto_derives_304_bodyless() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(b"GET", b"/", b"1.1", [(b"Host", b"x")])
+    conn.end_message()
+    conn.data_to_send()
+    conn.receive_data(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n")
+    assert [type(e).__name__ for e in drain(conn)] == ["Response", "EndOfMessage"]
+
+
+def test_client_still_frames_normal_response_body() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(b"GET", b"/", b"1.1", [(b"Host", b"x")])
+    conn.end_message()
+    conn.data_to_send()
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+    body = b"".join(e.data for e in drain(conn) if isinstance(e, zttp.Data))
+    assert body == b"hello"
+
+
+def test_server_auto_derives_head_response_bodyless() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n")
+    list(drain(conn))
+    conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"1234")])
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.send_data(b"body")
+    conn.end_message()
+    assert conn.data_to_send() == b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n"
