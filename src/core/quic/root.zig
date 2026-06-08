@@ -7,10 +7,12 @@ pub const varint = @import("varint.zig");
 pub const constants = @import("constants.zig");
 pub const frame = @import("frame.zig");
 pub const packet = @import("packet.zig");
+pub const crypto = @import("crypto.zig");
 
 test {
     _ = varint;
     _ = constants;
     _ = frame;
     _ = packet;
+    _ = crypto;
 }
