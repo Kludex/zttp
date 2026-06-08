@@ -71,39 +71,9 @@ def test_send_invalid_version_rejected(bad: bytes) -> None:
         conn.send_request(b"GET", b"/", bad, [])
 
 
-def test_head_response_is_bodyless() -> None:
-    # A response to HEAD carries Content-Length but no body. Without
-    # expect_bodyless the client would wait for / consume phantom body bytes.
-    conn = zttp.Connection(zttp.CLIENT)
-    conn.expect_bodyless()
-    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n")
-    events = list(drain(conn))
-    assert [type(e).__name__ for e in events] == ["Response", "EndOfMessage"]
-
-
-def test_204_response_is_bodyless() -> None:
-    conn = zttp.Connection(zttp.CLIENT)
-    conn.expect_bodyless()
-    conn.receive_data(b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n")
-    events = list(drain(conn))
-    assert [type(e).__name__ for e in events] == ["Response", "EndOfMessage"]
-
-
-def test_bodyless_resets_after_cycle() -> None:
-    # expect_bodyless applies only to the next message; the following one frames
-    # its body normally again.
-    conn = zttp.Connection(zttp.CLIENT)
-    conn.expect_bodyless()
-    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n")
-    assert [type(e).__name__ for e in drain(conn)] == ["Response", "EndOfMessage"]
-    conn.start_next_cycle()
-    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
-    body = b"".join(e.data for e in drain(conn) if isinstance(e, zttp.Data))
-    assert body == b"abc"
-
-
 def test_client_auto_derives_head_response_bodyless() -> None:
-    # No expect_bodyless: sending the HEAD makes the connection frame the response.
+    # A response to HEAD carries Content-Length but no body. Sending the HEAD
+    # through the connection lets it frame the response without phantom bytes.
     conn = zttp.Connection(zttp.CLIENT)
     conn.send_request(b"HEAD", b"/", b"1.1", [(b"Host", b"x")])
     conn.end_message()
@@ -119,6 +89,24 @@ def test_client_auto_derives_304_bodyless() -> None:
     conn.data_to_send()
     conn.receive_data(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n")
     assert [type(e).__name__ for e in drain(conn)] == ["Response", "EndOfMessage"]
+
+
+def test_bodyless_resets_after_cycle() -> None:
+    # The remembered method applies only to the next message; the following one
+    # frames its body normally again.
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(b"HEAD", b"/", b"1.1", [(b"Host", b"x")])
+    conn.end_message()
+    conn.data_to_send()
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n")
+    assert [type(e).__name__ for e in drain(conn)] == ["Response", "EndOfMessage"]
+    conn.start_next_cycle()
+    conn.send_request(b"GET", b"/", b"1.1", [(b"Host", b"x")])
+    conn.end_message()
+    conn.data_to_send()
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
+    body = b"".join(e.data for e in drain(conn) if isinstance(e, zttp.Data))
+    assert body == b"abc"
 
 
 def test_client_still_frames_normal_response_body() -> None:

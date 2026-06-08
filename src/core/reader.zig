@@ -85,12 +85,9 @@ pub const Reader = struct {
 
     body_remaining: u64 = 0,
     chunk: chunked_mod.ChunkDecoder = .{},
-    /// Set by the connection layer before headers are parsed: responses to HEAD
-    /// etc. have no body whatever the headers say.
-    next_bodyless: bool = false,
     /// The method the client sent for the in-flight request, so the reader can
-    /// auto-frame the matching response as bodyless (HEAD/CONNECT) without the
-    /// caller calling `expectBodyless`. Empty when unknown. Server-side unused.
+    /// auto-frame the matching response as bodyless (HEAD / 1xx / 204 / 304 /
+    /// CONNECT 2xx, RFC 9112 6.3). Empty when unknown. Server-side unused.
     request_method: [16]u8 = undefined,
     request_method_len: usize = 0,
     eof_seen: bool = false,
@@ -124,18 +121,10 @@ pub const Reader = struct {
         self.buf.appendSlice(self.gpa, data) catch return error.MessageTooLong;
     }
 
-    /// Declare that the next message to be parsed has no body regardless of its
-    /// headers - the client-side rule for responses to HEAD and for 1xx / 204 /
-    /// 304 (RFC 9112 6.3). Call after `reset`/`start_next_cycle` and before the
-    /// head is parsed; only the caller knows the request method / interim status.
-    pub fn expectBodyless(self: *Reader) void {
-        self.next_bodyless = true;
-    }
-
     /// Remember the method the client just sent, so the reader frames the
-    /// matching response as bodyless for HEAD/CONNECT (RFC 9112 6.3) without an
-    /// explicit `expectBodyless`. A method longer than the buffer simply does not
-    /// trigger the method-based rule; the status-based rule still applies.
+    /// matching response as bodyless for HEAD / 1xx / 204 / 304 / CONNECT 2xx
+    /// (RFC 9112 6.3). A method longer than the buffer simply does not trigger
+    /// the method-based rule; the status-based rule still applies.
     pub fn setRequestMethod(self: *Reader, method: []const u8) void {
         if (method.len > self.request_method.len) {
             self.request_method_len = 0;
@@ -158,7 +147,6 @@ pub const Reader = struct {
         self.trailer_bytes = 0;
         self.body_remaining = 0;
         self.chunk = .{};
-        self.next_bodyless = false;
         self.request_method_len = 0;
     }
 
@@ -258,7 +246,6 @@ pub const Reader = struct {
         if (self.role == .server) {
             const rl = try headers_mod.parseRequestLine(first);
             const f = try framing_mod.determine(self.headers.items, .{
-                .bodyless = self.next_bodyless,
                 .until_close_default = false,
             });
             self.enterBody(f);
@@ -271,9 +258,8 @@ pub const Reader = struct {
         } else {
             const st = try headers_mod.parseStatusLine(first);
             const method = self.request_method[0..self.request_method_len];
-            const bodyless = self.next_bodyless or framing_mod.responseIsBodyless(method, st.status_code);
             const f = try framing_mod.determine(self.headers.items, .{
-                .bodyless = bodyless,
+                .bodyless = framing_mod.responseIsBodyless(method, st.status_code),
                 .until_close_default = true,
             });
             self.enterBody(f);

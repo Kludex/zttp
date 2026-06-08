@@ -256,18 +256,10 @@ fn next_message(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     return py.none();
 }
 
-fn expect_bodyless(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
-    const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const r = self.reader orelse return py.raiseRuntime("connection is closed");
-    r.expectBodyless();
-    return py.none();
-}
-
 var methods = [_]py.MethodDef{
     .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
     .{ .ml_name = "next_event", .ml_meth = next_event, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the next parse event, or NEED_DATA." },
     .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
-    .{ .ml_name = "expect_bodyless", .ml_meth = expect_bodyless, .ml_flags = c.METH_NOARGS, .ml_doc = "Optional override: force the next response to be parsed bodyless. Standard cases (HEAD / 1xx / 204 / 304) are derived automatically from the request method sent." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
     .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(version, status, reason, headers). Bodyless framing (HEAD / 1xx / 204 / 304) is derived automatically." },
     .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },

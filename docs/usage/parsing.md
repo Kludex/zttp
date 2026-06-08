@@ -145,12 +145,6 @@ print([type(e).__name__ for e in events(conn)])  # (1)!
     yields `EndOfMessage` straight after the head instead of waiting for 1234 body
     bytes that never come.
 
-!!! tip "expect_bodyless"
-    If you *didn't* send the request through this connection - a proxy replaying a
-    response, say - call `conn.expect_bodyless()` before `receive_data` to force the
-    next message to parse bodyless. It's the manual override for the cases the
-    connection can't infer.
-
 ## A reusable drain helper
 
 In practice you'll want a small helper that pulls events until it needs more
