@@ -66,6 +66,16 @@ pub const Connection = struct {
     /// QUIC transport now has. Newly completed events are appended to the queue.
     /// The caller (the adapter) calls this when it knows a stream got data; a
     /// production driver would call it for every stream that advanced.
+    /// Advance the parse of every stream the transport currently knows about.
+    /// The adapter calls this after each datagram so it need not track which
+    /// streams advanced. The 64-id snapshot bound is far above any realistic
+    /// concurrent-stream count for a young connection.
+    pub fn pumpAll(self: *Connection) Error!void {
+        var ids: [64]u64 = undefined;
+        const n = self.qc.streamIds(&ids);
+        for (ids[0..n]) |id| try self.pump(id);
+    }
+
     pub fn pump(self: *Connection, id: u64) Error!void {
         // Only client-initiated bidirectional streams carry requests here.
         if (quic_stream.StreamType.of(id) != .client_bidi) return;

@@ -677,6 +677,18 @@ pub fn fromH2Event(ev: events.H2Event) py.Object {
     };
 }
 
+pub fn fromH3Event(ev: events.H3Event) py.Object {
+    return switch (ev) {
+        .request => |r| makeRequest(r),
+        .response => |r| makeResponse(r),
+        .data => |d| makeData(d),
+        .end_of_message => |e| makeEom(e),
+        .need_data => py.newRef(need_data),
+        .settings => |s| makeSettings(s),
+        .goaway => |g| makeGoaway(g),
+    };
+}
+
 fn u32Obj(v: u32) py.Object {
     return c.PyLong_FromUnsignedLong(v);
 }

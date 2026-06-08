@@ -251,6 +251,20 @@ pub const Connection = struct {
         if (self.streams.get(id)) |s| return s.isFinished();
         return false;
     }
+
+    /// Snapshot the ids of every stream the transport currently knows about, into
+    /// `out`, returning how many were written (capped at `out.len`). The HTTP/3
+    /// layer iterates these to advance each request stream's parse.
+    pub fn streamIds(self: *Connection, out: []u64) usize {
+        var n: usize = 0;
+        var it = self.streams.keyIterator();
+        while (it.next()) |k| {
+            if (n >= out.len) break;
+            out[n] = k.*;
+            n += 1;
+        }
+        return n;
+    }
 };
 
 const testing = std.testing;

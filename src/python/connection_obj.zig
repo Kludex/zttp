@@ -18,12 +18,17 @@ const H2Connection = core.h2.connection.Connection;
 const H2Role = core.h2.connection.Role;
 const H2Writer = core.h2.writer.Writer;
 
+const QuicConnection = core.quic.connection.Connection;
+const QuicRole = core.quic.connection.Role;
+const H3Connection = core.h3.connection.Connection;
+
 const gpa = std.heap.c_allocator;
 
 const SERVER: c_long = 1;
 const CLIENT: c_long = 2;
 const HTTP1: c_long = 1;
 const HTTP2: c_long = 2;
+const HTTP3: c_long = 3;
 
 // One Python Connection backs either an HTTP/1.1 Reader+Writer or an HTTP/2
 // engine, chosen by the `protocol` argument. The H1 path (reader/writer
@@ -46,6 +51,13 @@ const ConnectionObject = extern struct {
     /// `end_message` frame DATA on it: a client's last `send_request` id, or the
     /// `h2_recv_stream` a server's `send_response` answered.
     h2_send_stream: u32,
+    /// HTTP/3 only. The QUIC transport and the HTTP/3 engine on top of it are
+    /// built lazily on the first datagram (the connection id is read from the
+    /// client's first Initial packet, so it is not known at construction).
+    /// `is_h3` records the selected protocol; `qc`/`h3` are non-null once started.
+    is_h3: bool,
+    qc: ?*QuicConnection,
+    h3: ?*H3Connection,
     /// The method of the message the next response answers (server: the parsed
     /// request; client: the request we sent), so the connection auto-derives
     /// bodyless framing. Cleared per cycle by start_next_cycle.
@@ -72,7 +84,8 @@ fn new(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c
         CLIENT => .client,
         else => return py.raiseValue("role must be zttp.SERVER or zttp.CLIENT"),
     };
-    if (protocol_val != HTTP1 and protocol_val != HTTP2) return py.raiseValue("protocol must be zttp.HTTP1 or zttp.HTTP2");
+    if (protocol_val != HTTP1 and protocol_val != HTTP2 and protocol_val != HTTP3) return py.raiseValue("protocol must be zttp.HTTP1, zttp.HTTP2, or zttp.HTTP3");
+    if (protocol_val == HTTP3 and role != .server) return py.raiseValue("HTTP/3 currently supports the server read path only");
 
     const alloc = tp.?.tp_alloc.?;
     const obj = alloc(tp, 0);
@@ -85,9 +98,18 @@ fn new(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c
     self.h2_handshake_sent = false;
     self.h2_recv_stream = 0;
     self.h2_send_stream = 0;
+    self.is_h3 = false;
+    self.qc = null;
+    self.h3 = null;
     self.req_method_len = 0;
     self.should_close = false;
     self.upgrade_obj = null;
+
+    if (protocol_val == HTTP3) {
+        // The QUIC + HTTP/3 engine is built lazily on the first datagram.
+        self.is_h3 = true;
+        return obj;
+    }
 
     if (protocol_val == HTTP2) {
         const h2_role = if (role == .server) H2Role.server else H2Role.client;
@@ -140,6 +162,14 @@ fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
         w.deinit();
         gpa.destroy(w);
     }
+    if (self.h3) |h| {
+        h.deinit();
+        gpa.destroy(h);
+    }
+    if (self.qc) |q| {
+        q.deinit();
+        gpa.destroy(q);
+    }
     py.xdecref(self.upgrade_obj);
     py.freeInstance(@ptrCast(self));
 }
@@ -156,6 +186,39 @@ fn receive_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Objec
     return py.none();
 }
 
+fn receive_datagram(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    if (!self.is_h3) return py.raiseRuntime("receive_datagram is only valid for an HTTP/3 connection");
+    const dgram = py.asBytes(arg) orelse return null;
+
+    if (self.qc == null) {
+        // Build the transport from the connection id in the client's first
+        // Initial. A non-Initial first datagram has nowhere to take the id from.
+        if (dgram.len == 0 or !core.quic.packet.isLong(dgram[0])) {
+            return py.raise(exceptions.RemoteProtocolError, "the first HTTP/3 datagram must be a long-header Initial");
+        }
+        const hdr = core.quic.packet.parseLong(dgram) catch
+            return py.raise(exceptions.RemoteProtocolError, "malformed QUIC Initial packet");
+        const q = gpa.create(QuicConnection) catch return c.PyErr_NoMemory();
+        q.* = QuicConnection.init(gpa, QuicRole.server, hdr.dcid) catch {
+            gpa.destroy(q);
+            return c.PyErr_NoMemory();
+        };
+        const h = gpa.create(H3Connection) catch {
+            q.deinit();
+            gpa.destroy(q);
+            return c.PyErr_NoMemory();
+        };
+        h.* = H3Connection.init(gpa, q);
+        self.qc = q;
+        self.h3 = h;
+    }
+
+    self.qc.?.receiveDatagram(dgram, 0) catch |e| return exceptions.raiseQuic(e);
+    self.h3.?.pumpAll() catch |e| return exceptions.raiseH3(e);
+    return py.none();
+}
+
 fn rememberMethod(self: *ConnectionObject, method: []const u8) void {
     if (method.len > self.req_method.len) {
         self.req_method_len = 0;
@@ -167,6 +230,10 @@ fn rememberMethod(self: *ConnectionObject, method: []const u8) void {
 
 fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
+    if (self.is_h3) {
+        const h = self.h3 orelse return py.newRef(events_obj.need_data); // no datagram fed yet
+        return events_obj.fromH3Event(h.nextEvent());
+    }
     if (self.h2) |h| {
         const ev = h.nextEvent() catch |e| return exceptions.raiseH2(e);
         if (ev == .request) self.h2_recv_stream = ev.request.stream_id;
@@ -459,6 +526,7 @@ fn upgrade(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
 
 var methods = [_]py.MethodDef{
     .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
+    .{ .ml_name = "receive_datagram", .ml_meth = receive_datagram, .ml_flags = c.METH_O, .ml_doc = "Feed one received UDP datagram (HTTP/3 only)." },
     .{ .ml_name = "next_event", .ml_meth = next_event, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the next parse event, or NEED_DATA." },
     .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
@@ -494,5 +562,6 @@ pub fn register(module: py.Object) bool {
     _ = c.PyModule_AddIntConstant(module, "CLIENT", CLIENT);
     _ = c.PyModule_AddIntConstant(module, "HTTP1", HTTP1);
     _ = c.PyModule_AddIntConstant(module, "HTTP2", HTTP2);
+    _ = c.PyModule_AddIntConstant(module, "HTTP3", HTTP3);
     return true;
 }
