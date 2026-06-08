@@ -99,6 +99,24 @@ A `HEAD` response is the subtle case: it carries the `Content-Length` the `GET`
 would have, but no bytes. Because the connection remembers the request was a
 `HEAD`, `send_data` is refused and no body is framed - you don't track it.
 
+## It holds you to the Content-Length
+
+When you declare a `Content-Length`, zttp counts the body bytes you send against
+it. Sending more than you promised, or ending the message with bytes still owed,
+is refused - either would put a malformed message on the wire:
+
+```python
+import zttp
+
+conn = zttp.Connection(zttp.SERVER)
+conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"5")])
+conn.send_data(b"too long")
+#> zttp.LocalProtocolError: invalid send for current connection state
+```
+
+For a body of unknown length, use `Transfer-Encoding: chunked` instead - then
+`send_data` frames each run for you and there's nothing to count.
+
 ## It won't let you split the response
 
 zttp validates everything it serializes. A `\r\n` smuggled into a header value,

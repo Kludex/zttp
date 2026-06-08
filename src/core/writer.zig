@@ -116,6 +116,10 @@ pub const Writer = struct {
     gpa: std.mem.Allocator,
     out: std.ArrayList(u8) = .empty,
     state: State = .idle,
+    /// Bytes still owed under a fixed Content-Length. Sending more than declared,
+    /// or ending the message with bytes still owed, is a local protocol error -
+    /// it would put a malformed message on the wire.
+    body_remaining: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator) Writer {
         return .{ .gpa = gpa };
@@ -158,7 +162,9 @@ pub const Writer = struct {
         try self.w(ver);
         try self.w("\r\n");
         try self.writeHeaders(hdrs);
-        self.state = bodyStateFor(hdrs);
+        const framing_ = bodyStateFor(hdrs);
+        self.state = framing_.state;
+        self.body_remaining = framing_.length;
     }
 
     /// Serialize a status-line + headers. `request_method` is the method this
@@ -181,7 +187,14 @@ pub const Writer = struct {
         try self.w(reason);
         try self.w("\r\n");
         try self.writeHeaders(hdrs);
-        self.state = if (responseIsBodyless(request_method, status)) .body_none else bodyStateFor(hdrs);
+        if (responseIsBodyless(request_method, status)) {
+            self.state = .body_none;
+            self.body_remaining = 0;
+        } else {
+            const framing_ = bodyStateFor(hdrs);
+            self.state = framing_.state;
+            self.body_remaining = framing_.length;
+        }
     }
 
     fn writeHeaders(self: *Writer, hdrs: []const Header) WriteError!void {
@@ -198,7 +211,11 @@ pub const Writer = struct {
     /// chunked transfer-coding.
     pub fn sendData(self: *Writer, data: []const u8) WriteError!void {
         switch (self.state) {
-            .body_length => try self.w(data),
+            .body_length => {
+                if (data.len > self.body_remaining) return error.LocalProtocol; // over Content-Length
+                try self.w(data);
+                self.body_remaining -= data.len;
+            },
             .body_chunked => {
                 if (data.len == 0) return; // empty write is not a terminator
                 var size_buf: [18]u8 = undefined;
@@ -212,7 +229,9 @@ pub const Writer = struct {
     }
 
     /// Finish the message. For chunked, writes the terminating 0-chunk and any
-    /// trailers; otherwise just resets to idle for the next message.
+    /// trailers; otherwise just resets to idle for the next message. Trailers are
+    /// only framable after a chunked body, so passing them with any other framing
+    /// is a local protocol error - there is nowhere on the wire to put them.
     pub fn endMessage(self: *Writer, trailers: []const Header) WriteError!void {
         switch (self.state) {
             .body_chunked => {
@@ -226,7 +245,13 @@ pub const Writer = struct {
                 }
                 try self.w("\r\n");
             },
-            .body_length, .body_none => {},
+            .body_length => {
+                if (self.body_remaining != 0) return error.LocalProtocol; // under Content-Length
+                if (trailers.len != 0) return error.LocalProtocol; // Content-Length and trailers don't mix
+            },
+            .body_none => {
+                if (trailers.len != 0) return error.LocalProtocol; // no body, nowhere for trailers
+            },
             .idle => return error.LocalProtocol,
         }
         self.state = .idle;
@@ -239,17 +264,32 @@ fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+const BodyFraming = struct { state: State, length: u64 = 0 };
+
 /// Pick the body state from the headers the caller supplied: chunked if
 /// Transfer-Encoding is present, else length if Content-Length is present, else
-/// none. The caller is trusted to provide consistent framing headers.
-fn bodyStateFor(hdrs: []const Header) State {
+/// none. For a fixed length, also returns the declared count so the writer can
+/// hold the caller to it. The caller is trusted to provide consistent framing
+/// headers (validateFraming already rejected the ambiguous combinations).
+fn bodyStateFor(hdrs: []const Header) BodyFraming {
     for (hdrs) |h| {
-        if (eqIgnoreCase(h.name, "transfer-encoding")) return .body_chunked;
+        if (eqIgnoreCase(h.name, "transfer-encoding")) return .{ .state = .body_chunked };
     }
     for (hdrs) |h| {
-        if (eqIgnoreCase(h.name, "content-length")) return .body_length;
+        if (eqIgnoreCase(h.name, "content-length")) {
+            const n = parseLength(trimOws(h.value));
+            return if (n == 0) .{ .state = .body_none } else .{ .state = .body_length, .length = n };
+        }
     }
-    return .body_none;
+    return .{ .state = .body_none };
+}
+
+/// Parse a digits-only Content-Length. validateFraming already rejected
+/// non-digit and conflicting values, so this only sees valid input.
+fn parseLength(v: []const u8) u64 {
+    var n: u64 = 0;
+    for (v) |ch| n = n * 10 + (ch - '0');
+    return n;
 }
 
 const t = std.testing;
@@ -346,6 +386,61 @@ test "data before head is rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     try t.expectError(error.LocalProtocol, wr.sendData("x"));
+}
+
+test "oversized body rejected against Content-Length" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "5" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+    try t.expectError(error.LocalProtocol, wr.sendData("abcdef")); // 6 > 5
+}
+
+test "oversized body rejected across multiple writes" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "5" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+    try wr.sendData("abc");
+    try t.expectError(error.LocalProtocol, wr.sendData("def")); // 3 + 3 > 5
+}
+
+test "undersized body rejected at end_message" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "5" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+    try wr.sendData("abc");
+    try t.expectError(error.LocalProtocol, wr.endMessage(&.{})); // 2 bytes still owed
+}
+
+test "exact-length body is accepted" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "5" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+    try wr.sendData("ab");
+    try wr.sendData("cde");
+    try wr.endMessage(&.{});
+    try t.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde", wr.pending());
+}
+
+test "trailers rejected on a Content-Length body" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Content-Length", .value = "3" }};
+    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+    try wr.sendData("abc");
+    const trailers = [_]Header{.{ .name = "X-Checksum", .value = "abc" }};
+    try t.expectError(error.LocalProtocol, wr.endMessage(&trailers));
+}
+
+test "trailers rejected on a bodyless message" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try wr.sendResponse("1.1", 204, "No Content", &.{}, "GET");
+    const trailers = [_]Header{.{ .name = "X-Checksum", .value = "abc" }};
+    try t.expectError(error.LocalProtocol, wr.endMessage(&trailers));
 }
 
 test "two heads without ending is rejected" {
