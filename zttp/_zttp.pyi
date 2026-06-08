@@ -10,6 +10,8 @@ CLIENT: Final[int]
 class Request:
     method: bytes
     target: bytes
+    path: bytes
+    query: bytes
     http_version: bytes
     headers: list[tuple[bytes, bytes]]
     expect_continue: bool

@@ -13,6 +13,25 @@ def test_request_repr() -> None:
     assert repr(req) == "Request(method=b'GET', target=b'/p', http_version=b'1.1', headers=[(b'Host', b'x')])"
 
 
+def test_request_path_and_query() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET /api/users?page=2&q=x HTTP/1.1\r\nHost: x\r\n\r\n")
+    req = conn.next_event()
+    assert isinstance(req, zttp.Request)
+    assert req.target == b"/api/users?page=2&q=x"
+    assert req.path == b"/api/users"
+    assert req.query == b"page=2&q=x"
+
+
+def test_request_path_without_query() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET /plain HTTP/1.1\r\nHost: x\r\n\r\n")
+    req = conn.next_event()
+    assert isinstance(req, zttp.Request)
+    assert req.path == b"/plain"
+    assert req.query == b""
+
+
 def test_endofmessage_and_data_repr() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi")
