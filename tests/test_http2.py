@@ -161,6 +161,51 @@ def test_client_reads_a_response_with_a_body() -> None:
     assert data.data == b"hi"
 
 
+def test_client_sends_a_request_a_server_reads() -> None:
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    client.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")])
+    client.end_message()
+    wire = client.data_to_send()
+
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    server.receive_data(wire)
+    req = next(e for e in drain_h2(server) if isinstance(e, zttp.Request))
+    assert req.method == b"GET"
+    assert req.target == b"/"
+    assert req.http_version == b"2"
+    # :authority became a synthesized host header on the read side.
+    assert (b"host", b"example.com") in req.headers
+
+
+def test_server_sends_a_response_a_client_reads() -> None:
+    # Drive a request into the server so it knows the stream to answer on.
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
+    client.end_message()
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    server.receive_data(client.data_to_send())
+    list(drain_h2(server))  # consume the request so h2_recv_stream is set
+
+    server.send_response(b"2", 200, b"", [(b"content-type", b"text/plain")])
+    server.send_data(b"hi")
+    server.end_message()
+    # Feed the server's bytes (its SETTINGS + response) back into the client.
+    client.receive_data(server.data_to_send())
+    events = list(drain_h2(client))
+    resp = next(e for e in events if isinstance(e, zttp.Response))
+    data = next(e for e in events if isinstance(e, zttp.Data))
+    assert resp.status_code == 200
+    assert (b"content-type", b"text/plain") in resp.headers
+    assert data.data == b"hi"
+
+
+def test_h2_send_side_trailers_rejected() -> None:
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
+    with pytest.raises(zttp.LocalProtocolError):
+        client.end_message([(b"x-trailer", b"v")])
+
+
 def test_protocol_defaults_to_http1() -> None:
     conn = zttp.Connection(zttp.SERVER)  # no protocol arg
     conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")

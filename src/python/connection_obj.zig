@@ -16,6 +16,7 @@ const exceptions = @import("exceptions.zig");
 
 const H2Connection = core.h2.connection.Connection;
 const H2Role = core.h2.connection.Role;
+const H2Writer = core.h2.writer.Writer;
 
 const gpa = std.heap.c_allocator;
 
@@ -33,6 +34,18 @@ const ConnectionObject = extern struct {
     reader: ?*Reader,
     writer: ?*Writer,
     h2: ?*H2Connection,
+    /// The HTTP/2 write side (non-null exactly when `h2` is). It owns the outgoing
+    /// byte buffer and stream-id allocation for the send path.
+    h2_writer: ?*H2Writer,
+    /// HTTP/2 only: whether the preface+SETTINGS has been emitted yet (sent lazily
+    /// on the first send call), and the stream id of the most recently parsed
+    /// request, so `send_response` answers on the right stream.
+    h2_handshake_sent: bool,
+    h2_recv_stream: u32,
+    /// The stream id the current outgoing message is on, so `send_data` /
+    /// `end_message` frame DATA on it: a client's last `send_request` id, or the
+    /// `h2_recv_stream` a server's `send_response` answered.
+    h2_send_stream: u32,
     /// The method of the message the next response answers (server: the parsed
     /// request; client: the request we sent), so the connection auto-derives
     /// bodyless framing. Cleared per cycle by start_next_cycle.
@@ -68,17 +81,28 @@ fn new(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c
     self.reader = null;
     self.writer = null;
     self.h2 = null;
+    self.h2_writer = null;
+    self.h2_handshake_sent = false;
+    self.h2_recv_stream = 0;
+    self.h2_send_stream = 0;
     self.req_method_len = 0;
     self.should_close = false;
     self.upgrade_obj = null;
 
     if (protocol_val == HTTP2) {
+        const h2_role = if (role == .server) H2Role.server else H2Role.client;
         const h = gpa.create(H2Connection) catch {
             py.decref(obj);
             return c.PyErr_NoMemory();
         };
-        h.* = H2Connection.init(gpa, if (role == .server) H2Role.server else H2Role.client);
+        h.* = H2Connection.init(gpa, h2_role);
         self.h2 = h;
+        const w = gpa.create(H2Writer) catch {
+            py.decref(obj);
+            return c.PyErr_NoMemory();
+        };
+        w.* = H2Writer.init(gpa, if (role == .server) core.h2.writer.Role.server else core.h2.writer.Role.client);
+        self.h2_writer = w;
         return obj;
     }
 
@@ -112,6 +136,10 @@ fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
         h.deinit();
         gpa.destroy(h);
     }
+    if (self.h2_writer) |w| {
+        w.deinit();
+        gpa.destroy(w);
+    }
     py.xdecref(self.upgrade_obj);
     py.freeInstance(@ptrCast(self));
 }
@@ -141,6 +169,7 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     if (self.h2) |h| {
         const ev = h.nextEvent() catch |e| return exceptions.raiseH2(e);
+        if (ev == .request) self.h2_recv_stream = ev.request.stream_id;
         return events_obj.fromH2Event(ev);
     }
     const r = self.reader orelse return py.raiseRuntime("connection is closed");
@@ -222,9 +251,77 @@ fn borrowHeaders(seq: py.Object) ?BorrowedHeaders {
     return result;
 }
 
+// HTTP/2 send helpers -------------------------------------------------------
+
+fn h2EnsureHandshake(self: *ConnectionObject) bool {
+    if (self.h2_handshake_sent) return true;
+    const w = self.h2_writer.?;
+    w.sendPreface(&.{}) catch {
+        _ = raiseWrite(error.OutOfMemory);
+        return false;
+    };
+    self.h2_handshake_sent = true;
+    return true;
+}
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const lx = if (x >= 'A' and x <= 'Z') x + 32 else x;
+        const ly = if (y >= 'A' and y <= 'Z') y + 32 else y;
+        if (lx != ly) return false;
+    }
+    return true;
+}
+
+// Build the HTTP/2 regular-header list and pull out :authority. For a request the
+// adapter derives :authority from a `host` (or `:authority`) field and drops it
+// from the regular headers - HTTP/2 forbids `host` and carries it as a pseudo-
+// header instead. `:scheme` defaults to https.
+fn h2SplitAuthority(headers: []events.Header, out: *[]events.Header) []const u8 {
+    var authority: []const u8 = "";
+    var n: usize = 0;
+    for (headers) |h| {
+        if (asciiEqlIgnoreCase(h.name, "host") or asciiEqlIgnoreCase(h.name, ":authority")) {
+            if (authority.len == 0) authority = h.value;
+            continue; // dropped from the regular list
+        }
+        headers[n] = h;
+        n += 1;
+    }
+    out.* = headers[0..n];
+    return authority;
+}
+
+fn h2RaiseWrite(e: core.h2.writer.WriteError) py.Object {
+    const local = exceptions.LocalProtocolError;
+    return switch (e) {
+        error.OutOfMemory => c.PyErr_NoMemory(),
+        error.LocalProtocol => py.raise(local, "invalid HTTP/2 send: a pseudo-header order, status, or stream id was rejected"),
+        error.InvalidField => py.raise(local, "invalid field: a header name/value contained CR/LF/NUL or an uppercase byte"),
+    };
+}
+
+fn h2SendRequest(self: *ConnectionObject, mb: []const u8, tb: []const u8, hdrs: *BorrowedHeaders) py.Object {
+    const w = self.h2_writer.?;
+    if (!h2EnsureHandshake(self)) return null;
+    var regular: []events.Header = hdrs.headers;
+    const authority = h2SplitAuthority(hdrs.headers, &regular);
+    const id = w.sendRequest(mb, tb, "https", authority, regular, false) catch |e| return h2RaiseWrite(e);
+    self.h2_send_stream = id;
+    return py.none();
+}
+
+fn h2SendResponse(self: *ConnectionObject, status: u16, hdrs: *BorrowedHeaders) py.Object {
+    const w = self.h2_writer.?;
+    if (!h2EnsureHandshake(self)) return null;
+    w.sendResponse(self.h2_recv_stream, status, hdrs.headers, false) catch |e| return h2RaiseWrite(e);
+    self.h2_send_stream = self.h2_recv_stream;
+    return py.none();
+}
+
 fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
     var method: ?*c.PyObject = null;
     var target: ?*c.PyObject = null;
     var version: ?*c.PyObject = null;
@@ -235,6 +332,13 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
     const vb = py.asBytes(version) orelse return null;
     var hdrs = borrowHeaders(hdrs_seq) orelse return null;
     defer hdrs.deinit();
+    if (self.h2_writer != null) {
+        // HTTP/2: the version arg is ignored (always "2"); :authority is derived
+        // from a host header and :scheme defaults to https.
+        rememberMethod(self, mb);
+        return h2SendRequest(self, mb, tb, &hdrs);
+    }
+    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
     wc.sendRequest(mb, tb, vb, hdrs.headers) catch |e| return raiseWrite(e);
     rememberMethod(self, mb);
     if (self.reader) |r| r.setRequestMethod(mb);
@@ -243,7 +347,6 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
 
 fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
     var version: ?*c.PyObject = null;
     var status: c_long = 0;
     var reason: ?*c.PyObject = null;
@@ -254,6 +357,12 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     const rb = py.asBytes(reason) orelse return null;
     var hdrs = borrowHeaders(hdrs_seq) orelse return null;
     defer hdrs.deinit();
+    if (self.h2_writer != null) {
+        // HTTP/2: version and reason are ignored (no reason phrase exists); the
+        // response answers on the most recently parsed request's stream.
+        return h2SendResponse(self, @intCast(status), &hdrs);
+    }
+    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
     const method = self.req_method[0..self.req_method_len];
     wc.sendResponse(vb, @intCast(status), rb, hdrs.headers, method) catch |e| return raiseWrite(e);
     return py.none();
@@ -261,17 +370,30 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
 
 fn send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
     const data = py.asBytes(arg) orelse return null;
+    if (self.h2_writer) |w| {
+        w.sendData(self.h2_send_stream, data, false) catch |e| return h2RaiseWrite(e);
+        return py.none();
+    }
+    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
     wc.sendData(data) catch |e| return raiseWrite(e);
     return py.none();
 }
 
 fn end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
+    if (self.h2_writer) |w| {
+        // HTTP/2 ends a message with an empty END_STREAM DATA frame. Trailers are
+        // not yet supported on the send side.
+        if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
+            return py.raise(exceptions.LocalProtocolError, "HTTP/2 send-side trailers are not supported yet");
+        }
+        w.sendData(self.h2_send_stream, &.{}, true) catch |e| return h2RaiseWrite(e);
+        return py.none();
+    }
+    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
         wc.endMessage(&.{}) catch |e| return raiseWrite(e);
     } else {
@@ -284,6 +406,12 @@ fn end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Objec
 
 fn data_to_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
+    if (self.h2_writer) |w| {
+        const out = py.fromBytes(w.pending());
+        if (out == null) return null;
+        w.clear();
+        return out;
+    }
     const wc = self.writer orelse return py.raiseRuntime("connection is closed");
     const out = py.fromBytes(wc.pending());
     if (out == null) return null;
