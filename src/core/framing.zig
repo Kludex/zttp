@@ -71,6 +71,16 @@ fn parseContentLength(value: []const u8) ParseError!u64 {
     return n;
 }
 
+/// A response carries no body regardless of its headers when it answers a HEAD,
+/// is 1xx/204/304, or is a 2xx to a CONNECT (RFC 9112 6.3). Shared by the read
+/// and write paths so framing is decided identically in both directions.
+pub fn responseIsBodyless(method: []const u8, status: u16) bool {
+    if (status / 100 == 1 or status == 204 or status == 304) return true;
+    if (eqIgnoreCase(method, "HEAD")) return true;
+    if (eqIgnoreCase(method, "CONNECT") and status >= 200 and status < 300) return true;
+    return false;
+}
+
 pub const FramingOptions = struct {
     /// Responses to HEAD, 1xx/204/304, and the connect side have no body
     /// regardless of headers (RFC 9112 6.3). The connection layer sets this.
@@ -116,6 +126,18 @@ pub fn determine(headers: []const Header, opts: FramingOptions) ParseError!Frami
         return if (n == 0) .none else .{ .content_length = n };
     }
     return if (opts.until_close_default) .until_close else .none;
+}
+
+test "responseIsBodyless rule" {
+    try std.testing.expect(responseIsBodyless("HEAD", 200));
+    try std.testing.expect(responseIsBodyless("head", 200));
+    try std.testing.expect(responseIsBodyless("GET", 204));
+    try std.testing.expect(responseIsBodyless("GET", 304));
+    try std.testing.expect(responseIsBodyless("GET", 100));
+    try std.testing.expect(responseIsBodyless("CONNECT", 200));
+    try std.testing.expect(!responseIsBodyless("CONNECT", 404));
+    try std.testing.expect(!responseIsBodyless("GET", 200));
+    try std.testing.expect(!responseIsBodyless("POST", 201));
 }
 
 test "no body" {
