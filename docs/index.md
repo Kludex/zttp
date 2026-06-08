@@ -45,21 +45,21 @@ The key features are:
     zttp is experimental. The API and behaviour may change at any time, and it is
     not yet ready for production use.
 
-!!! note "Requirements"
-    zttp needs **CPython 3.12+** and runs on **Linux** and **macOS**.
-
 ## Installation
 
 ```console
-pip install zttp
+uv add zttp
 ```
+
+!!! note "Requirements"
+    zttp needs **CPython 3.12+** and runs on **Linux**, **macOS**, and **Windows**.
 
 ## Example
 
 Let's parse an HTTP request. You play the **server**: bytes come in, events come
 out.
 
-```python title="parse.py" hl_lines="3 9"
+```python title="parse.py" hl_lines="3 5 13"
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)  # (1)!
