@@ -1,0 +1,159 @@
+//! QUIC flow control (RFC 9000 section 4 and 19.9-19.11): the credit accounting
+//! that bounds how much a peer can make the receiver buffer. There are two
+//! granularities - per-stream (MAX_STREAM_DATA) and per-connection (MAX_DATA) -
+//! plus a concurrency cap on streams (MAX_STREAMS). Pure accounting state: it
+//! grants and consumes credit and flags when a new limit should be advertised; it
+//! sends nothing itself.
+
+const std = @import("std");
+
+/// One direction of a data flow-control window (used for both a stream's recv
+/// window and the connection-wide window). The receiver consumes credit as bytes
+/// arrive and re-grants it as the application reads, advertising a new MAX when
+/// the window is over half consumed.
+pub const Window = struct {
+    /// The largest offset the peer is allowed to send (the advertised limit).
+    limit: u64,
+    /// The largest offset actually received so far.
+    received: u64 = 0,
+    /// How much the application has consumed; the floor the window slides above.
+    consumed: u64 = 0,
+    /// The window size to maintain; a new limit is `consumed + initial`.
+    initial: u64,
+
+    pub fn init(initial: u64) Window {
+        return .{ .limit = initial, .initial = initial };
+    }
+
+    pub const Error = error{
+        /// The peer sent data past the limit it was granted (RFC 9000 4.1):
+        /// FLOW_CONTROL_ERROR.
+        FlowControlError,
+    };
+
+    /// Record that data up to `offset` (exclusive) has been received. Rejects an
+    /// offset beyond the advertised limit.
+    pub fn onReceived(self: *Window, offset: u64) Error!void {
+        if (offset > self.limit) return error.FlowControlError;
+        self.received = @max(self.received, offset);
+    }
+
+    /// The application consumed up to `offset`; this slides the window.
+    pub fn onConsumed(self: *Window, offset: u64) void {
+        self.consumed = @max(self.consumed, offset);
+    }
+
+    /// Should a new MAX be advertised? True once more than half the window has
+    /// been consumed since the last grant (RFC 9000 4.1 auto-tuning heuristic).
+    pub fn shouldUpdate(self: *const Window) bool {
+        return self.limit - self.consumed < self.initial / 2;
+    }
+
+    /// The new limit to advertise, and the side effect of recording it.
+    pub fn grant(self: *Window) u64 {
+        self.limit = self.consumed + self.initial;
+        return self.limit;
+    }
+};
+
+/// The send side of a data window: how much we are allowed to send, bounded by
+/// the peer's advertised MAX. Separate from `Window` because the roles differ -
+/// here the limit is set by the peer and we track what we have sent.
+pub const SendWindow = struct {
+    limit: u64,
+    sent: u64 = 0,
+
+    pub fn init(limit: u64) SendWindow {
+        return .{ .limit = limit };
+    }
+
+    /// How many more bytes may be sent right now.
+    pub fn available(self: *const SendWindow) u64 {
+        return self.limit -| self.sent;
+    }
+
+    pub fn onSent(self: *SendWindow, bytes: u64) void {
+        self.sent += bytes;
+    }
+
+    /// The peer raised the limit (a MAX_DATA / MAX_STREAM_DATA frame). A limit can
+    /// only grow; a lower value is ignored (RFC 9000 4.1).
+    pub fn onMaxData(self: *SendWindow, new_limit: u64) void {
+        self.limit = @max(self.limit, new_limit);
+    }
+
+    pub fn blocked(self: *const SendWindow) bool {
+        return self.available() == 0;
+    }
+};
+
+/// The concurrency cap on streams a peer may open (RFC 9000 4.6, MAX_STREAMS).
+/// Bidi and uni are tracked separately by the caller with two of these.
+pub const StreamLimit = struct {
+    /// The maximum stream count the peer may open (a count, not an id).
+    max: u64,
+    /// The highest stream count opened so far.
+    opened: u64 = 0,
+
+    pub fn init(max: u64) StreamLimit {
+        return .{ .max = max };
+    }
+
+    pub const Error = error{
+        /// The peer opened more streams than allowed (RFC 9000 4.6):
+        /// STREAM_LIMIT_ERROR.
+        StreamLimitError,
+    };
+
+    /// A peer-initiated stream with this 0-based index was opened.
+    pub fn onOpened(self: *StreamLimit, index: u64) Error!void {
+        if (index >= self.max) return error.StreamLimitError;
+        self.opened = @max(self.opened, index + 1);
+    }
+
+    pub fn shouldUpdate(self: *const StreamLimit) bool {
+        return self.max - self.opened < self.max / 2;
+    }
+
+    pub fn grant(self: *StreamLimit, increment: u64) u64 {
+        self.max += increment;
+        return self.max;
+    }
+};
+
+test "recv window rejects data past the limit" {
+    var w = Window.init(100);
+    try w.onReceived(80);
+    try std.testing.expectError(error.FlowControlError, w.onReceived(101));
+}
+
+test "recv window auto-tunes after half consumed" {
+    var w = Window.init(100);
+    try std.testing.expect(!w.shouldUpdate());
+    w.onConsumed(60);
+    try std.testing.expect(w.shouldUpdate());
+    try std.testing.expectEqual(@as(u64, 160), w.grant());
+    try std.testing.expect(!w.shouldUpdate());
+}
+
+test "send window tracks available credit" {
+    var s = SendWindow.init(100);
+    try std.testing.expectEqual(@as(u64, 100), s.available());
+    s.onSent(100);
+    try std.testing.expect(s.blocked());
+    s.onMaxData(150);
+    try std.testing.expectEqual(@as(u64, 50), s.available());
+}
+
+test "send window ignores a smaller MAX" {
+    var s = SendWindow.init(100);
+    s.onMaxData(80);
+    try std.testing.expectEqual(@as(u64, 100), s.limit);
+}
+
+test "stream limit rejects too many streams" {
+    var l = StreamLimit.init(3);
+    try l.onOpened(0);
+    try l.onOpened(2);
+    try std.testing.expectError(error.StreamLimitError, l.onOpened(3));
+}
