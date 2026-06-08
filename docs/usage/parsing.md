@@ -24,7 +24,7 @@ conn.receive_data(
     b"hello world"
 )
 
-body = b""
+body = bytearray()  # (1)!
 while True:
     event = conn.next_event()
     if isinstance(event, zttp.Data):
@@ -34,9 +34,12 @@ while True:
     elif event is zttp.NEED_DATA:
         break
 
-print(body)
+print(bytes(body))
 #> b'hello world'
 ```
+
+1.  Accumulate into a `bytearray`, not `b""`. Appending to `bytes` reallocates the
+    whole buffer on every `Data` event (quadratic); a `bytearray` grows in place.
 
 !!! tip
     Each `Data` event's `.data` is a real `bytes` object, copied out of the parse
@@ -79,7 +82,7 @@ conn.receive_data(
     b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"  # (1)!
 )
 
-body = b""
+body = bytearray()
 while True:
     event = conn.next_event()
     if isinstance(event, zttp.Data):
@@ -89,7 +92,7 @@ while True:
     elif event is zttp.NEED_DATA:
         break
 
-print(body)
+print(bytes(body))
 #> b'hello world'
 ```
 
