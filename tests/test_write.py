@@ -61,20 +61,22 @@ def test_trailers_rejected_on_bodyless_message() -> None:
         conn.end_message([(b"X-Checksum", b"abc")])
 
 
-def test_all_send_misuses_share_one_exception_class() -> None:
-    # Distinct messages, but every send-side misuse is a single catchable type.
-    cases = [
-        lambda c: c.send_data(b"x"),  # no head yet
-        lambda c: (c.send_response(b"1.1", 200, b"OK", []), c.send_response(b"1.1", 200, b"OK", [])),
-        lambda c: c.end_message(),  # nothing in progress
-    ]
-    messages = set()
-    for case in cases:
-        conn = zttp.Connection(zttp.SERVER)
-        with pytest.raises(zttp.ProtocolError) as exc_info:  # base class catches all
-            case(conn)
-        messages.add(str(exc_info.value))
-    assert len(messages) == len(cases)  # each misuse has its own message
+@pytest.mark.parametrize(
+    ("misuse", "message"),
+    [
+        (lambda c: c.send_data(b"x"), "send a head first"),
+        (
+            lambda c: (c.send_response(b"1.1", 200, b"OK", []), c.send_response(b"1.1", 200, b"OK", [])),
+            "a message is already in progress",
+        ),
+        (lambda c: c.end_message(), "no message is in progress to end"),
+    ],
+)
+def test_send_misuse_raises_specific_message(misuse, message: str) -> None:  # type: ignore[no-untyped-def]
+    # Distinct, actionable messages - all catchable by the one base class.
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(zttp.ProtocolError, match=message):
+        misuse(conn)
 
 
 def test_send_request() -> None:
