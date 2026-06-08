@@ -12,6 +12,7 @@ const std = @import("std");
 const events = @import("events.zig");
 const headers_mod = @import("headers.zig");
 const framing_mod = @import("framing.zig");
+const connection_mod = @import("connection.zig");
 const chunked_mod = @import("chunked.zig");
 const Scanner = @import("scanner.zig").Scanner;
 const ParseError = @import("errors.zig").ParseError;
@@ -90,6 +91,11 @@ pub const Reader = struct {
     /// CONNECT 2xx, RFC 9112 6.3). Empty when unknown. Server-side unused.
     request_method: [16]u8 = undefined,
     request_method_len: usize = 0,
+    /// Connection-scoped signals for the most recently parsed head, valid until
+    /// the next reset. `conn_upgrade` slices into the head buffer, so it is only
+    /// valid until the next feed/nextEvent - read it right after the event.
+    conn_should_close: bool = false,
+    conn_upgrade: ?[]const u8 = null,
     eof_seen: bool = false,
     /// The error that poisoned the connection, re-raised on every later call.
     failed_with: ParseError = error.ProtocolError,
@@ -148,6 +154,21 @@ pub const Reader = struct {
         self.body_remaining = 0;
         self.chunk = .{};
         self.request_method_len = 0;
+        self.conn_should_close = false;
+        self.conn_upgrade = null;
+    }
+
+    /// Whether the connection must close after the most recently parsed request
+    /// (RFC 9112 9.3). Valid after a Request event, until the next reset.
+    pub fn shouldClose(self: *const Reader) bool {
+        return self.conn_should_close;
+    }
+
+    /// The `Upgrade` value of the most recently parsed request iff its
+    /// `Connection` header listed the `upgrade` token; else null. The slice is
+    /// borrowed from the head buffer - read it right after the Request event.
+    pub fn upgrade(self: *const Reader) ?[]const u8 {
+        return self.conn_upgrade;
     }
 
     fn compact(self: *Reader) void {
@@ -246,11 +267,14 @@ pub const Reader = struct {
         if (self.role == .server) {
             const rl = try headers_mod.parseRequestLine(first);
             try self.frameBody(.{ .until_close_default = false });
+            self.conn_should_close = connection_mod.shouldClose(rl.http_version, self.headers.items);
+            self.conn_upgrade = connection_mod.upgrade(self.headers.items);
             return .{ .request = .{
                 .method = rl.method,
                 .target = rl.target,
                 .http_version = rl.http_version,
                 .headers = self.headers.items,
+                .expect_continue = connection_mod.expectsContinue(self.headers.items),
             } };
         }
 
