@@ -17,7 +17,7 @@ def test_send_response_content_length() -> None:
 def test_oversized_body_rejected() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"5")])
-    with pytest.raises(zttp.LocalProtocolError):
+    with pytest.raises(zttp.LocalProtocolError, match="more body than the declared Content-Length"):
         conn.send_data(b"too long")
 
 
@@ -33,7 +33,7 @@ def test_undersized_body_rejected_at_end() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"5")])
     conn.send_data(b"abc")
-    with pytest.raises(zttp.LocalProtocolError):
+    with pytest.raises(zttp.LocalProtocolError, match="ended before the declared Content-Length"):
         conn.end_message()
 
 
@@ -50,15 +50,31 @@ def test_trailers_rejected_on_content_length_body() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"3")])
     conn.send_data(b"abc")
-    with pytest.raises(zttp.LocalProtocolError):
+    with pytest.raises(zttp.LocalProtocolError, match="trailers can only follow a chunked body"):
         conn.end_message([(b"X-Checksum", b"abc")])
 
 
 def test_trailers_rejected_on_bodyless_message() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(b"1.1", 204, b"No Content", [])
-    with pytest.raises(zttp.LocalProtocolError):
+    with pytest.raises(zttp.LocalProtocolError, match="trailers can only follow a chunked body"):
         conn.end_message([(b"X-Checksum", b"abc")])
+
+
+def test_all_send_misuses_share_one_exception_class() -> None:
+    # Distinct messages, but every send-side misuse is a single catchable type.
+    cases = [
+        lambda c: c.send_data(b"x"),  # no head yet
+        lambda c: (c.send_response(b"1.1", 200, b"OK", []), c.send_response(b"1.1", 200, b"OK", [])),
+        lambda c: c.end_message(),  # nothing in progress
+    ]
+    messages = set()
+    for case in cases:
+        conn = zttp.Connection(zttp.SERVER)
+        with pytest.raises(zttp.ProtocolError) as exc_info:  # base class catches all
+            case(conn)
+        messages.add(str(exc_info.value))
+    assert len(messages) == len(cases)  # each misuse has its own message
 
 
 def test_send_request() -> None:

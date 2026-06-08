@@ -252,10 +252,16 @@ fn data_to_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
 }
 
 fn raiseWrite(e: core.writer.WriteError) py.Object {
+    const local = exceptions.LocalProtocolError;
     return switch (e) {
         error.OutOfMemory => c.PyErr_NoMemory(),
-        error.LocalProtocol => py.raise(exceptions.LocalProtocolError, "invalid send for current connection state"),
-        error.InvalidField => py.raise(exceptions.LocalProtocolError, "invalid field: a header/method/target/version/reason was malformed or contained CR/LF/control bytes"),
+        error.MessageNotEnded => py.raise(local, "a message is already in progress: end it before sending another head"),
+        error.NoBodyAllowed => py.raise(local, "cannot send body data now: send a head first, or this message takes no body"),
+        error.BodyTooLong => py.raise(local, "sent more body than the declared Content-Length"),
+        error.BodyTooShort => py.raise(local, "the message ended before the declared Content-Length was reached"),
+        error.TrailersNotAllowed => py.raise(local, "trailers can only follow a chunked body"),
+        error.NoMessageInProgress => py.raise(local, "no message is in progress to end"),
+        error.InvalidField => py.raise(local, "invalid field: a header/method/target/version/reason was malformed or contained CR/LF/control bytes"),
     };
 }
 
