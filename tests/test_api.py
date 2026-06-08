@@ -6,6 +6,24 @@ import zttp
 from tests.conftest import drain, drain_all
 
 
+def test_event_and_sentinels_public() -> None:
+    # Event and the two sentinels (constant + type) are importable from the
+    # package, not zttp._zttp.
+    for name in ("Event", "NeedData", "ConnectionClosed", "NEED_DATA", "CONNECTION_CLOSED"):
+        assert name in zttp.__all__
+    # Each sentinel is a singleton compared with `is`, and its type is named.
+    assert type(zttp.NEED_DATA) is zttp.NeedData
+    assert type(zttp.CONNECTION_CLOSED) is zttp.ConnectionClosed
+    ev: zttp.Event = zttp.Connection(zttp.SERVER).next_event()
+    assert ev is zttp.NEED_DATA
+
+
+def test_connection_closed_is_a_singleton() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"")
+    assert conn.next_event() is zttp.CONNECTION_CLOSED
+
+
 def test_request_repr() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"GET /p HTTP/1.1\r\nHost: x\r\n\r\n")

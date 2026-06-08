@@ -42,7 +42,11 @@ var request_type: py.Object = null;
 var response_type: py.Object = null;
 var data_type: py.Object = null;
 var end_of_message_type: py.Object = null;
-/// Singletons returned when no event is ready / read side is paused.
+/// The two terminal sentinels: NEED_DATA (no event yet) and CONNECTION_CLOSED
+/// (the peer closed). Each is a unique instance compared with `is`; its bare
+/// type (NeedData / ConnectionClosed) is exposed so the Event union can name it.
+var need_data_type: py.Object = null;
+var connection_closed_type: py.Object = null;
 pub var need_data: py.Object = null;
 pub var connection_closed: py.Object = null;
 
@@ -493,9 +497,14 @@ pub fn register(module: py.Object) bool {
         return false;
     }
 
-    // NEED_DATA / ConnectionClosed are unique sentinel instances of bare types.
-    need_data = makeSentinel("zttp.NeedDataType");
-    connection_closed = makeSentinel("zttp.ConnectionClosedType");
+    // NEED_DATA / CONNECTION_CLOSED are unique sentinel instances of bare types;
+    // we keep both the instance (compared with `is`) and the type so the Event
+    // union can name it.
+    need_data_type = py.typeFromSpec(&need_data_spec);
+    connection_closed_type = py.typeFromSpec(&connection_closed_spec);
+    if (need_data_type == null or connection_closed_type == null) return false;
+    need_data = py.allocInstance(need_data_type);
+    connection_closed = py.allocInstance(connection_closed_type);
     if (need_data == null or connection_closed == null) return false;
 
     if (!buildInternTable()) return false;
@@ -505,16 +514,13 @@ pub fn register(module: py.Object) bool {
     _ = c.PyModule_AddObjectRef(module, "Data", data_type);
     _ = c.PyModule_AddObjectRef(module, "EndOfMessage", end_of_message_type);
     _ = c.PyModule_AddObjectRef(module, "NEED_DATA", need_data);
-    _ = c.PyModule_AddObjectRef(module, "ConnectionClosed", connection_closed);
+    _ = c.PyModule_AddObjectRef(module, "NeedData", need_data_type);
+    _ = c.PyModule_AddObjectRef(module, "CONNECTION_CLOSED", connection_closed);
+    _ = c.PyModule_AddObjectRef(module, "ConnectionClosed", connection_closed_type);
     return true;
 }
 
-var sentinel_slots = [_]py.Slot{.{ .slot = 0, .pfunc = null }};
-
-fn makeSentinel(comptime name: [*c]const u8) py.Object {
-    var sp = py.Spec{ .name = name, .basicsize = @sizeOf(c.PyObject), .itemsize = 0, .flags = c.Py_TPFLAGS_DEFAULT, .slots = &sentinel_slots };
-    const tp = py.typeFromSpec(&sp);
-    if (tp == null) return null;
-    defer py.decref(tp);
-    return py.allocInstance(tp);
-}
+var need_data_slots = [_]py.Slot{.{ .slot = 0, .pfunc = null }};
+var need_data_spec = py.Spec{ .name = "zttp.NeedData", .basicsize = @sizeOf(c.PyObject), .itemsize = 0, .flags = c.Py_TPFLAGS_DEFAULT, .slots = &need_data_slots };
+var connection_closed_slots = [_]py.Slot{.{ .slot = 0, .pfunc = null }};
+var connection_closed_spec = py.Spec{ .name = "zttp.ConnectionClosed", .basicsize = @sizeOf(c.PyObject), .itemsize = 0, .flags = c.Py_TPFLAGS_DEFAULT, .slots = &connection_closed_slots };
