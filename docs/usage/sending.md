@@ -21,7 +21,7 @@ There are four building blocks, plus one call to collect the output:
 
 As a **server**, you answer a request:
 
-```python title="respond.py" hl_lines="12"
+```python title="respond.py" hl_lines="5 9 10"
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)
