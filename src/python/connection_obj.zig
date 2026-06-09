@@ -742,7 +742,10 @@ fn stream(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
         .h2 => {},
         else => return py.raiseRuntime("streams exist only on an HTTP/2 connection"),
     }
-    const id = c.PyLong_AsLong(arg);
+    // Parse as long long (64-bit on every platform; c_long is only 32-bit on
+    // Windows, where an id at/above 2^31 would otherwise raise OverflowError from
+    // PyLong_AsLong instead of the range ValueError below).
+    const id = c.PyLong_AsLongLong(arg);
     if (id <= 0) {
         if (c.PyErr_Occurred() != null) return null;
         return py.raiseValue("stream_id must be a positive integer");
