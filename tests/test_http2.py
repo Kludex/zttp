@@ -241,6 +241,17 @@ def test_h2_send_data_on_an_unselected_stream_is_rejected() -> None:
         conn.stream(0)
 
 
+def test_stream_id_out_of_range_is_rejected() -> None:
+    # HTTP/2 stream ids are 31-bit; a larger id must raise, not crash or truncate.
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    with pytest.raises(ValueError):
+        conn.stream(2**31)
+    with pytest.raises(ValueError):
+        conn.stream(1 << 40)
+    # The largest valid id is accepted.
+    assert conn.stream(2**31 - 1).stream_id == 2**31 - 1
+
+
 def test_connection_construction_picks_the_protocol_subtype() -> None:
     h1 = zttp.Connection(zttp.SERVER)
     h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)

@@ -747,6 +747,10 @@ fn stream(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
         if (c.PyErr_Occurred() != null) return null;
         return py.raiseValue("stream_id must be a positive integer");
     }
+    // HTTP/2 stream ids are 31-bit (RFC 9113 5.1.1). Reject anything larger before
+    // narrowing to u32, so an out-of-range id raises ValueError rather than
+    // trapping (safe builds) or silently truncating.
+    if (id > 0x7FFF_FFFF) return py.raiseValue("stream_id exceeds the 31-bit HTTP/2 limit");
     return makeStream(self_obj, @intCast(id));
 }
 
