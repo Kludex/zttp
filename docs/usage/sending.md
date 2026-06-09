@@ -12,7 +12,7 @@ would corrupt the wire.
 There are four building blocks, plus one call to collect the output:
 
 * `send_request(method, target, version, headers)` - a request head.
-* `send_response(version, status, reason, headers)` - a response head.
+* `send_response(status, headers=None)` - a response head.
 * `send_data(data)` - a run of body bytes.
 * `end_message(trailers=None)` - finish the message.
 * `data_to_send()` - take and clear the bytes produced so far.
@@ -27,7 +27,7 @@ import zttp
 conn = zttp.Connection(zttp.SERVER)
 
 conn.send_response(  # (1)!
-    b"1.1", 200, b"OK",
+    200,
     [(b"Content-Type", b"text/plain"), (b"Content-Length", b"5")],
 )
 conn.send_data(b"hello")  # (2)!
@@ -37,8 +37,9 @@ print(conn.data_to_send())  # (4)!
 #> b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello'
 ```
 
-1.  The head: version, status code, reason phrase, and the headers as a list of
-    `(name, value)` byte pairs.
+1.  The head: just the status code, plus the headers as a list of
+    `(name, value)` byte pairs. The reason phrase defaults from the status and
+    the version comes from the parsed request, so you pass neither.
 
 2.  Body bytes. With a `Content-Length` they pass straight through.
 
@@ -71,16 +72,19 @@ chunk-framed for you - so you can stream a body of unknown length:
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)
-conn.send_response(b"1.1", 200, b"OK", [(b"Transfer-Encoding", b"chunked")])
+conn.send_response(200, [(b"Transfer-Encoding", b"chunked")])  # (1)!
 conn.send_data(b"Wiki")
 conn.send_data(b"pedia")
-conn.end_message([(b"X-Checksum", b"abc")])  # (1)!
+conn.end_message([(b"X-Checksum", b"abc")])  # (2)!
 
 print(conn.data_to_send())
 #> b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Checksum: abc\r\n\r\n'
 ```
 
-1.  Trailers go on `end_message`. They're only emitted for a chunked body.
+1.  `send_response(status, headers=None)`. The reason phrase is derived from the
+    status (`200` -> `OK`), and the version is the one zttp parsed from the
+    request (or `1.1`), so you pass neither.
+2.  Trailers go on `end_message`. They're only emitted for a chunked body.
 
 ## Bodyless responses
 
@@ -89,7 +93,7 @@ Some responses have no body no matter what (a `204`, a `304`, the reply to a
 request method it parsed, so the framing stays correct on its own:
 
 ```python
-conn.send_response(b"1.1", 204, b"No Content", [])
+conn.send_response(204)
 conn.end_message()
 print(conn.data_to_send())
 #> b'HTTP/1.1 204 No Content\r\n\r\n'
@@ -109,7 +113,7 @@ is refused - either would put a malformed message on the wire:
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)
-conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"5")])
+conn.send_response(200, [(b"Content-Length", b"5")])
 conn.send_data(b"too long")
 #> zttp.LocalProtocolError: invalid send for current connection state
 ```
@@ -126,7 +130,7 @@ reason phrase, or target - the classic response-splitting trick - is refused:
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)
-conn.send_response(b"1.1", 200, b"OK", [(b"X-Evil", b"a\r\nInjected: yes")])
+conn.send_response(200, [(b"X-Evil", b"a\r\nInjected: yes")])
 #> zttp.LocalProtocolError: invalid field: a header/method/target/version/reason was malformed or contained CR/LF/control bytes
 ```
 
