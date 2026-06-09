@@ -5,8 +5,8 @@
 //! reject misuse (a body before a head, two heads in a row).
 
 const std = @import("std");
-const tables = @import("tables.zig");
-const events = @import("events.zig");
+const tables = @import("../tables.zig");
+const events = @import("../events.zig");
 const framing = @import("framing.zig");
 
 const Header = events.Header;
@@ -72,6 +72,84 @@ fn validLineToken(s: []const u8, allow_sp: bool) WriteError!void {
         if (ch == 0x7F) return error.InvalidField;
         if (!allow_sp and ch == ' ') return error.InvalidField;
     }
+}
+
+/// The IANA reason phrase for a status code. Unknown codes fall back to a
+/// per-class generic phrase; the code is what carries meaning, the phrase is
+/// advisory (RFC 9110 15.1), so callers may always override it.
+pub fn reasonPhrase(status: u16) []const u8 {
+    return switch (status) {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        102 => "Processing",
+        103 => "Early Hints",
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        203 => "Non-Authoritative Information",
+        204 => "No Content",
+        205 => "Reset Content",
+        206 => "Partial Content",
+        207 => "Multi-Status",
+        208 => "Already Reported",
+        226 => "IM Used",
+        300 => "Multiple Choices",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        305 => "Use Proxy",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        407 => "Proxy Authentication Required",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        410 => "Gone",
+        411 => "Length Required",
+        412 => "Precondition Failed",
+        413 => "Content Too Large",
+        414 => "URI Too Long",
+        415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
+        417 => "Expectation Failed",
+        418 => "I'm a Teapot",
+        421 => "Misdirected Request",
+        422 => "Unprocessable Content",
+        423 => "Locked",
+        424 => "Failed Dependency",
+        425 => "Too Early",
+        426 => "Upgrade Required",
+        428 => "Precondition Required",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        451 => "Unavailable For Legal Reasons",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        505 => "HTTP Version Not Supported",
+        506 => "Variant Also Negotiates",
+        507 => "Insufficient Storage",
+        508 => "Loop Detected",
+        510 => "Not Extended",
+        511 => "Network Authentication Required",
+        else => switch (status / 100) {
+            1 => "Informational",
+            2 => "Success",
+            3 => "Redirection",
+            4 => "Client Error",
+            5 => "Server Error",
+            else => "Unknown",
+        },
+    };
 }
 
 fn validateHeaders(hdrs: []const Header) WriteError!void {
@@ -183,11 +261,35 @@ pub const Writer = struct {
     /// is bodyless (RFC 9112 6.3), so the caller never tracks framing by hand.
     pub fn sendResponse(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header, request_method: []const u8) WriteError!void {
         if (self.state != .idle) return error.MessageNotEnded;
-        const ver = try normalizeVersion(version);
+        try self.writeStatusLine(try normalizeVersion(version), status, reason, hdrs);
+        if (responseIsBodyless(request_method, status)) {
+            self.state = .body_none;
+            self.body_remaining = 0;
+        } else {
+            const framing_ = bodyStateFor(hdrs);
+            self.state = framing_.state;
+            self.body_remaining = framing_.length;
+        }
+    }
+
+    /// Serialize an interim (1xx) response: a status-line + headers that precedes
+    /// the final response on the same message cycle. Unlike `sendResponse` it does
+    /// not consume the cycle - the writer stays idle, awaiting the real response.
+    /// The reason phrase is derived from the status, and the version is always 1.1
+    /// (1xx didn't exist in HTTP/1.0). Status must be 100..199, excluding 101:
+    /// 101 Switching Protocols is terminal (the connection leaves HTTP afterwards),
+    /// not interim, so it cannot be followed by a final response here.
+    pub fn sendInformational(self: *Writer, status: u16, hdrs: []const Header) WriteError!void {
+        if (self.state != .idle) return error.MessageNotEnded;
+        if (status / 100 != 1 or status == 101) return error.InvalidField;
+        try self.writeStatusLine("1.1", status, reasonPhrase(status), hdrs);
+    }
+
+    fn writeStatusLine(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header) WriteError!void {
         try validLineToken(reason, true); // reason-phrase may contain SP/HTAB
         try validateHeaders(hdrs);
         try self.w("HTTP/");
-        try self.w(ver);
+        try self.w(version);
         try self.w(" ");
         var buf: [3]u8 = undefined;
         buf[0] = '0' + @as(u8, @intCast((status / 100) % 10));
@@ -198,14 +300,6 @@ pub const Writer = struct {
         try self.w(reason);
         try self.w("\r\n");
         try self.writeHeaders(hdrs);
-        if (responseIsBodyless(request_method, status)) {
-            self.state = .body_none;
-            self.body_remaining = 0;
-        } else {
-            const framing_ = bodyStateFor(hdrs);
-            self.state = framing_.state;
-            self.body_remaining = framing_.length;
-        }
     }
 
     fn writeHeaders(self: *Writer, hdrs: []const Header) WriteError!void {
