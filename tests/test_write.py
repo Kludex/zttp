@@ -125,6 +125,16 @@ def test_head_response_is_bodyless_despite_content_length() -> None:
     assert conn.data_to_send() == b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n"
 
 
+def test_head_response_bodyless_after_early_start_next_cycle() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n")
+    list(drain(conn))
+    conn.start_next_cycle()
+    conn.send_response(200, [(b"Content-Length", b"1234")])
+    conn.end_message()
+    assert conn.data_to_send() == b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n"
+
+
 def test_status_code_formatting() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(404, [])
@@ -273,25 +283,15 @@ def test_send_response_headers_default_empty() -> None:
     assert conn.data_to_send() == b"HTTP/1.1 204 No Content\r\n\r\n"
 
 
-def test_send_response_version_from_request() -> None:
-    conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"GET / HTTP/1.0\r\nHost: h\r\n\r\n")
-    assert isinstance(conn.next_event(), zttp.Request)
-    conn.send_response(200, [(b"Content-Length", b"0")])
-    assert conn.data_to_send() == b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"
-
-
-def test_send_response_version_defaults_without_request() -> None:
+def test_send_response_version_is_always_1_1() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(500)
     assert conn.data_to_send() == b"HTTP/1.1 500 Internal Server Error\r\n\r\n"
 
 
-def test_send_response_version_survives_start_next_cycle() -> None:
+def test_send_response_version_1_1_even_for_http_1_0_request() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"GET / HTTP/1.0\r\nHost: h\r\n\r\n")
     assert isinstance(conn.next_event(), zttp.Request)
-    assert isinstance(conn.next_event(), zttp.EndOfMessage)
-    conn.start_next_cycle()
     conn.send_response(200, [(b"Content-Length", b"0")])
-    assert conn.data_to_send() == b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"
+    assert conn.data_to_send() == b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"

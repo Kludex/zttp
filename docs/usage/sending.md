@@ -38,8 +38,8 @@ print(conn.data_to_send())  # (4)!
 ```
 
 1.  The head: just the status code, plus the headers as a list of
-    `(name, value)` byte pairs. The reason phrase defaults from the status and
-    the version comes from the parsed request, so you pass neither.
+    `(name, value)` byte pairs. The reason phrase is derived from the status and
+    the version is `1.1`, so you pass neither.
 
 2.  Body bytes. With a `Content-Length` they pass straight through.
 
@@ -82,8 +82,7 @@ print(conn.data_to_send())
 ```
 
 1.  `send_response(status, headers=None)`. The reason phrase is derived from the
-    status (`200` -> `OK`), and the version is the one zttp parsed from the
-    request (or `1.1`), so you pass neither.
+    status (`200` -> `OK`) and the version is `1.1`, so you pass neither.
 2.  Trailers go on `end_message`. They're only emitted for a chunked body.
 
 ## Bodyless responses
