@@ -34,6 +34,7 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+          save-cache: false
 
       - name: Install dependencies
         run: scripts/install
