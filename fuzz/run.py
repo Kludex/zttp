@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import os
 import random
 import sys
@@ -94,8 +95,10 @@ def main() -> int:
 
     rng = random.Random(args.seed)
     findings = 0
-    # Replay saved reproducers first so a regression fails fast, then fuzz.
-    for data in (*_replay_corpus(), *_inputs(rng, args.runs)):
+    # Replay saved reproducers first so a regression fails fast, then fuzz. Chain
+    # lazily - materializing millions of generated inputs up front would blow the
+    # runner's memory before a single oracle runs.
+    for data in itertools.chain(_replay_corpus(), _inputs(rng, args.runs)):
         for oracle in ORACLES:
             try:
                 oracle(data)
