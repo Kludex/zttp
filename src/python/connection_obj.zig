@@ -40,13 +40,13 @@ const H1Engine = struct {
     should_close: bool = false,
     upgrade_obj: py.Object = null,
 
-    fn rememberMethod(self: *H1Engine, method: []const u8) void {
-        if (method.len > self.req_method.len) {
+    fn rememberMethod(self: *H1Engine, m: []const u8) void {
+        if (m.len > self.req_method.len) {
             self.req_method_len = 0;
             return;
         }
-        @memcpy(self.req_method[0..method.len], method);
-        self.req_method_len = method.len;
+        @memcpy(self.req_method[0..m.len], m);
+        self.req_method_len = m.len;
     }
 
     fn method(self: *const H1Engine) []const u8 {
