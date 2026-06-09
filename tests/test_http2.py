@@ -241,16 +241,27 @@ def test_h2_send_data_on_an_unselected_stream_is_rejected() -> None:
         conn.stream(0)
 
 
-def test_connection_level_send_is_http1_only() -> None:
-    # On HTTP/2 the message-scoped send_* methods route through a Stream, so the
-    # connection-level forms refuse rather than guessing a stream.
+def test_connection_construction_picks_the_protocol_subtype() -> None:
+    h1 = zttp.Connection(zttp.SERVER)
+    h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    assert type(h1) is zttp.H1Connection
+    assert type(h2) is zttp.H2Connection
+    # The base is a real supertype, so protocol-agnostic code can hold either.
+    assert isinstance(h1, zttp.Connection)
+    assert isinstance(h2, zttp.Connection)
+
+
+def test_message_scoped_send_is_absent_on_http2() -> None:
+    # The H2 send surface is stream-scoped: the connection simply does not carry
+    # the message-scoped methods, so misuse is a type error / AttributeError, not
+    # a runtime guard that has to be remembered.
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
-    with pytest.raises(RuntimeError):
-        conn.send_response(200, [(b"x", b"y")])
-    with pytest.raises(RuntimeError):
-        conn.send_data(b"body")
-    with pytest.raises(RuntimeError):
-        conn.end_message()
+    assert not hasattr(conn, "send_response")
+    assert not hasattr(conn, "send_data")
+    assert not hasattr(conn, "end_message")
+    # Conversely, stream-scoped sending is absent on HTTP/1.1.
+    h1 = zttp.Connection(zttp.SERVER)
+    assert not hasattr(h1, "stream")
 
 
 def test_protocol_defaults_to_http1() -> None:
@@ -304,12 +315,6 @@ def test_stream_handle_round_trips_a_response() -> None:
     data = next(e for e in events if isinstance(e, zttp.Data))
     assert resp.status_code == 200
     assert data.data == b"hi"
-
-
-def test_stream_only_on_http2() -> None:
-    conn = zttp.Connection(zttp.SERVER)  # HTTP/1.1
-    with pytest.raises(RuntimeError):
-        conn.stream(1)
 
 
 # -- Outbound flow control -----------------------------------------------------

@@ -155,6 +155,8 @@ const ConnectionObject = extern struct {
 };
 
 var connection_type: py.Object = null;
+var h1_connection_type: py.Object = null;
+var h2_connection_type: py.Object = null;
 var stream_type: py.Object = null;
 
 /// A handle to one HTTP/2 stream on a Connection. It is a borrowed view: the
@@ -284,33 +286,84 @@ var stream_spec = py.Spec{
     .slots = &stream_slots,
 };
 
-fn new(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+// Parse (role, protocol) from the constructor args. `default_protocol` is what a
+// missing `protocol` arg means - HTTP1 for the base Connection, but a subtype
+// fixes it (and the arg is rejected if it disagrees, so H2Connection(role, HTTP1)
+// can't lie). Returns false with a Python error set on bad input.
+fn parseArgs(args: ?*c.PyObject, kwds: ?*c.PyObject, role: *Role, protocol_out: *c_long, fixed: ?c_long) bool {
     var role_val: c_long = 0;
-    var protocol_val: c_long = HTTP1;
+    var protocol_val: c_long = fixed orelse HTTP1;
     // The kwlist parameter type differs across CPython versions (char** in 3.12,
     // const char* const* in 3.13+), so build a plain C-pointer array and ptrCast
     // it to whatever the translated signature expects.
     var kwlist = [_][*c]u8{ @constCast("role"), @constCast("protocol"), null };
-    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", @ptrCast(&kwlist), &role_val, &protocol_val) == 0) return null;
-    const role: Role = switch (role_val) {
+    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", @ptrCast(&kwlist), &role_val, &protocol_val) == 0) return false;
+    role.* = switch (role_val) {
         SERVER => .server,
         CLIENT => .client,
-        else => return py.raiseValue("role must be zttp.SERVER or zttp.CLIENT"),
+        else => {
+            _ = py.raiseValue("role must be zttp.SERVER or zttp.CLIENT");
+            return false;
+        },
     };
-    if (protocol_val != HTTP1 and protocol_val != HTTP2) return py.raiseValue("protocol must be zttp.HTTP1 or zttp.HTTP2");
+    if (protocol_val != HTTP1 and protocol_val != HTTP2) {
+        _ = py.raiseValue("protocol must be zttp.HTTP1 or zttp.HTTP2");
+        return false;
+    }
+    if (fixed) |f| {
+        if (protocol_val != f) {
+            _ = py.raiseValue("protocol does not match this Connection subclass; construct zttp.Connection to choose by protocol");
+            return false;
+        }
+    }
+    protocol_out.* = protocol_val;
+    return true;
+}
 
+// Allocate an instance of `tp` and build the engine for `protocol_val`. Shared by
+// the concrete subtypes' tp_new.
+fn allocAndBuild(tp: ?*c.PyTypeObject, role: Role, protocol_val: c_long) py.Object {
     const alloc = tp.?.tp_alloc.?;
     const obj = alloc(tp, 0);
     if (obj == null) return null;
     const self: *ConnectionObject = @ptrCast(obj);
     self.engine = null;
-
     const engine = buildEngine(role, protocol_val) orelse {
         py.decref(obj);
         return null;
     };
     self.engine = engine;
     return obj;
+}
+
+// Base `Connection` tp_new: a factory. Called as `Connection(role, protocol=...)`
+// it picks the H1/H2 subtype and returns an instance of THAT type, so the runtime
+// type is truthful (isinstance(obj, Connection) still holds via the base). Called
+// on a user subclass of Connection, it builds in place with the requested protocol
+// (the subclass is honoured; no foreign-type substitution).
+fn new_base(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    var role: Role = .server;
+    var protocol_val: c_long = HTTP1;
+    if (!parseArgs(args, kwds, &role, &protocol_val, null)) return null;
+    if (@intFromPtr(tp) == @intFromPtr(connection_type)) {
+        const sub: ?*c.PyTypeObject = @ptrCast(if (protocol_val == HTTP2) h2_connection_type else h1_connection_type);
+        return allocAndBuild(sub, role, protocol_val);
+    }
+    return allocAndBuild(tp, role, protocol_val);
+}
+
+fn new_h1(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    var role: Role = .server;
+    var protocol_val: c_long = HTTP1;
+    if (!parseArgs(args, kwds, &role, &protocol_val, HTTP1)) return null;
+    return allocAndBuild(tp, role, HTTP1);
+}
+
+fn new_h2(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    var role: Role = .server;
+    var protocol_val: c_long = HTTP2;
+    if (!parseArgs(args, kwds, &role, &protocol_val, HTTP2)) return null;
+    return allocAndBuild(tp, role, HTTP2);
 }
 
 fn buildEngine(role: Role, protocol_val: c_long) ?*Engine {
@@ -697,43 +750,94 @@ fn stream(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     return makeStream(self_obj, @intCast(id));
 }
 
-var methods = [_]py.MethodDef{
+// The read API, shared by both protocols and inherited by the subtypes. The base
+// Connection is the factory: constructing it picks H1Connection / H2Connection by
+// protocol (new_base), so the runtime type is truthful while isinstance(obj,
+// Connection) still holds.
+var base_methods = [_]py.MethodDef{
     .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
-    .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id on this HTTP/2 connection. The connection owns the stream state; the handle is a stream-scoped command surface (send_response / send_data / end_message)." },
     .{ .ml_name = "next_event", .ml_meth = next_event, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the next parse event, or NEED_DATA." },
-    .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
-    .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers). On HTTP/2 the client originates the stream, so this returns a Stream; on HTTP/1.1 it returns None." },
-    .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "HTTP/1.1 only: serialize a response head: send_response(status, headers=None). The reason phrase is derived from the status; the version is 1.1. Bodyless framing (HEAD / 204 / 304) is derived automatically. On HTTP/2, answer via a Stream (conn.stream(id))." },
-    .{ .ml_name = "send_informational", .ml_meth = send_informational, .ml_flags = c.METH_VARARGS, .ml_doc = "HTTP/1.1 only: serialize an interim 1xx response: send_informational(status, headers=None). The real response still follows on the same cycle." },
-    .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "HTTP/1.1 only: serialize a run of body bytes (chunk-framed if the head was chunked). On HTTP/2, send body via a Stream." },
-    .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "HTTP/1.1 only: end the outgoing message: end_message(trailers=None). On HTTP/2, end via a Stream." },
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
+    .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
+};
+
+// HTTP/1.1: the message-scoped send API plus keep-alive / upgrade signals.
+var h1_methods = [_]py.MethodDef{
+    .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
+    .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
+    .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(status, headers=None). The reason phrase is derived from the status; the version is 1.1. Bodyless framing (HEAD / 204 / 304) is derived automatically." },
+    .{ .ml_name = "send_informational", .ml_meth = send_informational, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response: send_informational(status, headers=None). The real response still follows on the same cycle." },
+    .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
+    .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
     .{ .ml_name = "should_close", .ml_meth = should_close, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request (Connection: close / HTTP/1.0)." },
     .{ .ml_name = "upgrade", .ml_meth = upgrade, .ml_flags = c.METH_NOARGS, .ml_doc = "The last request's Upgrade value if it asked to upgrade (Connection: upgrade), else None." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
-var slots = [_]py.Slot{
-    .{ .slot = c.Py_tp_new, .pfunc = @ptrCast(@constCast(&new)) },
+// HTTP/2: everything is stream-scoped. The client originates a stream by sending
+// a request (returns a Stream); the server reaches one with stream(id). There is
+// no connection-level body send - that is what the Stream handle is for.
+var h2_methods = [_]py.MethodDef{
+    .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
+    .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id. The connection owns the stream state; the handle is a stream-scoped command surface (send_response / send_data / end_message)." },
+    .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
+};
+
+var base_slots = [_]py.Slot{
+    .{ .slot = c.Py_tp_new, .pfunc = @ptrCast(@constCast(&new_base)) },
     .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&dealloc)) },
-    .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&methods) },
+    .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&base_methods) },
     .{ .slot = 0, .pfunc = null },
 };
 
-var spec = py.Spec{
+var h1_slots = [_]py.Slot{
+    .{ .slot = c.Py_tp_new, .pfunc = @ptrCast(@constCast(&new_h1)) },
+    .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&h1_methods) },
+    .{ .slot = 0, .pfunc = null },
+};
+
+var h2_slots = [_]py.Slot{
+    .{ .slot = c.Py_tp_new, .pfunc = @ptrCast(@constCast(&new_h2)) },
+    .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&h2_methods) },
+    .{ .slot = 0, .pfunc = null },
+};
+
+var base_spec = py.Spec{
     .name = "zttp.Connection",
     .basicsize = @sizeOf(ConnectionObject),
     .itemsize = 0,
+    .flags = c.Py_TPFLAGS_DEFAULT | c.Py_TPFLAGS_BASETYPE,
+    .slots = &base_slots,
+};
+
+var h1_spec = py.Spec{
+    .name = "zttp.H1Connection",
+    .basicsize = @sizeOf(ConnectionObject),
+    .itemsize = 0,
     .flags = c.Py_TPFLAGS_DEFAULT,
-    .slots = &slots,
+    .slots = &h1_slots,
+};
+
+var h2_spec = py.Spec{
+    .name = "zttp.H2Connection",
+    .basicsize = @sizeOf(ConnectionObject),
+    .itemsize = 0,
+    .flags = c.Py_TPFLAGS_DEFAULT,
+    .slots = &h2_slots,
 };
 
 pub fn register(module: py.Object) bool {
-    connection_type = py.typeFromSpec(&spec);
+    connection_type = py.typeFromSpec(&base_spec);
     if (connection_type == null) return false;
+    h1_connection_type = py.typeFromSpecWithBase(&h1_spec, connection_type);
+    if (h1_connection_type == null) return false;
+    h2_connection_type = py.typeFromSpecWithBase(&h2_spec, connection_type);
+    if (h2_connection_type == null) return false;
     stream_type = py.typeFromSpec(&stream_spec);
     if (stream_type == null) return false;
     _ = c.PyModule_AddObjectRef(module, "Connection", connection_type);
+    _ = c.PyModule_AddObjectRef(module, "H1Connection", h1_connection_type);
+    _ = c.PyModule_AddObjectRef(module, "H2Connection", h2_connection_type);
     _ = c.PyModule_AddObjectRef(module, "Stream", stream_type);
     _ = c.PyModule_AddIntConstant(module, "SERVER", SERVER);
     _ = c.PyModule_AddIntConstant(module, "CLIENT", CLIENT);
