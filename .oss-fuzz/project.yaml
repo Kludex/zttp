@@ -1,0 +1,12 @@
+homepage: "https://github.com/Kludex/zttp"
+language: c++
+main_repo: "https://github.com/Kludex/zttp"
+primary_contact: "marcelotryle@gmail.com"
+fuzzing_engines:
+  - libfuzzer
+  - afl
+sanitizers:
+  - address
+  - undefined
+architectures:
+  - x86_64

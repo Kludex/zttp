@@ -177,6 +177,17 @@ pub fn newException(name: [*c]const u8, base: Object) Object {
     return c.PyErr_NewException(name, base, null);
 }
 
+// -- free threading -----------------------------------------------------------
+
+/// Declare that the module is safe to import without the GIL. On free-threaded
+/// builds this keeps the GIL disabled; without it CPython re-enables the GIL at
+/// import time. The symbol only exists on 3.13+, so it's a no-op on 3.12.
+pub fn declareGilNotUsed(m: Object) void {
+    if (@hasDecl(c, "PyUnstable_Module_SetGIL")) {
+        _ = c.PyUnstable_Module_SetGIL(m, c.Py_MOD_GIL_NOT_USED);
+    }
+}
+
 // -- cyclic GC (for container types that hold PyObject references) -------------
 
 pub inline fn gcTrack(o: anytype) void {

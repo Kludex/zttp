@@ -125,8 +125,7 @@ if conn.upgrade() == b"websocket":  # Connection: upgrade + Upgrade: websocket
     ...  # hand the socket to your WebSocket stack
 
 if request.expect_continue:  # the client sent Expect: 100-continue
-    conn.send_response(b"1.1", 100, b"Continue", [])
-    conn.end_message()
+    conn.send_informational(100)  # the real response still follows
 ```
 
 `conn.upgrade()` returns the `Upgrade` value only when `Connection` lists the

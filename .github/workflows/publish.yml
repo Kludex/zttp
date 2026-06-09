@@ -9,38 +9,6 @@ on:
 permissions: {}
 
 jobs:
-  # Production: publish https://zttp.marcelotryle.com on every push to main.
-  docs:
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
-
-    environment:
-      name: cloudflare
-      url: https://zttp.marcelotryle.com
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-        with:
-          python-version: "3.12"
-          enable-cache: false
-
-      - name: Build docs
-        run: scripts/docs
-
-      - name: Deploy to Cloudflare
-        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
-
   build-wheels:
     name: "Wheels on ${{ matrix.os }}"
     runs-on: "${{ matrix.os }}"

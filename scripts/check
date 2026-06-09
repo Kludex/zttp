@@ -3,7 +3,7 @@
 # Run every read-only check the CI enforces: formatting, types, and linting -
 # for both the Python package and the Zig core.
 
-export SOURCE_FILES="zttp tests bench.py"
+export SOURCE_FILES="zttp tests bench.py fuzz"
 
 set -x
 
