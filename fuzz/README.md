@@ -37,8 +37,12 @@ uv sync --group fuzz
 uv run python fuzz/fuzz_parse.py fuzz/corpus -runs=2000000
 
 # Coverage-guided over the Zig core directly (libFuzzer + ASan/UBSan).
-# Needs an LLVM clang whose major version tracks Zig's; on macOS set CLANG.
+# Needs a Linux-style clang whose major version tracks Zig's.
 scripts/fuzz-libfuzzer -runs=2000000 fuzz/corpus
+
+# Same target in the OSS-Fuzz image - the no-fuss path on macOS, where the host
+# clang lacks the Mach-O sancov plumbing the ELF-only shim relies on.
+scripts/fuzz-docker -max_total_time=60
 ```
 
 ## libFuzzer target and OSS-Fuzz
