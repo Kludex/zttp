@@ -116,5 +116,9 @@ def bench(name: str, data: bytes, n: int) -> None:
 
 
 if __name__ == "__main__":
+    if zttp._zttp.BUILD_MODE == "Debug":
+        raise SystemExit(
+            "zttp was built in Debug mode; rebuild with `HATCH_ZIG_BUILD_MODE=ReleaseSafe uv sync` before benchmarking."
+        )
     bench("simple GET", SIMPLE, 200_000)
     bench("POST + body", POST, 200_000)

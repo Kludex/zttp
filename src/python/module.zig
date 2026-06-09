@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const py = @import("py.zig");
 const c = py.c;
 const connection = @import("connection_obj.zig");
@@ -21,6 +22,10 @@ fn PyInit__zttp() callconv(.c) ?*c.PyObject {
     if (m == null) return null;
 
     if (!exceptions.register(m) or !events_obj.register(m) or !connection.register(m)) {
+        py.decref(m);
+        return null;
+    }
+    if (c.PyModule_AddStringConstant(m, "BUILD_MODE", @tagName(builtin.mode)) != 0) {
         py.decref(m);
         return null;
     }

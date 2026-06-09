@@ -6,6 +6,7 @@ from typing import Final, Literal, overload
 
 SERVER: Final[int]
 CLIENT: Final[int]
+BUILD_MODE: Final[str]
 # Literal-typed so Connection(role, HTTP2) selects the H2Connection __new__ overload.
 HTTP1: Final = 1
 HTTP2: Final = 2
