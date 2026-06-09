@@ -16,5 +16,4 @@ build/
 site/
 .cache/
 .ossfuzz-out/
-crash-*
-crash-*.bin
+/crash-*

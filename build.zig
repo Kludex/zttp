@@ -54,6 +54,9 @@ pub fn build(b: *std.Build) void {
             .stack_check = false,
         }),
     });
+    // `.fuzz` instruments the whole object, not just its root module, so the
+    // imported `core` parser carries sancov coverage too - that is the surface
+    // the fuzzer actually explores.
     fuzz_obj.root_module.addImport("core", fuzz_core);
     const install_fuzz = b.addInstallBinFile(fuzz_obj.getEmittedBin(), "zttp_fuzz_reader.o");
     const fuzz_obj_step = b.step("fuzz-obj", "Emit the libFuzzer object (zig-out/bin/zttp_fuzz_reader.o)");
