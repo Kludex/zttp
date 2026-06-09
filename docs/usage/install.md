@@ -13,7 +13,7 @@ uv add zttp
 That's all you need. There's nothing else to configure. ✨
 
 !!! note "Requirements"
-    zttp needs **CPython 3.12+** and runs on **Linux**, **macOS**, and **Windows**.
+    zttp needs **CPython 3.10+** and runs on **Linux**, **macOS**, and **Windows**.
 
 ## Building from source
 

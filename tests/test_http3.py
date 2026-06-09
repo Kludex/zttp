@@ -22,10 +22,17 @@ def test_http3_requires_server_role() -> None:
         zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3)
 
 
+def test_http3_construction_picks_the_subtype() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+    assert type(conn) is zttp.H3Connection
+    assert isinstance(conn, zttp.Connection)
+
+
 def test_receive_datagram_only_on_http3() -> None:
+    # receive_datagram is an H3Connection method - it simply isn't on the others,
+    # so feeding datagrams to an HTTP/2 connection is a type error / AttributeError.
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
-    with pytest.raises(RuntimeError):
-        conn.receive_datagram(b"\x00")
+    assert not hasattr(conn, "receive_datagram")
 
 
 def test_first_datagram_must_be_an_initial() -> None:

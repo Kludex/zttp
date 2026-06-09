@@ -99,7 +99,7 @@ pub var connection_closed: py.Object = null;
 // -- members (read-only attribute exposure) -----------------------------------
 
 fn member(comptime name: [*c]const u8, comptime offset: usize) py.MemberDef {
-    return .{ .name = name, .type = c.Py_T_OBJECT_EX, .offset = @intCast(offset), .flags = c.Py_READONLY, .doc = null };
+    return .{ .name = name, .type = py.T_OBJECT_EX, .offset = @intCast(offset), .flags = py.READONLY, .doc = null };
 }
 
 var request_members = [_]py.MemberDef{
@@ -110,7 +110,7 @@ var request_members = [_]py.MemberDef{
     member("http_version", @offsetOf(RequestObject, "http_version")),
     member("headers", @offsetOf(RequestObject, "headers")),
     member("stream_id", @offsetOf(RequestObject, "stream_id")),
-    .{ .name = "expect_continue", .type = c.Py_T_BOOL, .offset = @intCast(@offsetOf(RequestObject, "expect_continue")), .flags = c.Py_READONLY, .doc = null },
+    .{ .name = "expect_continue", .type = py.T_BOOL, .offset = @intCast(@offsetOf(RequestObject, "expect_continue")), .flags = py.READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var response_members = [_]py.MemberDef{

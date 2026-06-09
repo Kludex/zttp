@@ -103,6 +103,12 @@ A client connection is the mirror image: you get `Response` (with `.status_code`
 `.reason`, `.http_version`, `.headers`) instead of `Request`, then the same
 `Data` / `EndOfMessage`.
 
+!!! tip "Same events on HTTP/2"
+    Pass `protocol=zttp.HTTP2` and the read side is unchanged - the *same*
+    `Request` / `Response` / `Data` / `EndOfMessage`, plus a `.stream_id` on each
+    (it's `0` on HTTP/1.1) because one connection now multiplexes many requests.
+    The send side differs - HTTP/2 sends on a stream. See [HTTP/2](http2.md).
+
 ## Keep-alive
 
 HTTP/1.1 connections are reused. After you've pulled `EndOfMessage` for one

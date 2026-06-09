@@ -13,6 +13,9 @@ from zttp._zttp import (
     Data,
     EndOfMessage,
     Goaway,
+    H1Connection,
+    H2Connection,
+    H3Connection,
     LocalProtocolError,
     NeedData,
     Ping,
@@ -22,6 +25,7 @@ from zttp._zttp import (
     Response,
     RstStream,
     Settings,
+    Stream,
     WindowUpdate,
 )
 
@@ -53,6 +57,9 @@ __all__ = [
     "EndOfMessage",
     "Event",
     "Goaway",
+    "H1Connection",
+    "H2Connection",
+    "H3Connection",
     "LocalProtocolError",
     "NeedData",
     "Ping",
@@ -62,5 +69,6 @@ __all__ = [
     "Response",
     "RstStream",
     "Settings",
+    "Stream",
     "WindowUpdate",
 ]
