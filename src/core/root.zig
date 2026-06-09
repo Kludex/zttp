@@ -5,6 +5,7 @@ pub const errors = @import("errors.zig");
 pub const events = @import("events.zig");
 pub const scanner = @import("scanner.zig");
 pub const h1 = @import("h1/root.zig");
+pub const h2 = @import("h2/root.zig");
 
 test {
     _ = tables;
@@ -12,4 +13,5 @@ test {
     _ = events;
     _ = scanner;
     _ = h1;
+    _ = h2;
 }

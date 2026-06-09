@@ -9,6 +9,11 @@ const c = py.c;
 const core = @import("core");
 const events = core.events;
 
+// stream_id is the HTTP/2 stream an event belongs to (0 for HTTP/1.1). It is
+// exposed as a read-only member but DELIBERATELY excluded from each event's repr
+// and equality field lists, so every existing HTTP/1.1 repr string and equality
+// test is byte-for-byte unchanged.
+
 const RequestObject = extern struct {
     ob_base: c.PyObject,
     method: py.Object,
@@ -17,6 +22,7 @@ const RequestObject = extern struct {
     query: py.Object,
     http_version: py.Object,
     headers: py.Object,
+    stream_id: py.Object,
     expect_continue: c_char,
 };
 
@@ -26,22 +32,62 @@ const ResponseObject = extern struct {
     reason: py.Object,
     http_version: py.Object,
     headers: py.Object,
+    stream_id: py.Object,
 };
 
 const DataObject = extern struct {
     ob_base: c.PyObject,
     data: py.Object,
+    stream_id: py.Object,
 };
 
 const EndOfMessageObject = extern struct {
     ob_base: c.PyObject,
     trailers: py.Object,
+    stream_id: py.Object,
+};
+
+// The five HTTP/2 control events. Each holds plain Python ints/bytes.
+
+const RstStreamObject = extern struct {
+    ob_base: c.PyObject,
+    stream_id: py.Object,
+    error_code: py.Object,
+};
+
+const GoawayObject = extern struct {
+    ob_base: c.PyObject,
+    last_stream_id: py.Object,
+    error_code: py.Object,
+    debug: py.Object,
+};
+
+const SettingsEventObject = extern struct {
+    ob_base: c.PyObject,
+    params: py.Object, // list of (id, value) int tuples
+};
+
+const PingObject = extern struct {
+    ob_base: c.PyObject,
+    ack: py.Object,
+    data: py.Object, // 8 opaque bytes
+};
+
+const WindowUpdateObject = extern struct {
+    ob_base: c.PyObject,
+    stream_id: py.Object,
+    increment: py.Object,
 };
 
 var request_type: py.Object = null;
 var response_type: py.Object = null;
 var data_type: py.Object = null;
 var end_of_message_type: py.Object = null;
+var rst_stream_type: py.Object = null;
+var goaway_type: py.Object = null;
+var settings_type: py.Object = null;
+var ping_type: py.Object = null;
+var window_update_type: py.Object = null;
 /// The two terminal sentinels: NEED_DATA (no event yet) and CONNECTION_CLOSED
 /// (the peer closed). Each is a unique instance compared with `is`; its bare
 /// type (NeedData / ConnectionClosed) is exposed so the Event union can name it.
@@ -63,6 +109,7 @@ var request_members = [_]py.MemberDef{
     member("query", @offsetOf(RequestObject, "query")),
     member("http_version", @offsetOf(RequestObject, "http_version")),
     member("headers", @offsetOf(RequestObject, "headers")),
+    member("stream_id", @offsetOf(RequestObject, "stream_id")),
     .{ .name = "expect_continue", .type = c.Py_T_BOOL, .offset = @intCast(@offsetOf(RequestObject, "expect_continue")), .flags = c.Py_READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
@@ -71,14 +118,42 @@ var response_members = [_]py.MemberDef{
     member("reason", @offsetOf(ResponseObject, "reason")),
     member("http_version", @offsetOf(ResponseObject, "http_version")),
     member("headers", @offsetOf(ResponseObject, "headers")),
+    member("stream_id", @offsetOf(ResponseObject, "stream_id")),
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var data_members = [_]py.MemberDef{
     member("data", @offsetOf(DataObject, "data")),
+    member("stream_id", @offsetOf(DataObject, "stream_id")),
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var eom_members = [_]py.MemberDef{
     member("trailers", @offsetOf(EndOfMessageObject, "trailers")),
+    member("stream_id", @offsetOf(EndOfMessageObject, "stream_id")),
+    .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
+};
+var rst_stream_members = [_]py.MemberDef{
+    member("stream_id", @offsetOf(RstStreamObject, "stream_id")),
+    member("error_code", @offsetOf(RstStreamObject, "error_code")),
+    .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
+};
+var goaway_members = [_]py.MemberDef{
+    member("last_stream_id", @offsetOf(GoawayObject, "last_stream_id")),
+    member("error_code", @offsetOf(GoawayObject, "error_code")),
+    member("debug", @offsetOf(GoawayObject, "debug")),
+    .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
+};
+var settings_members = [_]py.MemberDef{
+    member("params", @offsetOf(SettingsEventObject, "params")),
+    .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
+};
+var ping_members = [_]py.MemberDef{
+    member("ack", @offsetOf(PingObject, "ack")),
+    member("data", @offsetOf(PingObject, "data")),
+    .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
+};
+var window_update_members = [_]py.MemberDef{
+    member("stream_id", @offsetOf(WindowUpdateObject, "stream_id")),
+    member("increment", @offsetOf(WindowUpdateObject, "increment")),
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 
@@ -93,6 +168,7 @@ fn deallocRequest(o: ?*c.PyObject) callconv(.c) void {
     py.xdecref(s.query);
     py.xdecref(s.http_version);
     py.xdecref(s.headers);
+    py.xdecref(s.stream_id);
     py.freeInstance(@ptrCast(s));
 }
 fn deallocResponse(o: ?*c.PyObject) callconv(.c) void {
@@ -102,18 +178,56 @@ fn deallocResponse(o: ?*c.PyObject) callconv(.c) void {
     py.xdecref(s.reason);
     py.xdecref(s.http_version);
     py.xdecref(s.headers);
+    py.xdecref(s.stream_id);
     py.freeInstance(@ptrCast(s));
 }
 fn deallocData(o: ?*c.PyObject) callconv(.c) void {
     const s: *DataObject = @ptrCast(o.?);
     py.gcUntrack(s);
     py.xdecref(s.data);
+    py.xdecref(s.stream_id);
     py.freeInstance(@ptrCast(s));
 }
 fn deallocEom(o: ?*c.PyObject) callconv(.c) void {
     const s: *EndOfMessageObject = @ptrCast(o.?);
     py.gcUntrack(s);
     py.xdecref(s.trailers);
+    py.xdecref(s.stream_id);
+    py.freeInstance(@ptrCast(s));
+}
+fn deallocRstStream(o: ?*c.PyObject) callconv(.c) void {
+    const s: *RstStreamObject = @ptrCast(o.?);
+    py.gcUntrack(s);
+    py.xdecref(s.stream_id);
+    py.xdecref(s.error_code);
+    py.freeInstance(@ptrCast(s));
+}
+fn deallocGoaway(o: ?*c.PyObject) callconv(.c) void {
+    const s: *GoawayObject = @ptrCast(o.?);
+    py.gcUntrack(s);
+    py.xdecref(s.last_stream_id);
+    py.xdecref(s.error_code);
+    py.xdecref(s.debug);
+    py.freeInstance(@ptrCast(s));
+}
+fn deallocSettings(o: ?*c.PyObject) callconv(.c) void {
+    const s: *SettingsEventObject = @ptrCast(o.?);
+    py.gcUntrack(s);
+    py.xdecref(s.params);
+    py.freeInstance(@ptrCast(s));
+}
+fn deallocPing(o: ?*c.PyObject) callconv(.c) void {
+    const s: *PingObject = @ptrCast(o.?);
+    py.gcUntrack(s);
+    py.xdecref(s.ack);
+    py.xdecref(s.data);
+    py.freeInstance(@ptrCast(s));
+}
+fn deallocWindowUpdate(o: ?*c.PyObject) callconv(.c) void {
+    const s: *WindowUpdateObject = @ptrCast(o.?);
+    py.gcUntrack(s);
+    py.xdecref(s.stream_id);
+    py.xdecref(s.increment);
     py.freeInstance(@ptrCast(s));
 }
 
@@ -136,7 +250,7 @@ fn visitObj(obj: py.Object, visit: c.visitproc, arg: ?*anyopaque) c_int {
 
 fn traverseRequest(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const s: *RequestObject = @ptrCast(o.?);
-    inline for (.{ s.method, s.target, s.path, s.query, s.http_version, s.headers }) |f| {
+    inline for (.{ s.method, s.target, s.path, s.query, s.http_version, s.headers, s.stream_id }) |f| {
         const r = visitObj(f, visit, arg);
         if (r != 0) return r;
     }
@@ -150,11 +264,12 @@ fn clearRequest(o: ?*c.PyObject) callconv(.c) c_int {
     py.clear(&s.query);
     py.clear(&s.http_version);
     py.clear(&s.headers);
+    py.clear(&s.stream_id);
     return 0;
 }
 fn traverseResponse(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const s: *ResponseObject = @ptrCast(o.?);
-    inline for (.{ s.status_code, s.reason, s.http_version, s.headers }) |f| {
+    inline for (.{ s.status_code, s.reason, s.http_version, s.headers, s.stream_id }) |f| {
         const r = visitObj(f, visit, arg);
         if (r != 0) return r;
     }
@@ -166,24 +281,101 @@ fn clearResponse(o: ?*c.PyObject) callconv(.c) c_int {
     py.clear(&s.reason);
     py.clear(&s.http_version);
     py.clear(&s.headers);
+    py.clear(&s.stream_id);
     return 0;
 }
 fn traverseData(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const s: *DataObject = @ptrCast(o.?);
-    return visitObj(s.data, visit, arg);
+    inline for (.{ s.data, s.stream_id }) |f| {
+        const r = visitObj(f, visit, arg);
+        if (r != 0) return r;
+    }
+    return 0;
 }
 fn clearData(o: ?*c.PyObject) callconv(.c) c_int {
     const s: *DataObject = @ptrCast(o.?);
     py.clear(&s.data);
+    py.clear(&s.stream_id);
     return 0;
 }
 fn traverseEom(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const s: *EndOfMessageObject = @ptrCast(o.?);
-    return visitObj(s.trailers, visit, arg);
+    inline for (.{ s.trailers, s.stream_id }) |f| {
+        const r = visitObj(f, visit, arg);
+        if (r != 0) return r;
+    }
+    return 0;
 }
 fn clearEom(o: ?*c.PyObject) callconv(.c) c_int {
     const s: *EndOfMessageObject = @ptrCast(o.?);
     py.clear(&s.trailers);
+    py.clear(&s.stream_id);
+    return 0;
+}
+fn traverseRstStream(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const s: *RstStreamObject = @ptrCast(o.?);
+    inline for (.{ s.stream_id, s.error_code }) |f| {
+        const r = visitObj(f, visit, arg);
+        if (r != 0) return r;
+    }
+    return 0;
+}
+fn clearRstStream(o: ?*c.PyObject) callconv(.c) c_int {
+    const s: *RstStreamObject = @ptrCast(o.?);
+    py.clear(&s.stream_id);
+    py.clear(&s.error_code);
+    return 0;
+}
+fn traverseGoaway(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const s: *GoawayObject = @ptrCast(o.?);
+    inline for (.{ s.last_stream_id, s.error_code, s.debug }) |f| {
+        const r = visitObj(f, visit, arg);
+        if (r != 0) return r;
+    }
+    return 0;
+}
+fn clearGoaway(o: ?*c.PyObject) callconv(.c) c_int {
+    const s: *GoawayObject = @ptrCast(o.?);
+    py.clear(&s.last_stream_id);
+    py.clear(&s.error_code);
+    py.clear(&s.debug);
+    return 0;
+}
+fn traverseSettings(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const s: *SettingsEventObject = @ptrCast(o.?);
+    return visitObj(s.params, visit, arg);
+}
+fn clearSettings(o: ?*c.PyObject) callconv(.c) c_int {
+    const s: *SettingsEventObject = @ptrCast(o.?);
+    py.clear(&s.params);
+    return 0;
+}
+fn traversePing(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const s: *PingObject = @ptrCast(o.?);
+    inline for (.{ s.ack, s.data }) |f| {
+        const r = visitObj(f, visit, arg);
+        if (r != 0) return r;
+    }
+    return 0;
+}
+fn clearPing(o: ?*c.PyObject) callconv(.c) c_int {
+    const s: *PingObject = @ptrCast(o.?);
+    py.clear(&s.ack);
+    py.clear(&s.data);
+    return 0;
+}
+fn traverseWindowUpdate(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const s: *WindowUpdateObject = @ptrCast(o.?);
+    inline for (.{ s.stream_id, s.increment }) |f| {
+        const r = visitObj(f, visit, arg);
+        if (r != 0) return r;
+    }
+    return 0;
+}
+fn clearWindowUpdate(o: ?*c.PyObject) callconv(.c) c_int {
+    const s: *WindowUpdateObject = @ptrCast(o.?);
+    py.clear(&s.stream_id);
+    py.clear(&s.increment);
     return 0;
 }
 
@@ -278,15 +470,46 @@ const response_fields = .{
 const data_fields = .{FieldInfo(DataObject){ .name = "data", .field = "data" }};
 const eom_fields = .{FieldInfo(EndOfMessageObject){ .name = "trailers", .field = "trailers" }};
 
+// The HTTP/2 control events include stream_id in their repr/equality (they are
+// H2-only, so there is no H1 output to preserve).
+const rst_stream_fields = .{
+    FieldInfo(RstStreamObject){ .name = "stream_id", .field = "stream_id" },
+    FieldInfo(RstStreamObject){ .name = "error_code", .field = "error_code" },
+};
+const goaway_fields = .{
+    FieldInfo(GoawayObject){ .name = "last_stream_id", .field = "last_stream_id" },
+    FieldInfo(GoawayObject){ .name = "error_code", .field = "error_code" },
+    FieldInfo(GoawayObject){ .name = "debug", .field = "debug" },
+};
+const settings_fields = .{FieldInfo(SettingsEventObject){ .name = "params", .field = "params" }};
+const ping_fields = .{
+    FieldInfo(PingObject){ .name = "ack", .field = "ack" },
+    FieldInfo(PingObject){ .name = "data", .field = "data" },
+};
+const window_update_fields = .{
+    FieldInfo(WindowUpdateObject){ .name = "stream_id", .field = "stream_id" },
+    FieldInfo(WindowUpdateObject){ .name = "increment", .field = "increment" },
+};
+
 const reprRequest = reprFields(RequestObject, "Request", request_fields);
 const reprResponse = reprFields(ResponseObject, "Response", response_fields);
 const reprData = reprFields(DataObject, "Data", data_fields);
 const reprEom = reprFields(EndOfMessageObject, "EndOfMessage", eom_fields);
+const reprRstStream = reprFields(RstStreamObject, "RstStream", rst_stream_fields);
+const reprGoaway = reprFields(GoawayObject, "Goaway", goaway_fields);
+const reprSettings = reprFields(SettingsEventObject, "Settings", settings_fields);
+const reprPing = reprFields(PingObject, "Ping", ping_fields);
+const reprWindowUpdate = reprFields(WindowUpdateObject, "WindowUpdate", window_update_fields);
 
 const cmpRequest = richcompareFields(RequestObject, request_fields);
 const cmpResponse = richcompareFields(ResponseObject, response_fields);
 const cmpData = richcompareFields(DataObject, data_fields);
 const cmpEom = richcompareFields(EndOfMessageObject, eom_fields);
+const cmpRstStream = richcompareFields(RstStreamObject, rst_stream_fields);
+const cmpGoaway = richcompareFields(GoawayObject, goaway_fields);
+const cmpSettings = richcompareFields(SettingsEventObject, settings_fields);
+const cmpPing = richcompareFields(PingObject, ping_fields);
+const cmpWindowUpdate = richcompareFields(WindowUpdateObject, window_update_fields);
 
 // -- specs --------------------------------------------------------------------
 
@@ -306,6 +529,11 @@ var request_slots = slots(deallocRequest, &request_members, traverseRequest, cle
 var response_slots = slots(deallocResponse, &response_members, traverseResponse, clearResponse, reprResponse, cmpResponse);
 var data_slots = slots(deallocData, &data_members, traverseData, clearData, reprData, cmpData);
 var eom_slots = slots(deallocEom, &eom_members, traverseEom, clearEom, reprEom, cmpEom);
+var rst_stream_slots = slots(deallocRstStream, &rst_stream_members, traverseRstStream, clearRstStream, reprRstStream, cmpRstStream);
+var goaway_slots = slots(deallocGoaway, &goaway_members, traverseGoaway, clearGoaway, reprGoaway, cmpGoaway);
+var settings_slots = slots(deallocSettings, &settings_members, traverseSettings, clearSettings, reprSettings, cmpSettings);
+var ping_slots = slots(deallocPing, &ping_members, traversePing, clearPing, reprPing, cmpPing);
+var window_update_slots = slots(deallocWindowUpdate, &window_update_members, traverseWindowUpdate, clearWindowUpdate, reprWindowUpdate, cmpWindowUpdate);
 
 fn spec(comptime name: [*c]const u8, comptime size: usize, sl: anytype) py.Spec {
     return .{
@@ -321,6 +549,11 @@ var request_spec = spec("zttp.Request", @sizeOf(RequestObject), &request_slots);
 var response_spec = spec("zttp.Response", @sizeOf(ResponseObject), &response_slots);
 var data_spec = spec("zttp.Data", @sizeOf(DataObject), &data_slots);
 var eom_spec = spec("zttp.EndOfMessage", @sizeOf(EndOfMessageObject), &eom_slots);
+var rst_stream_spec = spec("zttp.RstStream", @sizeOf(RstStreamObject), &rst_stream_slots);
+var goaway_spec = spec("zttp.Goaway", @sizeOf(GoawayObject), &goaway_slots);
+var settings_spec = spec("zttp.Settings", @sizeOf(SettingsEventObject), &settings_slots);
+var ping_spec = spec("zttp.Ping", @sizeOf(PingObject), &ping_slots);
+var window_update_spec = spec("zttp.WindowUpdate", @sizeOf(WindowUpdateObject), &window_update_slots);
 
 // -- header-name interning ----------------------------------------------------
 
@@ -418,7 +651,7 @@ fn buildHeaders(hdrs: []const events.Header) py.Object {
 
 // -- constructors from core events --------------------------------------------
 
-pub fn fromEvent(ev: events.Event) py.Object {
+pub fn fromH1Event(ev: events.H1Event) py.Object {
     return switch (ev) {
         .request => |r| makeRequest(r),
         .response => |r| makeResponse(r),
@@ -427,6 +660,25 @@ pub fn fromEvent(ev: events.Event) py.Object {
         .need_data => py.newRef(need_data),
         .connection_closed => py.newRef(connection_closed),
     };
+}
+
+pub fn fromH2Event(ev: events.H2Event) py.Object {
+    return switch (ev) {
+        .request => |r| makeRequest(r),
+        .response => |r| makeResponse(r),
+        .data => |d| makeData(d),
+        .end_of_message => |e| makeEom(e),
+        .need_data => py.newRef(need_data),
+        .rst_stream => |r| makeRstStream(r),
+        .goaway => |g| makeGoaway(g),
+        .settings => |s| makeSettings(s),
+        .ping => |p| makePing(p),
+        .window_update => |w| makeWindowUpdate(w),
+    };
+}
+
+fn u32Obj(v: u32) py.Object {
+    return c.PyLong_FromUnsignedLong(v);
 }
 
 fn makeRequest(r: events.Request) py.Object {
@@ -439,8 +691,9 @@ fn makeRequest(r: events.Request) py.Object {
     s.query = py.fromBytes(r.query);
     s.http_version = py.fromBytes(r.http_version);
     s.headers = buildHeaders(r.headers);
+    s.stream_id = u32Obj(r.stream_id);
     s.expect_continue = @intFromBool(r.expect_continue);
-    if (s.method == null or s.target == null or s.path == null or s.query == null or s.http_version == null or s.headers == null) {
+    if (s.method == null or s.target == null or s.path == null or s.query == null or s.http_version == null or s.headers == null or s.stream_id == null) {
         py.decref(o);
         return null;
     }
@@ -455,7 +708,8 @@ fn makeResponse(r: events.Response) py.Object {
     s.reason = py.fromBytes(r.reason);
     s.http_version = py.fromBytes(r.http_version);
     s.headers = buildHeaders(r.headers);
-    if (s.status_code == null or s.reason == null or s.http_version == null or s.headers == null) {
+    s.stream_id = u32Obj(r.stream_id);
+    if (s.status_code == null or s.reason == null or s.http_version == null or s.headers == null or s.stream_id == null) {
         py.decref(o);
         return null;
     }
@@ -467,7 +721,8 @@ fn makeData(d: events.Data) py.Object {
     if (o == null) return null;
     const s: *DataObject = @ptrCast(o);
     s.data = py.fromBytes(d.data);
-    if (s.data == null) {
+    s.stream_id = u32Obj(d.stream_id);
+    if (s.data == null or s.stream_id == null) {
         py.decref(o);
         return null;
     }
@@ -479,7 +734,90 @@ fn makeEom(e: events.EndOfMessage) py.Object {
     if (o == null) return null;
     const s: *EndOfMessageObject = @ptrCast(o);
     s.trailers = buildHeaders(e.trailers);
-    if (s.trailers == null) {
+    s.stream_id = u32Obj(e.stream_id);
+    if (s.trailers == null or s.stream_id == null) {
+        py.decref(o);
+        return null;
+    }
+    return o;
+}
+
+fn makeRstStream(r: events.RstStream) py.Object {
+    const o = py.allocInstance(rst_stream_type);
+    if (o == null) return null;
+    const s: *RstStreamObject = @ptrCast(o);
+    s.stream_id = u32Obj(r.stream_id);
+    s.error_code = u32Obj(r.error_code);
+    if (s.stream_id == null or s.error_code == null) {
+        py.decref(o);
+        return null;
+    }
+    return o;
+}
+
+fn makeGoaway(g: events.Goaway) py.Object {
+    const o = py.allocInstance(goaway_type);
+    if (o == null) return null;
+    const s: *GoawayObject = @ptrCast(o);
+    s.last_stream_id = u32Obj(g.last_stream_id);
+    s.error_code = u32Obj(g.error_code);
+    s.debug = py.fromBytes(g.debug);
+    if (s.last_stream_id == null or s.error_code == null or s.debug == null) {
+        py.decref(o);
+        return null;
+    }
+    return o;
+}
+
+fn makeSettings(ev: events.SettingsEvent) py.Object {
+    const o = py.allocInstance(settings_type);
+    if (o == null) return null;
+    const s: *SettingsEventObject = @ptrCast(o);
+    const list = py.newList(@intCast(ev.params.len));
+    if (list == null) {
+        py.decref(o);
+        return null;
+    }
+    for (ev.params, 0..) |p, i| {
+        const id = u32Obj(p.id);
+        const value = u32Obj(p.value);
+        const tup = py.tupleNew(2);
+        if (id == null or value == null or tup == null) {
+            py.xdecref(id);
+            py.xdecref(value);
+            py.xdecref(tup);
+            py.decref(list);
+            py.decref(o);
+            return null;
+        }
+        py.tupleSet(tup, 0, id);
+        py.tupleSet(tup, 1, value);
+        py.listSet(list, @intCast(i), tup);
+    }
+    s.params = list;
+    return o;
+}
+
+fn makePing(p: events.Ping) py.Object {
+    const o = py.allocInstance(ping_type);
+    if (o == null) return null;
+    const s: *PingObject = @ptrCast(o);
+    s.ack = py.boolean(p.ack);
+    s.data = py.fromBytes(&p.opaque_data);
+    if (s.ack == null or s.data == null) {
+        py.decref(o);
+        return null;
+    }
+    return o;
+}
+
+fn makeWindowUpdate(w: events.WindowUpdate) py.Object {
+    const o = py.allocInstance(window_update_type);
+    if (o == null) return null;
+    const s: *WindowUpdateObject = @ptrCast(o);
+    s.stream_id = u32Obj(w.stream_id);
+    s.increment = u32Obj(w.increment);
+    if (s.stream_id == null or s.increment == null) {
         py.decref(o);
         return null;
     }
@@ -493,7 +831,15 @@ pub fn register(module: py.Object) bool {
     response_type = py.typeFromSpec(&response_spec);
     data_type = py.typeFromSpec(&data_spec);
     end_of_message_type = py.typeFromSpec(&eom_spec);
+    rst_stream_type = py.typeFromSpec(&rst_stream_spec);
+    goaway_type = py.typeFromSpec(&goaway_spec);
+    settings_type = py.typeFromSpec(&settings_spec);
+    ping_type = py.typeFromSpec(&ping_spec);
+    window_update_type = py.typeFromSpec(&window_update_spec);
     if (request_type == null or response_type == null or data_type == null or end_of_message_type == null) {
+        return false;
+    }
+    if (rst_stream_type == null or goaway_type == null or settings_type == null or ping_type == null or window_update_type == null) {
         return false;
     }
 
@@ -513,6 +859,11 @@ pub fn register(module: py.Object) bool {
     _ = c.PyModule_AddObjectRef(module, "Response", response_type);
     _ = c.PyModule_AddObjectRef(module, "Data", data_type);
     _ = c.PyModule_AddObjectRef(module, "EndOfMessage", end_of_message_type);
+    _ = c.PyModule_AddObjectRef(module, "RstStream", rst_stream_type);
+    _ = c.PyModule_AddObjectRef(module, "Goaway", goaway_type);
+    _ = c.PyModule_AddObjectRef(module, "Settings", settings_type);
+    _ = c.PyModule_AddObjectRef(module, "Ping", ping_type);
+    _ = c.PyModule_AddObjectRef(module, "WindowUpdate", window_update_type);
     _ = c.PyModule_AddObjectRef(module, "NEED_DATA", need_data);
     _ = c.PyModule_AddObjectRef(module, "NeedData", need_data_type);
     _ = c.PyModule_AddObjectRef(module, "CONNECTION_CLOSED", connection_closed);

@@ -18,7 +18,7 @@ const Scanner = @import("../scanner.zig").Scanner;
 const ParseError = @import("../errors.zig").ParseError;
 
 const Header = events.Header;
-const Event = events.Event;
+const Event = events.H1Event;
 const Framing = framing_mod.Framing;
 
 const COMPACT_THRESHOLD: usize = 64 * 1024;

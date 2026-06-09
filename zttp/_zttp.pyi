@@ -6,6 +6,8 @@ from typing import Final
 
 SERVER: Final[int]
 CLIENT: Final[int]
+HTTP1: Final[int]
+HTTP2: Final[int]
 
 class Request:
     method: bytes
@@ -14,6 +16,7 @@ class Request:
     query: bytes
     http_version: bytes
     headers: list[tuple[bytes, bytes]]
+    stream_id: int
     expect_continue: bool
 
 class Response:
@@ -21,12 +24,35 @@ class Response:
     reason: bytes
     http_version: bytes
     headers: list[tuple[bytes, bytes]]
+    stream_id: int
 
 class Data:
     data: bytes
+    stream_id: int
 
 class EndOfMessage:
     trailers: list[tuple[bytes, bytes]]
+    stream_id: int
+
+class RstStream:
+    stream_id: int
+    error_code: int
+
+class Goaway:
+    last_stream_id: int
+    error_code: int
+    debug: bytes
+
+class Settings:
+    params: list[tuple[int, int]]
+
+class Ping:
+    ack: bool
+    data: bytes
+
+class WindowUpdate:
+    stream_id: int
+    increment: int
 
 class NeedData: ...
 class ConnectionClosed: ...
@@ -34,14 +60,26 @@ class ConnectionClosed: ...
 NEED_DATA: Final[NeedData]
 CONNECTION_CLOSED: Final[ConnectionClosed]
 
-Event = Request | Response | Data | EndOfMessage | NeedData | ConnectionClosed
+Event = (
+    Request
+    | Response
+    | Data
+    | EndOfMessage
+    | RstStream
+    | Goaway
+    | Settings
+    | Ping
+    | WindowUpdate
+    | NeedData
+    | ConnectionClosed
+)
 
 class ProtocolError(Exception): ...
 class RemoteProtocolError(ProtocolError): ...
 class LocalProtocolError(ProtocolError): ...
 
 class Connection:
-    def __init__(self, role: int) -> None: ...
+    def __init__(self, role: int, protocol: int = ...) -> None: ...
     def receive_data(self, data: bytes) -> None: ...
     def next_event(self) -> Event: ...
     def start_next_cycle(self) -> None: ...
