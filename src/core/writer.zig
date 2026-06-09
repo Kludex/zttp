@@ -74,6 +74,18 @@ fn validLineToken(s: []const u8, allow_sp: bool) WriteError!void {
     }
 }
 
+/// The reason phrase for an interim status. Unknown 1xx codes fall back to a
+/// generic phrase; the code is what carries meaning, the phrase is advisory.
+fn reasonPhrase(status: u16) []const u8 {
+    return switch (status) {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        102 => "Processing",
+        103 => "Early Hints",
+        else => "Informational",
+    };
+}
+
 fn validateHeaders(hdrs: []const Header) WriteError!void {
     for (hdrs) |h| {
         try validName(h.name);
@@ -183,11 +195,33 @@ pub const Writer = struct {
     /// is bodyless (RFC 9112 6.3), so the caller never tracks framing by hand.
     pub fn sendResponse(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header, request_method: []const u8) WriteError!void {
         if (self.state != .idle) return error.MessageNotEnded;
-        const ver = try normalizeVersion(version);
+        try self.writeStatusLine(try normalizeVersion(version), status, reason, hdrs);
+        if (responseIsBodyless(request_method, status)) {
+            self.state = .body_none;
+            self.body_remaining = 0;
+        } else {
+            const framing_ = bodyStateFor(hdrs);
+            self.state = framing_.state;
+            self.body_remaining = framing_.length;
+        }
+    }
+
+    /// Serialize an interim (1xx) response: a status-line + headers that precedes
+    /// the final response on the same message cycle. Unlike `sendResponse` it does
+    /// not consume the cycle - the writer stays idle, awaiting the real response.
+    /// The reason phrase is derived from the status, and the version is always 1.1
+    /// (1xx didn't exist in HTTP/1.0). Status must be 100..199.
+    pub fn sendInformational(self: *Writer, status: u16, hdrs: []const Header) WriteError!void {
+        if (self.state != .idle) return error.MessageNotEnded;
+        if (status / 100 != 1) return error.InvalidField;
+        try self.writeStatusLine("1.1", status, reasonPhrase(status), hdrs);
+    }
+
+    fn writeStatusLine(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header) WriteError!void {
         try validLineToken(reason, true); // reason-phrase may contain SP/HTAB
         try validateHeaders(hdrs);
         try self.w("HTTP/");
-        try self.w(ver);
+        try self.w(version);
         try self.w(" ");
         var buf: [3]u8 = undefined;
         buf[0] = '0' + @as(u8, @intCast((status / 100) % 10));
@@ -198,14 +232,6 @@ pub const Writer = struct {
         try self.w(reason);
         try self.w("\r\n");
         try self.writeHeaders(hdrs);
-        if (responseIsBodyless(request_method, status)) {
-            self.state = .body_none;
-            self.body_remaining = 0;
-        } else {
-            const framing_ = bodyStateFor(hdrs);
-            self.state = framing_.state;
-            self.body_remaining = framing_.length;
-        }
     }
 
     fn writeHeaders(self: *Writer, hdrs: []const Header) WriteError!void {

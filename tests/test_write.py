@@ -176,3 +176,74 @@ def test_round_trip_server_reads_client_output() -> None:
     body = b"".join(e.data for e in events if isinstance(e, zttp.Data))
     assert body == b"data"
     assert isinstance(events[-1], zttp.EndOfMessage)
+
+
+def test_informational_then_final_response() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.send_informational(100)
+    conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"2")])
+    conn.send_data(b"hi")
+    conn.end_message()
+    assert conn.data_to_send() == (b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+
+
+def test_informational_reason_derived_from_status() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.send_informational(103, [(b"Link", b"</style.css>; rel=preload")])
+    assert conn.data_to_send() == b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"
+
+
+def test_informational_unknown_status_falls_back() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.send_informational(150)
+    assert conn.data_to_send() == b"HTTP/1.1 150 Informational\r\n\r\n"
+
+
+def test_multiple_informational_responses() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.send_informational(103, [(b"Link", b"</a.css>; rel=preload")])
+    conn.send_informational(100)
+    conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"0")])
+    conn.end_message()
+    assert conn.data_to_send() == (
+        b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n"
+        b"HTTP/1.1 100 Continue\r\n\r\n"
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    )
+
+
+@pytest.mark.parametrize("status", [99, 200, 204, 301, 500])
+def test_informational_rejects_non_1xx(status: int) -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(ValueError, match="informational status code must be in 100..199"):
+        conn.send_informational(status)
+
+
+def test_informational_rejected_mid_message() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"5")])
+    with pytest.raises(zttp.LocalProtocolError, match="a message is already in progress"):
+        conn.send_informational(100)
+
+
+def test_informational_round_trips_to_reader() -> None:
+    server = zttp.Connection(zttp.SERVER)
+    server.send_informational(100)
+    server.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"0")])
+    server.end_message()
+    wire = server.data_to_send()
+
+    client = zttp.Connection(zttp.CLIENT)
+    client.send_request(b"GET", b"/", b"1.1", [(b"Host", b"h")])
+    client.end_message()
+    client.receive_data(wire)
+
+    interim = client.next_event()
+    assert isinstance(interim, zttp.Response)
+    assert interim.status_code == 100
+    assert isinstance(client.next_event(), zttp.EndOfMessage)
+
+    client.start_next_cycle()
+    final = client.next_event()
+    assert isinstance(final, zttp.Response)
+    assert final.status_code == 200

@@ -219,6 +219,23 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     return py.none();
 }
 
+fn send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
+    var status: c_long = 0;
+    var hdrs_seq: ?*c.PyObject = null;
+    if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
+    if (status < 100 or status > 199) return py.raiseValue("informational status code must be in 100..199");
+    if (hdrs_seq == null or py.isNone(hdrs_seq)) {
+        wc.sendInformational(@intCast(status), &.{}) catch |e| return raiseWrite(e);
+    } else {
+        var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+        defer hdrs.deinit();
+        wc.sendInformational(@intCast(status), hdrs.headers) catch |e| return raiseWrite(e);
+    }
+    return py.none();
+}
+
 fn send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const wc = self.writer orelse return py.raiseRuntime("connection is closed");
@@ -294,7 +311,8 @@ var methods = [_]py.MethodDef{
     .{ .ml_name = "next_event", .ml_meth = next_event, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the next parse event, or NEED_DATA." },
     .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
-    .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(version, status, reason, headers). Bodyless framing (HEAD / 1xx / 204 / 304) is derived automatically." },
+    .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(version, status, reason, headers). Bodyless framing (HEAD / 204 / 304) is derived automatically." },
+    .{ .ml_name = "send_informational", .ml_meth = send_informational, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response: send_informational(status, headers=None). The real response still follows on the same cycle." },
     .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
     .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
