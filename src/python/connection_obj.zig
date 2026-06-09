@@ -7,9 +7,9 @@ const std = @import("std");
 const py = @import("py.zig");
 const c = py.c;
 const core = @import("core");
-const Reader = core.reader.Reader;
-const Role = core.reader.Role;
-const Writer = core.writer.Writer;
+const Reader = core.h1.reader.Reader;
+const Role = core.h1.reader.Role;
+const Writer = core.h1.writer.Writer;
 const events = core.events;
 const events_obj = @import("events_obj.zig");
 const exceptions = @import("exceptions.zig");
@@ -244,18 +244,38 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
 fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const wc = self.writer orelse return py.raiseRuntime("connection is closed");
-    var version: ?*c.PyObject = null;
     var status: c_long = 0;
-    var reason: ?*c.PyObject = null;
     var hdrs_seq: ?*c.PyObject = null;
-    if (c.PyArg_ParseTuple(args, "OlOO", &version, &status, &reason, &hdrs_seq) == 0) return null;
+    if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
     if (status < 0 or status > 999) return py.raiseValue("status code out of range");
-    const vb = py.asBytes(version) orelse return null;
-    const rb = py.asBytes(reason) orelse return null;
+    const rb = core.h1.writer.reasonPhrase(@intCast(status));
+    const vb = "1.1";
+    const method = self.req_method[0..self.req_method_len];
+    if (hdrs_seq == null or py.isNone(hdrs_seq)) {
+        wc.sendResponse(vb, @intCast(status), rb, &.{}, method) catch |e| return raiseWrite(e);
+        return py.none();
+    }
     var hdrs = borrowHeaders(hdrs_seq) orelse return null;
     defer hdrs.deinit();
-    const method = self.req_method[0..self.req_method_len];
     wc.sendResponse(vb, @intCast(status), rb, hdrs.headers, method) catch |e| return raiseWrite(e);
+    return py.none();
+}
+
+fn send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
+    var status: c_long = 0;
+    var hdrs_seq: ?*c.PyObject = null;
+    if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
+    if (status < 100 or status > 199) return py.raiseValue("informational status code must be in 100..199");
+    if (status == 101) return py.raiseValue("101 Switching Protocols is a terminal upgrade response, not interim");
+    if (hdrs_seq == null or py.isNone(hdrs_seq)) {
+        wc.sendInformational(@intCast(status), &.{}) catch |e| return raiseWrite(e);
+    } else {
+        var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+        defer hdrs.deinit();
+        wc.sendInformational(@intCast(status), hdrs.headers) catch |e| return raiseWrite(e);
+    }
     return py.none();
 }
 
@@ -291,7 +311,7 @@ fn data_to_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     return out;
 }
 
-fn raiseWrite(e: core.writer.WriteError) py.Object {
+fn raiseWrite(e: core.h1.writer.WriteError) py.Object {
     const local = exceptions.LocalProtocolError;
     return switch (e) {
         error.OutOfMemory => c.PyErr_NoMemory(),
@@ -310,7 +330,10 @@ fn next_message(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const r = self.reader orelse return py.raiseRuntime("connection is closed");
     r.reset();
-    self.req_method_len = 0;
+    // req_method is intentionally NOT cleared: a caller may call start_next_cycle()
+    // before serializing the previous response (e.g. pipelined keep-alive reads),
+    // and send_response reads it to frame HEAD / CONNECT responses as bodyless. It
+    // is overwritten when the next request is parsed, so a stale value is never seen.
     self.should_close = false;
     py.xdecref(self.upgrade_obj);
     self.upgrade_obj = null;
@@ -334,7 +357,8 @@ var methods = [_]py.MethodDef{
     .{ .ml_name = "next_event", .ml_meth = next_event, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the next parse event, or NEED_DATA." },
     .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
-    .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(version, status, reason, headers). Bodyless framing (HEAD / 1xx / 204 / 304) is derived automatically." },
+    .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(status, headers=None). The reason phrase is derived from the status; the version is 1.1. Bodyless framing (HEAD / 204 / 304) is derived automatically." },
+    .{ .ml_name = "send_informational", .ml_meth = send_informational, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response: send_informational(status, headers=None). The real response still follows on the same cycle." },
     .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
     .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },

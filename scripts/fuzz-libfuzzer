@@ -1,0 +1,55 @@
+#!/bin/sh -e
+
+# Coverage-guided libFuzzer run over the reader. Builds the instrumented Zig
+# object with `zig build fuzz-obj`, compiles the C shim that registers Zig's
+# SanitizerCoverage counters with the engine and owns the libFuzzer entry point,
+# then links the two into a runnable fuzzer.
+#
+# This is the same shape an OSS-Fuzz build.sh uses: $CC compiles fuzz/target.c
+# against $LIB_FUZZING_ENGINE and links the Zig object. Here we default to the
+# local clang's libFuzzer + ASan/UBSan so the same artifact runs off-CI too.
+#
+# The clang that links must come from an LLVM compatible with the one Zig used
+# to instrument the object - they share the SanitizerCoverage section layout.
+# Linux's stock clang (and OSS-Fuzz's) matches; on macOS, set CLANG to an LLVM
+# whose major version tracks Zig's (older Apple/Homebrew LLVMs may not).
+#
+# Any extra arguments are forwarded to the fuzzer binary (libFuzzer flags or a
+# corpus dir), e.g. `scripts/fuzz-libfuzzer -runs=100000 fuzz/corpus`.
+
+set -x
+
+zig build fuzz-obj
+
+OBJ=zig-out/bin/zttp_fuzz_reader.o
+SHIM_OBJ=zig-out/bin/zttp_fuzz_shim.o
+BIN=zig-out/bin/zttp_fuzz_reader
+
+if [ -n "$LIB_FUZZING_ENGINE" ]; then
+    # OSS-Fuzz path: the base image's clang and sanitizer flags are pre-set.
+    ${CC:-clang} $CFLAGS -c fuzz/target.c -o "$SHIM_OBJ"
+    ${CC:-clang} $CFLAGS "$SHIM_OBJ" "$OBJ" "$LIB_FUZZING_ENGINE" -o "$BIN"
+else
+    CLANG="${CLANG:-}"
+    if [ -z "$CLANG" ]; then
+        if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then
+            CLANG=/opt/homebrew/opt/llvm/bin/clang
+        elif [ -x /usr/local/opt/llvm/bin/clang ]; then
+            CLANG=/usr/local/opt/llvm/bin/clang
+        else
+            CLANG=clang
+        fi
+    fi
+    # The shim carries no coverage of its own - only ASan/UBSan - so the engine
+    # sees exactly one instrumented module (the parser).
+    "$CLANG" -g -O1 -fsanitize=address,undefined -c fuzz/target.c -o "$SHIM_OBJ"
+    "$CLANG" -fsanitize=fuzzer,address,undefined "$SHIM_OBJ" "$OBJ" -o "$BIN"
+fi
+
+# Default to a bounded run over the committed corpus so the script terminates;
+# pass `-runs=-1` (or no corpus) to fuzz indefinitely.
+if [ "$#" -eq 0 ]; then
+    set -- -runs=200000 fuzz/corpus
+fi
+
+exec "$BIN" "$@"

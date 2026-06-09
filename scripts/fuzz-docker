@@ -1,0 +1,31 @@
+#!/bin/sh -e
+
+# Run the coverage-guided libFuzzer target locally inside the OSS-Fuzz base
+# image - the same toolchain ClusterFuzz uses, so it works anywhere Docker does
+# (notably macOS, where the host clang lacks the Mach-O sancov plumbing the
+# shim's ELF section-boundary symbols rely on).
+#
+# Builds the OSS-Fuzz image, compiles via .oss-fuzz/build.sh, then runs the
+# fuzzer. Any arguments are forwarded to the fuzzer binary, e.g.
+# `scripts/fuzz-docker -runs=2000000` or `scripts/fuzz-docker -max_total_time=60`.
+
+set -x
+
+ROOT=$(git rev-parse --show-toplevel)
+IMAGE=zttp-ossfuzz
+
+docker build -t "$IMAGE" -f "$ROOT/.oss-fuzz/Dockerfile" "$ROOT/.oss-fuzz"
+
+# Default to a one-minute campaign over the seed corpus baked in by build.sh.
+if [ "$#" -eq 0 ]; then
+    set -- -max_total_time=60
+fi
+
+# Mount the working tree over $SRC/zttp so the local branch is what gets built,
+# not the GitHub clone in the image.
+docker run --rm --platform linux/amd64 \
+    -e FUZZING_ENGINE=libfuzzer -e SANITIZER=address -e ARCHITECTURE=x86_64 \
+    -e FUZZING_LANGUAGE=c++ \
+    -v "$ROOT":/src/zttp \
+    -v "$ROOT/.oss-fuzz/build.sh":/src/build.sh \
+    "$IMAGE" bash -c "cd /src/zttp && rm -rf zig-out .zig-cache && compile && /out/zttp_fuzz_reader $*"

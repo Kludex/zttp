@@ -1,0 +1,60 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Daily at 04:17 UTC - off the hour to dodge the cron rush.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Iterations per seed"
+        default: "5000000"
+
+permissions: {}
+
+jobs:
+  fuzz:
+    name: "Fuzz the parser"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.16.0"
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          save-cache: false
+
+      - name: Install dependencies
+        run: scripts/install
+
+      - name: Build the Zig core and extension
+        run: scripts/build
+
+      - name: Fuzz
+        env:
+          FUZZ_RUNS: ${{ github.event.inputs.runs || '5000000' }}
+        # A fresh seed each day (run id) plus a fixed seed for the always-replayed
+        # corpus regressions. Exits non-zero on any finding, failing the job.
+        run: |
+          uv run --no-sync python -m fuzz.run --runs "$FUZZ_RUNS" --seed "$GITHUB_RUN_ID"
+          uv run --no-sync python -m fuzz.run --runs "$FUZZ_RUNS" --seed 0
+
+      - name: Upload reproducers
+        if: failure()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: fuzz-reproducers
+          path: fuzz/corpus/crash-*.bin
+          if-no-files-found: ignore
