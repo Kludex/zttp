@@ -4,9 +4,9 @@
 //! conflicting values, we reject rather than guess.
 
 const std = @import("std");
-const tables = @import("tables.zig");
-const events = @import("events.zig");
-const ParseError = @import("errors.zig").ParseError;
+const tables = @import("../tables.zig");
+const events = @import("../events.zig");
+const ParseError = @import("../errors.zig").ParseError;
 
 const Header = events.Header;
 

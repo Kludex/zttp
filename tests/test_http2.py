@@ -186,7 +186,7 @@ def test_server_sends_a_response_a_client_reads() -> None:
     server.receive_data(client.data_to_send())
     list(drain_h2(server))  # consume the request so h2_recv_stream is set
 
-    server.send_response(b"2", 200, b"", [(b"content-type", b"text/plain")])
+    server.send_response(200, [(b"content-type", b"text/plain")])
     server.send_data(b"hi")
     server.end_message()
     # Feed the server's bytes (its SETTINGS + response) back into the client.
@@ -223,10 +223,10 @@ def test_h2_concurrent_responses_route_by_stream_id() -> None:
     assert s1 != s2
 
     # Answer the FIRST request explicitly, even though the second was parsed last.
-    server.send_response(b"2", 201, b"", [(b"x-which", b"a")], s1)
+    server.send_response(201, [(b"x-which", b"a")], s1)
     server.send_data(b"AA", s1)
     server.end_message(None, s1)
-    server.send_response(b"2", 202, b"", [(b"x-which", b"b")], s2)
+    server.send_response(202, [(b"x-which", b"b")], s2)
     server.send_data(b"BB", s2)
     server.end_message(None, s2)
 
