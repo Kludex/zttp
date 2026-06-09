@@ -69,7 +69,6 @@ fallback-version = "0.0.0"
 
 [tool.hatch.build.targets.wheel]
 packages = ["zttp"]
-artifacts = ["zttp/*.so"]
 
 [tool.hatch.build.targets.wheel.hooks.zig]
 package = "zttp"
