@@ -5,8 +5,8 @@
 //! reject misuse (a body before a head, two heads in a row).
 
 const std = @import("std");
-const tables = @import("tables.zig");
-const events = @import("events.zig");
+const tables = @import("../tables.zig");
+const events = @import("../events.zig");
 const framing = @import("framing.zig");
 
 const Header = events.Header;

@@ -6,8 +6,8 @@
 //! caller.
 
 const std = @import("std");
-const tables = @import("tables.zig");
-const events = @import("events.zig");
+const tables = @import("../tables.zig");
+const events = @import("../events.zig");
 
 const Header = events.Header;
 

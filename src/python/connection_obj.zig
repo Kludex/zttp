@@ -7,9 +7,9 @@ const std = @import("std");
 const py = @import("py.zig");
 const c = py.c;
 const core = @import("core");
-const Reader = core.reader.Reader;
-const Role = core.reader.Role;
-const Writer = core.writer.Writer;
+const Reader = core.h1.reader.Reader;
+const Role = core.h1.reader.Role;
+const Writer = core.h1.writer.Writer;
 const events = core.events;
 const events_obj = @import("events_obj.zig");
 const exceptions = @import("exceptions.zig");
@@ -208,7 +208,7 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
     if (status < 0 or status > 999) return py.raiseValue("status code out of range");
-    const rb = core.writer.reasonPhrase(@intCast(status));
+    const rb = core.h1.writer.reasonPhrase(@intCast(status));
     const vb = "1.1";
     const method = self.req_method[0..self.req_method_len];
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
@@ -271,7 +271,7 @@ fn data_to_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     return out;
 }
 
-fn raiseWrite(e: core.writer.WriteError) py.Object {
+fn raiseWrite(e: core.h1.writer.WriteError) py.Object {
     const local = exceptions.LocalProtocolError;
     return switch (e) {
         error.OutOfMemory => c.PyErr_NoMemory(),
