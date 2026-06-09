@@ -127,6 +127,40 @@ def test_partial_feed_resumes() -> None:
     assert any(isinstance(e, zttp.Request) for e in events)
 
 
+# HPACK static index 8 is exactly ":status: 200", so 0x88 is a complete head.
+STATUS_200 = bytes([0x88])
+
+
+def client_with(*extra: bytes) -> zttp.Connection:
+    """A client sees only the server's SETTINGS (no preface to consume)."""
+    conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    conn.receive_data(frame(0x04, 0, 0, b"") + b"".join(extra))
+    return conn
+
+
+def test_client_reads_a_response() -> None:
+    conn = client_with(frame(0x01, END_HEADERS | END_STREAM, 1, STATUS_200))
+    settings, resp, eom = list(drain_h2(conn))
+    assert isinstance(settings, zttp.Settings)
+    assert isinstance(resp, zttp.Response)
+    assert resp.status_code == 200
+    assert resp.http_version == b"2"
+    assert resp.stream_id == 1
+    assert isinstance(eom, zttp.EndOfMessage)
+
+
+def test_client_reads_a_response_with_a_body() -> None:
+    conn = client_with(
+        frame(0x01, END_HEADERS, 1, STATUS_200),
+        frame(0x00, END_STREAM, 1, b"hi"),  # DATA
+    )
+    events = list(drain_h2(conn))
+    resp = next(e for e in events if isinstance(e, zttp.Response))
+    data = next(e for e in events if isinstance(e, zttp.Data))
+    assert resp.status_code == 200
+    assert data.data == b"hi"
+
+
 def test_protocol_defaults_to_http1() -> None:
     conn = zttp.Connection(zttp.SERVER)  # no protocol arg
     conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
