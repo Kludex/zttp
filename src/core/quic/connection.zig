@@ -65,6 +65,12 @@ pub const Connection = struct {
     cc: congestion.Controller,
     conn_recv_window: flow.Window,
     conn_send_window: flow.SendWindow,
+    /// The connection-level flow-control counters (RFC 9000 4.1): the SUM across
+    /// all streams of the highest offset received and of the bytes consumed. A
+    /// per-stream offset would let a peer evade MAX_DATA by spreading data across
+    /// streams, so these are tracked separately from any one stream's window.
+    conn_received_total: u64 = 0,
+    conn_consumed_total: u64 = 0,
     streams: std.AutoHashMapUnmanaged(u64, *stream.RecvStream) = .empty,
     closed: bool = false,
 
@@ -208,12 +214,15 @@ pub const Connection = struct {
     }
 
     fn onStreamFrame(self: *Connection, id: u64, offset: u64, data: []const u8, fin: bool) Error!void {
-        try self.conn_recv_window.onReceived(offset + data.len);
         const s = try self.recvStream(id);
-        s.push(offset, data, fin) catch |e| switch (e) {
+        const delta = s.push(offset, data, fin) catch |e| switch (e) {
             error.FinalSizeError => return error.FinalSizeError,
             error.OutOfMemory => return error.OutOfMemory,
         };
+        // Charge the new bytes against the connection-wide window (the sum across
+        // every stream), not just this stream's offset.
+        self.conn_received_total += delta;
+        self.conn_recv_window.onReceived(self.conn_received_total) catch return error.FlowControlError;
     }
 
     fn onReset(self: *Connection, id: u64, final_size: u64) Error!void {
@@ -239,11 +248,15 @@ pub const Connection = struct {
         return &.{};
     }
 
-    /// Mark `n` bytes of a stream consumed, re-granting flow-control credit.
+    /// Mark `n` bytes of a stream consumed, re-granting flow-control credit. The
+    /// connection window slides by the connection-wide consumed total (the sum
+    /// across streams), matching how `onStreamFrame` charges it.
     pub fn consumeStream(self: *Connection, id: u64, n: usize) void {
         if (self.streams.get(id)) |s| {
+            const before = s.read_offset;
             s.consume(n);
-            self.conn_recv_window.onConsumed(s.read_offset);
+            self.conn_consumed_total += s.read_offset - before;
+            self.conn_recv_window.onConsumed(self.conn_consumed_total);
         }
     }
 
@@ -333,4 +346,23 @@ test "consume re-grants connection flow-control credit" {
     try testing.expectEqualStrings("abc", conn.streamData(0));
     conn.consumeStream(0, 3);
     try testing.expectEqualStrings("", conn.streamData(0));
+}
+
+test "connection flow control sums across streams" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x0a, 0x0b, 0x0c, 0x0d };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    // Shrink the connection window so a small payload spread over two streams
+    // exceeds it - this is exactly the evasion a per-stream check would miss.
+    conn.conn_recv_window.limit = 6;
+    // Two STREAM frames in one datagram: 4 bytes on stream 0, then 4 on stream 4.
+    // 0x0a = STREAM|LEN (no OFF). Their sum (8) is past the 6-byte window.
+    const frames = [_]u8{
+        0x0a, 0x00, 0x04, 'a', 'a', 'a', 'a', // stream 0, 4 bytes
+        0x0a, 0x04, 0x04, 'b', 'b', 'b', 'b', // stream 4, 4 bytes
+    };
+    const dgram = try testBuildInitial(gpa, &dcid, .client, 0, &frames);
+    defer gpa.free(dgram);
+    try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
 }
