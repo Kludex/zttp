@@ -15,3 +15,5 @@ build/
 *.egg-info/
 site/
 .cache/
+.ossfuzz-out/
+/crash-*

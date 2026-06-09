@@ -23,6 +23,45 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run the parser-core adversarial-input property test");
     fuzz_step.dependOn(&run_core_tests.step);
 
+    // A coverage-instrumented object exporting the `zttp_fuzz_drive` C ABI. The
+    // C shim (fuzz/target.c) owns the libFuzzer entry point and registers this
+    // object's sancov counters; the final link is done by the C compiler against
+    // `$LIB_FUZZING_ENGINE` (locally via scripts/fuzz-libfuzzer, or an OSS-Fuzz
+    // build.sh). ReleaseSafe keeps the parser's safety checks but drops the
+    // Debug-mode threaded panic machinery, whose thread-local accesses otherwise
+    // overflow 32-bit TLS relocations when OSS-Fuzz links its large binary.
+    const fuzz_core = b.createModule(.{
+        .root_source_file = b.path("src/core/root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .single_threaded = true,
+        .stack_check = false,
+    });
+    const fuzz_obj = b.addObject(.{
+        .name = "zttp_fuzz_reader",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("fuzz/target.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .link_libc = true,
+            .fuzz = true,
+            // single_threaded drops the thread-local panic/threading machinery
+            // whose local-dynamic TLS relocations overflow when the engine links;
+            // stack_check avoids Zig's __zig_probe_stack helper, which the C
+            // toolchain doing the final link does not provide.
+            .single_threaded = true,
+            .stack_check = false,
+        }),
+    });
+    // `.fuzz` instruments the whole object, not just its root module, so the
+    // imported `core` parser carries sancov coverage too - that is the surface
+    // the fuzzer actually explores.
+    fuzz_obj.root_module.addImport("core", fuzz_core);
+    const install_fuzz = b.addInstallBinFile(fuzz_obj.getEmittedBin(), "zttp_fuzz_reader.o");
+    const fuzz_obj_step = b.step("fuzz-obj", "Emit the libFuzzer object (zig-out/bin/zttp_fuzz_reader.o)");
+    fuzz_obj_step.dependOn(&install_fuzz.step);
+
     // Python build configuration is discovered by the hatch-ziglang hook and
     // passed in as -D options or environment variables. Resolved lazily so the
     // test step above never requires a Python toolchain.
