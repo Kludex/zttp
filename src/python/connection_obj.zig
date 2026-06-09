@@ -306,8 +306,10 @@ fn next_message(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const r = self.reader orelse return py.raiseRuntime("connection is closed");
     r.reset();
-    self.req_method_len = 0;
-    self.req_version_len = 0;
+    // req_method / req_version are intentionally NOT cleared here: a caller may
+    // call start_next_cycle() before writing the previous response, and they're
+    // only read by send_response (for framing/version). They're overwritten when
+    // the next request is parsed, so stale values are never observed.
     self.should_close = false;
     py.xdecref(self.upgrade_obj);
     self.upgrade_obj = null;

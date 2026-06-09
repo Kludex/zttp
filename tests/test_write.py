@@ -285,3 +285,13 @@ def test_send_response_version_defaults_without_request() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(500)
     assert conn.data_to_send() == b"HTTP/1.1 500 Internal Server Error\r\n\r\n"
+
+
+def test_send_response_version_survives_start_next_cycle() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET / HTTP/1.0\r\nHost: h\r\n\r\n")
+    assert isinstance(conn.next_event(), zttp.Request)
+    assert isinstance(conn.next_event(), zttp.EndOfMessage)
+    conn.start_next_cycle()
+    conn.send_response(200, [(b"Content-Length", b"0")])
+    assert conn.data_to_send() == b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"
