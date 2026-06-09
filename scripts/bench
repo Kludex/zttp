@@ -1,0 +1,9 @@
+#!/bin/sh -e
+
+# Benchmark against httptools and h11. Local installs default to Debug, whose
+# numbers are meaningless, so rebuild the way wheels ship before measuring.
+
+set -x
+
+HATCH_ZIG_BUILD_MODE=ReleaseSafe uv sync --all-groups
+uv run --no-sync python bench.py
