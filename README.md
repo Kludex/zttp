@@ -1,7 +1,7 @@
 # zttp
 
 <p align="center">
-  <img src="docs/assets/logo.png" alt="zttp" width="400">
+  <img src="https://github.com/Kludex/zttp/blob/main/docs/assets/logo.png?raw=true" alt="zttp" width="400">
 </p>
 
 > [!WARNING]
