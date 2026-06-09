@@ -9,13 +9,13 @@
 //! so steady-state parsing is append-and-advance with no per-call memmove.
 
 const std = @import("std");
-const events = @import("events.zig");
+const events = @import("../events.zig");
 const headers_mod = @import("headers.zig");
 const framing_mod = @import("framing.zig");
 const connection_mod = @import("connection.zig");
 const chunked_mod = @import("chunked.zig");
-const Scanner = @import("scanner.zig").Scanner;
-const ParseError = @import("errors.zig").ParseError;
+const Scanner = @import("../scanner.zig").Scanner;
+const ParseError = @import("../errors.zig").ParseError;
 
 const Header = events.Header;
 const Event = events.Event;

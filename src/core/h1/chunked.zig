@@ -5,9 +5,9 @@
 //! Trailer field-lines after the last chunk are returned to the caller to parse.
 
 const std = @import("std");
-const tables = @import("tables.zig");
-const Scanner = @import("scanner.zig").Scanner;
-const ParseError = @import("errors.zig").ParseError;
+const tables = @import("../tables.zig");
+const Scanner = @import("../scanner.zig").Scanner;
+const ParseError = @import("../errors.zig").ParseError;
 
 const State = enum {
     /// Reading the chunk-size hex digits (and any chunk extensions) up to CRLF.
