@@ -163,8 +163,8 @@ def test_client_reads_a_response_with_a_body() -> None:
 
 def test_client_sends_a_request_a_server_reads() -> None:
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
-    client.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")])
-    client.end_message()
+    stream = client.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")])
+    stream.end_message()
     wire = client.data_to_send()
 
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
@@ -178,18 +178,16 @@ def test_client_sends_a_request_a_server_reads() -> None:
 
 
 def test_server_sends_a_response_a_client_reads() -> None:
-    # Drive a request into the server so it knows the stream to answer on.
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
     client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
-    client.end_message()
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
     server.receive_data(client.data_to_send())
-    list(drain_h2(server))  # consume the request so h2_recv_stream is set
+    req = next(e for e in drain_h2(server) if isinstance(e, zttp.Request))
 
-    server.send_response(200, [(b"content-type", b"text/plain")])
-    server.send_data(b"hi")
-    server.end_message()
-    # Feed the server's bytes (its SETTINGS + response) back into the client.
+    stream = server.stream(req.stream_id)
+    stream.send_response(200, [(b"content-type", b"text/plain")])
+    stream.send_data(b"hi")
+    stream.end_message()
     client.receive_data(server.data_to_send())
     events = list(drain_h2(client))
     resp = next(e for e in events if isinstance(e, zttp.Response))
@@ -201,19 +199,18 @@ def test_server_sends_a_response_a_client_reads() -> None:
 
 def test_h2_send_side_trailers_rejected() -> None:
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
-    client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
+    stream = client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
     with pytest.raises(zttp.LocalProtocolError):
-        client.end_message([(b"x-trailer", b"v")])
+        stream.end_message([(b"x-trailer", b"v")])
 
 
-def test_h2_concurrent_responses_route_by_stream_id() -> None:
-    # Two requests arrive before either is answered. Without an explicit stream_id
-    # both responses would go to the last request's stream; with it they route.
+def test_h2_concurrent_responses_route_by_their_stream() -> None:
+    # Two requests arrive before either is answered. Each is answered through its
+    # own Stream handle, so the responses route to the right stream regardless of
+    # the order they were parsed in.
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
-    client.send_request(b"GET", b"/a", b"2", [(b"host", b"x")])
-    client.end_message()
-    client.send_request(b"GET", b"/b", b"2", [(b"host", b"x")])
-    client.end_message()
+    client.send_request(b"GET", b"/a", b"2", [(b"host", b"x")]).end_message()
+    client.send_request(b"GET", b"/b", b"2", [(b"host", b"x")]).end_message()
 
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
     server.receive_data(client.data_to_send())
@@ -222,13 +219,14 @@ def test_h2_concurrent_responses_route_by_stream_id() -> None:
     s1, s2 = reqs[0].stream_id, reqs[1].stream_id
     assert s1 != s2
 
-    # Answer the FIRST request explicitly, even though the second was parsed last.
-    server.send_response(201, [(b"x-which", b"a")], s1)
-    server.send_data(b"AA", s1)
-    server.end_message(None, s1)
-    server.send_response(202, [(b"x-which", b"b")], s2)
-    server.send_data(b"BB", s2)
-    server.end_message(None, s2)
+    # Answer the FIRST request, even though the second was parsed last.
+    a, b = server.stream(s1), server.stream(s2)
+    a.send_response(201, [(b"x-which", b"a")])
+    a.send_data(b"AA")
+    a.end_message()
+    b.send_response(202, [(b"x-which", b"b")])
+    b.send_data(b"BB")
+    b.end_message()
 
     client.receive_data(server.data_to_send())
     responses = {e.stream_id: e for e in drain_h2(client) if isinstance(e, zttp.Response)}
@@ -236,10 +234,23 @@ def test_h2_concurrent_responses_route_by_stream_id() -> None:
     assert responses[s2].status_code == 202
 
 
-def test_h2_send_data_before_stream_selected_is_rejected() -> None:
+def test_h2_send_data_on_an_unselected_stream_is_rejected() -> None:
+    # Stream 0 is the connection-control stream and can never carry DATA.
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
-    with pytest.raises(zttp.LocalProtocolError):
-        conn.send_data(b"orphan")
+    with pytest.raises(ValueError):
+        conn.stream(0)
+
+
+def test_connection_level_send_is_http1_only() -> None:
+    # On HTTP/2 the message-scoped send_* methods route through a Stream, so the
+    # connection-level forms refuse rather than guessing a stream.
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    with pytest.raises(RuntimeError):
+        conn.send_response(200, [(b"x", b"y")])
+    with pytest.raises(RuntimeError):
+        conn.send_data(b"body")
+    with pytest.raises(RuntimeError):
+        conn.end_message()
 
 
 def test_protocol_defaults_to_http1() -> None:
@@ -295,30 +306,6 @@ def test_stream_handle_round_trips_a_response() -> None:
     assert data.data == b"hi"
 
 
-def test_connection_send_data_and_stream_send_data_are_equivalent() -> None:
-    # The connection-level stream_id= form is a thin delegate over the Stream.
-    def via_connection() -> bytes:
-        s = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
-        s.receive_data(server_preface_then_get())
-        list(drain_h2(s))
-        s.send_response(200, [(b"x", b"y")], 1)
-        s.send_data(b"body", 1)
-        s.end_message(None, 1)
-        return s.data_to_send()
-
-    def via_stream() -> bytes:
-        s = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
-        s.receive_data(server_preface_then_get())
-        list(drain_h2(s))
-        st = s.stream(1)
-        st.send_response(200, [(b"x", b"y")])
-        st.send_data(b"body")
-        st.end_message()
-        return s.data_to_send()
-
-    assert via_connection() == via_stream()
-
-
 def test_stream_only_on_http2() -> None:
     conn = zttp.Connection(zttp.SERVER)  # HTTP/1.1
     with pytest.raises(RuntimeError):
@@ -326,10 +313,6 @@ def test_stream_only_on_http2() -> None:
 
 
 # -- Outbound flow control -----------------------------------------------------
-
-
-def server_preface_then_get() -> bytes:
-    return PREFACE + frame(0x04, 0, 0, b"") + frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK)
 
 
 def server_with_small_window(initial: int) -> zttp.Connection:
