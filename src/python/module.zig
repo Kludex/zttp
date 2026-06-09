@@ -24,5 +24,6 @@ fn PyInit__zttp() callconv(.c) ?*c.PyObject {
         py.decref(m);
         return null;
     }
+    py.declareGilNotUsed(m);
     return m;
 }

@@ -1,7 +1,7 @@
 # zttp
 
 <p align="center">
-  <img src="docs/assets/logo.png" alt="zttp" width="400">
+  <img src="https://github.com/Kludex/zttp/blob/main/docs/assets/logo.png?raw=true" alt="zttp" width="400">
 </p>
 
 > [!WARNING]
@@ -29,7 +29,7 @@ conn.next_event()   # EndOfMessage(trailers=[])
 conn.next_event()   # NEED_DATA
 
 # Build a response:
-conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"5")])
+conn.send_response(200, [(b"Content-Length", b"5")])
 conn.send_data(b"hello")
 conn.end_message()
 conn.data_to_send()  # b'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello'

@@ -4,11 +4,11 @@
 //! of (name, value) pairs, which the caller owns.
 
 const std = @import("std");
-const tables = @import("tables.zig");
-const events = @import("events.zig");
-const Scanner = @import("scanner.zig").Scanner;
-const trimTrailingOws = @import("scanner.zig").trimTrailingOws;
-const ParseError = @import("errors.zig").ParseError;
+const tables = @import("../tables.zig");
+const events = @import("../events.zig");
+const Scanner = @import("../scanner.zig").Scanner;
+const trimTrailingOws = @import("../scanner.zig").trimTrailingOws;
+const ParseError = @import("../errors.zig").ParseError;
 
 const Header = events.Header;
 
