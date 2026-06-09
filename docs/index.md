@@ -18,11 +18,12 @@ icon: lucide/zap
 
 ---
 
-zttp is a [sans-IO](https://sans-io.readthedocs.io/) HTTP/1.1 parser whose engine
-is written in [Zig](https://ziglang.org). It does **no I/O of its own**: you feed
-it bytes and pull out events, and you ask it for bytes to send. It never touches a
-socket - so it works with any I/O you like (asyncio, threads, a green-thread
-library, a test harness), and it's a joy to test.
+zttp is a [sans-IO](https://sans-io.readthedocs.io/) HTTP parser whose engine
+is written in [Zig](https://ziglang.org). It speaks **HTTP/1.1 and HTTP/2**, and
+it does **no I/O of its own**: you feed it bytes and pull out events, and you ask
+it for bytes to send. It never touches a socket - so it works with any I/O you
+like (asyncio, threads, a green-thread library, a test harness), and it's a joy
+to test.
 
 It's the same idea as [h11](https://github.com/python-hyper/h11), with a
 hand-written Zig engine underneath instead of pure Python.
@@ -32,6 +33,9 @@ The key features are:
 * **Sans-IO**: a clean, event-based API. Feed bytes with `receive_data`, pull
   `Request` / `Data` / `EndOfMessage` events with `next_event`. No callbacks, no
   sockets, no surprises.
+* **HTTP/1.1 and HTTP/2**: the *same* event API for both. Pass
+  `protocol=zttp.HTTP2` and you get multiplexed streams, HPACK, and flow control -
+  see [HTTP/2](usage/http2.md).
 * **Fast**: a hand-written Zig engine with branch-light scanning and minimal
   allocation - see [Performance](reference/performance.md) for the numbers.
 * **Safe**: strict by default. It defends against request smuggling, rejects bare
@@ -52,7 +56,7 @@ uv add zttp
 ```
 
 !!! note "Requirements"
-    zttp needs **CPython 3.12+** and runs on **Linux**, **macOS**, and **Windows**.
+    zttp needs **CPython 3.10+** and runs on **Linux**, **macOS**, and **Windows**.
 
 ## Example
 
@@ -119,6 +123,12 @@ That's it. The buffering, the header parsing, the body framing - all Zig. 🎉
     ---
 
     The write side: build requests and responses, get bytes to send.
+
+-   :material-transit-connection-variant: **[HTTP/2](usage/http2.md)**
+
+    ---
+
+    The same API, multiplexed: streams, flow control, and the control events.
 
 -   :material-sitemap: **[Why sans-IO](architecture/sans-io.md)**
 

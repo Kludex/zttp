@@ -90,9 +90,9 @@ integrator is responsible for.
   use zttp unchanged.
 - **HTTP/2** - HPACK, the frame layer, and the multiplexed connection state
   machine in the Zig core, surfaced through the same event API
-  (`Connection(role, protocol=zttp.HTTP2)`); events carry a `stream_id`. The
-  server read path (prior-knowledge) is implemented; client responses and the
-  Python write side are next. *(in progress)*
+  (`Connection(role, protocol=zttp.HTTP2)`); events carry a `stream_id`. Both
+  read paths (server requests, client responses) and the full write side - a
+  `Stream` handle per stream, with outbound flow control - are implemented. *(done)*
 - **HTTP/3** - a from-scratch QUIC transport in the Zig core (packets, RFC 9001
   packet protection on `std.crypto`, loss recovery, NewReno congestion control,
   flow control, and stream reassembly) plus the HTTP/3 framing and QPACK, surfaced

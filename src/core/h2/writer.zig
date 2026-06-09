@@ -207,6 +207,21 @@ pub const Writer = struct {
         }
     }
 
+    /// Emit a single DATA frame verbatim (no window check, no further splitting):
+    /// the flow-control layer in connection.zig has already chosen `chunk` to fit
+    /// the send window and the peer's max frame size, and decides END_STREAM. The
+    /// plain `sendData` above stays for callers that frame a full body at once with
+    /// no flow control (the round-trip tests); the connection's flow-controlled
+    /// path calls this.
+    pub fn writeDataFrame(self: *Writer, stream_id: u32, chunk: []const u8, end_stream: bool) WriteError!void {
+        const flags: u8 = if (end_stream) Flags.end_stream else 0;
+        try self.writeFrame(.data, flags, stream_id, chunk);
+    }
+
+    pub fn peerMaxFrame(self: *const Writer) u32 {
+        return @max(self.peer_max_frame, 1);
+    }
+
     fn writeFrame(self: *Writer, ftype: FrameType, flags: u8, stream_id: u32, payload: []const u8) WriteError!void {
         frame_mod.write(&self.out, self.gpa, ftype, flags, stream_id, payload) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,

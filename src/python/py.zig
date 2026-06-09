@@ -16,6 +16,16 @@ pub const c = @import("pyc");
 pub const Object = [*c]c.PyObject;
 pub const ssize = c.Py_ssize_t;
 
+// -- member-def constants (3.12 renamed these with a Py_ prefix) ---------------
+//
+// 3.12+ exposes Py_T_OBJECT_EX / Py_T_BOOL / Py_READONLY from Python.h; on
+// 3.10/3.11 only the legacy T_OBJECT_EX / T_BOOL / READONLY exist, and only via
+// structmember.h (pulled in by cimport.h). Prefer the new spelling, fall back to
+// the old one, so the same Zig compiles against every supported interpreter.
+pub const T_OBJECT_EX: c_int = if (@hasDecl(c, "Py_T_OBJECT_EX")) c.Py_T_OBJECT_EX else c.T_OBJECT_EX;
+pub const T_BOOL: c_int = if (@hasDecl(c, "Py_T_BOOL")) c.Py_T_BOOL else c.T_BOOL;
+pub const READONLY: c_int = if (@hasDecl(c, "Py_READONLY")) c.Py_READONLY else c.READONLY;
+
 // -- reference counting -------------------------------------------------------
 
 // The function forms (Py_IncRef / Py_DecRef) instead of the Py_INCREF / Py_DECREF
@@ -155,6 +165,16 @@ pub const MemberDef = c.PyMemberDef;
 
 pub fn typeFromSpec(spec: *Spec) Object {
     return c.PyType_FromSpec(spec);
+}
+
+/// Create a type from `spec` deriving from `base` (a single base type). Uses
+/// PyType_FromSpecWithBases (stable API) with a one-tuple of bases. Returns null
+/// on failure. The caller owns the returned reference.
+pub fn typeFromSpecWithBase(spec: *Spec, base: Object) Object {
+    const bases = c.PyTuple_Pack(1, base);
+    if (bases == null) return null;
+    defer decref(bases);
+    return c.PyType_FromSpecWithBases(spec, bases);
 }
 
 /// Allocate a new instance of `tp` (a type object) with its memory zeroed by
