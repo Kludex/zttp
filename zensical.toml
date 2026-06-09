@@ -1,6 +1,6 @@
 [project]
 site_name = "zttp"
-site_description = "A sans-IO HTTP parser for Python with a Zig core."
+site_description = "A sans-IO HTTP/1.1 and HTTP/2 parser for Python with a Zig core."
 site_author = "Marcelo Trylesinski"
 #site_url = "https://zttp.dev/"
 repo_url = "https://github.com/Kludex/zttp"
@@ -18,6 +18,7 @@ nav = [
   { "Using zttp" = [
     "usage/parsing.md",
     "usage/sending.md",
+    "usage/http2.md",
     "usage/errors.md",
   ] },
   { "Architecture" = [

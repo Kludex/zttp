@@ -17,6 +17,10 @@ There are four building blocks, plus one call to collect the output:
 * `end_message(trailers=None)` - finish the message.
 * `data_to_send()` - take and clear the bytes produced so far.
 
+These same four building blocks carry over to HTTP/2 - there, you call them on a
+[`Stream`](http2.md) instead of the connection, because one connection carries
+many at once.
+
 ## A response
 
 As a **server**, you answer a request:
@@ -137,3 +141,8 @@ conn.send_response(200, [(b"X-Evil", b"a\r\nInjected: yes")])
     Misusing the send API raises `LocalProtocolError` - *you* did something wrong.
     Malformed bytes from the peer raise `RemoteProtocolError`. See
     [Errors](errors.md).
+
+## Where to go next
+
+* [HTTP/2](http2.md) - the same four building blocks, multiplexed across streams.
+* [Errors](errors.md) - what zttp rejects on the send side, and why.

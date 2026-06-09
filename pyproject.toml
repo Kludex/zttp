@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zttp"
-description = "A sans-IO HTTP parser for Python with a Zig core."
+description = "A sans-IO HTTP/1.1 and HTTP/2 parser for Python with a Zig core."
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Marcelo Trylesinski", email = "marcelotryle@gmail.com" }]
-keywords = ["http", "parser", "sans-io", "zig", "asgi"]
+keywords = ["http", "http2", "parser", "sans-io", "zig", "asgi"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
