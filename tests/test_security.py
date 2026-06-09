@@ -91,8 +91,8 @@ def test_bare_lf_request_rejected_by_default() -> None:
 @pytest.mark.parametrize(
     "call",
     [
-        lambda c: c.send_response(b"1.1", 200, b"OK\r\nX-Evil: 1", []),
-        lambda c: c.send_response(b"1.1", 200, b"OK", [(b"X", b"a\r\nInjected: 1")]),
+        lambda c: c.send_response(200, b"OK\r\nX-Evil: 1", []),
+        lambda c: c.send_response(200, b"OK", [(b"X", b"a\r\nInjected: 1")]),
         lambda c: c.send_request(b"GET", b"/ HTTP/1.1\r\nX: y", b"1.1", []),
         lambda c: c.send_request(b"GET", b"/", b"1.1", [(b"Bad Name", b"x")]),
     ],
@@ -162,7 +162,7 @@ def test_start_next_cycle_cannot_unpoison_after_error() -> None:
 def test_send_rejects_ambiguous_framing(headers: list[tuple[bytes, bytes]]) -> None:
     conn = zttp.Connection(zttp.SERVER)
     with pytest.raises(zttp.LocalProtocolError):
-        conn.send_response(b"1.1", 200, b"OK", headers)
+        conn.send_response(200, b"OK", headers)
 
 
 @pytest.mark.parametrize("version", [b"GET / HTTP/2.0\r\n\r\n", b"GET / HTTP/0.9\r\n\r\n"])
