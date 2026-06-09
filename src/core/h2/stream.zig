@@ -51,9 +51,19 @@ pub const Stream = struct {
     data_seen: u64 = 0,
     headers_done: bool = false, // the request/response HEADERS block completed
     end_stream_seen: bool = false,
+    /// Outbound DATA the send window could not yet admit, parked here and drained
+    /// as WINDOW_UPDATE credits arrive. `send_end_pending` records that END_STREAM
+    /// is owed once the buffer empties (so an end_message on a blocked stream still
+    /// closes it at the right point). Empty/false for streams that never send.
+    send_pending: std.ArrayListUnmanaged(u8) = .empty,
+    send_end_pending: bool = false,
 
     pub fn init(id: u32, recv_window: i32, send_window: i32) Stream {
         return .{ .id = id, .recv_window = recv_window, .send_window = send_window };
+    }
+
+    pub fn deinit(self: *Stream, gpa: std.mem.Allocator) void {
+        self.send_pending.deinit(gpa);
     }
 
     /// Does this stream count toward MAX_CONCURRENT_STREAMS? Only open and the

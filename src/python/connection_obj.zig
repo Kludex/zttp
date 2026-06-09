@@ -63,16 +63,14 @@ const H1Engine = struct {
     }
 };
 
-/// The HTTP/2 engine: the read-side connection plus the writer and the stream
-/// bookkeeping the send path needs. `handshake_sent` gates the lazy preface;
-/// `recv_stream` is the most recently parsed request's stream (so `send_response`
-/// answers on the right one) and `send_stream` the current outgoing message's.
+/// The HTTP/2 engine: the read-side connection plus the writer. `handshake_sent`
+/// gates the lazy preface. All send operations are stream-scoped and addressed by
+/// an explicit id (from send_request's return or conn.stream(id)), so no
+/// "current stream" is tracked here - the stream state lives in the core.
 const H2Engine = struct {
     conn: *H2Connection,
     writer: *H2Writer,
     handshake_sent: bool = false,
-    recv_stream: u32 = 0,
-    send_stream: u32 = 0,
 
     fn ensureHandshake(self: *H2Engine) bool {
         if (self.handshake_sent) return true;
@@ -84,33 +82,47 @@ const H2Engine = struct {
         return true;
     }
 
-    fn sendRequest(self: *H2Engine, mb: []const u8, tb: []const u8, hdrs: *BorrowedHeaders) py.Object {
+    /// Serialize a request head and return the stream id it opened, or null on
+    /// error (with a Python error set). The id is registered for flow control so
+    /// later DATA on it is gated by the send window.
+    fn sendRequestId(self: *H2Engine, mb: []const u8, tb: []const u8, hdrs: *BorrowedHeaders) ?u32 {
         if (!self.ensureHandshake()) return null;
         var regular: []events.Header = hdrs.headers;
         const authority = h2SplitAuthority(hdrs.headers, &regular);
-        const id = self.writer.sendRequest(mb, tb, "https", authority, regular, false) catch |e| return h2RaiseWrite(e);
-        self.send_stream = id;
-        return py.none();
+        const id = self.writer.sendRequest(mb, tb, "https", authority, regular, false) catch |e| {
+            _ = h2RaiseWrite(e);
+            return null;
+        };
+        self.conn.registerSendStream(id) catch {
+            _ = c.PyErr_NoMemory();
+            return null;
+        };
+        return id;
     }
 
     fn sendResponse(self: *H2Engine, stream_id: u32, status: u16, hdrs: *BorrowedHeaders) py.Object {
         if (!self.ensureHandshake()) return null;
         self.writer.sendResponse(stream_id, status, hdrs.headers, false) catch |e| return h2RaiseWrite(e);
-        self.send_stream = stream_id;
+        self.conn.registerSendStream(stream_id) catch return c.PyErr_NoMemory();
         return py.none();
     }
 
-    // Resolve the stream a body frame targets: an explicit `stream_id`, or the
-    // current outgoing stream. Stream 0 is the connection-control stream and can
-    // never carry DATA, so a missing selection is a local protocol error rather
-    // than silently emitting an invalid frame.
-    fn outgoingStream(self: *H2Engine, stream_id: c_long) ?u32 {
-        if (stream_id > 0) return @intCast(stream_id);
-        if (self.send_stream == 0) {
-            _ = py.raise(exceptions.LocalProtocolError, "no HTTP/2 stream selected: send a request or response first, or pass stream_id");
-            return null;
-        }
-        return self.send_stream;
+    /// Queue body bytes on `id` through the flow-controlled send path: the core
+    /// emits what the connection and stream send windows allow and parks the rest.
+    fn sendData(self: *H2Engine, id: u32, data: []const u8) py.Object {
+        self.conn.sendStreamData(self.writer, id, data, false) catch |e| return h2RaiseWrite(e);
+        return py.none();
+    }
+
+    fn endStream(self: *H2Engine, id: u32) py.Object {
+        self.conn.sendStreamData(self.writer, id, &.{}, true) catch |e| return h2RaiseWrite(e);
+        return py.none();
+    }
+
+    /// Drain parked DATA that a freshly-parsed WINDOW_UPDATE / SETTINGS credit now
+    /// permits. Called from next_event after such an event is produced.
+    fn flushSendable(self: *H2Engine) void {
+        self.conn.flushSendable(self.writer) catch {};
     }
 
     fn deinit(self: *H2Engine) void {
@@ -143,34 +155,215 @@ const ConnectionObject = extern struct {
 };
 
 var connection_type: py.Object = null;
+var h1_connection_type: py.Object = null;
+var h2_connection_type: py.Object = null;
+var stream_type: py.Object = null;
 
-fn new(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+/// A handle to one HTTP/2 stream on a Connection. It is a borrowed view: the
+/// Connection owns the stream state (the core's stream map); the handle holds the
+/// stream id plus an owned reference to the Connection (so the connection cannot
+/// be freed while a handle to it lives) and re-validates on every call. The send
+/// window, pending-DATA buffer, and lifecycle all live in the core - the handle
+/// is a command surface, never its own I/O buffer, so bytes still drain through
+/// the Connection's single data_to_send.
+const StreamObject = extern struct {
+    ob_base: c.PyObject,
+    conn: ?*c.PyObject, // owned reference to the ConnectionObject
+    stream_id: u32,
+
+    /// The H2 engine behind the handle, or a Python error if the connection was
+    /// torn down or is not HTTP/2. (A Stream only ever wraps an H2 connection, but
+    /// the connection object can outlive its engine.)
+    fn engine(self: *StreamObject) ?*H2Engine {
+        const conn_obj: *ConnectionObject = @ptrCast(self.conn orelse {
+            _ = py.raiseRuntime("connection is closed");
+            return null;
+        });
+        const eng = conn_obj.engine orelse {
+            _ = py.raiseRuntime("connection is closed");
+            return null;
+        };
+        switch (eng.*) {
+            .h2 => |*h| return h,
+            else => {
+                _ = py.raiseRuntime("not an HTTP/2 connection");
+                return null;
+            },
+        }
+    }
+};
+
+/// Build a Stream handle for `stream_id` on `conn_obj` (a ConnectionObject). Holds
+/// an owned reference to the connection. Returns null with a Python error set on
+/// allocation failure. Public so events_obj can attach `event.stream`.
+pub fn makeStream(conn_obj: ?*c.PyObject, stream_id: u32) py.Object {
+    const tp: *c.PyTypeObject = @ptrCast(stream_type);
+    const alloc = tp.tp_alloc.?;
+    const obj = alloc(tp, 0);
+    if (obj == null) return null;
+    const self: *StreamObject = @ptrCast(obj);
+    py.incref(conn_obj);
+    self.conn = conn_obj;
+    self.stream_id = stream_id;
+    return obj;
+}
+
+fn stream_dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
+    const self: *StreamObject = @ptrCast(self_obj.?);
+    py.xdecref(self.conn);
+    py.freeInstance(@ptrCast(self));
+}
+
+fn stream_send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *StreamObject = @ptrCast(self_obj.?);
+    const e = self.engine() orelse return null;
+    var status: c_long = 0;
+    var hdrs_seq: ?*c.PyObject = null;
+    if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
+    if (status < 0 or status > 999) return py.raiseValue("status code out of range");
+    var hdrs: ?BorrowedHeaders = null;
+    defer if (hdrs) |*h| h.deinit();
+    if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
+        hdrs = borrowHeaders(hdrs_seq) orelse return null;
+    }
+    var h = hdrs orelse BorrowedHeaders{ .headers = &.{}, .refs = &.{} };
+    return e.sendResponse(self.stream_id, @intCast(status), &h);
+}
+
+fn stream_send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *StreamObject = @ptrCast(self_obj.?);
+    const e = self.engine() orelse return null;
+    const data = py.asBytes(arg) orelse return null;
+    return e.sendData(self.stream_id, data);
+}
+
+fn stream_end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *StreamObject = @ptrCast(self_obj.?);
+    const e = self.engine() orelse return null;
+    var hdrs_seq: ?*c.PyObject = null;
+    if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
+    if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
+        return py.raise(exceptions.LocalProtocolError, "HTTP/2 send-side trailers are not supported yet");
+    }
+    return e.endStream(self.stream_id);
+}
+
+fn stream_id_get(self_obj: ?*c.PyObject, _: ?*anyopaque) callconv(.c) py.Object {
+    const self: *StreamObject = @ptrCast(self_obj.?);
+    return c.PyLong_FromUnsignedLong(self.stream_id);
+}
+
+fn stream_repr(self_obj: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *StreamObject = @ptrCast(self_obj.?);
+    return c.PyUnicode_FromFormat("Stream(stream_id=%u)", self.stream_id);
+}
+
+var stream_methods = [_]py.MethodDef{
+    .{ .ml_name = "send_response", .ml_meth = stream_send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head on this stream: send_response(status, headers=None)." },
+    .{ .ml_name = "send_data", .ml_meth = stream_send_data, .ml_flags = c.METH_O, .ml_doc = "Queue body bytes on this stream (flow-controlled; parked until the send window allows)." },
+    .{ .ml_name = "end_message", .ml_meth = stream_end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message on this stream (empty END_STREAM DATA)." },
+    .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
+};
+
+var stream_getset = [_]c.PyGetSetDef{
+    .{ .name = "stream_id", .get = stream_id_get, .set = null, .doc = "The HTTP/2 stream id this handle addresses.", .closure = null },
+    .{ .name = null, .get = null, .set = null, .doc = null, .closure = null },
+};
+
+var stream_slots = [_]py.Slot{
+    .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&stream_dealloc)) },
+    .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&stream_methods) },
+    .{ .slot = c.Py_tp_getset, .pfunc = @ptrCast(&stream_getset) },
+    .{ .slot = c.Py_tp_repr, .pfunc = @ptrCast(@constCast(&stream_repr)) },
+    .{ .slot = 0, .pfunc = null },
+};
+
+var stream_spec = py.Spec{
+    .name = "zttp.Stream",
+    .basicsize = @sizeOf(StreamObject),
+    .itemsize = 0,
+    .flags = c.Py_TPFLAGS_DEFAULT,
+    .slots = &stream_slots,
+};
+
+// Parse (role, protocol) from the constructor args. `default_protocol` is what a
+// missing `protocol` arg means - HTTP1 for the base Connection, but a subtype
+// fixes it (and the arg is rejected if it disagrees, so H2Connection(role, HTTP1)
+// can't lie). Returns false with a Python error set on bad input.
+fn parseArgs(args: ?*c.PyObject, kwds: ?*c.PyObject, role: *Role, protocol_out: *c_long, fixed: ?c_long) bool {
     var role_val: c_long = 0;
-    var protocol_val: c_long = HTTP1;
+    var protocol_val: c_long = fixed orelse HTTP1;
     // The kwlist parameter type differs across CPython versions (char** in 3.12,
     // const char* const* in 3.13+), so build a plain C-pointer array and ptrCast
     // it to whatever the translated signature expects.
     var kwlist = [_][*c]u8{ @constCast("role"), @constCast("protocol"), null };
-    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", @ptrCast(&kwlist), &role_val, &protocol_val) == 0) return null;
-    const role: Role = switch (role_val) {
+    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", @ptrCast(&kwlist), &role_val, &protocol_val) == 0) return false;
+    role.* = switch (role_val) {
         SERVER => .server,
         CLIENT => .client,
-        else => return py.raiseValue("role must be zttp.SERVER or zttp.CLIENT"),
+        else => {
+            _ = py.raiseValue("role must be zttp.SERVER or zttp.CLIENT");
+            return false;
+        },
     };
-    if (protocol_val != HTTP1 and protocol_val != HTTP2) return py.raiseValue("protocol must be zttp.HTTP1 or zttp.HTTP2");
+    if (protocol_val != HTTP1 and protocol_val != HTTP2) {
+        _ = py.raiseValue("protocol must be zttp.HTTP1 or zttp.HTTP2");
+        return false;
+    }
+    if (fixed) |f| {
+        if (protocol_val != f) {
+            _ = py.raiseValue("protocol does not match this Connection subclass; construct zttp.Connection to choose by protocol");
+            return false;
+        }
+    }
+    protocol_out.* = protocol_val;
+    return true;
+}
 
+// Allocate an instance of `tp` and build the engine for `protocol_val`. Shared by
+// the concrete subtypes' tp_new.
+fn allocAndBuild(tp: ?*c.PyTypeObject, role: Role, protocol_val: c_long) py.Object {
     const alloc = tp.?.tp_alloc.?;
     const obj = alloc(tp, 0);
     if (obj == null) return null;
     const self: *ConnectionObject = @ptrCast(obj);
     self.engine = null;
-
     const engine = buildEngine(role, protocol_val) orelse {
         py.decref(obj);
         return null;
     };
     self.engine = engine;
     return obj;
+}
+
+// Base `Connection` tp_new: a factory. Called as `Connection(role, protocol=...)`
+// it picks the H1/H2 subtype and returns an instance of THAT type, so the runtime
+// type is truthful (isinstance(obj, Connection) still holds via the base). Called
+// on a user subclass of Connection, it builds in place with the requested protocol
+// (the subclass is honoured; no foreign-type substitution).
+fn new_base(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    var role: Role = .server;
+    var protocol_val: c_long = HTTP1;
+    if (!parseArgs(args, kwds, &role, &protocol_val, null)) return null;
+    if (@intFromPtr(tp) == @intFromPtr(connection_type)) {
+        const sub: ?*c.PyTypeObject = @ptrCast(if (protocol_val == HTTP2) h2_connection_type else h1_connection_type);
+        return allocAndBuild(sub, role, protocol_val);
+    }
+    return allocAndBuild(tp, role, protocol_val);
+}
+
+fn new_h1(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    var role: Role = .server;
+    var protocol_val: c_long = HTTP1;
+    if (!parseArgs(args, kwds, &role, &protocol_val, HTTP1)) return null;
+    return allocAndBuild(tp, role, HTTP1);
+}
+
+fn new_h2(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    var role: Role = .server;
+    var protocol_val: c_long = HTTP2;
+    if (!parseArgs(args, kwds, &role, &protocol_val, HTTP2)) return null;
+    return allocAndBuild(tp, role, HTTP2);
 }
 
 fn buildEngine(role: Role, protocol_val: c_long) ?*Engine {
@@ -225,8 +418,10 @@ fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
     py.freeInstance(@ptrCast(self));
 }
 
-/// The H1 engine, or a "connection is closed" error when this is not an H1
-/// connection or has been torn down. Used by H1-only API (keep-alive / upgrade).
+/// The H1 engine, or a Python error if torn down (closed) or HTTP/2. The H1-only
+/// API (keep-alive / upgrade, and the message-scoped send_* methods) lives on the
+/// Connection; HTTP/2 is stream-scoped, so its sends go through a Stream and these
+/// methods report that rather than pretending the connection is closed.
 fn h1(self: *ConnectionObject) ?*H1Engine {
     const engine = self.engine orelse {
         _ = py.raiseRuntime("connection is closed");
@@ -234,8 +429,8 @@ fn h1(self: *ConnectionObject) ?*H1Engine {
     };
     switch (engine.*) {
         .h1 => |*e| return e,
-        else => {
-            _ = py.raiseRuntime("connection is closed");
+        .h2 => {
+            _ = py.raiseRuntime("this is an HTTP/2 connection; send on a Stream (conn.stream(id) or the Stream returned by send_request)");
             return null;
         },
     }
@@ -263,7 +458,10 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     switch (engine.*) {
         .h2 => |*e| {
             const ev = e.conn.nextEvent() catch |err| return exceptions.raiseH2(err);
-            if (ev == .request) e.recv_stream = ev.request.stream_id;
+            // A parsed WINDOW_UPDATE / SETTINGS may have credited a send window;
+            // drain any DATA that was parked waiting for it. The bytes land in the
+            // writer's buffer for the next data_to_send.
+            if (ev == .window_update or ev == .settings) e.flushSendable();
             return events_obj.fromH2Event(ev);
         },
         .h1 => |*e| {
@@ -403,8 +601,10 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
     switch (engine.*) {
         .h2 => |*e| {
             // HTTP/2: the version arg is ignored (always "2"); :authority is
-            // derived from a host header and :scheme defaults to https.
-            return e.sendRequest(mb, tb, &hdrs);
+            // derived from a host header and :scheme defaults to https. The
+            // client originates the stream, so the handle is returned here.
+            const id = e.sendRequestId(mb, tb, &hdrs) orelse return null;
+            return makeStream(self_obj, id);
         },
         .h1 => |*e| {
             e.writer.sendRequest(mb, tb, vb, hdrs.headers) catch |err| return raiseWrite(err);
@@ -417,11 +617,10 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
 
 fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    const e = h1(self) orelse return null; // HTTP/2 answers via a Stream (conn.stream(id))
     var status: c_long = 0;
     var hdrs_seq: ?*c.PyObject = null;
-    var stream_id: c_long = -1; // HTTP/2 only; -1 means "the last parsed request"
-    if (c.PyArg_ParseTuple(args, "l|Ol", &status, &hdrs_seq, &stream_id) == 0) return null;
+    if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
     if (status < 0 or status > 999) return py.raiseValue("status code out of range");
 
     var hdrs: ?BorrowedHeaders = null;
@@ -431,21 +630,9 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     }
     const header_slice = if (hdrs) |h| h.headers else &.{};
 
-    switch (engine.*) {
-        .h2 => |*e| {
-            // HTTP/2: the response answers on `stream_id` if given - required when
-            // several requests are outstanding - else the most recently parsed
-            // request's stream (the single-request convenience).
-            const id: u32 = if (stream_id >= 0) @intCast(stream_id) else e.recv_stream;
-            var h = hdrs orelse BorrowedHeaders{ .headers = &.{}, .refs = &.{} };
-            return e.sendResponse(id, @intCast(status), &h);
-        },
-        .h1 => |*e| {
-            const rb = core.h1.writer.reasonPhrase(@intCast(status));
-            e.writer.sendResponse("1.1", @intCast(status), rb, header_slice, e.method()) catch |err| return raiseWrite(err);
-            return py.none();
-        },
-    }
+    const rb = core.h1.writer.reasonPhrase(@intCast(status));
+    e.writer.sendResponse("1.1", @intCast(status), rb, header_slice, e.method()) catch |err| return raiseWrite(err);
+    return py.none();
 }
 
 fn send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
@@ -466,54 +653,27 @@ fn send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     return py.none();
 }
 
-fn send_data(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+fn send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
-    var data_obj: ?*c.PyObject = null;
-    var stream_id: c_long = -1; // HTTP/2 only
-    if (c.PyArg_ParseTuple(args, "O|l", &data_obj, &stream_id) == 0) return null;
-    const data = py.asBytes(data_obj) orelse return null;
-    switch (engine.*) {
-        .h2 => |*e| {
-            const id = e.outgoingStream(stream_id) orelse return null;
-            e.writer.sendData(id, data, false) catch |err| return h2RaiseWrite(err);
-            return py.none();
-        },
-        .h1 => |*e| {
-            e.writer.sendData(data) catch |err| return raiseWrite(err);
-            return py.none();
-        },
-    }
+    const e = h1(self) orelse return null; // HTTP/2 sends body via a Stream
+    const data = py.asBytes(arg) orelse return null;
+    e.writer.sendData(data) catch |err| return raiseWrite(err);
+    return py.none();
 }
 
 fn end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    const e = h1(self) orelse return null; // HTTP/2 ends a message via a Stream
     var hdrs_seq: ?*c.PyObject = null;
-    var stream_id: c_long = -1; // HTTP/2 only
-    if (c.PyArg_ParseTuple(args, "|Ol", &hdrs_seq, &stream_id) == 0) return null;
-    switch (engine.*) {
-        .h2 => |*e| {
-            // HTTP/2 ends a message with an empty END_STREAM DATA frame. Trailers
-            // are not yet supported on the send side.
-            if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
-                return py.raise(exceptions.LocalProtocolError, "HTTP/2 send-side trailers are not supported yet");
-            }
-            const id = e.outgoingStream(stream_id) orelse return null;
-            e.writer.sendData(id, &.{}, true) catch |err| return h2RaiseWrite(err);
-            return py.none();
-        },
-        .h1 => |*e| {
-            if (hdrs_seq == null or py.isNone(hdrs_seq)) {
-                e.writer.endMessage(&.{}) catch |err| return raiseWrite(err);
-            } else {
-                var hdrs = borrowHeaders(hdrs_seq) orelse return null;
-                defer hdrs.deinit();
-                e.writer.endMessage(hdrs.headers) catch |err| return raiseWrite(err);
-            }
-            return py.none();
-        },
+    if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
+    if (hdrs_seq == null or py.isNone(hdrs_seq)) {
+        e.writer.endMessage(&.{}) catch |err| return raiseWrite(err);
+    } else {
+        var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+        defer hdrs.deinit();
+        e.writer.endMessage(hdrs.headers) catch |err| return raiseWrite(err);
     }
+    return py.none();
 }
 
 fn data_to_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
@@ -575,40 +735,117 @@ fn upgrade(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     return obj;
 }
 
-var methods = [_]py.MethodDef{
+fn stream(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    switch (engine.*) {
+        .h2 => {},
+        else => return py.raiseRuntime("streams exist only on an HTTP/2 connection"),
+    }
+    // Parse as long long (64-bit on every platform; c_long is only 32-bit on
+    // Windows, where an id at/above 2^31 would otherwise raise OverflowError from
+    // PyLong_AsLong instead of the range ValueError below).
+    const id = c.PyLong_AsLongLong(arg);
+    if (id <= 0) {
+        if (c.PyErr_Occurred() != null) return null;
+        return py.raiseValue("stream_id must be a positive integer");
+    }
+    // HTTP/2 stream ids are 31-bit (RFC 9113 5.1.1). Reject anything larger before
+    // narrowing to u32, so an out-of-range id raises ValueError rather than
+    // trapping (safe builds) or silently truncating.
+    if (id > 0x7FFF_FFFF) return py.raiseValue("stream_id exceeds the 31-bit HTTP/2 limit");
+    return makeStream(self_obj, @intCast(id));
+}
+
+// The read API, shared by both protocols and inherited by the subtypes. The base
+// Connection is the factory: constructing it picks H1Connection / H2Connection by
+// protocol (new_base), so the runtime type is truthful while isinstance(obj,
+// Connection) still holds.
+var base_methods = [_]py.MethodDef{
     .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
     .{ .ml_name = "next_event", .ml_meth = next_event, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the next parse event, or NEED_DATA." },
+    .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
+    .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
+};
+
+// HTTP/1.1: the message-scoped send API plus keep-alive / upgrade signals.
+var h1_methods = [_]py.MethodDef{
     .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
-    .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(status, headers=None, stream_id=...). The reason phrase is derived from the status; the version is 1.1. Bodyless framing (HEAD / 204 / 304) is derived automatically. stream_id is HTTP/2 only." },
+    .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(status, headers=None). The reason phrase is derived from the status; the version is 1.1. Bodyless framing (HEAD / 204 / 304) is derived automatically." },
     .{ .ml_name = "send_informational", .ml_meth = send_informational, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response: send_informational(status, headers=None). The real response still follows on the same cycle." },
-    .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a run of body bytes: send_data(data, stream_id=...). stream_id is HTTP/2 only." },
-    .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None, stream_id=...). stream_id is HTTP/2 only." },
-    .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
+    .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
+    .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
     .{ .ml_name = "should_close", .ml_meth = should_close, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request (Connection: close / HTTP/1.0)." },
     .{ .ml_name = "upgrade", .ml_meth = upgrade, .ml_flags = c.METH_NOARGS, .ml_doc = "The last request's Upgrade value if it asked to upgrade (Connection: upgrade), else None." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
-var slots = [_]py.Slot{
-    .{ .slot = c.Py_tp_new, .pfunc = @ptrCast(@constCast(&new)) },
+// HTTP/2: everything is stream-scoped. The client originates a stream by sending
+// a request (returns a Stream); the server reaches one with stream(id). There is
+// no connection-level body send - that is what the Stream handle is for.
+var h2_methods = [_]py.MethodDef{
+    .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
+    .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id. The connection owns the stream state; the handle is a stream-scoped command surface (send_response / send_data / end_message)." },
+    .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
+};
+
+var base_slots = [_]py.Slot{
+    .{ .slot = c.Py_tp_new, .pfunc = @ptrCast(@constCast(&new_base)) },
     .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&dealloc)) },
-    .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&methods) },
+    .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&base_methods) },
     .{ .slot = 0, .pfunc = null },
 };
 
-var spec = py.Spec{
+var h1_slots = [_]py.Slot{
+    .{ .slot = c.Py_tp_new, .pfunc = @ptrCast(@constCast(&new_h1)) },
+    .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&h1_methods) },
+    .{ .slot = 0, .pfunc = null },
+};
+
+var h2_slots = [_]py.Slot{
+    .{ .slot = c.Py_tp_new, .pfunc = @ptrCast(@constCast(&new_h2)) },
+    .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&h2_methods) },
+    .{ .slot = 0, .pfunc = null },
+};
+
+var base_spec = py.Spec{
     .name = "zttp.Connection",
     .basicsize = @sizeOf(ConnectionObject),
     .itemsize = 0,
+    .flags = c.Py_TPFLAGS_DEFAULT | c.Py_TPFLAGS_BASETYPE,
+    .slots = &base_slots,
+};
+
+var h1_spec = py.Spec{
+    .name = "zttp.H1Connection",
+    .basicsize = @sizeOf(ConnectionObject),
+    .itemsize = 0,
     .flags = c.Py_TPFLAGS_DEFAULT,
-    .slots = &slots,
+    .slots = &h1_slots,
+};
+
+var h2_spec = py.Spec{
+    .name = "zttp.H2Connection",
+    .basicsize = @sizeOf(ConnectionObject),
+    .itemsize = 0,
+    .flags = c.Py_TPFLAGS_DEFAULT,
+    .slots = &h2_slots,
 };
 
 pub fn register(module: py.Object) bool {
-    connection_type = py.typeFromSpec(&spec);
+    connection_type = py.typeFromSpec(&base_spec);
     if (connection_type == null) return false;
+    h1_connection_type = py.typeFromSpecWithBase(&h1_spec, connection_type);
+    if (h1_connection_type == null) return false;
+    h2_connection_type = py.typeFromSpecWithBase(&h2_spec, connection_type);
+    if (h2_connection_type == null) return false;
+    stream_type = py.typeFromSpec(&stream_spec);
+    if (stream_type == null) return false;
     _ = c.PyModule_AddObjectRef(module, "Connection", connection_type);
+    _ = c.PyModule_AddObjectRef(module, "H1Connection", h1_connection_type);
+    _ = c.PyModule_AddObjectRef(module, "H2Connection", h2_connection_type);
+    _ = c.PyModule_AddObjectRef(module, "Stream", stream_type);
     _ = c.PyModule_AddIntConstant(module, "SERVER", SERVER);
     _ = c.PyModule_AddIntConstant(module, "CLIENT", CLIENT);
     _ = c.PyModule_AddIntConstant(module, "HTTP1", HTTP1);

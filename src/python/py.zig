@@ -167,6 +167,16 @@ pub fn typeFromSpec(spec: *Spec) Object {
     return c.PyType_FromSpec(spec);
 }
 
+/// Create a type from `spec` deriving from `base` (a single base type). Uses
+/// PyType_FromSpecWithBases (stable API) with a one-tuple of bases. Returns null
+/// on failure. The caller owns the returned reference.
+pub fn typeFromSpecWithBase(spec: *Spec, base: Object) Object {
+    const bases = c.PyTuple_Pack(1, base);
+    if (bases == null) return null;
+    defer decref(bases);
+    return c.PyType_FromSpecWithBases(spec, bases);
+}
+
 /// Allocate a new instance of `tp` (a type object) with its memory zeroed by
 /// tp_alloc. Returns the new object or null on error.
 pub fn allocInstance(tp: Object) Object {

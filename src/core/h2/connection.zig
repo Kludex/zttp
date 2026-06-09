@@ -16,6 +16,7 @@ const frame_mod = @import("frame.zig");
 const settings_mod = @import("settings.zig");
 const stream_mod = @import("stream.zig");
 const decoder_mod = @import("hpack/decoder.zig");
+const writer_mod = @import("writer.zig");
 const events = @import("../events.zig");
 const tables = @import("../tables.zig");
 
@@ -127,6 +128,8 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection) void {
         self.buf.deinit(self.gpa);
+        var it = self.streams.valueIterator();
+        while (it.next()) |s| s.deinit(self.gpa);
         self.streams.deinit(self.gpa);
         self.hpack.deinit();
         self.settings_scratch.deinit(self.gpa);
@@ -682,6 +685,94 @@ pub const Connection = struct {
             },
             .content_length = content_length,
         };
+    }
+
+    // -- Send side: flow-controlled DATA ------------------------------------
+    //
+    // The window state already lives here (conn_send_window, per-stream
+    // send_window, credited by WINDOW_UPDATE and SETTINGS), so the send gate
+    // lives here too rather than being mirrored into the Writer. The Writer stays
+    // a stateless framer: this code decides how many bytes may leave now and hands
+    // each chunk to writer.writeDataFrame. Bytes the window cannot yet admit are
+    // parked in the stream's send_pending and drained by flushSendable when a
+    // WINDOW_UPDATE or SETTINGS credit arrives. The caller owns the Writer (the
+    // adapter pairs them), so it is passed in rather than stored.
+
+    /// Ensure a stream entry exists for an outgoing message. A client opens the
+    /// stream by sending; the read side has no entry until then. The send window
+    /// is seeded from the peer's INITIAL_WINDOW_SIZE (what the peer will accept).
+    pub fn registerSendStream(self: *Connection, id: u32) error{OutOfMemory}!void {
+        if (self.streams.getPtr(id) != null) return;
+        self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size)) catch return error.OutOfMemory;
+        self.streams.getPtr(id).?.recvApply(.headers, false); // idle -> open
+    }
+
+    /// Queue outbound body bytes on `id`, emitting as much as the connection and
+    /// stream send windows (and the peer's max frame) allow, parking the rest.
+    pub fn sendStreamData(self: *Connection, writer: *writer_mod.Writer, id: u32, data: []const u8, end_stream: bool) writer_mod.WriteError!void {
+        try self.registerSendStream(id);
+        const s = self.streams.getPtr(id).?;
+        if (data.len != 0) s.send_pending.appendSlice(self.gpa, data) catch return error.OutOfMemory;
+        if (end_stream) s.send_end_pending = true;
+        try self.flushStream(writer, id);
+    }
+
+    /// Drain parked DATA on every stream the windows now permit. Call after a
+    /// WINDOW_UPDATE or an INITIAL_WINDOW_SIZE change credits a send window.
+    /// Flushing mutates only each stream's own fields and the writer (never the
+    /// map's shape), so iterating value pointers in place is safe.
+    pub fn flushSendable(self: *Connection, writer: *writer_mod.Writer) writer_mod.WriteError!void {
+        var it = self.streams.valueIterator();
+        while (it.next()) |s| try self.flushStreamPtr(writer, s);
+    }
+
+    fn flushStream(self: *Connection, writer: *writer_mod.Writer, id: u32) writer_mod.WriteError!void {
+        const s = self.streams.getPtr(id) orelse return;
+        try self.flushStreamPtr(writer, s);
+    }
+
+    fn flushStreamPtr(self: *Connection, writer: *writer_mod.Writer, s: *Stream) writer_mod.WriteError!void {
+        const id = s.id;
+        const max_frame = writer.peerMaxFrame();
+        var off: usize = 0;
+        while (off < s.send_pending.items.len) {
+            const stream_room: i64 = s.send_window;
+            const conn_room: i64 = self.conn_send_window;
+            const room = @min(stream_room, conn_room);
+            if (room <= 0) break; // window closed; the rest stays parked
+            const remaining = s.send_pending.items.len - off;
+            const chunk: usize = @intCast(@min(@min(room, @as(i64, max_frame)), @as(i64, @intCast(remaining))));
+            const last = off + chunk == s.send_pending.items.len;
+            const end = last and s.send_end_pending;
+            try writer.writeDataFrame(id, s.send_pending.items[off .. off + chunk], end);
+            s.send_window -= @intCast(chunk);
+            self.conn_send_window -= @intCast(chunk);
+            off += chunk;
+            if (end) s.send_end_pending = false;
+        }
+        // Drop the bytes we emitted; keep what the window could not admit.
+        if (off > 0) {
+            const rest = s.send_pending.items.len - off;
+            std.mem.copyForwards(u8, s.send_pending.items[0..rest], s.send_pending.items[off..]);
+            s.send_pending.shrinkRetainingCapacity(rest);
+        }
+        // A bodyless end (END_STREAM with no buffered bytes left) still needs an
+        // empty DATA frame to close the stream.
+        if (s.send_pending.items.len == 0 and s.send_end_pending) {
+            try writer.writeDataFrame(id, &.{}, true);
+            s.send_end_pending = false;
+        }
+    }
+
+    /// Whether any stream still has parked outbound bytes (or an owed END_STREAM)
+    /// that the send window has not yet admitted. The adapter exposes this so the
+    /// integrator knows a flush is pending once more credit arrives.
+    pub fn hasPendingSend(self: *Connection) bool {
+        var it = self.streams.valueIterator();
+        while (it.next()) |s| {
+            if (s.send_pending.items.len != 0 or s.send_end_pending) return true;
+        }
+        return false;
     }
 
     fn liveStreamCount(self: *Connection) u32 {
