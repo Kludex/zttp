@@ -17,6 +17,12 @@ There are four building blocks, plus one call to collect the output:
 * `end_message(trailers=None)` - finish the message.
 * `data_to_send()` - take and clear the bytes produced so far.
 
+!!! note "This page is the HTTP/1.1 write side"
+    These message-scoped calls live on an `H1Connection`. HTTP/2 sends on a
+    *stream* instead - the same four building blocks, scoped to a `Stream`
+    handle. See [HTTP/2](http2.md). The read side and `data_to_send` are
+    identical on both.
+
 ## A response
 
 As a **server**, you answer a request:
