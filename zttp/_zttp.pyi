@@ -51,7 +51,6 @@ class Connection:
     def send_response(
         self,
         status: int,
-        reason: bytes | None = ...,
         headers: list[tuple[bytes, bytes]] | None = ...,
         /,
     ) -> None: ...

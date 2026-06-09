@@ -160,7 +160,7 @@ def test_server_auto_derives_head_response_bodyless() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n")
     list(drain(conn))
-    conn.send_response(200, b"OK", [(b"Content-Length", b"1234")])
+    conn.send_response(200, [(b"Content-Length", b"1234")])
     with pytest.raises(zttp.LocalProtocolError):
         conn.send_data(b"body")
     conn.end_message()
