@@ -251,3 +251,140 @@ def test_protocol_defaults_to_http1() -> None:
 def test_invalid_protocol_rejected() -> None:
     with pytest.raises(ValueError):
         zttp.Connection(zttp.SERVER, protocol=99)
+
+
+# -- Stream object -------------------------------------------------------------
+
+
+def _data_payload_bytes(buf: bytes) -> int:
+    """Total payload length across all DATA frames (type 0x00) in `buf`."""
+    i, total = 0, 0
+    while i < len(buf):
+        length = int.from_bytes(buf[i : i + 3], "big")
+        if buf[i + 3] == 0x00:
+            total += length
+        i += 9 + length
+    return total
+
+
+def test_send_request_returns_a_stream() -> None:
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    stream = client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
+    assert isinstance(stream, zttp.Stream)
+    assert stream.stream_id == 1
+
+
+def test_stream_handle_round_trips_a_response() -> None:
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    server.receive_data(client.data_to_send())
+    req = next(e for e in drain_h2(server) if isinstance(e, zttp.Request))
+
+    stream = server.stream(req.stream_id)
+    assert stream.stream_id == req.stream_id
+    stream.send_response(200, [(b"content-type", b"text/plain")])
+    stream.send_data(b"hi")
+    stream.end_message()
+
+    client.receive_data(server.data_to_send())
+    events = list(drain_h2(client))
+    resp = next(e for e in events if isinstance(e, zttp.Response))
+    data = next(e for e in events if isinstance(e, zttp.Data))
+    assert resp.status_code == 200
+    assert data.data == b"hi"
+
+
+def test_connection_send_data_and_stream_send_data_are_equivalent() -> None:
+    # The connection-level stream_id= form is a thin delegate over the Stream.
+    def via_connection() -> bytes:
+        s = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+        s.receive_data(server_preface_then_get())
+        list(drain_h2(s))
+        s.send_response(200, [(b"x", b"y")], 1)
+        s.send_data(b"body", 1)
+        s.end_message(None, 1)
+        return s.data_to_send()
+
+    def via_stream() -> bytes:
+        s = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+        s.receive_data(server_preface_then_get())
+        list(drain_h2(s))
+        st = s.stream(1)
+        st.send_response(200, [(b"x", b"y")])
+        st.send_data(b"body")
+        st.end_message()
+        return s.data_to_send()
+
+    assert via_connection() == via_stream()
+
+
+def test_stream_only_on_http2() -> None:
+    conn = zttp.Connection(zttp.SERVER)  # HTTP/1.1
+    with pytest.raises(RuntimeError):
+        conn.stream(1)
+
+
+# -- Outbound flow control -----------------------------------------------------
+
+
+def server_preface_then_get() -> bytes:
+    return PREFACE + frame(0x04, 0, 0, b"") + frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK)
+
+
+def server_with_small_window(initial: int) -> zttp.Connection:
+    """A server whose peer advertised SETTINGS_INITIAL_WINDOW_SIZE=`initial`, with
+    request stream 1 already opened and drained."""
+    settings = (0x04).to_bytes(2, "big") + initial.to_bytes(4, "big")  # INITIAL_WINDOW_SIZE
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    conn.receive_data(PREFACE + frame(0x04, 0, 0, settings) + frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    return conn
+
+
+def test_send_data_is_capped_by_the_stream_window() -> None:
+    conn = server_with_small_window(5)
+    stream = conn.stream(1)
+    stream.send_response(200, [(b"content-type", b"text/plain")])
+    stream.send_data(b"HELLO WORLD")  # 11 bytes; only 5 may leave
+    stream.end_message()
+    # The head plus exactly the 5 admitted body bytes; the other 6 stay parked.
+    assert _data_payload_bytes(conn.data_to_send()) == 5
+
+
+def test_window_update_flushes_parked_data() -> None:
+    conn = server_with_small_window(5)
+    stream = conn.stream(1)
+    stream.send_response(200, [(b"content-type", b"text/plain")])
+    stream.send_data(b"HELLO WORLD")
+    stream.end_message()
+    assert _data_payload_bytes(conn.data_to_send()) == 5  # drains the first 5
+
+    # Peer grants 100 more on the stream: the parked 6 bytes now flush.
+    conn.receive_data(frame(0x08, 0, 1, (100).to_bytes(4, "big")))
+    list(drain_h2(conn))
+    assert _data_payload_bytes(conn.data_to_send()) == 6
+
+
+def test_full_body_round_trips_across_window_updates() -> None:
+    conn = server_with_small_window(4)
+    stream = conn.stream(1)
+    stream.send_response(200, [(b"content-type", b"text/plain")])
+    stream.send_data(b"abcdefghij")  # 10 bytes, window 4 at a time
+    stream.end_message()
+
+    body = bytearray()
+    # Read the head + first window's worth on a fresh client.
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    client.receive_data(frame(0x04, 0, 0, b""))  # server SETTINGS stand-in
+    # Feed the server output in, granting more window until the body completes.
+    rounds = 0
+    while len(body) < 10 and rounds < 10:
+        client.receive_data(conn.data_to_send())
+        for e in drain_h2(client):
+            if isinstance(e, zttp.Data):
+                body += e.data
+        conn.receive_data(frame(0x08, 0, 1, (4).to_bytes(4, "big")))
+        list(drain_h2(conn))
+        rounds += 1
+    assert bytes(body) == b"abcdefghij"

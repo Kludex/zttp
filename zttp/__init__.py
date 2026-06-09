@@ -21,6 +21,7 @@ from zttp._zttp import (
     Response,
     RstStream,
     Settings,
+    Stream,
     WindowUpdate,
 )
 
@@ -60,5 +61,6 @@ __all__ = [
     "Response",
     "RstStream",
     "Settings",
+    "Stream",
     "WindowUpdate",
 ]
