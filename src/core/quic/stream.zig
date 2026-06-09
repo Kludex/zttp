@@ -59,6 +59,10 @@ pub const RecvStream = struct {
     state: RecvState = .recv,
     read_offset: u64 = 0,
     contiguous: u64 = 0,
+    /// The largest byte offset ever received on this stream (may exceed
+    /// `contiguous` when fragments arrive out of order). Connection-level flow
+    /// control sums the growth of this across all streams.
+    highest_received: u64 = 0,
     final_size: ?u64 = null,
     /// Out-of-order fragments above `contiguous`, kept sorted by offset.
     pending: std.ArrayListUnmanaged(Fragment) = .empty,
@@ -77,13 +81,17 @@ pub const RecvStream = struct {
 
     /// Take a STREAM frame fragment. Bytes at or below `contiguous` extend the
     /// in-order run (and may unlock buffered fragments); bytes above it are
-    /// buffered. A FIN fixes the final size.
-    pub fn push(self: *RecvStream, offset: u64, data: []const u8, fin: bool) Error!void {
+    /// buffered. A FIN fixes the final size. Returns how much the stream's highest
+    /// received offset grew, which the connection charges against its window.
+    pub fn push(self: *RecvStream, offset: u64, data: []const u8, fin: bool) Error!u64 {
         const end = offset + data.len;
         if (self.final_size) |fs| {
             if (end > fs) return error.FinalSizeError;
             if (fin and end != fs) return error.FinalSizeError;
         }
+        const new_high = @max(self.highest_received, end);
+        const delta = new_high - self.highest_received;
+        self.highest_received = new_high;
         if (fin) {
             if (self.final_size) |fs| {
                 if (fs != end) return error.FinalSizeError;
@@ -91,7 +99,7 @@ pub const RecvStream = struct {
             if (self.state == .recv) self.state = .size_known;
         }
 
-        if (end <= self.contiguous) return; // wholly duplicate
+        if (end <= self.contiguous) return delta; // wholly duplicate
 
         if (offset <= self.contiguous) {
             const skip = self.contiguous - offset;
@@ -101,6 +109,7 @@ pub const RecvStream = struct {
         } else {
             try self.buffer(offset, data);
         }
+        return delta;
     }
 
     fn buffer(self: *RecvStream, offset: u64, data: []const u8) Error!void {
@@ -184,8 +193,8 @@ test "in-order fragments assemble" {
     const gpa = std.testing.allocator;
     var s = RecvStream.init(gpa);
     defer s.deinit();
-    try s.push(0, "hello ", false);
-    try s.push(6, "world", true);
+    _ = try s.push(0, "hello ", false);
+    _ = try s.push(6, "world", true);
     try std.testing.expectEqualStrings("hello world", s.readable());
     try std.testing.expect(s.isFinished());
 }
@@ -194,9 +203,9 @@ test "out-of-order fragments are buffered then drained" {
     const gpa = std.testing.allocator;
     var s = RecvStream.init(gpa);
     defer s.deinit();
-    try s.push(6, "world", true); // arrives first, buffered
+    _ = try s.push(6, "world", true); // arrives first, buffered
     try std.testing.expectEqualStrings("", s.readable());
-    try s.push(0, "hello ", false); // unlocks the buffered tail
+    _ = try s.push(0, "hello ", false); // unlocks the buffered tail
     try std.testing.expectEqualStrings("hello world", s.readable());
     try std.testing.expect(s.isFinished());
 }
@@ -205,9 +214,9 @@ test "overlapping and duplicate data is handled" {
     const gpa = std.testing.allocator;
     var s = RecvStream.init(gpa);
     defer s.deinit();
-    try s.push(0, "abcdef", false);
-    try s.push(3, "def", false); // wholly duplicate
-    try s.push(4, "efghij", false); // partial overlap, extends to 10
+    _ = try s.push(0, "abcdef", false);
+    _ = try s.push(3, "def", false); // wholly duplicate
+    _ = try s.push(4, "efghij", false); // partial overlap, extends to 10
     try std.testing.expectEqualStrings("abcdefghij", s.readable());
 }
 
@@ -215,7 +224,7 @@ test "consume slides the read offset" {
     const gpa = std.testing.allocator;
     var s = RecvStream.init(gpa);
     defer s.deinit();
-    try s.push(0, "abcdef", true);
+    _ = try s.push(0, "abcdef", true);
     s.consume(3);
     try std.testing.expectEqualStrings("def", s.readable());
     try std.testing.expectEqual(@as(u64, 3), s.read_offset);
@@ -227,7 +236,7 @@ test "data past a known final size is a final-size error" {
     const gpa = std.testing.allocator;
     var s = RecvStream.init(gpa);
     defer s.deinit();
-    try s.push(0, "abc", true); // final size = 3
+    _ = try s.push(0, "abc", true); // final size = 3
     try std.testing.expectError(error.FinalSizeError, s.push(3, "d", false));
 }
 
@@ -235,6 +244,6 @@ test "a conflicting FIN offset is rejected" {
     const gpa = std.testing.allocator;
     var s = RecvStream.init(gpa);
     defer s.deinit();
-    try s.push(0, "abcde", true); // final size 5
+    _ = try s.push(0, "abcde", true); // final size 5
     try std.testing.expectError(error.FinalSizeError, s.push(0, "abc", true)); // fin at 3
 }

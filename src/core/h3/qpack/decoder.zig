@@ -29,9 +29,17 @@ pub const Error = error{
     OutOfMemory,
 };
 
+// A name/value pair as offsets into `store`, not slices: the store is an
+// ArrayList that may reallocate as later fields append to it, so a slice taken
+// mid-decode can dangle. Offsets are stable; they are resolved into slices once,
+// after the whole block is decoded and the store can no longer move.
+const Span = struct { off: usize, len: usize };
+const Field = struct { name: Span, value: Span };
+
 pub const Decoder = struct {
     gpa: std.mem.Allocator,
     headers: std.ArrayListUnmanaged(Header) = .empty,
+    fields: std.ArrayListUnmanaged(Field) = .empty,
     store: std.ArrayListUnmanaged(u8) = .empty,
     max_field_section_size: usize,
 
@@ -41,7 +49,14 @@ pub const Decoder = struct {
 
     pub fn deinit(self: *Decoder) void {
         self.headers.deinit(self.gpa);
+        self.fields.deinit(self.gpa);
         self.store.deinit(self.gpa);
+    }
+
+    fn intern(self: *Decoder, bytes: []const u8) Error!Span {
+        const off = self.store.items.len;
+        self.store.appendSlice(self.gpa, bytes) catch return error.OutOfMemory;
+        return .{ .off = off, .len = bytes.len };
     }
 
     /// Decode one field section. The returned slice (and the slices inside it) are
@@ -49,6 +64,7 @@ pub const Decoder = struct {
     /// a caller must materialise anything it keeps, matching the core's discipline.
     pub fn decode(self: *Decoder, block: []const u8) Error![]const Header {
         self.headers.clearRetainingCapacity();
+        self.fields.clearRetainingCapacity();
         self.store.clearRetainingCapacity();
         var p = Parser{ .buf = block };
 
@@ -75,6 +91,13 @@ pub const Decoder = struct {
             }
             if (section_size > self.max_field_section_size) return error.DecompressionFailed;
         }
+        // The store can no longer move; resolve every offset pair into a slice.
+        for (self.fields.items) |f| {
+            self.headers.append(self.gpa, .{
+                .name = self.store.items[f.name.off .. f.name.off + f.name.len],
+                .value = self.store.items[f.value.off .. f.value.off + f.value.len],
+            }) catch return error.OutOfMemory;
+        }
         return self.headers.items;
     }
 
@@ -83,7 +106,7 @@ pub const Decoder = struct {
         if (p.buf[p.pos] & 0x40 == 0) return error.DynamicReferenceUnsupported;
         const index = try p.integer(6);
         const entry = static_table.get(index) orelse return error.BadIndex;
-        try self.emit(entry.name, entry.value, section_size);
+        try self.emit(try self.intern(entry.name), try self.intern(entry.value), section_size);
     }
 
     fn literalNameRef(self: *Decoder, p: *Parser, section_size: *usize) Error!void {
@@ -91,8 +114,9 @@ pub const Decoder = struct {
         if (p.buf[p.pos] & 0x10 == 0) return error.DynamicReferenceUnsupported;
         const index = try p.integer(4);
         const entry = static_table.get(index) orelse return error.BadIndex;
+        const name = try self.intern(entry.name);
         const value = try self.string(p, 7);
-        try self.emit(entry.name, value, section_size);
+        try self.emit(name, value, section_size);
     }
 
     fn literalLiteralName(self: *Decoder, p: *Parser, section_size: *usize) Error!void {
@@ -102,15 +126,16 @@ pub const Decoder = struct {
         try self.emit(name, value, section_size);
     }
 
-    fn emit(self: *Decoder, name: []const u8, value: []const u8, section_size: *usize) Error!void {
+    fn emit(self: *Decoder, name: Span, value: Span, section_size: *usize) Error!void {
         section_size.* += name.len + value.len + 32; // RFC 9204 4.1 size accounting
-        self.headers.append(self.gpa, .{ .name = name, .value = value }) catch return error.OutOfMemory;
+        self.fields.append(self.gpa, .{ .name = name, .value = value }) catch return error.OutOfMemory;
     }
 
     /// Decode a length-prefixed (optionally Huffman) string into the store and
-    /// return the stored slice. `prefix` is the integer prefix width for the
-    /// length; the high bit of the prefix byte is the Huffman flag.
-    fn string(self: *Decoder, p: *Parser, prefix: u4) Error![]const u8 {
+    /// return its (offset, len) span. `prefix` is the integer prefix width for the
+    /// length; the high bit of the prefix byte is the Huffman flag. A span, not a
+    /// slice, so a later append that reallocates the store cannot dangle it.
+    fn string(self: *Decoder, p: *Parser, prefix: u4) Error!Span {
         if (p.pos >= p.buf.len) return error.DecompressionFailed;
         const huff = (p.buf[p.pos] & (@as(u8, 1) << @intCast(prefix))) != 0;
         const len = try p.integer(prefix);
@@ -123,7 +148,7 @@ pub const Decoder = struct {
         } else {
             self.store.appendSlice(self.gpa, raw) catch return error.OutOfMemory;
         }
-        return self.store.items[start..];
+        return .{ .off = start, .len = self.store.items.len - start };
     }
 };
 
@@ -183,6 +208,33 @@ test "decode a literal with a static name reference (no Huffman)" {
     const hs = try dec.decode(&block);
     try testing.expectEqualStrings(":authority", hs[0].name);
     try testing.expectEqualStrings("h", hs[0].value);
+}
+
+test "many literal fields stay valid across store growth (realloc regression)" {
+    const gpa = testing.allocator;
+    var dec = Decoder.init(gpa, 1 << 20);
+    defer dec.deinit();
+    // Several literal-name + literal-value fields, each appending to the store and
+    // forcing it to grow/reallocate. Earlier fields' name/value slices must still
+    // resolve correctly (they are offsets, resolved after the last append).
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    defer block.deinit(gpa);
+    try block.appendSlice(gpa, &.{ 0x00, 0x00 }); // prefix
+    // 6-char names: the literal-name 3-bit length prefix encodes 0-6 inline (7
+    // would mean "continue"), so 6 keeps the length a single byte.
+    const names = [_][]const u8{ "aaaaaa", "bbbbbb", "cccccc", "dddddd", "eeeeee" };
+    for (names) |n| {
+        try block.append(gpa, 0x20 | @as(u8, @intCast(n.len))); // literal name (001), len 6
+        try block.appendSlice(gpa, n);
+        try block.append(gpa, @intCast(n.len)); // value length (7-bit prefix, no Huffman)
+        try block.appendSlice(gpa, n);
+    }
+    const hs = try dec.decode(block.items);
+    try testing.expectEqual(@as(usize, 5), hs.len);
+    for (hs, names) |h, n| {
+        try testing.expectEqualStrings(n, h.name);
+        try testing.expectEqualStrings(n, h.value);
+    }
 }
 
 test "decode a literal name and literal value (no Huffman)" {

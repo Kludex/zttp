@@ -31,7 +31,6 @@ pub const Error = error{
 const ReqState = enum { idle, headers_done, done };
 
 const RequestStream = struct {
-    parsed: usize = 0, // how many of the stream's ready bytes we have consumed
     state: ReqState = .idle,
 };
 
@@ -83,13 +82,17 @@ pub const Connection = struct {
         if (!gop.found_existing) gop.value_ptr.* = .{};
         const rs = gop.value_ptr;
 
+        // Parse from the start of the ordered bytes the transport currently holds:
+        // every fully-decoded frame is consumed (removed from the QUIC stream)
+        // before this returns, so the next pump always begins at offset 0 with the
+        // not-yet-consumed tail (a partial frame plus any newer bytes). Tracking a
+        // persistent offset here would desync once consumeStream slides the buffer.
         const ready = self.qc.streamData(id);
         var consumed_total: usize = 0;
-        while (rs.parsed < ready.len) {
-            const rest = ready[rs.parsed..];
+        while (consumed_total < ready.len) {
+            const rest = ready[consumed_total..];
             const d = h3_frame.decode(rest) catch break; // NeedData: wait for more
             try self.onFrame(id, rs, d.frame);
-            rs.parsed += d.len;
             consumed_total += d.len;
         }
         if (self.qc.streamFinished(id) and rs.state == .headers_done) {
@@ -180,6 +183,11 @@ pub const Connection = struct {
         if (self.qpos >= self.queue.items.len) {
             self.queue.clearRetainingCapacity();
             self.qpos = 0;
+            // Every queued event has been handed out (and, per the core's contract,
+            // materialised by the caller before this call), so the strings they
+            // borrowed can be reclaimed. Without this the arena grows for the life
+            // of the connection - one block per request body and header set.
+            _ = self.arena.reset(.retain_capacity);
             return .need_data;
         }
         const ev = self.queue.items[self.qpos];
@@ -282,4 +290,85 @@ test "DATA before HEADERS is rejected" {
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
     try testing.expectError(error.H3Error, h3.pump(0));
+}
+
+// Build an Initial whose STREAM frame carries `h3_bytes` at `offset` on stream 0
+// (the OFF flag is set), with packet number `pn` so a second datagram decrypts.
+fn buildRequestAt(gpa: std.mem.Allocator, dcid: []const u8, offset: u64, pn: u64, h3_bytes: []const u8) ![]u8 {
+    const varint = @import("../quic/varint.zig");
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x0e); // STREAM, OFF|LEN set
+    try varint.append(&sframe, gpa, 0); // stream id 0
+    try varint.append(&sframe, gpa, offset);
+    try varint.append(&sframe, gpa, h3_bytes.len);
+    try sframe.appendSlice(gpa, h3_bytes);
+    return @import("../quic/connection.zig").testBuildInitial(gpa, dcid, .client, pn, sframe.items);
+}
+
+test "a request split across two datagrams parses correctly (parsed-offset regression)" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x55, 0x66, 0x77, 0x88 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    const qpack_block = [_]u8{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1 }; // POST https /
+    var headers_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer headers_bytes.deinit(gpa);
+    try h3_frame.append(&headers_bytes, gpa, .headers, &qpack_block);
+    var data_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer data_bytes.deinit(gpa);
+    try h3_frame.append(&data_bytes, gpa, .data, "second-datagram-body");
+
+    // Datagram 1: just the HEADERS frame.
+    const dg1 = try buildRequestAt(gpa, &dcid, 0, 0, headers_bytes.items);
+    defer gpa.free(dg1);
+    try qc.receiveDatagram(dg1, 1000);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expect(h3.nextEvent() == .need_data);
+
+    // Datagram 2: the DATA frame at the offset right after the HEADERS frame.
+    const dg2 = try buildRequestAt(gpa, &dcid, headers_bytes.items.len, 1, data_bytes.items);
+    defer gpa.free(dg2);
+    try qc.receiveDatagram(dg2, 2000);
+    try h3.pump(0);
+    const data_ev = h3.nextEvent();
+    try testing.expect(data_ev == .data);
+    try testing.expectEqualStrings("second-datagram-body", data_ev.data.data);
+}
+
+test "the event arena is reclaimed when the queue drains" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x21, 0x22, 0x23, 0x24 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    const qpack_block = [_]u8{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 };
+    var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer h3_bytes.deinit(gpa);
+    try h3_frame.append(&h3_bytes, gpa, .headers, &qpack_block);
+    const dgram = try buildRequest(gpa, &dcid, 0, h3_bytes.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pump(0);
+    const req = h3.nextEvent();
+    try testing.expect(req == .request);
+    try testing.expectEqualStrings("GET", req.request.method);
+    // Draining to need_data resets the arena. A second request on a new stream
+    // must still decode correctly (the reset reclaims the first request's copies
+    // without corrupting the decode path).
+    try testing.expect(h3.nextEvent() == .need_data);
+
+    const dgram2 = try buildRequest(gpa, &dcid, 4, h3_bytes.items); // stream 4 (client bidi)
+    defer gpa.free(dgram2);
+    try qc.receiveDatagram(dgram2, 2000);
+    try h3.pump(4);
+    const req2 = h3.nextEvent();
+    try testing.expect(req2 == .request);
+    try testing.expectEqualStrings("GET", req2.request.method);
 }
