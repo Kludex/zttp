@@ -2,7 +2,7 @@
 
 # Apply every auto-fix the CI checks for: format and lint Python, format Zig.
 
-export SOURCE_FILES="zttp tests bench.py"
+export SOURCE_FILES="zttp tests bench.py fuzz"
 
 set -x
 

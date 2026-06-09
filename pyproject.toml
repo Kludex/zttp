@@ -47,6 +47,12 @@ docs = [
     "zensical",
     "mkdocstrings[python]",
 ]
+# Coverage-guided fuzzing. Optional: Atheris lacks wheels on some interpreters,
+# so the cron job relies on the dependency-free `fuzz/run.py` runner instead and
+# this group is only needed for local `python fuzz/fuzz_parse.py` sessions.
+fuzz = [
+    "atheris; python_version < '3.13'",
+]
 
 [tool.hatch.version]
 source = "uv-dynamic-versioning"
@@ -135,3 +141,7 @@ strict = true
 warn_unused_ignores = true
 show_error_codes = true
 files = ["zttp"]
+
+[[tool.mypy.overrides]]
+module = "atheris"
+ignore_missing_imports = true
