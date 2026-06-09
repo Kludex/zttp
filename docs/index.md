@@ -52,7 +52,7 @@ uv add zttp
 ```
 
 !!! note "Requirements"
-    zttp needs **CPython 3.12+** and runs on **Linux**, **macOS**, and **Windows**.
+    zttp needs **CPython 3.10+** and runs on **Linux**, **macOS**, and **Windows**.
 
 ## Example
 

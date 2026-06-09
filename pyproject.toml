@@ -8,7 +8,7 @@ description = "A sans-IO HTTP parser for Python with a Zig core."
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 authors = [{ name = "Marcelo Trylesinski", email = "marcelotryle@gmail.com" }]
 keywords = ["http", "parser", "sans-io", "zig", "asgi"]
 classifiers = [
@@ -19,6 +19,8 @@ classifiers = [
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -84,7 +86,7 @@ include = ["zttp", "src", "tools", "build.zig"]
 # cp314t is the free-threaded build; the extension declares Py_MOD_GIL_NOT_USED.
 # Windows is skipped for cp314t: its pyconfig.h doesn't self-define Py_GIL_DISABLED
 # (POSIX does), so translate-c would compile against the GIL ABI and mismatch.
-build = "cp312-* cp313-* cp314-* cp314t-*"
+build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
 skip = "*_i686 *-pp* cp314t-win*"
 build-frontend = "build[uv]"
 test-command = 'python -c "import zttp; c = zttp.Connection(zttp.SERVER); c.receive_data(b\"GET / HTTP/1.1\r\n\r\n\"); assert type(c.next_event()).__name__ == \"Request\""'
