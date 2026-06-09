@@ -79,7 +79,6 @@ fn validLineToken(s: []const u8, allow_sp: bool) WriteError!void {
 fn reasonPhrase(status: u16) []const u8 {
     return switch (status) {
         100 => "Continue",
-        101 => "Switching Protocols",
         102 => "Processing",
         103 => "Early Hints",
         else => "Informational",
@@ -210,10 +209,12 @@ pub const Writer = struct {
     /// the final response on the same message cycle. Unlike `sendResponse` it does
     /// not consume the cycle - the writer stays idle, awaiting the real response.
     /// The reason phrase is derived from the status, and the version is always 1.1
-    /// (1xx didn't exist in HTTP/1.0). Status must be 100..199.
+    /// (1xx didn't exist in HTTP/1.0). Status must be 100..199, excluding 101:
+    /// 101 Switching Protocols is terminal (the connection leaves HTTP afterwards),
+    /// not interim, so it cannot be followed by a final response here.
     pub fn sendInformational(self: *Writer, status: u16, hdrs: []const Header) WriteError!void {
         if (self.state != .idle) return error.MessageNotEnded;
-        if (status / 100 != 1) return error.InvalidField;
+        if (status / 100 != 1 or status == 101) return error.InvalidField;
         try self.writeStatusLine("1.1", status, reasonPhrase(status), hdrs);
     }
 

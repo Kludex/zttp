@@ -226,6 +226,7 @@ fn send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
     if (status < 100 or status > 199) return py.raiseValue("informational status code must be in 100..199");
+    if (status == 101) return py.raiseValue("101 Switching Protocols is a terminal upgrade response, not interim");
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
         wc.sendInformational(@intCast(status), &.{}) catch |e| return raiseWrite(e);
     } else {

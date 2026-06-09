@@ -219,6 +219,12 @@ def test_informational_rejects_non_1xx(status: int) -> None:
         conn.send_informational(status)
 
 
+def test_informational_rejects_switching_protocols() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(ValueError, match="101 Switching Protocols is a terminal upgrade response"):
+        conn.send_informational(101)
+
+
 def test_informational_rejected_mid_message() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(b"1.1", 200, b"OK", [(b"Content-Length", b"5")])
