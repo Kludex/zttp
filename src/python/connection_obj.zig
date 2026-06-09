@@ -379,11 +379,11 @@ fn h2SendRequest(self: *ConnectionObject, mb: []const u8, tb: []const u8, hdrs: 
     return py.none();
 }
 
-fn h2SendResponse(self: *ConnectionObject, status: u16, hdrs: *BorrowedHeaders) py.Object {
+fn h2SendResponse(self: *ConnectionObject, stream_id: u32, status: u16, hdrs: *BorrowedHeaders) py.Object {
     const w = self.h2_writer.?;
     if (!h2EnsureHandshake(self)) return null;
-    w.sendResponse(self.h2_recv_stream, status, hdrs.headers, false) catch |e| return h2RaiseWrite(e);
-    self.h2_send_stream = self.h2_recv_stream;
+    w.sendResponse(stream_id, status, hdrs.headers, false) catch |e| return h2RaiseWrite(e);
+    self.h2_send_stream = stream_id;
     return py.none();
 }
 
@@ -418,16 +418,20 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     var status: c_long = 0;
     var reason: ?*c.PyObject = null;
     var hdrs_seq: ?*c.PyObject = null;
-    if (c.PyArg_ParseTuple(args, "OlOO", &version, &status, &reason, &hdrs_seq) == 0) return null;
+    var stream_id: c_long = -1; // HTTP/2 only; -1 means "the last parsed request"
+    if (c.PyArg_ParseTuple(args, "OlOO|l", &version, &status, &reason, &hdrs_seq, &stream_id) == 0) return null;
     if (status < 0 or status > 999) return py.raiseValue("status code out of range");
     const vb = py.asBytes(version) orelse return null;
     const rb = py.asBytes(reason) orelse return null;
     var hdrs = borrowHeaders(hdrs_seq) orelse return null;
     defer hdrs.deinit();
     if (self.h2_writer != null) {
-        // HTTP/2: version and reason are ignored (no reason phrase exists); the
-        // response answers on the most recently parsed request's stream.
-        return h2SendResponse(self, @intCast(status), &hdrs);
+        // HTTP/2: version and reason are ignored (no reason phrase exists). The
+        // response answers on `stream_id` if given - required when several
+        // requests are outstanding - else the most recently parsed request's
+        // stream (the single-request convenience).
+        const id: u32 = if (stream_id >= 0) @intCast(stream_id) else self.h2_recv_stream;
+        return h2SendResponse(self, id, @intCast(status), &hdrs);
     }
     const wc = self.writer orelse return py.raiseRuntime("connection is closed");
     const method = self.req_method[0..self.req_method_len];
@@ -435,11 +439,15 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     return py.none();
 }
 
-fn send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+fn send_data(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const data = py.asBytes(arg) orelse return null;
+    var data_obj: ?*c.PyObject = null;
+    var stream_id: c_long = -1; // HTTP/2 only
+    if (c.PyArg_ParseTuple(args, "O|l", &data_obj, &stream_id) == 0) return null;
+    const data = py.asBytes(data_obj) orelse return null;
     if (self.h2_writer) |w| {
-        w.sendData(self.h2_send_stream, data, false) catch |e| return h2RaiseWrite(e);
+        const id = h2OutgoingStream(self, stream_id) orelse return null;
+        w.sendData(id, data, false) catch |e| return h2RaiseWrite(e);
         return py.none();
     }
     const wc = self.writer orelse return py.raiseRuntime("connection is closed");
@@ -447,17 +455,32 @@ fn send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     return py.none();
 }
 
+// Resolve the HTTP/2 stream a body frame targets: an explicit `stream_id`, or
+// the current outgoing stream. Stream 0 is the connection-control stream and can
+// never carry DATA, so a missing selection is a local protocol error rather than
+// silently emitting an invalid frame.
+fn h2OutgoingStream(self: *ConnectionObject, stream_id: c_long) ?u32 {
+    if (stream_id > 0) return @intCast(stream_id);
+    if (self.h2_send_stream == 0) {
+        _ = py.raise(exceptions.LocalProtocolError, "no HTTP/2 stream selected: send a request or response first, or pass stream_id");
+        return null;
+    }
+    return self.h2_send_stream;
+}
+
 fn end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     var hdrs_seq: ?*c.PyObject = null;
-    if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
+    var stream_id: c_long = -1; // HTTP/2 only
+    if (c.PyArg_ParseTuple(args, "|Ol", &hdrs_seq, &stream_id) == 0) return null;
     if (self.h2_writer) |w| {
         // HTTP/2 ends a message with an empty END_STREAM DATA frame. Trailers are
         // not yet supported on the send side.
         if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
             return py.raise(exceptions.LocalProtocolError, "HTTP/2 send-side trailers are not supported yet");
         }
-        w.sendData(self.h2_send_stream, &.{}, true) catch |e| return h2RaiseWrite(e);
+        const id = h2OutgoingStream(self, stream_id) orelse return null;
+        w.sendData(id, &.{}, true) catch |e| return h2RaiseWrite(e);
         return py.none();
     }
     const wc = self.writer orelse return py.raiseRuntime("connection is closed");
@@ -531,7 +554,7 @@ var methods = [_]py.MethodDef{
     .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
     .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(version, status, reason, headers). Bodyless framing (HEAD / 1xx / 204 / 304) is derived automatically." },
-    .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
+    .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a run of body bytes: send_data(data, stream_id=...). stream_id is HTTP/2 only." },
     .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
     .{ .ml_name = "should_close", .ml_meth = should_close, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request (Connection: close / HTTP/1.0)." },

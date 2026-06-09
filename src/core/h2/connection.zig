@@ -500,8 +500,15 @@ pub const Connection = struct {
                 error.OutOfMemory => return error.MessageTooLong,
             };
             // A 1xx interim response is informational: it carries no body and the
-            // stream stays open for the final response (RFC 9110 15.2).
+            // stream stays open for the final response (RFC 9110 15.2). It must
+            // therefore NOT end the stream - an interim with END_STREAM would leave
+            // the receive side closed waiting for a final response that can never
+            // arrive, so it is malformed and resets the stream.
             if (resp.event.status_code >= 100 and resp.event.status_code < 200) {
+                if (end_stream) {
+                    self.resetStream(s, id, .protocol_error);
+                    return;
+                }
                 self.push(.{ .response = resp.event });
                 return;
             }
@@ -646,6 +653,9 @@ pub const Connection = struct {
                     if (d < '0' or d > '9') return error.Malformed;
                     code = code * 10 + (d - '0');
                 }
+                // Only the defined status classes (1xx-5xx) are valid; 000-099 and
+                // 600-999 are impossible codes (RFC 9110 15).
+                if (code < 100 or code > 599) return error.Malformed;
                 status = code;
                 continue;
             }
@@ -1112,6 +1122,30 @@ test "an even response stream id is a connection error for a client" {
     try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 2, &STATUS_200_BLOCK);
     try clientHandshook(&c, frames.items);
     try testing.expectError(error.ProtocolError, c.nextEvent());
+}
+
+test "an out-of-range :status resets the stream" {
+    var c = Connection.init(testing.allocator, .client);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    // A literal ":status: 700" - a code outside the 100-599 range.
+    const bad = [_]u8{ 0x00, 0x07 } ++ ":status".* ++ [_]u8{0x03} ++ "700".*;
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &bad);
+    try clientHandshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "a 1xx response with END_STREAM resets the stream" {
+    var c = Connection.init(testing.allocator, .client);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    // A literal ":status: 100" that illegally ends the stream.
+    const interim = [_]u8{ 0x00, 0x07 } ++ ":status".* ++ [_]u8{0x03} ++ "100".*;
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &interim);
+    try clientHandshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
 }
 
 test "HEADERS after END_STREAM (not a trailer) is a connection error" {
