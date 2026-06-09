@@ -1,4 +1,4 @@
-//! The Python `Connection` object: a thin wrapper over the core Reader exposing
+//! The Python `Connection` object: a thin wrapper over the core engine exposing
 //! the sans-IO pull API. `receive_data(bytes)` appends to the parse buffer;
 //! `next_event()` returns the next Request/Response/Data/EndOfMessage event, or
 //! the NEED_DATA singleton. The write side (send/data_to_send) is added on top.
@@ -24,24 +24,74 @@ const CLIENT: c_long = 2;
 const HTTP1: c_long = 1;
 const HTTP2: c_long = 2;
 
-// One Python Connection backs either an HTTP/1.1 Reader+Writer or an HTTP/2
-// engine, chosen by the `protocol` argument. The H1 path (reader/writer
-// non-null, h2 null) is byte-for-byte the original; H2 leaves reader/writer null
-// and drives `h2` instead. Methods dispatch on which is set.
-const ConnectionObject = extern struct {
-    ob_base: c.PyObject,
-    reader: ?*Reader,
-    writer: ?*Writer,
-    h2: ?*H2Connection,
+/// The HTTP/1.1 engine: the pull-API reader, the writer, and the per-connection
+/// state the send path needs (the request method the next response answers, the
+/// keep-alive / upgrade signals captured at parse time).
+const H1Engine = struct {
+    reader: *Reader,
+    writer: *Writer,
     /// The method of the message the next response answers (server: the parsed
     /// request; client: the request we sent), so the connection auto-derives
     /// bodyless framing. Cleared per cycle by start_next_cycle.
-    req_method: [16]u8,
-    req_method_len: usize,
+    req_method: [16]u8 = undefined,
+    req_method_len: usize = 0,
     /// Connection signals for the last parsed request, captured at event time so
     /// they outlive the head buffer. `upgrade_obj` is held Python bytes (or null).
-    should_close: bool,
-    upgrade_obj: py.Object,
+    should_close: bool = false,
+    upgrade_obj: py.Object = null,
+
+    fn rememberMethod(self: *H1Engine, method: []const u8) void {
+        if (method.len > self.req_method.len) {
+            self.req_method_len = 0;
+            return;
+        }
+        @memcpy(self.req_method[0..method.len], method);
+        self.req_method_len = method.len;
+    }
+
+    fn method(self: *const H1Engine) []const u8 {
+        return self.req_method[0..self.req_method_len];
+    }
+
+    fn deinit(self: *H1Engine) void {
+        self.reader.deinit();
+        gpa.destroy(self.reader);
+        self.writer.deinit();
+        gpa.destroy(self.writer);
+        py.xdecref(self.upgrade_obj);
+    }
+};
+
+/// The HTTP/2 engine. Only the read side exists on this branch; the write side
+/// (an H2 writer plus stream-id bookkeeping) is added in a later step.
+const H2Engine = struct {
+    conn: *H2Connection,
+
+    fn deinit(self: *H2Engine) void {
+        self.conn.deinit();
+        gpa.destroy(self.conn);
+    }
+};
+
+/// One Python Connection drives exactly one protocol engine, chosen at
+/// construction. Modelling it as a tagged union (rather than a set of nullable
+/// per-protocol fields) makes the "exactly one is live" invariant structural -
+/// an illegal mix of H1 and H2 state cannot be represented - and lets each new
+/// protocol slot in as another arm instead of another branch in every method.
+const Engine = union(enum) {
+    h1: H1Engine,
+    h2: H2Engine,
+
+    fn deinit(self: *Engine) void {
+        switch (self.*) {
+            inline else => |*e| e.deinit(),
+        }
+    }
+};
+
+const ConnectionObject = extern struct {
+    ob_base: c.PyObject,
+    engine: ?*Engine,
 };
 
 var connection_type: py.Object = null;
@@ -65,93 +115,111 @@ fn new(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c
     const obj = alloc(tp, 0);
     if (obj == null) return null;
     const self: *ConnectionObject = @ptrCast(obj);
-    self.reader = null;
-    self.writer = null;
-    self.h2 = null;
-    self.req_method_len = 0;
-    self.should_close = false;
-    self.upgrade_obj = null;
+    self.engine = null;
+
+    const engine = buildEngine(role, protocol_val) orelse {
+        py.decref(obj);
+        return null;
+    };
+    self.engine = engine;
+    return obj;
+}
+
+fn buildEngine(role: Role, protocol_val: c_long) ?*Engine {
+    const engine = gpa.create(Engine) catch {
+        _ = c.PyErr_NoMemory();
+        return null;
+    };
 
     if (protocol_val == HTTP2) {
-        const h = gpa.create(H2Connection) catch {
-            py.decref(obj);
-            return c.PyErr_NoMemory();
+        const conn = gpa.create(H2Connection) catch {
+            gpa.destroy(engine);
+            _ = c.PyErr_NoMemory();
+            return null;
         };
-        h.* = H2Connection.init(gpa, if (role == .server) H2Role.server else H2Role.client);
-        self.h2 = h;
-        return obj;
+        conn.* = H2Connection.init(gpa, if (role == .server) H2Role.server else H2Role.client);
+        engine.* = .{ .h2 = .{ .conn = conn } };
+        return engine;
     }
 
-    const r = gpa.create(Reader) catch {
-        py.decref(obj);
-        return c.PyErr_NoMemory();
+    const reader = gpa.create(Reader) catch {
+        gpa.destroy(engine);
+        _ = c.PyErr_NoMemory();
+        return null;
     };
-    r.* = Reader.init(gpa, role);
-    self.reader = r;
-
-    const wctx = gpa.create(Writer) catch {
-        py.decref(obj);
-        return c.PyErr_NoMemory();
+    reader.* = Reader.init(gpa, role);
+    const writer = gpa.create(Writer) catch {
+        reader.deinit();
+        gpa.destroy(reader);
+        gpa.destroy(engine);
+        _ = c.PyErr_NoMemory();
+        return null;
     };
-    wctx.* = Writer.init(gpa);
-    self.writer = wctx;
-    return obj;
+    writer.* = Writer.init(gpa);
+    engine.* = .{ .h1 = .{ .reader = reader, .writer = writer } };
+    return engine;
 }
 
 fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    if (self.reader) |r| {
-        r.deinit();
-        gpa.destroy(r);
+    if (self.engine) |engine| {
+        engine.deinit();
+        gpa.destroy(engine);
     }
-    if (self.writer) |wc| {
-        wc.deinit();
-        gpa.destroy(wc);
-    }
-    if (self.h2) |h| {
-        h.deinit();
-        gpa.destroy(h);
-    }
-    py.xdecref(self.upgrade_obj);
     py.freeInstance(@ptrCast(self));
+}
+
+/// The H1 engine, or a "connection is closed" error when this is not an H1
+/// connection or has been torn down. The write/keep-alive API is H1-only.
+fn h1(self: *ConnectionObject) ?*H1Engine {
+    const engine = self.engine orelse {
+        _ = py.raiseRuntime("connection is closed");
+        return null;
+    };
+    switch (engine.*) {
+        .h1 => |*e| return e,
+        else => {
+            _ = py.raiseRuntime("connection is closed");
+            return null;
+        },
+    }
 }
 
 fn receive_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const bytes = py.asBytes(arg) orelse return null;
-    if (self.h2) |h| {
-        h.feed(bytes) catch |e| return exceptions.raiseH2(e);
-        return py.none();
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    switch (engine.*) {
+        .h2 => |*e| {
+            e.conn.feed(bytes) catch |err| return exceptions.raiseH2(err);
+            return py.none();
+        },
+        .h1 => |*e| {
+            e.reader.feed(bytes) catch |err| return exceptions.raiseParse(err); // MessageTooLong -> RemoteProtocolError
+            return py.none();
+        },
     }
-    const r = self.reader orelse return py.raiseRuntime("connection is closed");
-    r.feed(bytes) catch |e| return exceptions.raiseParse(e); // MessageTooLong -> RemoteProtocolError
-    return py.none();
-}
-
-fn rememberMethod(self: *ConnectionObject, method: []const u8) void {
-    if (method.len > self.req_method.len) {
-        self.req_method_len = 0;
-        return;
-    }
-    @memcpy(self.req_method[0..method.len], method);
-    self.req_method_len = method.len;
 }
 
 fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    if (self.h2) |h| {
-        const ev = h.nextEvent() catch |e| return exceptions.raiseH2(e);
-        return events_obj.fromH2Event(ev);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    switch (engine.*) {
+        .h2 => |*e| {
+            const ev = e.conn.nextEvent() catch |err| return exceptions.raiseH2(err);
+            return events_obj.fromH2Event(ev);
+        },
+        .h1 => |*e| {
+            const ev = e.reader.nextEvent() catch |err| return exceptions.raiseParse(err);
+            if (ev == .request) {
+                e.rememberMethod(ev.request.method);
+                e.should_close = e.reader.shouldClose();
+                py.xdecref(e.upgrade_obj);
+                e.upgrade_obj = if (e.reader.upgrade()) |u| py.fromBytes(u) else null;
+            }
+            return events_obj.fromH1Event(ev);
+        },
     }
-    const r = self.reader orelse return py.raiseRuntime("connection is closed");
-    const ev = r.nextEvent() catch |e| return exceptions.raiseParse(e);
-    if (ev == .request) {
-        rememberMethod(self, ev.request.method);
-        self.should_close = r.shouldClose();
-        py.xdecref(self.upgrade_obj);
-        self.upgrade_obj = if (r.upgrade()) |u| py.fromBytes(u) else null;
-    }
-    return events_obj.fromH1Event(ev);
 }
 
 /// Headers borrowed (zero-copy) from a Python sequence of (name, value) bytes
@@ -224,7 +292,7 @@ fn borrowHeaders(seq: py.Object) ?BorrowedHeaders {
 
 fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
+    const e = h1(self) orelse return null;
     var method: ?*c.PyObject = null;
     var target: ?*c.PyObject = null;
     var version: ?*c.PyObject = null;
@@ -235,79 +303,79 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
     const vb = py.asBytes(version) orelse return null;
     var hdrs = borrowHeaders(hdrs_seq) orelse return null;
     defer hdrs.deinit();
-    wc.sendRequest(mb, tb, vb, hdrs.headers) catch |e| return raiseWrite(e);
-    rememberMethod(self, mb);
-    if (self.reader) |r| r.setRequestMethod(mb);
+    e.writer.sendRequest(mb, tb, vb, hdrs.headers) catch |err| return raiseWrite(err);
+    e.rememberMethod(mb);
+    e.reader.setRequestMethod(mb);
     return py.none();
 }
 
 fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
+    const e = h1(self) orelse return null;
     var status: c_long = 0;
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
     if (status < 0 or status > 999) return py.raiseValue("status code out of range");
     const rb = core.h1.writer.reasonPhrase(@intCast(status));
     const vb = "1.1";
-    const method = self.req_method[0..self.req_method_len];
+    const method = e.method();
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
-        wc.sendResponse(vb, @intCast(status), rb, &.{}, method) catch |e| return raiseWrite(e);
+        e.writer.sendResponse(vb, @intCast(status), rb, &.{}, method) catch |err| return raiseWrite(err);
         return py.none();
     }
     var hdrs = borrowHeaders(hdrs_seq) orelse return null;
     defer hdrs.deinit();
-    wc.sendResponse(vb, @intCast(status), rb, hdrs.headers, method) catch |e| return raiseWrite(e);
+    e.writer.sendResponse(vb, @intCast(status), rb, hdrs.headers, method) catch |err| return raiseWrite(err);
     return py.none();
 }
 
 fn send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
+    const e = h1(self) orelse return null;
     var status: c_long = 0;
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
     if (status < 100 or status > 199) return py.raiseValue("informational status code must be in 100..199");
     if (status == 101) return py.raiseValue("101 Switching Protocols is a terminal upgrade response, not interim");
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
-        wc.sendInformational(@intCast(status), &.{}) catch |e| return raiseWrite(e);
+        e.writer.sendInformational(@intCast(status), &.{}) catch |err| return raiseWrite(err);
     } else {
         var hdrs = borrowHeaders(hdrs_seq) orelse return null;
         defer hdrs.deinit();
-        wc.sendInformational(@intCast(status), hdrs.headers) catch |e| return raiseWrite(e);
+        e.writer.sendInformational(@intCast(status), hdrs.headers) catch |err| return raiseWrite(err);
     }
     return py.none();
 }
 
 fn send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
+    const e = h1(self) orelse return null;
     const data = py.asBytes(arg) orelse return null;
-    wc.sendData(data) catch |e| return raiseWrite(e);
+    e.writer.sendData(data) catch |err| return raiseWrite(err);
     return py.none();
 }
 
 fn end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
+    const e = h1(self) orelse return null;
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
-        wc.endMessage(&.{}) catch |e| return raiseWrite(e);
+        e.writer.endMessage(&.{}) catch |err| return raiseWrite(err);
     } else {
         var hdrs = borrowHeaders(hdrs_seq) orelse return null;
         defer hdrs.deinit();
-        wc.endMessage(hdrs.headers) catch |e| return raiseWrite(e);
+        e.writer.endMessage(hdrs.headers) catch |err| return raiseWrite(err);
     }
     return py.none();
 }
 
 fn data_to_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const wc = self.writer orelse return py.raiseRuntime("connection is closed");
-    const out = py.fromBytes(wc.pending());
+    const e = h1(self) orelse return null;
+    const out = py.fromBytes(e.writer.pending());
     if (out == null) return null;
-    wc.clear();
+    e.writer.clear();
     return out;
 }
 
@@ -328,26 +396,28 @@ fn raiseWrite(e: core.h1.writer.WriteError) py.Object {
 fn next_message(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     // Convenience for keep-alive: reset the reader for the next request/response.
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const r = self.reader orelse return py.raiseRuntime("connection is closed");
-    r.reset();
+    const e = h1(self) orelse return null;
+    e.reader.reset();
     // req_method is intentionally NOT cleared: a caller may call start_next_cycle()
     // before serializing the previous response (e.g. pipelined keep-alive reads),
     // and send_response reads it to frame HEAD / CONNECT responses as bodyless. It
     // is overwritten when the next request is parsed, so a stale value is never seen.
-    self.should_close = false;
-    py.xdecref(self.upgrade_obj);
-    self.upgrade_obj = null;
+    e.should_close = false;
+    py.xdecref(e.upgrade_obj);
+    e.upgrade_obj = null;
     return py.none();
 }
 
 fn should_close(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    return py.boolean(self.should_close);
+    const e = h1(self) orelse return null;
+    return py.boolean(e.should_close);
 }
 
 fn upgrade(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const obj = self.upgrade_obj orelse return py.none();
+    const e = h1(self) orelse return null;
+    const obj = e.upgrade_obj orelse return py.none();
     py.incref(obj);
     return obj;
 }
