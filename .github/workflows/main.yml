@@ -55,53 +55,6 @@ jobs:
       - name: Enforce coverage
         run: scripts/coverage
 
-  # Preview: build the docs for each PR and upload a versioned Cloudflare build,
-  # commenting the URL on the PR. Skipped on forks and when the secret is absent.
-  docs-preview:
-    if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-
-    env:
-      HAS_CLOUDFLARE_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
-
-    permissions:
-      contents: read
-      pull-requests: write
-
-    environment:
-      name: cloudflare
-      url: ${{ steps.deploy.outputs.deployment-url }}
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-        with:
-          python-version: "3.12"
-          enable-cache: false
-
-      - name: Build docs
-        run: scripts/docs
-
-      - name: Upload preview to Cloudflare
-        id: deploy
-        if: ${{ env.HAS_CLOUDFLARE_TOKEN == 'true' }}
-        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: versions upload --tag pr-${{ github.event.pull_request.number }}
-
-      - name: Comment preview URL on PR
-        if: ${{ steps.deploy.outcome == 'success' }}
-        uses: thollander/actions-comment-pull-request@24bffb9b452ba05a4f3f77933840a6a841d1b32b # v3.0.1
-        with:
-          message: |
-            :book: Docs preview: ${{ steps.deploy.outputs.deployment-url }}
-          comment-tag: docs-preview
-
   # https://github.com/marketplace/actions/alls-green#why
   check:
     name: All green

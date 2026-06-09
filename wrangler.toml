@@ -6,8 +6,12 @@ workers_dev = true
 directory = "./site"
 not_found_handling = "404-page"
 
+# Cloudflare Workers Builds (the GitHub App connected to this repo) builds and
+# deploys this worker: production on main, preview URLs per pull request. The
+# build runs scripts/docs to render ./site.
+#
 # Serve the production docs at the custom domain. The zone must live on the same
-# Cloudflare account as the worker (CLOUDFLARE_ACCOUNT_ID).
+# Cloudflare account as the worker.
 [[routes]]
 pattern = "zttp.marcelotryle.com"
 custom_domain = true
