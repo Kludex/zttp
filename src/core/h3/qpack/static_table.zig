@@ -115,6 +115,24 @@ pub fn get(index: u64) ?Entry {
     return TABLE[@intCast(index)];
 }
 
+/// The index whose name AND value both equal `name`/`value`, for an indexed
+/// field line, or null if none. The lowest matching index wins.
+pub fn nameValueIndex(name: []const u8, value: []const u8) ?usize {
+    for (TABLE, 0..) |e, i| {
+        if (std.mem.eql(u8, e.name, name) and std.mem.eql(u8, e.value, value)) return i;
+    }
+    return null;
+}
+
+/// The index whose name equals `name`, for a literal with a static name
+/// reference, or null if none. The lowest matching index wins.
+pub fn nameIndex(name: []const u8) ?usize {
+    for (TABLE, 0..) |e, i| {
+        if (std.mem.eql(u8, e.name, name)) return i;
+    }
+    return null;
+}
+
 test "the table has the RFC 9204 appendix A length" {
     try std.testing.expectEqual(@as(usize, 99), TABLE.len);
 }
