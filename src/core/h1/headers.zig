@@ -6,8 +6,9 @@
 const std = @import("std");
 const tables = @import("../tables.zig");
 const events = @import("../events.zig");
-const Scanner = @import("../scanner.zig").Scanner;
-const trimTrailingOws = @import("../scanner.zig").trimTrailingOws;
+const scanner = @import("../scanner.zig");
+const Scanner = scanner.Scanner;
+const trimTrailingOws = scanner.trimTrailingOws;
 const ParseError = @import("../errors.zig").ParseError;
 
 const Header = events.Header;
@@ -34,7 +35,7 @@ pub fn parseRequestLine(line: []const u8) ParseError!RequestLine {
     if (method.len == 0 or sc.peek() != ' ') return error.InvalidLine;
     _ = sc.take(1);
 
-    const target = sc.span(tables.is_target_char);
+    const target = sc.spanTarget();
     if (target.len == 0 or sc.peek() != ' ') return error.InvalidLine;
     _ = sc.take(1);
 
@@ -105,9 +106,7 @@ pub fn parseHeaderLine(line: []const u8) ParseError!Header {
     sc.skipOws();
 
     const rest = sc.remaining();
-    for (rest) |ch| {
-        if (!tables.is_field_vchar[ch]) return error.InvalidHeader;
-    }
+    if (!scanner.validFieldValue(rest)) return error.InvalidHeader;
     return .{ .name = name, .value = trimTrailingOws(rest) };
 }
 

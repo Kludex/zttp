@@ -36,7 +36,9 @@ The key features are:
   sockets, no surprises.
 * **HTTP/1.1, HTTP/2, and HTTP/3**: the *same* event API for all three. Pass
   `protocol=zttp.HTTP2` and you get multiplexed streams, HPACK, and flow control
-  (see [HTTP/2](usage/http2.md)).
+  (see [HTTP/2](usage/http2.md)); pass `protocol=zttp.HTTP3` and a from-scratch
+  QUIC transport feeds the same events from UDP datagrams (see
+  [HTTP/3](usage/http3.md)).
 * **Fast**: a hand-written Zig engine with branch-light scanning and minimal
   allocation (see [Performance](reference/performance.md) for the numbers).
 * **Safe**: strict by default. It defends against request smuggling, rejects bare
@@ -130,6 +132,12 @@ That's it. The buffering, the header parsing, the body framing: all Zig. 🎉
     ---
 
     The same API, multiplexed: streams, flow control, and the control events.
+
+-   :material-radio-tower: **[HTTP/3](usage/http3.md)**
+
+    ---
+
+    The same events again, fed by UDP datagrams through a QUIC transport.
 
 -   :material-sitemap: **[Why sans-IO](architecture/sans-io.md)**
 

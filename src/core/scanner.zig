@@ -7,6 +7,9 @@
 const std = @import("std");
 const tables = @import("tables.zig");
 
+const block_len = std.simd.suggestVectorLength(u8) orelse 8;
+const Block = @Vector(block_len, u8);
+
 pub const Scanner = struct {
     buf: []const u8,
     pos: usize = 0,
@@ -44,26 +47,10 @@ pub const Scanner = struct {
     }
 
     /// Index of the next LF (0x0A) at or after the cursor, relative to the
-    /// buffer start, or null if none is buffered yet. SWAR-scans 8 bytes at a
-    /// time: the classic "has a zero byte" bit trick applied to (word ^ LF*).
+    /// buffer start, or null if none is buffered yet. std's findScalarPos scans
+    /// two SIMD vectors (32 bytes on NEON) per iteration.
     pub fn indexOfLf(self: *const Scanner) ?usize {
-        const needle: u64 = 0x0A0A0A0A0A0A0A0A;
-        const ones: u64 = 0x0101010101010101;
-        const high: u64 = 0x8080808080808080;
-        var i = self.pos;
-        const buf = self.buf;
-        while (i + 8 <= buf.len) : (i += 8) {
-            const word = std.mem.readInt(u64, buf[i..][0..8], .little);
-            const x = word ^ needle;
-            const found = (x -% ones) & ~x & high;
-            if (found != 0) {
-                return i + (@ctz(found) >> 3);
-            }
-        }
-        while (i < buf.len) : (i += 1) {
-            if (buf[i] == '\n') return i;
-        }
-        return null;
+        return std.mem.findScalarPos(u8, self.buf, self.pos, '\n');
     }
 
     pub const LineError = error{ MessageTooLong, BareLf };
@@ -100,6 +87,27 @@ pub const Scanner = struct {
         return buf[start..i];
     }
 
+    /// `span(tables.is_target_char)` with a vectorized fast path: a whole block
+    /// is inside the class iff no byte is < 0x21, DEL, or DQUOTE, so clean
+    /// blocks are skipped with three lane-compares and the block holding the
+    /// span's end (or an invalid byte) falls back to the exact table walk.
+    pub fn spanTarget(self: *Scanner) []const u8 {
+        const start = self.pos;
+        var i = start;
+        const buf = self.buf;
+        while (i + block_len <= buf.len) {
+            const block: Block = buf[i..][0..block_len].*;
+            const below = block < @as(Block, @splat(0x21));
+            const del = block == @as(Block, @splat(0x7F));
+            const quote = block == @as(Block, @splat('"'));
+            if (@reduce(.Or, below) or @reduce(.Or, del) or @reduce(.Or, quote)) break;
+            i += block_len;
+        }
+        while (i < buf.len and tables.is_target_char[buf[i]]) : (i += 1) {}
+        self.pos = i;
+        return buf[start..i];
+    }
+
     /// Skip any leading optional whitespace (SP / HTAB), per RFC 9110 OWS.
     pub fn skipOws(self: *Scanner) void {
         while (self.pos < self.buf.len) : (self.pos += 1) {
@@ -115,6 +123,25 @@ pub fn trimTrailingOws(s: []const u8) []const u8 {
     var end = s.len;
     while (end > 0 and (s[end - 1] == ' ' or s[end - 1] == '\t')) end -= 1;
     return s[0..end];
+}
+
+/// Whether every byte of `s` is field-vchar / SP / HTAB (tables.is_field_vchar).
+/// Vectorized fast path: a block with no byte < 0x20 and no DEL is all-valid;
+/// a suspect block (which includes the rare valid HTAB) falls back to the
+/// exact table walk for the remainder.
+pub fn validFieldValue(s: []const u8) bool {
+    var i: usize = 0;
+    while (i + block_len <= s.len) {
+        const block: Block = s[i..][0..block_len].*;
+        const ctl = block < @as(Block, @splat(0x20));
+        const del = block == @as(Block, @splat(0x7F));
+        if (@reduce(.Or, ctl) or @reduce(.Or, del)) break;
+        i += block_len;
+    }
+    while (i < s.len) : (i += 1) {
+        if (!tables.is_field_vchar[s[i]]) return false;
+    }
+    return true;
 }
 
 test "indexOfLf finds across word boundary" {
@@ -174,4 +201,41 @@ test "consume matches a literal" {
 test "trimTrailingOws" {
     try std.testing.expectEqualStrings("value", trimTrailingOws("value  \t "));
     try std.testing.expectEqualStrings("", trimTrailingOws("   "));
+}
+
+test "spanTarget agrees with the table for every byte at every block offset" {
+    var buf: [block_len * 2 + 1]u8 = undefined;
+    var b: usize = 0;
+    while (b < 256) : (b += 1) {
+        var offset: usize = 0;
+        while (offset < buf.len) : (offset += 1) {
+            @memset(&buf, 'a');
+            buf[offset] = @intCast(b);
+            var vec = Scanner.init(&buf);
+            var scalar = Scanner.init(&buf);
+            try std.testing.expectEqualStrings(scalar.span(tables.is_target_char), vec.spanTarget());
+            try std.testing.expectEqual(scalar.pos, vec.pos);
+        }
+    }
+}
+
+test "validFieldValue agrees with the table for every byte at every block offset" {
+    var buf: [block_len * 2 + 1]u8 = undefined;
+    var b: usize = 0;
+    while (b < 256) : (b += 1) {
+        var offset: usize = 0;
+        while (offset < buf.len) : (offset += 1) {
+            @memset(&buf, 'a');
+            buf[offset] = @intCast(b);
+            try std.testing.expectEqual(tables.is_field_vchar[b], validFieldValue(&buf));
+        }
+    }
+}
+
+test "validFieldValue accepts HTAB inside a vector block" {
+    var buf: [block_len * 2]u8 = undefined;
+    @memset(&buf, 'x');
+    buf[3] = '\t';
+    buf[block_len + 2] = '\t';
+    try std.testing.expect(validFieldValue(&buf));
 }

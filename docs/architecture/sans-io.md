@@ -73,8 +73,3 @@ callbacks.
 | Control flow | inverted into your callbacks | yours |
 | Body | copied per callback | one `Data` event per span |
 | I/O coupling | none (also sans-IO at the core) | none |
-
-!!! tip
-    If you know [h11](https://github.com/python-hyper/h11), you already know
-    zttp's shape: it's the same `Connection` / `receive_data` / `next_event`
-    model, with a Zig engine instead of pure Python.

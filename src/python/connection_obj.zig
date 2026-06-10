@@ -37,7 +37,9 @@ const H1Engine = struct {
     /// Embedded by value: the engine is one allocation, so constructing a
     /// Connection does not pay a separate heap allocation for the Reader.
     reader: Reader,
-    writer: *Writer,
+    /// Created on the first send_* call: server connections that only parse
+    /// never pay the Writer's allocation.
+    writer: ?*Writer = null,
     /// The method of the message the next response answers (server: the parsed
     /// request; client: the request we sent), so the connection auto-derives
     /// bodyless framing. Cleared per cycle by start_next_cycle.
@@ -65,6 +67,18 @@ const H1Engine = struct {
 
     fn method(self: *const H1Engine) []const u8 {
         return self.req_method[0..self.req_method_len];
+    }
+
+    /// The writer, created on first use, or null with a Python error set.
+    fn ensureWriter(self: *H1Engine) ?*Writer {
+        if (self.writer) |w| return w;
+        const w = gpa.create(Writer) catch {
+            _ = c.PyErr_NoMemory();
+            return null;
+        };
+        w.* = Writer.init(gpa);
+        self.writer = w;
+        return w;
     }
 
     fn stash(self: *H1Engine, obj: py.Object, rest: []const u8) void {
@@ -118,8 +132,10 @@ const H1Engine = struct {
 
     fn deinit(self: *H1Engine) void {
         self.reader.deinit();
-        self.writer.deinit();
-        gpa.destroy(self.writer);
+        if (self.writer) |w| {
+            w.deinit();
+            gpa.destroy(w);
+        }
         py.xdecref(self.upgrade_obj);
         py.xdecref(self.pending_obj);
     }
@@ -587,12 +603,7 @@ fn buildEngine(engine: *Engine, role: Role, protocol_val: c_long) bool {
         return true;
     }
 
-    const writer = gpa.create(Writer) catch {
-        _ = c.PyErr_NoMemory();
-        return false;
-    };
-    writer.* = Writer.init(gpa);
-    engine.* = .{ .h1 = .{ .reader = Reader.init(gpa, role), .writer = writer } };
+    engine.* = .{ .h1 = .{ .reader = Reader.init(gpa, role) } };
     return true;
 }
 
@@ -841,7 +852,8 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
             return makeStream(self_obj, id);
         },
         .h1 => |*e| {
-            e.writer.sendRequest(mb, tb, vb, hdrs.headers) catch |err| return raiseWrite(err);
+            const w = e.ensureWriter() orelse return null;
+            w.sendRequest(mb, tb, vb, hdrs.headers) catch |err| return raiseWrite(err);
             e.rememberMethod(mb);
             e.reader.setRequestMethod(mb);
             return py.none();
@@ -866,7 +878,8 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     const header_slice = if (hdrs) |h| h.headers else &.{};
 
     const rb = core.h1.writer.reasonPhrase(@intCast(status));
-    e.writer.sendResponse("1.1", @intCast(status), rb, header_slice, e.method()) catch |err| return raiseWrite(err);
+    const w = e.ensureWriter() orelse return null;
+    w.sendResponse("1.1", @intCast(status), rb, header_slice, e.method()) catch |err| return raiseWrite(err);
     return py.none();
 }
 
@@ -878,12 +891,13 @@ fn send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
     if (status < 100 or status > 199) return py.raiseValue("informational status code must be in 100..199");
     if (status == 101) return py.raiseValue("101 Switching Protocols is a terminal upgrade response, not interim");
+    const w = e.ensureWriter() orelse return null;
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
-        e.writer.sendInformational(@intCast(status), &.{}) catch |err| return raiseWrite(err);
+        w.sendInformational(@intCast(status), &.{}) catch |err| return raiseWrite(err);
     } else {
         var hdrs = borrowHeaders(hdrs_seq) orelse return null;
         defer hdrs.deinit();
-        e.writer.sendInformational(@intCast(status), hdrs.headers) catch |err| return raiseWrite(err);
+        w.sendInformational(@intCast(status), hdrs.headers) catch |err| return raiseWrite(err);
     }
     return py.none();
 }
@@ -892,7 +906,8 @@ fn send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const e = h1(self) orelse return null; // HTTP/2 sends body via a Stream
     const data = py.asBytes(arg) orelse return null;
-    e.writer.sendData(data) catch |err| return raiseWrite(err);
+    const w = e.ensureWriter() orelse return null;
+    w.sendData(data) catch |err| return raiseWrite(err);
     return py.none();
 }
 
@@ -901,12 +916,13 @@ fn end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Objec
     const e = h1(self) orelse return null; // HTTP/2 ends a message via a Stream
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
+    const w = e.ensureWriter() orelse return null;
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
-        e.writer.endMessage(&.{}) catch |err| return raiseWrite(err);
+        w.endMessage(&.{}) catch |err| return raiseWrite(err);
     } else {
         var hdrs = borrowHeaders(hdrs_seq) orelse return null;
         defer hdrs.deinit();
-        e.writer.endMessage(hdrs.headers) catch |err| return raiseWrite(err);
+        w.endMessage(hdrs.headers) catch |err| return raiseWrite(err);
     }
     return py.none();
 }
@@ -916,14 +932,14 @@ fn data_to_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
     const pending = switch (engine.*) {
         .h2 => |*e| e.writer.pending(),
-        .h1 => |*e| e.writer.pending(),
+        .h1 => |*e| if (e.writer) |w| w.pending() else "",
         .h3 => return py.raiseRuntime("the HTTP/3 write side is not implemented yet"),
     };
     const out = py.fromBytes(pending);
     if (out == null) return null;
     switch (engine.*) {
         .h2 => |*e| e.writer.clear(),
-        .h1 => |*e| e.writer.clear(),
+        .h1 => |*e| if (e.writer) |w| w.clear(),
         .h3 => unreachable,
     }
     return out;

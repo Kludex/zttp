@@ -10,18 +10,36 @@ number.
 
 ## The numbers
 
-Parsing the same requests through zttp, [httptools](https://github.com/MagicStack/httptools)
-(the parser uvicorn uses), and [h11](https://github.com/python-hyper/h11), with
-all three driven to extract the **same** information (method, headers, body):
+Parsing the same messages through zttp and
+[httptools](https://github.com/MagicStack/httptools) (the parser uvicorn uses),
+with both driven to extract the **same** information (request line or status,
+headers, body), across a suite drawn from the parser-benchmark literature and
+realistic modern traffic:
 
-| Workload | zttp | httptools | h11 | zttp vs httptools |
-| --- | ---: | ---: | ---: | ---: |
-| Simple `GET` (7 headers) | ~1.1M req/s | ~0.87M req/s | ~57k req/s | **~1.25x** |
-| `POST` + JSON body | ~5.0M req/s | ~1.8M req/s | ~0.6M req/s | **~2.7x** |
+| Workload | zttp | httptools | zttp vs httptools |
+| --- | ---: | ---: | ---: |
+| wrk default `GET` | 2.42M msg/s | 2.09M msg/s | **1.16x** |
+| httparse `REQ_SHORT` | 2.12M msg/s | 1.79M msg/s | **1.18x** |
+| TFB plaintext, 16x pipelined | 151k msg/s | 161k msg/s | 0.94x |
+| Small API `GET` | 1.24M msg/s | 1.07M msg/s | **1.16x** |
+| `POST` + JSON body | 1.42M msg/s | 1.25M msg/s | **1.14x** |
+| Real-world `GET` (pico/llhttp) | 947k msg/s | 831k msg/s | **1.14x** |
+| Chunked `POST` (llhttp bench) | 875k msg/s | 741k msg/s | **1.18x** |
+| Chrome navigation `GET` | 702k msg/s | 577k msg/s | **1.22x** |
+| k8s ingress proxied `GET` | 688k msg/s | 634k msg/s | **1.08x** |
+| 16KB upload `POST` | 1.11M msg/s | 1.05M msg/s | **1.06x** |
+| 16KB upload, MTU pieces | 441k msg/s | 214k msg/s | **2.06x** |
+| httparse `RESP_SHORT` | 1.79M msg/s | 1.60M msg/s | **1.12x** |
+| JSON API response | 1.46M msg/s | 1.31M msg/s | **1.12x** |
+| Chunked HTML response | 813k msg/s | 784k msg/s | **1.04x** |
 
-zttp is faster than httptools on both, and roughly an order of magnitude faster
-than h11. Measured on an Apple Silicon machine with CPython 3.14 and the
-safety-checked (`ReleaseSafe`) build.
+The honest summary: zttp beats httptools, a C parser, on thirteen of the
+fourteen workloads while keeping the sans-IO pull API, and is roughly 15x the
+pure-Python alternative everywhere. The one remaining gap is the synthetic
+16-messages-per-buffer pipelined read, where httptools' per-connection parser
+construction amortizes in a way zttp's per-message event objects cannot.
+Measured on an Apple Silicon machine with CPython 3.14, httptools 0.8.0, and
+the safety-checked (`ReleaseSafe`) build; the run-to-run spread is about 5%.
 
 !!! info "These are parser microbenchmarks"
     They measure parsing throughput in isolation, not a full server. In a real
@@ -30,14 +48,24 @@ safety-checked (`ReleaseSafe`) build.
 
 ## Run it yourself
 
-The benchmark lives in `bench.py` and compares all three parsers:
+The benchmark lives in `bench.py`:
 
 ```console
-uv run --group bench python bench.py
+./scripts/bench
 ```
 
 It feeds each parser identical bytes and verifies they extract identical data
-before timing, so the comparison is apples to apples.
+before timing, so the comparison is apples to apples. Each parser runs many
+short batches, interleaved round-robin so thermal drift and scheduler placement
+hit all parsers equally, with the GC disabled while a batch is timed; the
+headline is the median batch and the spread is printed alongside it.
+
+The workloads come from the parser-benchmark literature wherever one exists:
+the picohttpparser/llhttp real-world GET, llhttp's chunked POST, httparse's
+short request and response, the wrk and TechEmpower request shapes, plus
+faithful reconstructions of modern traffic (a Chrome navigation, a k8s-ingress
+proxied API call), large uploads delivered whole and in MTU-sized pieces, and
+response parsing in the client role. `--only <substring>` runs a subset.
 
 ## Why it's fast
 
@@ -51,10 +79,9 @@ before timing, so the comparison is apples to apples.
 ## The honest caveat: safety has a cost
 
 zttp ships in Zig's `ReleaseSafe` mode, which keeps bounds and overflow checks on.
-The unchecked `ReleaseFast` mode is roughly 10% faster again, but for a parser
+The unchecked `ReleaseFast` mode is a few percent faster again, but for a parser
 eating untrusted network bytes, those checks turn a would-be memory bug into a
-clean trap. We chose safety, and zttp still beats httptools. That trade is the
-right one for this library.
+clean trap. We chose safety. That trade is the right one for this library.
 
 !!! tip
     If you have a workload where the last 10% matters and you trust your input,

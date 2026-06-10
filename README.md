@@ -16,7 +16,7 @@ hand-written Zig engine underneath that is fast enough to be the HTTP parser in
 ## Sans-IO
 
 **zttp** does no I/O. You feed it bytes and pull out events; you ask it for bytes to
-send. It never touches a socket. This is the h11 model:
+send. It never touches a socket, so it works with any I/O you like:
 
 ```python
 import zttp
@@ -40,17 +40,58 @@ The read side yields `Request` / `Response` / `Data` / `EndOfMessage`, or the
 head, body data, and the end of the message, framing the body (Content-Length or
 chunked) for you.
 
+## One API, three protocols
+
+The `protocol=` argument selects the wire format; the event API stays the same:
+
+```python
+import zttp
+
+h1 = zttp.Connection(zttp.SERVER)                       # HTTP/1.1
+h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)  # HTTP/2
+h3 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)  # HTTP/3
+```
+
+On **HTTP/2**, one connection multiplexes many requests, so the `Request` /
+`Response` / `Data` / `EndOfMessage` events carry a `stream_id` and you send on
+a `Stream` handle (connection-level control events like `Settings` and `Ping`
+have no stream to name). Outbound flow control is handled for you: `send_data`
+emits what the peer's window allows and parks the rest until credit arrives.
+
+```python
+stream = h2.stream(request.stream_id)
+stream.send_response(200, [(b"content-type", b"text/plain")])
+stream.send_data(b"Hello, HTTP/2!")
+stream.end_message()
+h2.data_to_send()  # the HTTP/2 frames to put on the wire
+```
+
+On **HTTP/3**, the wire is UDP, so you feed whole datagrams with
+`receive_datagram` and pull the same events. The QUIC transport underneath
+(packet protection, loss recovery, congestion control, stream reassembly) is
+written from scratch in the Zig core. The server read path is implemented end to
+end; the TLS 1.3 handshake driver, the write side, and the client read path are
+still in progress.
+
+```python
+h3.receive_datagram(datagram)
+h3.next_event()  # the same Request / Data / EndOfMessage, tagged with stream_id
+```
+
 ## Performance
 
-Against httptools and h11 on the same requests (macOS arm64, CPython 3.14,
-`ReleaseFast`), all three verified to extract identical data:
+Against httptools on the same requests (macOS arm64, CPython 3.14, httptools
+0.8.0, the safety-checked `ReleaseSafe` build), both verified to extract
+identical data, median of 15 interleaved batches:
 
-| Workload          | zttp        | httptools    | h11        | zttp vs httptools |
-| ----------------- | -----------: | -----------: | ---------: | -----------------: |
-| Simple GET        | ~1.25M req/s | ~880k req/s  | ~57k req/s | **1.41x**          |
-| POST + JSON body  | ~6.7M req/s  | ~1.84M req/s | ~616k req/s| **3.62x**          |
+| Workload          | zttp         | httptools    | zttp vs httptools |
+| ----------------- | -----------: | -----------: | ----------------: |
+| Simple GET        | ~1.24M req/s | ~1.07M req/s | **~1.16x**        |
+| POST + JSON body  | ~1.42M req/s | ~1.25M req/s | **~1.14x**        |
 
-Run it yourself: `uv run --group bench python bench.py`.
+zttp beats a C parser on 13 of the benchmark suite's 14 workloads while staying
+sans-IO and event-based, and is roughly 15x faster than the pure-Python
+alternative. Run it yourself: `./scripts/bench`.
 
 ## Why it is fast
 
@@ -73,6 +114,10 @@ bounded (`Limits`) so a malicious peer cannot exhaust memory, and the outbound
 serializer rejects CR/LF/control bytes to prevent response splitting. The build
 defaults to Zig's safety-checked `ReleaseSafe` mode. Malformed input raises
 `RemoteProtocolError`; misusing the send API raises `LocalProtocolError`.
+
+The HTTP/2 layer applies the same posture: the per-stream state machine enforces
+RFC 9113's stream lifecycle, with the exact stream-vs-connection error
+classification the RFC requires.
 
 The parser has been through two adversarial security audits (a code review and a
 CVE-driven review against real HTTP-parser CVEs across Node, Go, Python, Rust, and
