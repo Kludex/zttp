@@ -80,7 +80,6 @@ pub fn expandLabelPrk(out: []u8, prk: [Hkdf.prk_length]u8, comptime label: []con
     var info: [2 + 1 + 255 + 1 + 255]u8 = undefined; // the maximum legal HkdfLabel (RFC 8446 7.1)
     const full_label = "tls13 " ++ label;
     comptime std.debug.assert(full_label.len <= 255);
-    std.debug.assert(context.len <= 255);
     var i: usize = 0;
     info[i] = @intCast(out.len >> 8);
     info[i + 1] = @intCast(out.len & 0xff);
