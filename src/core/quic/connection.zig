@@ -54,12 +54,21 @@ const SpaceState = struct {
     rec: recovery.Space = .{},
     crypto: crypto_stream.CryptoStream,
     ack_pending: bool = false,
+    /// The STREAM range each in-flight packet carried (pn -> {id,offset,len,fin}),
+    /// so a lost packet's data can be re-queued and an acked packet's data freed.
+    /// Only the Application space carries STREAM frames, but the field is uniform.
+    stream_sent: std.AutoHashMapUnmanaged(u64, StreamSent) = .empty,
 
     fn deinit(self: *SpaceState, gpa: std.mem.Allocator) void {
         self.rec.deinit(gpa);
         self.crypto.deinit();
+        self.stream_sent.deinit(gpa);
     }
 };
+
+/// The STREAM frame one sent packet carried, kept so loss recovery can map a lost
+/// or acked packet number back to the stream bytes it was responsible for.
+const StreamSent = struct { id: u64, offset: u64, len: u64, fin: bool };
 
 pub const Connection = struct {
     gpa: std.mem.Allocator,
@@ -171,10 +180,11 @@ pub const Connection = struct {
     /// Build one packet in `space` carrying `frames` (already-encoded frame bytes),
     /// seal and header-protect it, append it to the outbound queue, and record it
     /// for loss recovery / congestion control. The single send primitive: CRYPTO,
-    /// ACK, and (later) STREAM all funnel through here. `frames` MUST fit one
-    /// datagram. A long header (Initial/Handshake) carries our scid + a length
-    /// field; a short header (Application) runs to the datagram end.
-    fn buildPacket(self: *Connection, space: Space, frames: []const u8, ack_eliciting: bool, now: u64) Error!void {
+    /// ACK, and STREAM all funnel through here. Returns the packet number assigned,
+    /// so the STREAM caller can map it back to the range it carried. `frames` MUST
+    /// fit one datagram. A long header (Initial/Handshake) carries our scid + a
+    /// length field; a short header (Application) runs to the datagram end.
+    fn buildPacket(self: *Connection, space: Space, frames: []const u8, ack_eliciting: bool, now: u64) Error!u64 {
         assertFramesAllowedIn(space, frames); // no STREAM in Initial/Handshake, by construction
         const st = &self.spaces[@intFromEnum(space)];
         const keys = st.send_keys orelse return error.ProtocolViolation; // driver installs first
@@ -208,6 +218,7 @@ pub const Connection = struct {
         st.rec.onSent(self.gpa, .{ .pn = pn, .sent_time = now, .size = datagram_len, .ack_eliciting = ack_eliciting, .in_flight = ack_eliciting }) catch return error.OutOfMemory;
         self.cc.onSent(datagram_len);
         st.next_pn += 1;
+        return pn;
     }
 
     /// The built datagrams as one contiguous buffer; pair with `datagramLengths`.
@@ -242,6 +253,12 @@ pub const Connection = struct {
 
     /// Queue `data` (and/or a FIN) to be sent on stream `id`. `flushSend` packetizes
     /// the queue once the Application keys exist. Writing after a FIN is rejected.
+    ///
+    /// This is application queueing: it buffers everything written. Only `flushSend`
+    /// applies the connection send window, so the in-flight bytes on the wire are
+    /// bounded by the peer's MAX_DATA grant, but the queued-but-unsent buffer is
+    /// bounded only by what the application writes. A write-side backpressure cap is
+    /// a follow-up.
     pub fn sendStreamData(self: *Connection, id: u64, data: []const u8, fin: bool) Error!void {
         const s = try self.sendStream(id);
         s.write(data, fin) catch |e| switch (e) {
@@ -262,9 +279,10 @@ pub const Connection = struct {
     /// 12.4), so nothing flows until the handshake installs the 1-RTT send keys -
     /// the structural fix for shipping STREAM data in Initial packets.
     ///
-    /// `commit` drops each chunk from the SendStream once it is framed, so a packet
-    /// lost in flight is NOT retransmitted: loss-recovery for STREAM data (tracking
-    /// sent-but-unacked ranges and requeueing on loss/PTO) is a deliberate follow-up.
+    /// Each sent range is recorded per packet (stream_sent) and retained in the
+    /// SendStream until acked, so a lost packet is retransmitted (the ACK arm routes
+    /// lost pns back into SendStream.onLost). Loss is detected on ACK; a tail packet
+    /// with no later ACK to trigger detection needs the PTO timer, a follow-up.
     pub fn flushSend(self: *Connection, now: u64) Error!void {
         const space = Space.application;
         const st = &self.spaces[@intFromEnum(space)];
@@ -276,19 +294,57 @@ pub const Connection = struct {
             const id = entry.key_ptr.*;
             const s = entry.value_ptr.*;
             while (s.pending()) {
-                // Cap the chunk by the connection-level send window (RFC 9000 4.1):
-                // the peer's MAX_DATA grant limits how much STREAM data may be sent.
-                // A chunk that carries only a FIN (no bytes) needs no credit.
-                const credit = self.conn_send_window.available();
-                const room = @min(packet_room, credit);
-                const chunk = s.peek(room) orelse break; // no bytes fit and no FIN owed
-                if (chunk.data.len == 0 and !chunk.fin) break; // out of window: keep the rest queued
+                // Peek a full packet's worth; a retransmit (offset below the send
+                // cursor) re-sends already-presented bytes, a new chunk presents
+                // fresh offsets. Only new bytes consume connection send-window credit
+                // (RFC 9000 4.1); the window is a monotonic high-water mark, so a
+                // retransmit and a pure FIN need none.
+                var chunk = s.peek(packet_room) orelse break;
+                const is_new = chunk.offset >= s.sent;
+                if (is_new and chunk.data.len > 0) {
+                    const credit = self.conn_send_window.available();
+                    if (credit == 0) break; // out of window: keep new bytes queued
+                    if (chunk.data.len > credit) chunk = s.peek(@intCast(credit)).?; // shrink to fit
+                }
+                if (chunk.data.len == 0 and !chunk.fin) break;
                 var frames: std.ArrayListUnmanaged(u8) = .empty;
                 defer frames.deinit(self.gpa);
                 frame.encodeStream(&frames, self.gpa, id, chunk.offset, chunk.data, chunk.fin) catch return error.OutOfMemory;
-                try self.buildPacket(space, frames.items, true, now);
-                self.conn_send_window.onSent(chunk.data.len);
-                s.commit(chunk.data.len, chunk.fin);
+                // Reserve the record slot BEFORE sending, so the packet is never put
+                // on the wire without a retransmit route (an OOM here leaves nothing
+                // queued).
+                st.stream_sent.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+                const pn = try self.buildPacket(space, frames.items, true, now);
+                st.stream_sent.putAssumeCapacity(pn, .{ .id = id, .offset = chunk.offset, .len = chunk.data.len, .fin = chunk.fin });
+                if (is_new) self.conn_send_window.onSent(chunk.data.len); // monotonic: only new offsets
+                s.commit(chunk.offset, chunk.data.len, chunk.fin);
+            }
+        }
+    }
+
+    /// Process an incoming ACK for `space`: fold it into recovery, free the STREAM
+    /// bytes the acked packets carried, then run loss detection and re-queue the
+    /// bytes any newly-lost packet carried so the next flushSend retransmits them.
+    /// A pn lives in `rec.sent` and `stream_sent` in lockstep, so each is routed to
+    /// the SendStream exactly once (fetchRemove), defending double-free / resurrect.
+    fn onAckFrame(self: *Connection, space: Space, a: anytype, now: u64) Error!void {
+        const st = &self.spaces[@intFromEnum(space)];
+        var acked_pns: std.ArrayListUnmanaged(u64) = .empty;
+        defer acked_pns.deinit(self.gpa);
+        var it = frame.ackRanges(a.ranges);
+        _ = st.rec.onAck(&self.rtt, &self.cc, now, a.largest, a.delay, a.first_range, &it, &acked_pns, self.gpa) catch
+            return error.ProtocolViolation;
+        for (acked_pns.items) |pn| {
+            if (st.stream_sent.fetchRemove(pn)) |e| {
+                if (self.send_streams.get(e.value.id)) |s| try s.onAck(e.value.offset, e.value.len, e.value.fin);
+            }
+        }
+        var lost_pns: std.ArrayListUnmanaged(u64) = .empty;
+        defer lost_pns.deinit(self.gpa);
+        _ = st.rec.detectLost(&self.rtt, &self.cc, now, &lost_pns, self.gpa) catch return error.OutOfMemory;
+        for (lost_pns.items) |pn| {
+            if (st.stream_sent.fetchRemove(pn)) |e| {
+                if (self.send_streams.get(e.value.id)) |s| try s.onLost(e.value.offset, e.value.len, e.value.fin);
             }
         }
     }
@@ -346,7 +402,7 @@ pub const Connection = struct {
         var frames: std.ArrayListUnmanaged(u8) = .empty;
         defer frames.deinit(self.gpa);
         frame.encodeCrypto(&frames, self.gpa, 0, data) catch return error.OutOfMemory;
-        try self.buildPacket(space, frames.items, true, now);
+        _ = try self.buildPacket(space, frames.items, true, now); // CRYPTO carries no STREAM record
     }
 
     fn sendAck(self: *Connection, space: Space, now: u64) Error!void {
@@ -355,7 +411,7 @@ pub const Connection = struct {
         var frames: std.ArrayListUnmanaged(u8) = .empty;
         defer frames.deinit(self.gpa);
         frame.encodeAck(&frames, self.gpa, largest, 0, 0) catch return error.OutOfMemory; // one contiguous range
-        try self.buildPacket(space, frames.items, false, now); // an ACK is not ack-eliciting
+        _ = try self.buildPacket(space, frames.items, false, now); // ACK is not ack-eliciting
         st.ack_pending = false;
     }
 
@@ -471,11 +527,7 @@ pub const Connection = struct {
         switch (f) {
             .padding => {},
             .ping => st.ack_pending = true,
-            .ack => |a| {
-                var it = frame.ackRanges(a.ranges);
-                _ = st.rec.onAck(&self.rtt, &self.cc, now, a.largest, a.delay, a.first_range, &it) catch
-                    return error.ProtocolViolation;
-            },
+            .ack => |a| try self.onAckFrame(space, a, now),
             .crypto => |c| {
                 st.ack_pending = true;
                 try self.onCrypto(space, c.offset, c.data, now);
@@ -1033,4 +1085,118 @@ test "writing after a FIN is a final-size error" {
     defer conn.deinit();
     try conn.sendStreamData(1, "done", true);
     try testing.expectError(error.FinalSizeError, conn.sendStreamData(1, "more", false));
+}
+
+// ---- STREAM retransmission tests --------------------------------------------
+
+// An Application (1-RTT) datagram carrying one ACK frame, sealed with the test app
+// keys so a sender installed via testInstallAppKeys decrypts it.
+fn buildAppAck(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, largest: u64, first_range: u64) ![]u8 {
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeAck(&frames, gpa, largest, 0, first_range);
+    return testBuildApp(gpa, dcid, pn, frames.items);
+}
+
+// Deliver every queued datagram in `sender`'s send buffer to `peer`, sliced by the
+// per-datagram lengths (each is its own UDP datagram). Optionally skip index `drop`.
+fn deliverAllExcept(sender: *Connection, peer: *Connection, drop: ?usize, now: u64) !void {
+    const buf = sender.datagramsToSend();
+    var off: usize = 0;
+    var idx: usize = 0;
+    for (sender.datagramLengths()) |len| {
+        if (drop == null or idx != drop.?) try peer.receiveDatagram(buf[off .. off + len], now);
+        off += len;
+        idx += 1;
+    }
+}
+
+test "a lost STREAM packet is retransmitted and the peer reassembles the whole stream" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    testInstallAppKeys(&peer);
+
+    // Enough data to span many packets so a dropped pn 0 lands past PACKET_THRESHOLD.
+    const payload = [_]u8{0x5c} ** 5000;
+    try sender.sendStreamData(1, &payload, true);
+    try sender.flushSend(1000);
+    const n = sender.datagramLengths().len;
+    try testing.expect(n >= 5);
+
+    // Deliver every packet EXCEPT the first (pn 0): it is "lost".
+    try deliverAllExcept(&sender, &peer, 0, 2000);
+    try testing.expect(peer.streamData(1).len < payload.len); // a hole remains
+
+    // ACK pns 1..n-1 back to the sender: largest = n-1, first_range covers down to 1.
+    sender.clearSend();
+    const ack = try buildAppAck(gpa, &dcid, 0, n - 1, n - 2);
+    defer gpa.free(ack);
+    try sender.receiveDatagram(ack, 3000);
+
+    // pn 0 is now > PACKET_THRESHOLD behind n-1, so detectLost re-queued its range.
+    try testing.expect(sender.hasPendingSend());
+    try sender.flushSend(4000);
+    try testing.expect(sender.datagramLengths().len >= 1);
+
+    // Deliver the retransmission; the peer now holds the complete stream.
+    try deliverAllExcept(&sender, &peer, null, 5000);
+    try testing.expectEqual(@as(usize, payload.len), peer.streamData(1).len);
+    try testing.expect(peer.streamFinished(1));
+}
+
+test "a retransmit does not consume new send-window credit" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    const payload = [_]u8{0x33} ** 5000;
+    try sender.sendStreamData(1, &payload, false);
+    try sender.flushSend(1000);
+    const sent_after_first = sender.conn_send_window.sent;
+    const n = sender.datagramLengths().len;
+
+    // Lose pn 0, ack the rest -> the range is re-queued and retransmitted.
+    sender.clearSend();
+    const ack = try buildAppAck(gpa, &dcid, 0, n - 1, n - 2);
+    defer gpa.free(ack);
+    try sender.receiveDatagram(ack, 2000);
+    try sender.flushSend(3000);
+
+    // The retransmit re-sent already-presented offsets, so the monotonic window
+    // high-water mark did not advance (it only ever counts new bytes).
+    try testing.expectEqual(sent_after_first, sender.conn_send_window.sent);
+}
+
+test "a late ACK of an already-lost packet is a harmless no-op" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    const payload = [_]u8{0x44} ** 5000;
+    try sender.sendStreamData(1, &payload, true);
+    try sender.flushSend(1000);
+    const n = sender.datagramLengths().len;
+
+    // Declare pn 0 lost (ack the rest), retransmit it, then deliver a LATE ack that
+    // names pn 0 - it was already removed from recovery, so it routes nowhere.
+    sender.clearSend();
+    const ack1 = try buildAppAck(gpa, &dcid, 0, n - 1, n - 2);
+    defer gpa.free(ack1);
+    try sender.receiveDatagram(ack1, 2000);
+    try sender.flushSend(3000); // retransmits pn 0's range under a new pn
+    sender.clearSend();
+
+    const late = try buildAppAck(gpa, &dcid, 1, 0, 0); // ack pn 0 only, late
+    defer gpa.free(late);
+    try sender.receiveDatagram(late, 4000); // must not crash, double-free, or resurrect
+    try testing.expect(!sender.closed);
 }

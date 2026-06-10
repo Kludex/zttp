@@ -85,6 +85,9 @@ pub const Space = struct {
     /// Apply an ACK (its largest, first-range, and the raw range bytes from the
     /// frame). Removes acked packets from the in-flight set, updates the RTT from
     /// the largest newly acked ack-eliciting packet, and returns what was acked.
+    /// Each removed packet's number is appended to `acked_pns`, so a frame-aware
+    /// caller (e.g. STREAM retransmission) can free the data it carried - recovery
+    /// itself stays oblivious to what a packet held.
     pub fn onAck(
         self: *Space,
         rtt: *RttEstimator,
@@ -94,6 +97,8 @@ pub const Space = struct {
         ack_delay: u64,
         first_range: u64,
         ranges: anytype, // an iterator yielding {gap,len}
+        acked_pns: *std.ArrayListUnmanaged(u64),
+        gpa: std.mem.Allocator,
     ) !AckOutcome {
         var acked = AckSet{};
         acked.add(largest - first_range, largest);
@@ -114,6 +119,9 @@ pub const Space = struct {
         while (i < self.sent.items.len) {
             const p = self.sent.items[i];
             if (acked.contains(p.pn)) {
+                // Record the pn first: a failed append must not leave congestion
+                // state mutated while the packet stays in the in-flight set.
+                try acked_pns.append(gpa, p.pn);
                 outcome.newly_acked += 1;
                 if (p.in_flight) {
                     outcome.acked_bytes += p.size;
@@ -141,8 +149,16 @@ pub const Space = struct {
     /// Detect lost packets (RFC 9002 6.1): a packet is lost if a later packet was
     /// acked and it is either more than PACKET_THRESHOLD behind the largest acked
     /// or older than the time threshold. Lost packets are removed and their bytes
-    /// reported to congestion control. Returns how many were lost.
-    pub fn detectLost(self: *Space, rtt: *const RttEstimator, cc: *congestion.Controller, now: u64) u64 {
+    /// reported to congestion control; each removed pn is appended to `lost_pns` so
+    /// a frame-aware caller can re-queue the data it carried. Returns how many were lost.
+    pub fn detectLost(
+        self: *Space,
+        rtt: *const RttEstimator,
+        cc: *congestion.Controller,
+        now: u64,
+        lost_pns: *std.ArrayListUnmanaged(u64),
+        gpa: std.mem.Allocator,
+    ) !u64 {
         const largest = self.largest_acked orelse return 0;
         const threshold = @max(rtt.latest, rtt.smoothed) * TIME_THRESHOLD_NUM / TIME_THRESHOLD_DEN;
         self.loss_time = null;
@@ -157,6 +173,7 @@ pub const Space = struct {
             const by_packet = largest >= p.pn + PACKET_THRESHOLD;
             const by_time = now >= p.sent_time + threshold;
             if (by_packet or by_time) {
+                try lost_pns.append(gpa, p.pn); // record before mutating cc / removing
                 if (p.in_flight) cc.onLost(p.pn, p.size);
                 lost += 1;
                 _ = self.sent.swapRemove(i);
@@ -227,7 +244,9 @@ test "ack removes the in-flight packet and updates RTT" {
     cc.onSent(1200);
     try space.onSent(gpa, .{ .pn = 0, .sent_time = 1000, .size = 1200, .ack_eliciting = true, .in_flight = true });
     var ranges = EmptyRanges{};
-    const out = try space.onAck(&rtt, &cc, 51_000, 0, 0, 0, &ranges);
+    var sink: std.ArrayListUnmanaged(u64) = .empty;
+    defer sink.deinit(gpa);
+    const out = try space.onAck(&rtt, &cc, 51_000, 0, 0, 0, &ranges, &sink, gpa);
     try std.testing.expectEqual(@as(u64, 1), out.newly_acked);
     try std.testing.expectEqual(@as(u64, 1200), out.acked_bytes);
     try std.testing.expectEqual(@as(u64, 0), cc.bytes_in_flight);
@@ -252,7 +271,9 @@ test "ack with multiple ranges" {
         }
     };
     var r = Ranges{};
-    const out = try space.onAck(&rtt, &cc, 2000, 5, 0, 1, &r);
+    var sink: std.ArrayListUnmanaged(u64) = .empty;
+    defer sink.deinit(gpa);
+    const out = try space.onAck(&rtt, &cc, 2000, 5, 0, 1, &r, &sink, gpa);
     try std.testing.expectEqual(@as(u64, 4), out.newly_acked); // 4,5,1,2
     try std.testing.expectEqual(@as(u64, 5), out.largest_newly_acked.?);
     try std.testing.expectEqual(@as(usize, 2), space.sent.items.len); // 0 and 3 remain
@@ -269,8 +290,12 @@ test "packet threshold declares an old packet lost" {
     try space.onSent(gpa, .{ .pn = 0, .sent_time = 1000, .size = 1200, .ack_eliciting = true, .in_flight = true });
     try space.onSent(gpa, .{ .pn = 4, .sent_time = 1000, .size = 1200, .ack_eliciting = true, .in_flight = true });
     var ranges = EmptyRanges{};
-    _ = try space.onAck(&rtt, &cc, 2000, 4, 0, 0, &ranges);
-    const lost = space.detectLost(&rtt, &cc, 2000);
+    var sink: std.ArrayListUnmanaged(u64) = .empty;
+    defer sink.deinit(gpa);
+    _ = try space.onAck(&rtt, &cc, 2000, 4, 0, 0, &ranges, &sink, gpa);
+    var lost_pns: std.ArrayListUnmanaged(u64) = .empty;
+    defer lost_pns.deinit(gpa);
+    const lost = try space.detectLost(&rtt, &cc, 2000, &lost_pns, gpa);
     try std.testing.expectEqual(@as(u64, 1), lost);
     try std.testing.expectEqual(@as(usize, 0), space.sent.items.len);
 }
