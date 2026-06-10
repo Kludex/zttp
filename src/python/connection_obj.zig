@@ -102,6 +102,9 @@ const H2Engine = struct {
             _ = c.PyErr_NoMemory();
             return null;
         };
+        // A HEAD response carries no body regardless of content-length (RFC 9110
+        // 8.6); mark the stream so the response's content-length check is skipped.
+        if (asciiEqlIgnoreCase(mb, "HEAD")) self.conn.markBodylessRequest(id);
         return id;
     }
 
@@ -124,10 +127,39 @@ const H2Engine = struct {
         return py.none();
     }
 
+    fn resetStream(self: *H2Engine, id: u32, code: u32) py.Object {
+        if (!self.ensureHandshake()) return null;
+        self.writer.sendRstStream(id, @enumFromInt(code)) catch |e| return h2RaiseWrite(e);
+        self.conn.localReset(id);
+        return py.none();
+    }
+
+    fn goaway(self: *H2Engine, code: u32, last_stream_id: ?u32) py.Object {
+        if (!self.ensureHandshake()) return null;
+        const last = last_stream_id orelse self.conn.lastPeerStreamId();
+        self.writer.sendGoaway(last, @enumFromInt(code), &.{}) catch |e| return h2RaiseWrite(e);
+        return py.none();
+    }
+
     /// Drain parked DATA that a freshly-parsed WINDOW_UPDATE / SETTINGS credit now
     /// permits. Called from next_event after such an event is produced.
-    fn flushSendable(self: *H2Engine) core.h2.writer.WriteError!void {
-        try self.conn.flushSendable(self.writer);
+    /// Auto-handle the connection-management frames RFC 9113 expects a peer to
+    /// answer without app involvement: ACK the peer's SETTINGS and PING, and
+    /// advertise consumed receive window via WINDOW_UPDATE. The serialized frames
+    /// land in the writer buffer for the next data_to_send.
+    fn autoRespond(self: *H2Engine, ev: events.H2Event) core.h2.writer.WriteError!void {
+        switch (ev) {
+            .settings => try self.writer.sendSettingsAck(),
+            .ping => |p| if (!p.ack) try self.writer.sendPingAck(p.opaque_data),
+            else => {},
+        }
+        // Advertise consumed receive window. Not gated on the .data event: a DATA
+        // frame of pure padding consumes window but surfaces no event, so flushing
+        // here (threshold-checked, idempotent) keeps the peer's send window open.
+        try self.conn.flushRecvWindows(self.writer);
+        // A parsed WINDOW_UPDATE / SETTINGS may have credited a send window; drain
+        // any DATA parked waiting for it.
+        if (ev == .window_update or ev == .settings) try self.conn.flushSendable(self.writer);
     }
 
     fn deinit(self: *H2Engine) void {
@@ -309,6 +341,15 @@ fn stream_end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     return e.endStream(self.stream_id);
 }
 
+fn stream_reset(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *StreamObject = @ptrCast(self_obj.?);
+    const e = self.engine() orelse return null;
+    var code: c_ulong = @intFromEnum(core.h2.constants.ErrorCode.cancel);
+    if (c.PyArg_ParseTuple(args, "|k", &code) == 0) return null;
+    if (code > 0xFFFF_FFFF) return py.raiseValue("error code out of range");
+    return e.resetStream(self.stream_id, @intCast(code));
+}
+
 fn stream_id_get(self_obj: ?*c.PyObject, _: ?*anyopaque) callconv(.c) py.Object {
     const self: *StreamObject = @ptrCast(self_obj.?);
     return c.PyLong_FromUnsignedLong(self.stream_id);
@@ -323,6 +364,7 @@ var stream_methods = [_]py.MethodDef{
     .{ .ml_name = "send_response", .ml_meth = stream_send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head on this stream: send_response(status, headers=None)." },
     .{ .ml_name = "send_data", .ml_meth = stream_send_data, .ml_flags = c.METH_O, .ml_doc = "Queue body bytes on this stream (flow-controlled; parked until the send window allows)." },
     .{ .ml_name = "end_message", .ml_meth = stream_end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message on this stream (empty END_STREAM DATA)." },
+    .{ .ml_name = "reset", .ml_meth = stream_reset, .ml_flags = c.METH_VARARGS, .ml_doc = "Send RST_STREAM to cancel this stream: reset(error_code=CANCEL)." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
@@ -558,11 +600,7 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
         .h3 => |*e| return e.nextEvent(),
         .h2 => |*e| {
             const ev = e.conn.nextEvent() catch |err| return exceptions.raiseH2(err);
-            // A parsed WINDOW_UPDATE / SETTINGS may have credited a send window;
-            // drain any DATA that was parked waiting for it. The bytes land in the
-            // writer's buffer for the next data_to_send.
-            if (ev == .window_update or ev == .settings)
-                e.flushSendable() catch |err| return h2RaiseWrite(err);
+            e.autoRespond(ev) catch |err| return h2RaiseWrite(err);
             return events_obj.fromH2Event(ev);
         },
         .h1 => |*e| {
@@ -864,6 +902,30 @@ fn stream(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     return makeStream(self_obj, @intCast(id));
 }
 
+fn h2_close(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    const h = switch (engine.*) {
+        .h2 => |*x| x,
+        else => return py.raiseRuntime("close() exists only on an HTTP/2 connection"),
+    };
+    var code: c_ulong = @intFromEnum(core.h2.constants.ErrorCode.no_error);
+    var last_obj: ?*c.PyObject = null;
+    if (c.PyArg_ParseTuple(args, "|kO", &code, &last_obj) == 0) return null;
+    if (code > 0xFFFF_FFFF) return py.raiseValue("error code out of range");
+    var last: ?u32 = null;
+    if (last_obj != null and !py.isNone(last_obj)) {
+        const v = c.PyLong_AsLongLong(last_obj);
+        if (v < 0) {
+            if (c.PyErr_Occurred() != null) return null;
+            return py.raiseValue("last_stream_id must be a non-negative integer");
+        }
+        if (v > 0x7FFF_FFFF) return py.raiseValue("last_stream_id exceeds the 31-bit HTTP/2 limit");
+        last = @intCast(v);
+    }
+    return h.goaway(@intCast(code), last);
+}
+
 // The read API, shared by both protocols and inherited by the subtypes. The base
 // Connection is the factory: constructing it picks H1Connection / H2Connection by
 // protocol (new_base), so the runtime type is truthful while isinstance(obj,
@@ -894,6 +956,7 @@ var h1_methods = [_]py.MethodDef{
 var h2_methods = [_]py.MethodDef{
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
     .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id. The connection owns the stream state; the handle is a stream-scoped command surface (send_response / send_data / end_message)." },
+    .{ .ml_name = "close", .ml_meth = h2_close, .ml_flags = c.METH_VARARGS, .ml_doc = "Send GOAWAY to shut the connection down: close(error_code=NO_ERROR, last_stream_id=None). last_stream_id defaults to the highest peer stream processed." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

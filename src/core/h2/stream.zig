@@ -45,10 +45,16 @@ pub const Stream = struct {
     /// check against 2^31-1 is done in i64 by the caller before narrowing.
     recv_window: i32,
     send_window: i32,
+    /// Receive bytes consumed on this stream since the last WINDOW_UPDATE we sent.
+    recv_credit: u32 = 0,
     /// Declared Content-Length (if any) and bytes of DATA seen, for the
     /// h2->h1 smuggling guard (validated at END_STREAM).
     content_length: ?u64 = null,
     data_seen: u64 = 0,
+    /// The response on this stream carries no body regardless of content-length
+    /// (it answers a HEAD, or its status is 204/304), so the content-length vs
+    /// data-seen check is skipped (RFC 9110 8.6).
+    expects_bodyless: bool = false,
     headers_done: bool = false, // the request/response HEADERS block completed
     end_stream_seen: bool = false,
     /// Outbound DATA the send window could not yet admit, parked here and drained
@@ -142,6 +148,25 @@ pub const Stream = struct {
         };
     }
 
+    /// Apply the local side sending a frame, mirroring recvApply for the send
+    /// direction. END_STREAM half-closes locally: open -> half_closed_local,
+    /// half_closed_remote -> closed.
+    pub fn sendApply(self: *Stream, end_stream: bool) void {
+        if (end_stream) self.state = switch (self.state) {
+            .open => .half_closed_local,
+            .half_closed_remote => .closed,
+            else => self.state,
+        };
+    }
+
+    /// Whether the stream has reached the fully-closed terminal state with no
+    /// outbound send still owed - i.e. it can be evicted from the connection map.
+    /// A half_closed_* stream is NOT done: it still counts toward concurrency and
+    /// stays addressable until both directions finish.
+    pub fn isFullyClosed(self: *const Stream) bool {
+        return self.state == .closed and self.send_pending.items.len == 0 and !self.send_end_pending;
+    }
+
     /// Account for inbound DATA against the receive window. Returns a transition:
     /// a window overrun is a connection FLOW_CONTROL_ERROR. `len` is the full
     /// frame payload length (including padding), which is what counts against the
@@ -152,6 +177,13 @@ pub const Stream = struct {
         }
         self.recv_window -= @intCast(len);
         return Transition.ok;
+    }
+
+    /// Refill the receive window by `len` (the data was just consumed) and record
+    /// the same amount as credit to advertise back via WINDOW_UPDATE.
+    pub fn creditRecvWindow(self: *Stream, len: u32) void {
+        self.recv_window += @intCast(len);
+        self.recv_credit +|= len;
     }
 
     /// Apply a WINDOW_UPDATE increment to the send window. A zero increment is a
@@ -183,6 +215,7 @@ pub const Stream = struct {
     /// At END_STREAM, verify the body length matched a declared Content-Length.
     /// A mismatch is a STREAM error PROTOCOL_ERROR (h2->h1 smuggling guard).
     pub fn checkContentLength(self: *const Stream) Transition {
+        if (self.expects_bodyless) return Transition.ok;
         if (self.content_length) |cl| {
             if (cl != self.data_seen) return Transition.streamErr(.protocol_error);
         }
