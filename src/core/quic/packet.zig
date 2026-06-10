@@ -145,6 +145,73 @@ pub fn packetNumberLen(pn: u64, largest_acked: ?u64) usize {
     return 4;
 }
 
+// -- write (the header writers, the inverse of parseLong/parseShort) ----------
+//
+// These append a cleartext header through the Length field; the caller then
+// writes the `pn_len`-byte packet number and the payload, seals (AEAD), and
+// applies header protection. `pn_len` (1-4) is encoded into the first byte's low
+// two bits as pn_len-1. The returned pn_offset is where the packet number goes -
+// the start of the header-protected region.
+
+/// Write a long header (Initial/Handshake/0-RTT) through the Length field.
+/// `length` must cover the packet number plus the protected payload (RFC 9000
+/// 17.2). `token` is written only for an Initial (pass empty otherwise). Returns
+/// the packet-number offset.
+pub fn writeLongHeader(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    ltype: LongType,
+    version: u32,
+    dcid: []const u8,
+    scid: []const u8,
+    token: []const u8,
+    length: u64,
+    pn_len: usize,
+) !usize {
+    std.debug.assert(pn_len >= 1 and pn_len <= 4);
+    const first: u8 = constants.HEADER_FORM_LONG | constants.FIXED_BIT |
+        (@as(u8, @intFromEnum(ltype)) << 4) | @as(u8, @intCast(pn_len - 1));
+    try out.append(gpa, first);
+    var ver: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ver, version, .big);
+    try out.appendSlice(gpa, &ver);
+    try out.append(gpa, @intCast(dcid.len));
+    try out.appendSlice(gpa, dcid);
+    try out.append(gpa, @intCast(scid.len));
+    try out.appendSlice(gpa, scid);
+    if (ltype == .initial) {
+        try varint.append(out, gpa, token.len);
+        try out.appendSlice(gpa, token);
+    }
+    try varint.append(out, gpa, length);
+    return out.items.len;
+}
+
+/// Write a short (1-RTT) header through the dcid. Returns the packet-number
+/// offset (right after the dcid); the caller writes the pn and payload next.
+pub fn writeShortHeader(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    dcid: []const u8,
+    pn_len: usize,
+) !usize {
+    std.debug.assert(pn_len >= 1 and pn_len <= 4);
+    // Short header: the form bit is clear (1-RTT); fixed bit set, pn_len-1 in the
+    // low two bits. The spin and key-phase bits are 0.
+    const first: u8 = constants.FIXED_BIT | @as(u8, @intCast(pn_len - 1));
+    try out.append(gpa, first);
+    try out.appendSlice(gpa, dcid);
+    return out.items.len;
+}
+
+/// Write a packet number in its minimal `pn_len`-byte big-endian truncated form
+/// (RFC 9000 17.1). The matching length comes from `packetNumberLen`.
+pub fn writePacketNumber(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pn: u64, pn_len: usize) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, @intCast(pn & 0xFFFF_FFFF), .big);
+    try out.appendSlice(gpa, buf[4 - pn_len ..]);
+}
+
 test "isLong reads the form bit" {
     try std.testing.expect(isLong(0xC0));
     try std.testing.expect(!isLong(0x40));
@@ -194,4 +261,55 @@ test "packetNumberLen grows with the gap" {
     try std.testing.expectEqual(@as(usize, 1), packetNumberLen(5, 0));
     try std.testing.expectEqual(@as(usize, 2), packetNumberLen(1000, 0));
     try std.testing.expectEqual(@as(usize, 1), packetNumberLen(1000, 999));
+}
+
+test "writeLongHeader round-trips through parseLong" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    // An Initial header: dcid "abcd", empty scid, empty token, length 5, 1-byte pn.
+    const pn_off = try writeLongHeader(&out, gpa, .initial, constants.VERSION_1, "abcd", "", "", 5, 1);
+    // Append the 1-byte pn + 4 payload octets so parseLong's length check passes.
+    try out.appendSlice(gpa, &.{ 0x00, 0xAA, 0xBB, 0xCC, 0xDD });
+    const h = try parseLong(out.items);
+    try std.testing.expectEqual(LongType.initial, h.ltype);
+    try std.testing.expectEqual(constants.VERSION_1, h.version);
+    try std.testing.expectEqualStrings("abcd", h.dcid);
+    try std.testing.expectEqual(@as(usize, 0), h.scid.len);
+    try std.testing.expectEqual(@as(u64, 5), h.length);
+    try std.testing.expectEqual(pn_off, h.pn_offset);
+}
+
+test "writeLongHeader encodes pn_len into the first byte" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    _ = try writeLongHeader(&out, gpa, .handshake, constants.VERSION_1, "", "", "", 1, 3);
+    // first byte: long(0x80) | fixed(0x40) | type handshake(2<<4=0x20) | pn_len-1(2).
+    try std.testing.expectEqual(@as(u8, 0x80 | 0x40 | 0x20 | 0x02), out.items[0]);
+}
+
+test "writeShortHeader round-trips through parseShort" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    const pn_off = try writeShortHeader(&out, gpa, "cid", 2);
+    try out.appendSlice(gpa, &.{ 0x00, 0x01 }); // 2-byte pn
+    const h = try parseShort(out.items, 3);
+    try std.testing.expectEqualStrings("cid", h.dcid);
+    try std.testing.expectEqual(pn_off, h.pn_offset);
+    // form bit clear, fixed bit set, pn_len-1 = 1.
+    try std.testing.expect(!isLong(out.items[0]));
+    try std.testing.expectEqual(@as(u8, 0x40 | 0x01), out.items[0]);
+}
+
+test "writePacketNumber writes the minimal big-endian form" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try writePacketNumber(&out, gpa, 0x1234, 2);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x12, 0x34 }, out.items);
+    out.clearRetainingCapacity();
+    try writePacketNumber(&out, gpa, 0x05, 1);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0x05}, out.items);
 }

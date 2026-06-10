@@ -190,6 +190,50 @@ fn decodeClose(cur: *Cursor, app: bool) Error!Frame {
     return .{ .connection_close = .{ .app = app, .error_code = error_code, .frame_type = frame_type, .reason = reason } };
 }
 
+// -- encode (the write side) -------------------------------------------------
+//
+// The inverse of `decode` for the frames an outbound packet carries: STREAM (the
+// response bytes) and ACK (acknowledging the peer). Each appends to the caller's
+// payload buffer; the connection layer seals and protects the assembled packet.
+
+/// Append a STREAM frame (RFC 9000 19.8). The length is always written (LEN bit
+/// set) so frames can be followed by others in the same packet; OFF is written
+/// only for a nonzero offset. `fin` sets the FIN bit.
+pub fn encodeStream(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    stream_id: u64,
+    offset: u64,
+    data: []const u8,
+    fin: bool,
+) !void {
+    var ty: u64 = constants.STREAM_BASE | constants.STREAM_LEN;
+    if (offset != 0) ty |= constants.STREAM_OFF;
+    if (fin) ty |= constants.STREAM_FIN;
+    try varint.append(out, gpa, ty);
+    try varint.append(out, gpa, stream_id);
+    if (offset != 0) try varint.append(out, gpa, offset);
+    try varint.append(out, gpa, data.len);
+    try out.appendSlice(gpa, data);
+}
+
+/// Append an ACK frame (RFC 9000 19.3) acknowledging `largest` and the
+/// `first_range` packets below it, with no additional ranges (the common case:
+/// one contiguous run). `delay` is the ack-delay varint.
+pub fn encodeAck(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    largest: u64,
+    delay: u64,
+    first_range: u64,
+) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.ack));
+    try varint.append(out, gpa, largest);
+    try varint.append(out, gpa, delay);
+    try varint.append(out, gpa, 0); // ACK Range Count: no additional ranges
+    try varint.append(out, gpa, first_range);
+}
+
 /// Iterate the ranges of a parsed ACK frame. The recovery layer walks these to
 /// learn which packet numbers the peer acknowledged.
 pub fn ackRanges(ack_ranges: []const u8) AckRangeIterator {
@@ -289,4 +333,55 @@ test "empty NEW_TOKEN is a frame encoding error" {
 test "NEW_CONNECTION_ID with retire_prior_to past seq is rejected" {
     // seq=1, retire_prior_to=2 (invalid), ...
     try std.testing.expectError(error.FrameEncodingError, decode(&.{ 0x18, 0x01, 0x02 }));
+}
+
+test "encodeStream round-trips through decode" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodeStream(&out, gpa, 4, 8, "abc", true);
+    const d = try decode(out.items);
+    const s = d.frame.stream;
+    try std.testing.expectEqual(@as(u64, 4), s.stream_id);
+    try std.testing.expectEqual(@as(u64, 8), s.offset);
+    try std.testing.expectEqualStrings("abc", s.data);
+    try std.testing.expect(s.fin);
+    try std.testing.expectEqual(out.items.len, d.len);
+}
+
+test "encodeStream omits the offset field when offset is zero" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodeStream(&out, gpa, 0, 0, "hi", false);
+    // type 0x0a (BASE|LEN, no OFF, no FIN), id 0, len 2, "hi".
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x0a, 0x00, 0x02, 'h', 'i' }, out.items);
+    const s = (try decode(out.items)).frame.stream;
+    try std.testing.expectEqual(@as(u64, 0), s.offset);
+    try std.testing.expect(!s.fin);
+}
+
+test "encodeAck round-trips through decode" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodeAck(&out, gpa, 10, 0, 2);
+    const ack = (try decode(out.items)).frame.ack;
+    try std.testing.expectEqual(@as(u64, 10), ack.largest);
+    try std.testing.expectEqual(@as(u64, 2), ack.first_range);
+    var it = ackRanges(ack.ranges);
+    try std.testing.expect(it.next() == null); // no additional ranges
+}
+
+test "two encoded frames decode back to back in one payload" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodeAck(&out, gpa, 5, 0, 0);
+    try encodeStream(&out, gpa, 0, 0, "ok", true);
+    const first = try decode(out.items);
+    try std.testing.expect(first.frame == .ack);
+    const second = try decode(out.items[first.len..]);
+    try std.testing.expectEqualStrings("ok", second.frame.stream.data);
+    try std.testing.expect(second.frame.stream.fin);
 }
