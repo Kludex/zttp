@@ -46,6 +46,12 @@ pub const Limits = struct {
     /// against the CONTINUATION flood (CVE-2024-27316).
     max_field_block_bytes: usize = 64 * 1024,
     max_continuation_frames: u32 = 16,
+    /// Total streams ever opened on one connection and total resets the peer may
+    /// drive, defending against rapid-reset churn (CVE-2023-44487). Defaults are
+    /// generous multiples of max_concurrent_streams; exceeding either trips
+    /// EnhanceYourCalm (-> GOAWAY).
+    max_streams: u64 = 4096,
+    max_stream_resets: u64 = 256,
 };
 
 /// The error set the H2 engine raises. Mapped to RFC 9113 error codes for the
@@ -87,6 +93,11 @@ pub const Connection = struct {
     conn_recv_window: i32 = constants.DEFAULT_WINDOW_SIZE,
     conn_send_window: i32 = constants.DEFAULT_WINDOW_SIZE,
     highest_peer_id: u32 = 0,
+    /// Rapid-reset churn budgets: total streams ever opened and total resets.
+    /// These count streams that no longer exist (evicted), so unlike the live
+    /// concurrency count they are real state, not derivable from the map.
+    streams_opened: u64 = 0,
+    stream_resets: u64 = 0,
 
     pending: [PENDING_CAP]Event = undefined,
     pending_len: usize = 0,
@@ -94,6 +105,9 @@ pub const Connection = struct {
     /// Owned scratch for a Settings event's params; valid until the next event is
     /// produced (the integrator copies what it needs synchronously, as for Data).
     settings_scratch: std.ArrayList(events.SettingPair) = .empty,
+    /// Scratch list of stream ids to evict after a flushSendable pass, so the map
+    /// is never mutated while its iterator is live.
+    evict_scratch: std.ArrayList(u32) = .empty,
 
     /// The single open field block (RFC 9113 4.3): once HEADERS without
     /// END_HEADERS opens it, the very next frame must be CONTINUATION on this
@@ -133,6 +147,7 @@ pub const Connection = struct {
         self.streams.deinit(self.gpa);
         self.hpack.deinit();
         self.settings_scratch.deinit(self.gpa);
+        self.evict_scratch.deinit(self.gpa);
         self.fb_buf.deinit(self.gpa);
         self.req_headers.deinit(self.gpa);
         self.req_scratch.deinit(self.gpa);
@@ -343,7 +358,14 @@ pub const Connection = struct {
         if (@as(i64, self.conn_recv_window) - @as(i64, f.header.length) < 0) return error.FlowControlError;
         self.conn_recv_window -= @intCast(f.header.length);
 
-        const s = self.streams.getPtr(f.header.stream_id) orelse return error.ProtocolError;
+        const s = self.streams.getPtr(f.header.stream_id) orelse {
+            // No live stream: an idle id (never opened) is a connection error;
+            // a closed/evicted id is a stream error STREAM_CLOSED (RFC 9113 5.1,
+            // mirroring stream.classifyRecv's .closed branch).
+            if (self.isIdle(f.header.stream_id)) return error.ProtocolError;
+            self.push(.{ .rst_stream = .{ .stream_id = f.header.stream_id, .error_code = @intFromEnum(ErrorCode.stream_closed) } });
+            return;
+        };
         const classify = s.classifyRecv(.data, end_stream);
         switch (classify.action) {
             .ok => {},
@@ -380,6 +402,8 @@ pub const Connection = struct {
             return;
         };
         s.recvApply(.rst_stream, false);
+        self.evictStream(f.header.stream_id);
+        try self.chargeReset();
         self.push(.{ .rst_stream = .{ .stream_id = f.header.stream_id, .error_code = code } });
     }
 
@@ -401,12 +425,13 @@ pub const Connection = struct {
             // A second HEADERS block is a trailer ONLY while the stream is still
             // open (body not yet ended). A HEADERS after the peer's END_STREAM
             // (half-closed-remote) or on a closed stream is a protocol error.
+            const client_reading = self.role == .client and (s.state == .open or s.state == .half_closed_local);
             if (s.headers_done and s.state == .open) {
                 is_trailer = true;
-            } else if (self.role == .client and !s.headers_done and s.state == .open) {
-                // A client stream that is open but whose head is not done yet: an
-                // interim (1xx) response already arrived and this is the next
-                // response head (another interim, or the final). Accept it.
+            } else if (client_reading and !s.headers_done) {
+                // A client reading a response head: the stream is open, or
+                // half_closed_local once the client finished sending its request.
+                // An interim (1xx) head may already have arrived; accept the next.
             } else {
                 return error.ProtocolError;
             }
@@ -416,8 +441,7 @@ pub const Connection = struct {
             // out of scope). The stream is created here for the response if the
             // send side has not already (the H2 write path opens it on request).
             if (id % 2 == 0) return error.ProtocolError;
-            self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size)) catch return error.MessageTooLong;
-            self.streams.getPtr(id).?.recvApply(.headers, false); // idle -> open
+            try self.openPeerStream(id);
         } else {
             // A new request stream. Its id must be odd and exceed the highest peer
             // id (5.1.1: parity + monotonicity).
@@ -428,8 +452,7 @@ pub const Connection = struct {
             // is inserted, so the map cannot grow under a refused-stream flood.
             refused = self.liveStreamCount() >= self.limits.max_concurrent_streams;
             if (!refused) {
-                self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size)) catch return error.MessageTooLong;
-                self.streams.getPtr(id).?.recvApply(.headers, false); // idle -> open
+                try self.openPeerStream(id);
             }
             self.highest_peer_id = id;
         }
@@ -485,7 +508,7 @@ pub const Connection = struct {
             // Trailers: a second HEADERS block; must carry END_STREAM (8.1) and
             // must not contain pseudo-headers or otherwise-invalid fields.
             if (!end_stream or !validTrailers(headers)) {
-                self.resetStream(s, id, .protocol_error);
+                try self.resetStream(s, id, .protocol_error);
                 return;
             }
             s.recvApply(.headers, true);
@@ -497,7 +520,7 @@ pub const Connection = struct {
             // Collapse the response pseudo-header (:status) + regular fields.
             const resp = self.collapseResponse(headers, id) catch |e| switch (e) {
                 error.Malformed => {
-                    self.resetStream(s, id, .protocol_error);
+                    try self.resetStream(s, id, .protocol_error);
                     return;
                 },
                 error.OutOfMemory => return error.MessageTooLong,
@@ -509,7 +532,7 @@ pub const Connection = struct {
             // arrive, so it is malformed and resets the stream.
             if (resp.event.status_code >= 100 and resp.event.status_code < 200) {
                 if (end_stream) {
-                    self.resetStream(s, id, .protocol_error);
+                    try self.resetStream(s, id, .protocol_error);
                     return;
                 }
                 self.push(.{ .response = resp.event });
@@ -528,7 +551,7 @@ pub const Connection = struct {
         // Collapse pseudo-headers into the request line + regular headers.
         const req = self.collapseRequest(headers, id) catch |e| switch (e) {
             error.Malformed => {
-                self.resetStream(s, id, .protocol_error);
+                try self.resetStream(s, id, .protocol_error);
                 return;
             },
             error.OutOfMemory => return error.MessageTooLong,
@@ -542,10 +565,12 @@ pub const Connection = struct {
         }
     }
 
-    /// Reset a stream for a stream error: emit RST_STREAM and move its state to
-    /// closed so later frames on it are no longer treated as open.
-    fn resetStream(self: *Connection, s: *Stream, id: u32, code: ErrorCode) void {
+    /// Reset a stream for a stream error: emit RST_STREAM, move its state to
+    /// closed, and evict it. A locally-driven reset still counts as churn.
+    fn resetStream(self: *Connection, s: *Stream, id: u32, code: ErrorCode) H2Error!void {
         s.recvApply(.rst_stream, false); // -> closed
+        self.evictStream(id);
+        try self.chargeReset();
         self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(code) } });
     }
 
@@ -709,8 +734,7 @@ pub const Connection = struct {
     /// is seeded from the peer's INITIAL_WINDOW_SIZE (what the peer will accept).
     pub fn registerSendStream(self: *Connection, id: u32) error{OutOfMemory}!void {
         if (self.streams.getPtr(id) != null) return;
-        self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size)) catch return error.OutOfMemory;
-        self.streams.getPtr(id).?.recvApply(.headers, false); // idle -> open
+        self.openStream(id) catch return error.OutOfMemory;
     }
 
     /// Queue outbound body bytes on `id`, emitting as much as the connection and
@@ -728,13 +752,26 @@ pub const Connection = struct {
     /// Flushing mutates only each stream's own fields and the writer (never the
     /// map's shape), so iterating value pointers in place is safe.
     pub fn flushSendable(self: *Connection, writer: *writer_mod.Writer) writer_mod.WriteError!void {
-        var it = self.streams.valueIterator();
-        while (it.next()) |s| try self.flushStreamPtr(writer, s);
+        // Flush every stream, then evict the ones that fully closed in a SEPARATE
+        // pass. Removing entries while the value iterator is live would be fragile
+        // (it happens to work only because the hash map tombstones rather than
+        // back-shifts on remove), so the eviction ids are collected first.
+        self.evict_scratch.clearRetainingCapacity();
+        var it = self.streams.iterator();
+        while (it.next()) |e| {
+            try self.flushStreamPtr(writer, e.value_ptr);
+            const st = e.value_ptr;
+            if (st.isFullyClosed()) {
+                self.evict_scratch.append(self.gpa, e.key_ptr.*) catch return error.OutOfMemory;
+            }
+        }
+        for (self.evict_scratch.items) |id| self.evictStream(id);
     }
 
     fn flushStream(self: *Connection, writer: *writer_mod.Writer, id: u32) writer_mod.WriteError!void {
         const s = self.streams.getPtr(id) orelse return;
         try self.flushStreamPtr(writer, s);
+        self.maybeEvictDone(id);
     }
 
     fn flushStreamPtr(self: *Connection, writer: *writer_mod.Writer, s: *Stream) writer_mod.WriteError!void {
@@ -754,7 +791,10 @@ pub const Connection = struct {
             s.send_window -= @intCast(chunk);
             self.conn_send_window -= @intCast(chunk);
             off += chunk;
-            if (end) s.send_end_pending = false;
+            if (end) {
+                s.send_end_pending = false;
+                s.sendApply(true);
+            }
         }
         // Drop the bytes we emitted; keep what the window could not admit.
         if (off > 0) {
@@ -767,6 +807,7 @@ pub const Connection = struct {
         if (s.send_pending.items.len == 0 and s.send_end_pending) {
             try writer.writeDataFrame(id, &.{}, true);
             s.send_end_pending = false;
+            s.sendApply(true);
         }
     }
 
@@ -781,6 +822,41 @@ pub const Connection = struct {
         return false;
     }
 
+    /// Insert a stream and move it idle->open. Maintains the live counter and the
+    /// total-streams churn cap (CVE-2023-44487). Every counted insertion goes
+    /// through here so live_streams and streams_opened stay exact.
+    /// Insert a stream and move it idle->open. The single insertion point; the
+    /// trusted send path and the peer-driven read path both route through it. The
+    /// total-streams churn cap is enforced only on the peer path (openPeerStream),
+    /// never here - the local app is not the adversary, so a client/server opening
+    /// many streams to send is not abuse.
+    fn openStream(self: *Connection, id: u32) H2Error!void {
+        self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size)) catch return error.MessageTooLong;
+        self.streams.getPtr(id).?.recvApply(.headers, false); // idle -> open
+    }
+
+    /// Open a PEER-initiated stream, enforcing the total-streams churn cap
+    /// (CVE-2023-44487) that bounds how many streams one peer may ever open.
+    fn openPeerStream(self: *Connection, id: u32) H2Error!void {
+        if (self.limits.max_streams != 0 and self.streams_opened >= self.limits.max_streams) return error.EnhanceYourCalm;
+        try self.openStream(id);
+        self.streams_opened += 1;
+    }
+
+    /// Remove a stream from the map. Safe to call on a closed entry: the null path
+    /// in handleData/handleWindowUpdate/handleRstStream classifies an evicted
+    /// (id <= highest_peer_id) stream as closed, not idle.
+    fn evictStream(self: *Connection, id: u32) void {
+        if (self.streams.fetchRemove(id)) |kv| {
+            var s = kv.value;
+            s.deinit(self.gpa);
+        }
+    }
+
+    /// Streams currently counting toward MAX_CONCURRENT_STREAMS (open or
+    /// half-closed). Derived from the map rather than cached: the map is bounded by
+    /// max_concurrent_streams plus a few in-flight, so the scan is cheap and there
+    /// is no counter to drift out of sync.
     fn liveStreamCount(self: *Connection) u32 {
         var n: u32 = 0;
         var it = self.streams.valueIterator();
@@ -790,11 +866,27 @@ pub const Connection = struct {
         return n;
     }
 
+    /// Evict a stream that has reached the fully-closed terminal state with no
+    /// outbound send still owed. A half_closed_remote stream is NOT evicted here:
+    /// it still counts toward MAX_CONCURRENT_STREAMS and must stay addressable for
+    /// a late RST_STREAM/WINDOW_UPDATE until the local side finishes the response
+    /// (RFC 9113 5.1). The connection-error/memory bound for streams that never
+    /// finish comes from max_concurrent_streams and the churn caps, not eviction.
+    fn maybeEvictDone(self: *Connection, id: u32) void {
+        const s = self.streams.getPtr(id) orelse return;
+        if (s.isFullyClosed()) self.evictStream(id);
+    }
+
+    /// Charge one stream reset against the churn budget (CVE-2023-44487).
+    fn chargeReset(self: *Connection) H2Error!void {
+        self.stream_resets += 1;
+        if (self.limits.max_stream_resets != 0 and self.stream_resets > self.limits.max_stream_resets) return error.EnhanceYourCalm;
+    }
+
     /// Open a stream as if a HEADERS had arrived - used by tests that exercise the
     /// DATA path without driving a full HEADERS block.
     pub fn openStreamForTest(self: *Connection, id: u32) !void {
-        try self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size));
-        self.streams.getPtr(id).?.recvApply(.headers, false);
+        try self.openStream(id);
         if (id > self.highest_peer_id) self.highest_peer_id = id;
     }
 
@@ -1456,6 +1548,276 @@ test "an inner-whitespace value is accepted (only edge OWS is rejected)" {
     const req = try c.nextEvent();
     try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
     try testing.expectEqualStrings("a b", req.request.headers[0].value);
+}
+
+test "rapid open+RST churn keeps the stream map and live counter bounded" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    // Open-then-RST 100 streams on increasing odd ids. Each pair must leave zero
+    // residue: no map entry, no live count.
+    var id: u32 = 1;
+    var k: usize = 0;
+    while (k < 100) : (k += 1) {
+        try frameBytes(&frames, .headers, Flags.end_headers, id, &GET_BLOCK); // open, no END_STREAM
+        try frameBytes(&frames, .rst_stream, 0, id, &[_]u8{ 0x00, 0x00, 0x00, 0x08 }); // CANCEL
+        id += 2;
+    }
+    try handshook(&c, frames.items);
+    var seen: usize = 0;
+    while (true) {
+        const ev = try c.nextEvent();
+        if (ev == .need_data) break;
+        seen += 1;
+    }
+    try testing.expect(seen >= 100); // at least the 100 rst_stream echoes surfaced
+    try testing.expectEqual(@as(usize, 0), c.streams.count());
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
+}
+
+test "a late WINDOW_UPDATE or RST on an evicted closed stream is tolerated" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    // Open stream 1, RST it (evicts), then send a stray WINDOW_UPDATE and a stray
+    // RST on the now-evicted id 1 (<= highest_peer_id, so closed not idle).
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &GET_BLOCK);
+    try frameBytes(&frames, .rst_stream, 0, 1, &[_]u8{ 0x00, 0x00, 0x00, 0x08 });
+    try frameBytes(&frames, .window_update, 0, 1, &[_]u8{ 0x00, 0x00, 0x00, 0x10 });
+    try frameBytes(&frames, .rst_stream, 0, 1, &[_]u8{ 0x00, 0x00, 0x00, 0x08 });
+    try handshook(&c, frames.items);
+    // The opening HEADERS surfaces the request; then the RST echo; then the strays
+    // after eviction are dropped.
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(Event.need_data, try c.nextEvent());
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
+}
+
+test "DATA on an evicted closed stream is a stream error STREAM_CLOSED" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &GET_BLOCK); // open
+    try frameBytes(&frames, .rst_stream, 0, 1, &[_]u8{ 0x00, 0x00, 0x00, 0x08 }); // evicts
+    try frameBytes(&frames, .data, Flags.end_stream, 1, "x"); // DATA on the evicted id
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent())); // the opening request
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent())); // the RST echo
+    const stale = try c.nextEvent();
+    try testing.expectEqual(@as(u32, 1), stale.rst_stream.stream_id);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.stream_closed)), stale.rst_stream.error_code);
+}
+
+test "the live-stream count matches reality across read-completion and reset" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    // Stream 1: a complete request (END_STREAM) lingers in half_closed_remote and
+    // still counts until the app responds.
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK);
+    // Stream 3: open, no END_STREAM -> still receiving -> counts.
+    try frameBytes(&frames, .headers, Flags.end_headers, 3, &GET_BLOCK);
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent())); // 1 request
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent())); // 1 eom
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent())); // 3 request
+    try testing.expectEqual(Event.need_data, try c.nextEvent());
+    // Both count: stream 1 (half_closed_remote, awaiting response) and stream 3 (open).
+    try testing.expectEqual(@as(u32, 2), c.liveStreamCount());
+    try testing.expectEqual(@as(usize, 2), c.streams.count());
+    // Now RST stream 3: it is evicted; stream 1 still lingers awaiting its response.
+    var more: std.ArrayList(u8) = .empty;
+    defer more.deinit(testing.allocator);
+    try frameBytes(&more, .rst_stream, 0, 3, &[_]u8{ 0x00, 0x00, 0x00, 0x08 });
+    try c.feed(more.items);
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(@as(u32, 1), c.liveStreamCount());
+    try testing.expectEqual(@as(usize, 1), c.streams.count());
+}
+
+test "a reset-churn flood trips EnhanceYourCalm" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    c.limits.max_stream_resets = 3;
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    // Four open+RST cycles; the 4th reset exceeds the budget of 3.
+    var id: u32 = 1;
+    var k: usize = 0;
+    while (k < 4) : (k += 1) {
+        try frameBytes(&frames, .headers, Flags.end_headers, id, &GET_BLOCK);
+        try frameBytes(&frames, .rst_stream, 0, id, &[_]u8{ 0x00, 0x00, 0x00, 0x08 });
+        id += 2;
+    }
+    try handshook(&c, frames.items);
+    var tripped = false;
+    for (0..64) |_| {
+        const ev = c.nextEvent() catch |e| {
+            try testing.expectEqual(error.EnhanceYourCalm, e);
+            tripped = true;
+            break;
+        };
+        if (ev == .need_data) break;
+    }
+    try testing.expect(tripped);
+}
+
+test "opening more than max_streams trips EnhanceYourCalm" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    c.limits.max_streams = 2;
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    // Three opens (no END_STREAM); the 3rd open exceeds the cap of 2.
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &GET_BLOCK);
+    try frameBytes(&frames, .headers, Flags.end_headers, 3, &GET_BLOCK);
+    try frameBytes(&frames, .headers, Flags.end_headers, 5, &GET_BLOCK);
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent())); // stream 1
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent())); // stream 3
+    try testing.expectError(error.EnhanceYourCalm, c.nextEvent()); // stream 5 over the cap
+}
+
+test "half-closed-remote requests count toward concurrency until the response finishes" {
+    // A completed request the app has not yet responded to lingers in
+    // half_closed_remote and counts toward MAX_CONCURRENT_STREAMS (RFC 9113 5.1.2),
+    // so a flood of bodyless requests is refused past the cap rather than all
+    // surfaced. (This is the inverse of the earlier eager-eviction bug.)
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    c.limits.max_concurrent_streams = 4;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    try input.appendSlice(testing.allocator, constants.CLIENT_PREFACE);
+    try frameBytes(&input, .settings, 0, 0, &.{});
+    var id: u32 = 1;
+    var k: usize = 0;
+    while (k < 10) : (k += 1) {
+        try frameBytes(&input, .headers, Flags.end_headers | Flags.end_stream, id, &GET_BLOCK);
+        id += 2;
+    }
+    try c.feed(input.items);
+    try testing.expectEqual(std.meta.Tag(Event).settings, std.meta.activeTag(try c.nextEvent()));
+    var requests: usize = 0;
+    var refusals: usize = 0;
+    while (true) {
+        const ev = try c.nextEvent();
+        switch (ev) {
+            .need_data => break,
+            .request => requests += 1,
+            .rst_stream => refusals += 1,
+            else => {},
+        }
+    }
+    // The first 4 are surfaced; the rest are refused (REFUSED_STREAM) because the
+    // half-closed-remote streams still occupy concurrency slots.
+    try testing.expectEqual(@as(usize, 4), requests);
+    try testing.expectEqual(@as(usize, 6), refusals);
+    try testing.expectEqual(@as(u32, 4), c.liveStreamCount());
+}
+
+test "a request+response cycle returns the live-stream count to zero" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var w = writer_mod.Writer.init(testing.allocator, .server);
+    defer w.deinit();
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    // A complete request (END_STREAM): the recv side ends, but the stream lingers
+    // in half_closed_remote and still counts toward concurrency until the local
+    // side finishes the response (RFC 9113 5.1).
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK);
+    try handshook(&c, hdr.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(Event.need_data, try c.nextEvent());
+    try testing.expectEqual(@as(u32, 1), c.liveStreamCount()); // still awaiting the response
+    // The app responds: register the send, then a body with END_STREAM. Once the
+    // response drains the stream reaches .closed and is evicted - back to zero.
+    try w.sendResponse(1, 200, &.{}, false);
+    try c.sendStreamData(&w, 1, "hi", true);
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
+    try testing.expectEqual(@as(usize, 0), c.streams.count());
+}
+
+test "many request+response cycles do not leak the concurrency budget" {
+    // Regression: a re-created response stream must drain to eviction, or every
+    // cycle leaks one live_streams and the connection refuses requests past 128.
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var w = writer_mod.Writer.init(testing.allocator, .server);
+    defer w.deinit();
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    try input.appendSlice(testing.allocator, constants.CLIENT_PREFACE);
+    try frameBytes(&input, .settings, 0, 0, &.{});
+    try c.feed(input.items);
+    try testing.expectEqual(std.meta.Tag(Event).settings, std.meta.activeTag(try c.nextEvent()));
+    var id: u32 = 1;
+    var k: usize = 0;
+    while (k < 300) : (k += 1) {
+        var hdr: std.ArrayList(u8) = .empty;
+        defer hdr.deinit(testing.allocator);
+        try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, id, &GET_BLOCK);
+        try c.feed(hdr.items);
+        try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+        try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+        try testing.expectEqual(Event.need_data, try c.nextEvent());
+        try w.sendResponse(id, 200, &.{}, false);
+        try c.sendStreamData(&w, id, "ok", true);
+        try testing.expectEqual(@as(u32, 0), c.liveStreamCount()); // never accumulates
+        id += 2;
+    }
+    try testing.expectEqual(@as(usize, 0), c.streams.count());
+}
+
+test "late DATA after a response is registered is a stream error STREAM_CLOSED" {
+    // The re-created response stream is half_closed_remote, so a peer sending DATA
+    // after its own END_STREAM is rejected, not silently reopened (smuggling guard).
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var w = writer_mod.Writer.init(testing.allocator, .server);
+    defer w.deinit();
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK);
+    try handshook(&c, hdr.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(Event.need_data, try c.nextEvent());
+    try w.sendResponse(1, 200, &.{}, false); // register the response (re-creates stream 1 half_closed_remote)
+    try c.registerSendStream(1);
+    // The peer sends DATA on stream 1 after it already ended: STREAM_CLOSED.
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(testing.allocator);
+    try frameBytes(&data, .data, 0, 1, "evil");
+    try c.feed(data.items);
+    const ev = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(ev));
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.stream_closed)), ev.rst_stream.error_code);
+}
+
+test "a WINDOW_UPDATE on a half-closed-remote stream awaiting its response is honored" {
+    // The P1 case: a completed request awaiting a response stays addressable - a
+    // WINDOW_UPDATE for it must be applied, not dropped as a forgotten stream.
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK);
+    try frameBytes(&frames, .window_update, 0, 1, &[_]u8{ 0x00, 0x00, 0x00, 0x10 });
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    // The stream is still present, so the WINDOW_UPDATE is surfaced (not dropped).
+    const wu = try c.nextEvent();
+    try testing.expectEqual(@as(u32, 1), wu.window_update.stream_id);
+    try testing.expectEqual(@as(u32, 0x10), wu.window_update.increment);
 }
 
 test "fuzz: H2 connection never panics on adversarial frame streams" {

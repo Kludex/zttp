@@ -142,6 +142,25 @@ pub const Stream = struct {
         };
     }
 
+    /// Apply the local side sending a frame, mirroring recvApply for the send
+    /// direction. END_STREAM half-closes locally: open -> half_closed_local,
+    /// half_closed_remote -> closed.
+    pub fn sendApply(self: *Stream, end_stream: bool) void {
+        if (end_stream) self.state = switch (self.state) {
+            .open => .half_closed_local,
+            .half_closed_remote => .closed,
+            else => self.state,
+        };
+    }
+
+    /// Whether the stream has reached the fully-closed terminal state with no
+    /// outbound send still owed - i.e. it can be evicted from the connection map.
+    /// A half_closed_* stream is NOT done: it still counts toward concurrency and
+    /// stays addressable until both directions finish.
+    pub fn isFullyClosed(self: *const Stream) bool {
+        return self.state == .closed and self.send_pending.items.len == 0 and !self.send_end_pending;
+    }
+
     /// Account for inbound DATA against the receive window. Returns a transition:
     /// a window overrun is a connection FLOW_CONTROL_ERROR. `len` is the full
     /// frame payload length (including padding), which is what counts against the
