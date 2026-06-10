@@ -97,6 +97,9 @@ const H2Engine = struct {
             _ = c.PyErr_NoMemory();
             return null;
         };
+        // A HEAD response carries no body regardless of content-length (RFC 9110
+        // 8.6); mark the stream so the response's content-length check is skipped.
+        if (asciiEqlIgnoreCase(mb, "HEAD")) self.conn.markBodylessRequest(id);
         return id;
     }
 

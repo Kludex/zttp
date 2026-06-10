@@ -565,6 +565,8 @@ pub const Connection = struct {
             }
             s.headers_done = true;
             if (resp.content_length) |cl| s.content_length = cl;
+            // 204/304 responses carry no body regardless of content-length.
+            if (resp.event.status_code == 204 or resp.event.status_code == 304) s.expects_bodyless = true;
             self.push(.{ .response = resp.event });
             if (end_stream) {
                 s.recvApply(.headers, true); // open -> half_closed_remote
@@ -761,6 +763,13 @@ pub const Connection = struct {
         if (id > self.highest_local_id) self.highest_local_id = id;
         if (self.streams.getPtr(id) != null) return;
         self.openStream(id) catch return error.OutOfMemory;
+    }
+
+    /// Mark that the response on `id` will carry no body (the request method is
+    /// HEAD), so the content-length vs data-seen check is skipped when it ends.
+    /// Call after registerSendStream. A no-op on an unknown id.
+    pub fn markBodylessRequest(self: *Connection, id: u32) void {
+        if (self.streams.getPtr(id)) |s| s.expects_bodyless = true;
     }
 
     /// Account for a locally-initiated RST_STREAM: the stream is terminally closed,

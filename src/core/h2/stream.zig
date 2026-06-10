@@ -51,6 +51,10 @@ pub const Stream = struct {
     /// h2->h1 smuggling guard (validated at END_STREAM).
     content_length: ?u64 = null,
     data_seen: u64 = 0,
+    /// The response on this stream carries no body regardless of content-length
+    /// (it answers a HEAD, or its status is 204/304), so the content-length vs
+    /// data-seen check is skipped (RFC 9110 8.6).
+    expects_bodyless: bool = false,
     headers_done: bool = false, // the request/response HEADERS block completed
     end_stream_seen: bool = false,
     /// Outbound DATA the send window could not yet admit, parked here and drained
@@ -211,6 +215,7 @@ pub const Stream = struct {
     /// At END_STREAM, verify the body length matched a declared Content-Length.
     /// A mismatch is a STREAM error PROTOCOL_ERROR (h2->h1 smuggling guard).
     pub fn checkContentLength(self: *const Stream) Transition {
+        if (self.expects_bodyless) return Transition.ok;
         if (self.content_length) |cl| {
             if (cl != self.data_seen) return Transition.streamErr(.protocol_error);
         }
@@ -303,5 +308,12 @@ test "content-length mismatch at end of stream is a stream error" {
     try testing.expectEqual(Action.stream_error, t.action);
     try testing.expectEqual(ErrorCode.protocol_error, t.code);
     s.recordData(2);
+    try testing.expectEqual(Action.ok, s.checkContentLength().action);
+}
+
+test "a bodyless stream skips the content-length check" {
+    var s = Stream.init(1, 65535, 65535);
+    s.content_length = 1234; // a HEAD response advertises a length but sends no body
+    s.expects_bodyless = true;
     try testing.expectEqual(Action.ok, s.checkContentLength().action);
 }
