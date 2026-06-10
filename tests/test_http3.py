@@ -11,7 +11,9 @@ import zttp
 # rides the Application space; the adapter installs the deterministic test 1-RTT
 # keys until it drives the real handshake. Generated from the Zig transport's
 # test builders (testBuildInitial + testBuildApp).
-GET_DATAGRAM = bytes.fromhex("cb00000001041122334400002503391124feae5563a7a45c7119a2ac826e2902aeed3285921485b19e31d5895764ce99219b4111223344d5873c1ca2ad7e827da34fc75fb850c4431c3430c66c9b3844ba46ebfb0f")
+GET_DATAGRAM = bytes.fromhex(
+    "cb00000001041122334400002503391124feae5563a7a45c7119a2ac826e2902aeed3285921485b19e31d5895764ce99219b4111223344d5873c1ca2ad7e827da34fc75fb850c4431c3430c66c9b3844ba46ebfb0f"
+)
 
 
 def test_http3_constant_exists() -> None:
