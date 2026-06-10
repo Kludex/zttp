@@ -841,12 +841,19 @@ fn isValidFieldName(name: []const u8) bool {
     return true;
 }
 
-/// A legal field-value byte (RFC 9113 8.2.1): no CR/LF/NUL or other control, no
-/// DEL; obs-text (0x80-0xFF) and inner SP/HTAB are allowed. The same rule the H1
-/// path and the H2 write path enforce, so a re-serialized request cannot split.
+/// A legal field value (RFC 9113 8.2.1): no CR/LF/NUL or other control and no
+/// DEL (obs-text 0x80-0xFF and inner SP/HTAB are allowed), and no leading or
+/// trailing whitespace. The same rule the H2 write path enforces, so a value the
+/// read side accepts the write side can re-serialize without splitting or being
+/// silently re-trimmed by a peer.
 fn validValue(value: []const u8) bool {
     for (value) |ch| {
         if (!tables.is_field_vchar[ch]) return false;
+    }
+    if (value.len > 0) {
+        const first = value[0];
+        const last = value[value.len - 1];
+        if (first == ' ' or first == '\t' or last == ' ' or last == '\t') return false;
     }
     return true;
 }
@@ -1409,6 +1416,46 @@ test "an obs-text value (0x80-0xFF) is accepted" {
     try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
     try testing.expectEqualStrings("x-obs", req.request.headers[0].name);
     try testing.expectEqualStrings(&[_]u8{ 0x80, 0xFF }, req.request.headers[0].value);
+}
+
+test "a trailing-whitespace value resets the stream (RFC 9113 8.2.1)" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // :method GET, :scheme http, :path /, then literal "x-test: val " (trailing SP).
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x06 } ++ "x-test".* ++ [_]u8{ 0x04, 'v', 'a', 'l', ' ' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    const ev = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(ev));
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), ev.rst_stream.error_code);
+}
+
+test "a leading-whitespace value resets the stream (RFC 9113 8.2.1)" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // literal "x-test: \tval" (leading HTAB).
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x06 } ++ "x-test".* ++ [_]u8{ 0x04, 0x09, 'v', 'a', 'l' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "an inner-whitespace value is accepted (only edge OWS is rejected)" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // literal "x-test: a b" - an inner SP is legal (e.g. media-type parameters).
+    const block = GET_BLOCK ++ [_]u8{ 0x00, 0x06 } ++ "x-test".* ++ [_]u8{ 0x03, 'a', ' ', 'b' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    const req = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
+    try testing.expectEqualStrings("a b", req.request.headers[0].value);
 }
 
 fn driveConnection(input: []const u8) void {
