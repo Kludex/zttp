@@ -157,6 +157,32 @@ var window_update_members = [_]py.MemberDef{
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 
+// -- event shell cache ----------------------------------------------------------
+
+// next_event allocates one event object that callers typically drop before the
+// next call, so one cached shell per hot type recycles nearly every alloc/free
+// pair. The slot is swapped atomically, so it stays correct on free-threaded
+// builds; the dealloc path nulls every field before stashing.
+var request_cache: py.Object = null;
+var response_cache: py.Object = null;
+var data_cache: py.Object = null;
+var eom_cache: py.Object = null;
+
+fn cacheTake(slot: *py.Object, tp: py.Object) py.Object {
+    if (@atomicRmw(py.Object, slot, .Xchg, null, .acq_rel)) |shell| {
+        c.Py_SET_REFCNT(shell, 1);
+        py.gcTrack(shell);
+        return shell;
+    }
+    return py.allocInstance(tp);
+}
+
+fn cacheStash(slot: *py.Object, o: py.Object) void {
+    if (@atomicRmw(py.Object, slot, .Xchg, o, .acq_rel)) |evicted| {
+        py.freeInstance(evicted);
+    }
+}
+
 // -- dealloc ------------------------------------------------------------------
 
 fn deallocRequest(o: ?*c.PyObject) callconv(.c) void {
@@ -169,7 +195,15 @@ fn deallocRequest(o: ?*c.PyObject) callconv(.c) void {
     py.xdecref(s.http_version);
     py.xdecref(s.headers);
     py.xdecref(s.stream_id);
-    py.freeInstance(@ptrCast(s));
+    s.method = null;
+    s.target = null;
+    s.path = null;
+    s.query = null;
+    s.http_version = null;
+    s.headers = null;
+    s.stream_id = null;
+    s.expect_continue = 0;
+    cacheStash(&request_cache, @ptrCast(s));
 }
 fn deallocResponse(o: ?*c.PyObject) callconv(.c) void {
     const s: *ResponseObject = @ptrCast(o.?);
@@ -179,21 +213,30 @@ fn deallocResponse(o: ?*c.PyObject) callconv(.c) void {
     py.xdecref(s.http_version);
     py.xdecref(s.headers);
     py.xdecref(s.stream_id);
-    py.freeInstance(@ptrCast(s));
+    s.status_code = null;
+    s.reason = null;
+    s.http_version = null;
+    s.headers = null;
+    s.stream_id = null;
+    cacheStash(&response_cache, @ptrCast(s));
 }
 fn deallocData(o: ?*c.PyObject) callconv(.c) void {
     const s: *DataObject = @ptrCast(o.?);
     py.gcUntrack(s);
     py.xdecref(s.data);
     py.xdecref(s.stream_id);
-    py.freeInstance(@ptrCast(s));
+    s.data = null;
+    s.stream_id = null;
+    cacheStash(&data_cache, @ptrCast(s));
 }
 fn deallocEom(o: ?*c.PyObject) callconv(.c) void {
     const s: *EndOfMessageObject = @ptrCast(o.?);
     py.gcUntrack(s);
     py.xdecref(s.trailers);
     py.xdecref(s.stream_id);
-    py.freeInstance(@ptrCast(s));
+    s.trailers = null;
+    s.stream_id = null;
+    cacheStash(&eom_cache, @ptrCast(s));
 }
 fn deallocRstStream(o: ?*c.PyObject) callconv(.c) void {
     const s: *RstStreamObject = @ptrCast(o.?);
@@ -592,12 +635,49 @@ const INTERNED_NAMES = [_][]const u8{
     "Transfer-Encoding",
 };
 
+// The same trick for header values: the values of the connection-management
+// and content-negotiation headers are drawn from a tiny fixed vocabulary, so
+// the common ones get a pre-built PyBytes too (exact-bytes match only).
+const INTERNED_VALUES = [_][]const u8{
+    "1",
+    "*/*",
+    "cors",
+    "none",
+    "close",
+    "empty",
+    "https",
+    "chunked",
+    "Upgrade",
+    "no-cache",
+    "identity",
+    "navigate",
+    "document",
+    "text/html",
+    "websocket",
+    "max-age=0",
+    "keep-alive",
+    "text/plain",
+    "same-origin",
+    "gzip, deflate",
+    "en-US,en;q=0.9",
+    "XMLHttpRequest",
+    "application/json",
+    "gzip, deflate, br",
+    "gzip, deflate, br, zstd",
+    "application/x-www-form-urlencoded",
+};
+
 var interned: [INTERNED_NAMES.len]py.Object = @splat(null);
+var interned_values: [INTERNED_VALUES.len]py.Object = @splat(null);
 
 fn buildInternTable() bool {
     inline for (INTERNED_NAMES, 0..) |name, i| {
         interned[i] = py.fromBytes(name);
         if (interned[i] == null) return false;
+    }
+    inline for (INTERNED_VALUES, 0..) |value, i| {
+        interned_values[i] = py.fromBytes(value);
+        if (interned_values[i] == null) return false;
     }
     return true;
 }
@@ -620,6 +700,20 @@ fn internName(name: []const u8) ?py.Object {
     }
 }
 
+fn internValue(value: []const u8) ?py.Object {
+    switch (value.len) {
+        inline 1...33 => |L| {
+            inline for (INTERNED_VALUES, 0..) |cand, i| {
+                if (comptime cand.len == L) {
+                    if (value[0] == cand[0] and std.mem.eql(u8, value, cand)) return py.newRef(interned_values[i]);
+                }
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
 // -- header list materialisation ----------------------------------------------
 
 /// Build a Python list of (name, value) bytes tuples from the core headers.
@@ -628,7 +722,7 @@ fn buildHeaders(hdrs: []const events.Header) py.Object {
     if (list == null) return null;
     for (hdrs, 0..) |h, i| {
         const name = internName(h.name) orelse py.fromBytes(h.name);
-        const value = py.fromBytes(h.value);
+        const value = internValue(h.value) orelse py.fromBytes(h.value);
         if (name == null or value == null) {
             py.xdecref(name);
             py.xdecref(value);
@@ -694,7 +788,7 @@ fn u32Obj(v: u32) py.Object {
 }
 
 fn makeRequest(r: events.Request) py.Object {
-    const o = py.allocInstance(request_type);
+    const o = cacheTake(&request_cache, request_type);
     if (o == null) return null;
     const s: *RequestObject = @ptrCast(o);
     s.method = py.fromBytes(r.method);
@@ -713,7 +807,7 @@ fn makeRequest(r: events.Request) py.Object {
 }
 
 fn makeResponse(r: events.Response) py.Object {
-    const o = py.allocInstance(response_type);
+    const o = cacheTake(&response_cache, response_type);
     if (o == null) return null;
     const s: *ResponseObject = @ptrCast(o);
     s.status_code = py.fromU16(r.status_code);
@@ -729,7 +823,7 @@ fn makeResponse(r: events.Response) py.Object {
 }
 
 fn makeData(d: events.Data) py.Object {
-    const o = py.allocInstance(data_type);
+    const o = cacheTake(&data_cache, data_type);
     if (o == null) return null;
     const s: *DataObject = @ptrCast(o);
     s.data = py.fromBytes(d.data);
@@ -742,7 +836,7 @@ fn makeData(d: events.Data) py.Object {
 }
 
 fn makeEom(e: events.EndOfMessage) py.Object {
-    const o = py.allocInstance(end_of_message_type);
+    const o = cacheTake(&eom_cache, end_of_message_type);
     if (o == null) return null;
     const s: *EndOfMessageObject = @ptrCast(o);
     s.trailers = buildHeaders(e.trailers);
