@@ -93,6 +93,11 @@ pub const Connection = struct {
     conn_recv_window: i32 = constants.DEFAULT_WINDOW_SIZE,
     conn_send_window: i32 = constants.DEFAULT_WINDOW_SIZE,
     highest_peer_id: u32 = 0,
+    /// High-water of the client's own (odd) stream ids it has opened to send. Lets
+    /// the client read path tell a response for a still-live stream from a stray
+    /// response for a stream it already reset/closed (the client analogue of
+    /// highest_peer_id, which only tracks peer-initiated ids).
+    highest_local_id: u32 = 0,
     /// Rapid-reset churn budgets: total streams ever opened and total resets.
     /// These count streams that no longer exist (evicted), so unlike the live
     /// concurrency count they are real state, not derivable from the map.
@@ -117,6 +122,7 @@ pub const Connection = struct {
     fb_end_stream: bool = false, // END_STREAM carried by the opening HEADERS
     fb_is_trailer: bool = false, // a second HEADERS block on an open stream
     fb_refused: bool = false, // over the concurrency cap: decode for HPACK sync, then discard
+    fb_ignored: bool = false, // a response for a client stream we already reset: decode for HPACK sync, surface nothing
     fb_buf: std.ArrayList(u8) = .empty, // accumulated fragment bytes
     fb_frames: u32 = 0, // CONTINUATION frame count (flood guard)
     /// Storage for a collapsed request/response: the regular header list and a
@@ -342,8 +348,13 @@ pub const Connection = struct {
 
     /// Is `id` a peer-initiated stream that has never been opened (idle)? An id
     /// above the highest one we have seen open is idle; at/below is closed.
+    /// Is `id` a stream that has never been opened (idle)? An id is idle only if it
+    /// is above BOTH high-water marks: peer-initiated streams (highest_peer_id) and
+    /// the client's own opened streams (highest_local_id). An id at/below either is
+    /// a stream that was opened and is now closed/evicted - stray frames on it are
+    /// tolerated, not a connection error.
     fn isIdle(self: *const Connection, id: u32) bool {
-        return id > self.highest_peer_id;
+        return id > self.highest_peer_id and id > self.highest_local_id;
     }
 
     fn handleData(self: *Connection, f: frame_mod.Frame) H2Error!void {
@@ -421,6 +432,7 @@ pub const Connection = struct {
         const existing = self.streams.getPtr(id);
         var is_trailer = false;
         var refused = false;
+        var ignored = false;
         if (existing) |s| {
             // A second HEADERS block is a trailer ONLY while the stream is still
             // open (body not yet ended). A HEADERS after the peer's END_STREAM
@@ -438,10 +450,17 @@ pub const Connection = struct {
         } else if (self.role == .client) {
             // A client reads HEADERS as a response on a stream IT opened: the id
             // must be odd (client-initiated, 5.1.1) and not server-pushed (push is
-            // out of scope). The stream is created here for the response if the
-            // send side has not already (the H2 write path opens it on request).
+            // out of scope). An id at/below the local high-water that is no longer
+            // in the map is one we already reset/closed; decode the block to keep
+            // the HPACK table in sync but surface nothing. A genuinely new id has
+            // its stream created here for the response (the H2 write path opens it
+            // on request).
             if (id % 2 == 0) return error.ProtocolError;
-            try self.openPeerStream(id);
+            if (id <= self.highest_local_id) {
+                ignored = true;
+            } else {
+                try self.openPeerStream(id);
+            }
         } else {
             // A new request stream. Its id must be odd and exceed the highest peer
             // id (5.1.1: parity + monotonicity).
@@ -461,6 +480,7 @@ pub const Connection = struct {
         self.fb_end_stream = Flags.has(f.header.flags, Flags.end_stream);
         self.fb_is_trailer = is_trailer;
         self.fb_refused = refused;
+        self.fb_ignored = ignored;
         self.fb_frames = 0;
         self.fb_buf.clearRetainingCapacity();
         self.fb_buf.appendSlice(self.gpa, fragment) catch return error.MessageTooLong;
@@ -486,6 +506,7 @@ pub const Connection = struct {
         const end_stream = self.fb_end_stream;
         const is_trailer = self.fb_is_trailer;
         const refused = self.fb_refused;
+        const ignored = self.fb_ignored;
         self.fb_stream = null; // block closed
 
         // Always decode (even when refused/malformed) to keep the dynamic table
@@ -495,6 +516,13 @@ pub const Connection = struct {
             error.MessageTooLong => return error.MessageTooLong,
             error.OutOfMemory => return error.MessageTooLong,
         };
+
+        if (ignored) {
+            // A response for a client stream we already reset: the block was decoded
+            // to keep the HPACK table in sync, but the stream is gone - surface
+            // nothing (we already sent RST_STREAM for it).
+            return;
+        }
 
         if (refused) {
             // Decoded for HPACK sync; the request is not surfaced and no stream
@@ -733,6 +761,7 @@ pub const Connection = struct {
     /// stream by sending; the read side has no entry until then. The send window
     /// is seeded from the peer's INITIAL_WINDOW_SIZE (what the peer will accept).
     pub fn registerSendStream(self: *Connection, id: u32) error{OutOfMemory}!void {
+        if (id > self.highest_local_id) self.highest_local_id = id;
         if (self.streams.getPtr(id) != null) return;
         self.openStream(id) catch return error.OutOfMemory;
     }
@@ -1332,6 +1361,31 @@ test "a request pseudo-header in a response resets the stream" {
     try clientHandshook(&c, frames.items);
     const ev = try c.nextEvent();
     try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(ev));
+}
+
+test "a response for a client-reset stream is ignored, not surfaced or re-opened" {
+    var c = Connection.init(testing.allocator, .client);
+    defer c.deinit();
+    // The client opens stream 1 to send, then resets it locally.
+    try c.registerSendStream(1);
+    c.localReset(1);
+    try testing.expectEqual(@as(usize, 0), c.streams.count());
+    // An in-flight response head + body for stream 1 then arrives. The head is
+    // decoded (HPACK sync) but surfaces nothing, and the stray DATA is a tolerated
+    // stream error - never a Response/Data event or a re-opened stream.
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &STATUS_200_BLOCK);
+    try frameBytes(&frames, .data, Flags.end_stream, 1, "hi");
+    try clientHandshook(&c, frames.items);
+    while (true) {
+        const ev = try c.nextEvent();
+        if (ev == .need_data) break;
+        // The only events allowed are RST_STREAM (the client telling the peer the
+        // stream is closed); never a response or data.
+        try testing.expect(ev != .response and ev != .data);
+    }
+    try testing.expectEqual(@as(usize, 0), c.streams.count()); // not re-opened
 }
 
 test "an even response stream id is a connection error for a client" {

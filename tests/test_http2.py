@@ -456,3 +456,28 @@ def test_h2_close_on_an_http1_connection_is_an_error() -> None:
     conn = zttp.Connection(zttp.SERVER)
     with pytest.raises(AttributeError):
         conn.close()
+
+
+def test_h2_response_after_stream_reset_is_ignored() -> None:
+    # A client that reset its own stream must not surface an in-flight response for
+    # it (the reset id is closed, not a fresh stream to re-open).
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    opener = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    opener.send_request(b"GET", b"/", b"2", [(b"host", b"x")]).end_message()
+    server.receive_data(opener.data_to_send())
+    list(drain_h2(server))
+    handle = server.stream(1)
+    handle.send_response(200, [(b"x", b"y")])
+    handle.send_data(b"hi")
+    handle.end_message()
+    response = server.data_to_send()
+
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    stream = client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
+    stream.reset()
+    client.data_to_send()  # flush the request + RST_STREAM
+
+    client.receive_data(response)
+    events = list(drain_h2(client))
+    # The response head and body are dropped; nothing is surfaced for the reset id.
+    assert not any(isinstance(e, (zttp.Response, zttp.Data)) for e in events)
