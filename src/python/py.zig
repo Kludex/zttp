@@ -130,16 +130,33 @@ pub fn asBytes(o: Object) ?[]const u8 {
 pub fn newList(len: ssize) Object {
     return c.PyList_New(len);
 }
+// SET_ITEM on a fresh, fully-overwritten container is a direct ob_item store -
+// the same store the C macros perform. The macros themselves translate
+// unreliably (3.10's macro form and PyTuple's flexible-array ob_item both
+// defeat translate-c), so the store is written out against the translated
+// structs, which are plain declarations on every supported version.
+const inline_list_set = @hasDecl(c, "PyListObject");
+const inline_tuple_set = @hasDecl(c, "PyTupleObject");
+
 /// Store `item` at `idx`, stealing its reference (PyList_SET_ITEM semantics).
+/// Only valid for freshly created, not-yet-shared lists with empty slots.
 pub fn listSet(list: Object, idx: ssize, item: Object) void {
-    _ = c.PyList_SetItem(list, idx, item);
+    if (comptime inline_list_set) {
+        const l: [*c]c.PyListObject = @ptrCast(list);
+        l.*.ob_item[@as(usize, @intCast(idx))] = item;
+    } else _ = c.PyList_SetItem(list, idx, item);
 }
 pub fn tupleNew(len: ssize) Object {
     return c.PyTuple_New(len);
 }
 /// Store `item` at `idx`, stealing its reference (PyTuple_SET_ITEM semantics).
+/// Only valid for freshly created, not-yet-shared tuples with empty slots.
 pub fn tupleSet(tuple: Object, idx: ssize, item: Object) void {
-    _ = c.PyTuple_SetItem(tuple, idx, item);
+    if (comptime inline_tuple_set) {
+        const t: [*c]c.PyTupleObject = @ptrCast(tuple);
+        const items: [*c]Object = @ptrCast(&t.*.ob_item);
+        items[@as(usize, @intCast(idx))] = item;
+    } else _ = c.PyTuple_SetItem(tuple, idx, item);
 }
 
 // -- attribute & call helpers -------------------------------------------------
