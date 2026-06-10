@@ -100,9 +100,9 @@ integrator is responsible for.
   `receive_datagram` / `datagrams_to_send` carry the UDP payloads and events carry
   a `stream_id`. The server read path is implemented end-to-end - through Python, a
   real client Initial datagram is decrypted and decoded into request events. The
-  TLS 1.3 handshake driver (only the Initial key space is wired today) and the
-  client read path are next; the QPACK dynamic table is intentionally disabled (we
-  advertise `MAX_TABLE_CAPACITY = 0`). *(in progress)*
+  TLS 1.3 handshake driver (only the Initial key space is wired today), the write
+  side, and the client read path are next; the QPACK dynamic table is intentionally
+  disabled (we advertise `MAX_TABLE_CAPACITY = 0`). *(in progress)*
 
 ## Status
 
