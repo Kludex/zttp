@@ -10,7 +10,7 @@ once bodies, chunked encoding, and partial data enter the picture.
 ## Bodies
 
 A body shows up as one or more `Data` events between the head and `EndOfMessage`.
-You concatenate them yourself - which means **you decide** whether to buffer the
+You concatenate them yourself, which means **you decide** whether to buffer the
 whole body or stream it.
 
 ```python
@@ -43,13 +43,13 @@ print(bytes(body))
 
 !!! tip
     Each `Data` event's `.data` is a real `bytes` object, copied out of the parse
-    buffer - so it's safe to keep. You're never handed a view that the next
+    buffer, so it's safe to keep. You're never handed a view that the next
     `receive_data` will overwrite.
 
 ## Partial data
 
 This is the whole point of sans-IO: the parser doesn't care how the bytes are
-split. Feed it a trickle and it resumes mid-anything - mid-header, mid-body,
+split. Feed it a trickle and it resumes mid-anything: mid-header, mid-body,
 mid-chunk.
 
 ```python
@@ -65,7 +65,7 @@ print(request.headers)
 ```
 
 1.  Half a header line isn't a complete event, so you get `NEED_DATA`. No error,
-    no lost state - just feed the rest.
+    no lost state. Just feed the rest.
 
 ## Chunked transfer encoding
 
@@ -96,7 +96,7 @@ print(bytes(body))
 #> b'hello world'
 ```
 
-1.  Chunk framing on the wire - `<size>\r\n<data>\r\n`, ending with a `0` chunk.
+1.  Chunk framing on the wire: `<size>\r\n<data>\r\n`, ending with a `0` chunk.
     You never see it; you get the decoded `hello world`.
 
 ## Trailers
@@ -125,7 +125,7 @@ print(end.trailers)
 
 ## Bodyless responses (client)
 
-Some responses have **no body no matter what their headers say** - the response to
+Some responses have **no body no matter what their headers say**: the response to
 a `HEAD` request, and any `1xx` / `204` / `304`. A `HEAD` response, for instance,
 carries the `Content-Length` the `GET` *would* have had, but sends no bytes.
 

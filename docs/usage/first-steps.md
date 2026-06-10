@@ -15,8 +15,8 @@ conn = zttp.Connection(zttp.SERVER)
 A `Connection` holds the parse state for **one** HTTP connection. You tell it your
 role when you create it:
 
-* `zttp.SERVER` - you receive **requests** and send **responses**.
-* `zttp.CLIENT` - you send **requests** and receive **responses**.
+* `zttp.SERVER`: you receive **requests** and send **responses**.
+* `zttp.CLIENT`: you send **requests** and receive **responses**.
 
 The whole read side is just two calls.
 
@@ -29,7 +29,7 @@ conn.receive_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 ```
 
 You can feed a whole message, or a fragment, or a single byte. zttp buffers what
-it has and resumes where it left off - so the network can chop your data up
+it has and resumes where it left off, so the network can chop your data up
 however it likes.
 
 ```python
@@ -63,7 +63,7 @@ while True:
 
 1.  Each call returns the **next complete event**, in order.
 
-2.  When there isn't a complete event yet, you get the `NEED_DATA` sentinel -
+2.  When there isn't a complete event yet, you get the `NEED_DATA` sentinel:
     your cue to `receive_data` more bytes (or stop).
 
 Run it:
@@ -85,10 +85,10 @@ A server connection yields these, in order, per request:
 | `Request` | The request line + all headers are parsed | `.method`, `.target`, `.path`, `.query`, `.http_version`, `.headers`, `.expect_continue` |
 | `Data` | A chunk of the body is available | `.data` |
 | `EndOfMessage` | The body (and any trailers) finished | `.trailers` |
-| `NEED_DATA` | No complete event yet - feed more | *(it's a sentinel)* |
+| `NEED_DATA` | No complete event yet. Feed more | *(it's a sentinel)* |
 
 !!! tip
-    `next_event()` returns `NEED_DATA` (a singleton) - compare with `is`, not
+    `next_event()` returns `NEED_DATA` (a singleton). Compare with `is`, not
     `==`:
 
     ```python
@@ -97,22 +97,22 @@ A server connection yields these, in order, per request:
     ```
 
 `.target` is the raw request-target; `.path` and `.query` are it split at the
-first `?` (both verbatim - zttp doesn't percent-decode, that's yours to do).
+first `?` (both verbatim: zttp doesn't percent-decode, that's yours to do).
 
 A client connection is the mirror image: you get `Response` (with `.status_code`,
 `.reason`, `.http_version`, `.headers`) instead of `Request`, then the same
 `Data` / `EndOfMessage`.
 
 !!! tip "Same events on HTTP/2"
-    Pass `protocol=zttp.HTTP2` and the read side is unchanged - the *same*
+    Pass `protocol=zttp.HTTP2` and the read side is unchanged: the *same*
     `Request` / `Response` / `Data` / `EndOfMessage`, plus a `.stream_id` on each
     (it's `0` on HTTP/1.1) because one connection now multiplexes many requests.
-    The send side differs - HTTP/2 sends on a stream. See [HTTP/2](http2.md).
+    The send side differs: HTTP/2 sends on a stream. See [HTTP/2](http2.md).
 
 ## Keep-alive
 
 HTTP/1.1 connections are reused. After you've pulled `EndOfMessage` for one
-message, tell the connection to start the next one - unless the peer asked to
+message, tell the connection to start the next one, unless the peer asked to
 close. zttp works that out from the head it parsed, so you don't scan headers:
 
 ```python
@@ -142,6 +142,6 @@ the `Request` event.
 
 You've seen the read side. Next:
 
-* [Parsing in depth](parsing.md) - bodies, chunked encoding, trailers, partial data.
-* [Sending](sending.md) - the write side: build messages, get bytes to send.
-* [Errors](errors.md) - what zttp rejects, and how.
+* [Parsing in depth](parsing.md): bodies, chunked encoding, trailers, partial data.
+* [Sending](sending.md): the write side, building messages and getting bytes to send.
+* [Errors](errors.md): what zttp rejects, and how.

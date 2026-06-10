@@ -24,7 +24,7 @@ import zttp
 try:
     conn.next_event()
 except zttp.RemoteProtocolError:
-    ...  # the client sent garbage - reply 400 and close
+    ...  # the client sent garbage: reply 400 and close
 ```
 
 ## `RemoteProtocolError`: the peer is wrong
@@ -47,7 +47,7 @@ What zttp rejects (a partial list):
 * **Request smuggling**: `Content-Length` together with `Transfer-Encoding`,
   conflicting duplicate `Content-Length`, or a `chunked` coding that isn't the
   final one (even split across multiple `Transfer-Encoding` lines).
-* A bare `LF` line ending (zttp wants `CRLF` - see the tip below).
+* A bare `LF` line ending (zttp wants `CRLF`, see the tip below).
 * A malformed chunk size or chunk framing.
 * A message that blows past a configured size limit.
 
@@ -59,7 +59,7 @@ What zttp rejects (a partial list):
 ## `LocalProtocolError`: you are wrong
 
 Raised from the **send** side when you call it in a way that can't produce a valid
-message - sending a body before a head, two heads in a row, or a field with
+message: sending a body before a head, two heads in a row, or a field with
 control characters in it:
 
 ```python

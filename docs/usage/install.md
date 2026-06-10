@@ -18,7 +18,7 @@ That's all you need. There's nothing else to configure. ✨
 ## Building from source
 
 Wheels cover the common platforms, so most people never compile anything. But the
-source distribution builds the Zig extension on install - you only need a Zig
+source distribution builds the Zig extension on install. You only need a Zig
 toolchain, and even that comes along automatically:
 
 ```console

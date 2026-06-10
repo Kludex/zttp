@@ -19,25 +19,26 @@ icon: lucide/zap
 ---
 
 zttp is a [sans-IO](https://sans-io.readthedocs.io/) HTTP parser whose engine
-is written in [Zig](https://ziglang.org). It speaks **HTTP/1.1 and HTTP/2**, and
-it does **no I/O of its own**: you feed it bytes and pull out events, and you ask
-it for bytes to send. It never touches a socket - so it works with any I/O you
-like (asyncio, threads, a green-thread library, a test harness), and it's a joy
-to test.
+is written in [Zig](https://ziglang.org). It speaks **HTTP/1.1, HTTP/2, and
+HTTP/3**, and it does **no I/O of its own**: you feed it bytes and pull out
+events, and you ask it for bytes to send. It never touches a socket, so it works
+with any I/O you like (asyncio, threads, a green-thread library, a test harness),
+and it's a joy to test.
 
 It's the same idea as [h11](https://github.com/python-hyper/h11), with a
-hand-written Zig engine underneath instead of pure Python.
+hand-written Zig engine underneath instead of pure Python. **It has no
+dependencies.**
 
 The key features are:
 
 * **Sans-IO**: a clean, event-based API. Feed bytes with `receive_data`, pull
   `Request` / `Data` / `EndOfMessage` events with `next_event`. No callbacks, no
   sockets, no surprises.
-* **HTTP/1.1 and HTTP/2**: the *same* event API for both. Pass
-  `protocol=zttp.HTTP2` and you get multiplexed streams, HPACK, and flow control -
-  see [HTTP/2](usage/http2.md).
+* **HTTP/1.1, HTTP/2, and HTTP/3**: the *same* event API for all three. Pass
+  `protocol=zttp.HTTP2` and you get multiplexed streams, HPACK, and flow control
+  (see [HTTP/2](usage/http2.md)).
 * **Fast**: a hand-written Zig engine with branch-light scanning and minimal
-  allocation - see [Performance](reference/performance.md) for the numbers.
+  allocation (see [Performance](reference/performance.md) for the numbers).
 * **Safe**: strict by default. It defends against request smuggling, rejects bare
   `LF` line endings, bounds every buffer, and ships in Zig's safety-checked build.
 * **Typed**: a `py.typed` package with full type hints. Your editor knows every
@@ -82,11 +83,11 @@ print(conn.next_event())
 #> EndOfMessage(trailers=[])
 ```
 
-1.  A `Connection` is the one object you need. Tell it your role - `SERVER` (you
+1.  A `Connection` is the one object you need. Tell it your role: `SERVER` (you
     receive requests) or `CLIENT` (you receive responses).
 
-2.  Feed it whatever bytes you have. A whole request, half a request, one byte -
-    it doesn't matter. zttp buffers and resumes.
+2.  Feed it whatever bytes you have. A whole request, half a request, a single
+    byte: it doesn't matter. zttp buffers and resumes.
 
 3.  Pull events out one at a time. Each call returns the next complete event, or
     the `NEED_DATA` sentinel when it needs more bytes.
@@ -100,12 +101,12 @@ b'GET' b'/hello?name=you'
 EndOfMessage(trailers=[])
 ```
 
-That's it. The buffering, the header parsing, the body framing - all Zig. 🎉
+That's it. The buffering, the header parsing, the body framing: all Zig. 🎉
 
 !!! tip
     Notice there were **no callbacks**. You don't register `on_header` /
     `on_body` functions and lose control of the flow. You *pull* events when
-    *you* are ready. That's what sans-IO means - read
+    *you* are ready. That's what sans-IO means. Read
     [Why sans-IO](architecture/sans-io.md) for the why.
 
 ## Where to go next

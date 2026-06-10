@@ -4,13 +4,13 @@ icon: lucide/unplug
 
 # Why sans-IO
 
-zttp does no I/O. That's not a limitation - it's the design. This page explains
+zttp does no I/O. That's not a limitation; it's the design. This page explains
 what that means and why it's the right shape for a parser.
 
 ## The problem with a parser that does I/O
 
 Most parsers are tangled up with how the bytes arrive. They read from a socket, or
-they call you back - `on_header(name, value)`, `on_body(chunk)` - and now your
+they call you back (`on_header(name, value)`, `on_body(chunk)`), and now your
 application logic lives inside the parser's callbacks. You don't control the flow
 anymore; the parser does. Want to use it with threads instead of asyncio? With a
 test that feeds canned bytes? With a new async library? You're rewriting glue.
@@ -28,7 +28,7 @@ and the control flow; zttp owns only the protocol.
 
 ```python
 conn = zttp.Connection(zttp.SERVER)
-conn.receive_data(raw)        # bytes from wherever - socket, file, test
+conn.receive_data(raw)        # bytes from wherever: socket, file, test
 event = conn.next_event()     # pull, when you want it
 ```
 
@@ -62,8 +62,8 @@ a callback parser: you give it a protocol object with `on_url`, `on_header`,
 `on_body`, ... and it calls them as it parses. It's fast, but the control flow is
 inverted into your callbacks, and the body gets copied per callback.
 
-zttp keeps the performance of a native engine - it's written in Zig (see
-[Performance](../reference/performance.md)) - but gives you the cleaner pull API,
+zttp keeps the performance of a native engine, since it's written in Zig (see
+[Performance](../reference/performance.md)), but gives you the cleaner pull API,
 and emits each body span as a single `Data` event instead of a stream of
 callbacks.
 
@@ -76,5 +76,5 @@ callbacks.
 
 !!! tip
     If you know [h11](https://github.com/python-hyper/h11), you already know
-    zttp's shape - it's the same `Connection` / `receive_data` / `next_event`
+    zttp's shape: it's the same `Connection` / `receive_data` / `next_event`
     model, with a Zig engine instead of pure Python.
