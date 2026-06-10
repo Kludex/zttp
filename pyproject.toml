@@ -57,6 +57,18 @@ fuzz = [
     "atheris; sys_platform == 'linux' and python_version < '3.13'",
 ]
 
+[tool.uv]
+# uv only rebuilds the project when pyproject.toml changes by default; the
+# extension must also rebuild when Zig sources or the build mode change.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "build.zig" },
+    { file = "src/**/*.zig" },
+    { file = "src/**/*.h" },
+    { file = "tools/**/*.zig" },
+    { env = "HATCH_ZIG_BUILD_MODE" },
+]
+
 [tool.hatch.version]
 source = "uv-dynamic-versioning"
 
@@ -69,7 +81,6 @@ fallback-version = "0.0.0"
 
 [tool.hatch.build.targets.wheel]
 packages = ["zttp"]
-artifacts = ["zttp/*.so"]
 
 [tool.hatch.build.targets.wheel.hooks.zig]
 package = "zttp"
