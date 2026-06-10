@@ -6,6 +6,9 @@
 
 if [ -z "$GITHUB_ACTIONS" ]; then
     set -x
+    # Local builds default to Debug for symbolized panics and debuggable cores;
+    # CI and release wheels keep the pyproject default (stripped ReleaseSafe).
+    export HATCH_ZIG_BUILD_MODE="${HATCH_ZIG_BUILD_MODE:-Debug}"
 fi
 
 uv sync --all-groups

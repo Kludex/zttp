@@ -3,6 +3,9 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // DWARF debug info is ~3 MB per extension (vs ~450 KB of code); shipped
+    // wheels don't need it. Keep it for Debug builds.
+    const strip = optimize != .Debug;
 
     // Pure-Zig unit tests for the parser core. Defined first so `zig build test`
     // works without any Python configuration.
@@ -82,6 +85,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = strip,
     });
 
     // Translate the CPython C-API to Zig from a real header, then patch the
@@ -114,6 +118,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = strip,
     });
     pyc_mod.addIncludePath(.{ .cwd_relative = py_include });
 
@@ -122,6 +127,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = strip,
     });
     mod.addIncludePath(.{ .cwd_relative = py_include });
     mod.addImport("core", core_mod);
