@@ -8,11 +8,24 @@ pub const schedule = @import("schedule.zig");
 pub const keyshare = @import("keyshare.zig");
 pub const sign = @import("sign.zig");
 pub const finished = @import("finished.zig");
+pub const wire = @import("wire.zig");
+pub const extension = @import("extension.zig");
+pub const handshake = @import("handshake.zig");
+pub const client_hello = @import("client_hello.zig");
+pub const flight = @import("flight.zig");
+pub const codec = @import("codec.zig");
 
 test {
+    _ = @import("codec_test.zig");
     _ = transcript;
     _ = schedule;
     _ = keyshare;
     _ = sign;
     _ = finished;
+    _ = wire;
+    _ = extension;
+    _ = handshake;
+    _ = client_hello;
+    _ = flight;
+    _ = codec;
 }
