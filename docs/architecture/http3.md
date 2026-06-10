@@ -12,8 +12,6 @@ conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
 conn.receive_datagram(udp_payload)          # one UDP datagram in
 while (event := conn.next_event()) is not zttp.NEED_DATA:
     ...                                      # Request / Data / EndOfMessage, each with .stream_id
-for dgram in conn.datagrams_to_send():       # UDP datagrams out
-    sock.sendto(dgram, addr)
 ```
 
 The difference from HTTP/1.1 and HTTP/2 is the layer underneath. HTTP/1.1 and
@@ -25,8 +23,9 @@ multiplexing. Everything QUIC normally delegates to the OS for TCP, zttp does
 itself.
 
 The sans-IO discipline is unchanged: the core never touches a socket. The I/O
-layer feeds it UDP datagrams with `receive_datagram` and drains the datagrams it
-wants to send with `datagrams_to_send`. The boundary moved from "decrypted byte
+layer feeds it UDP datagrams with `receive_datagram`; the outbound half (a
+`datagrams_to_send` drain, mirroring `data_to_send`) arrives with the write
+side, which is still in progress. The boundary moved from "decrypted byte
 stream" (TCP) down to "UDP datagram" (QUIC), but the shape (bytes in, events and
 bytes out, no I/O in the core) is identical.
 
@@ -120,8 +119,8 @@ wide as its reality.
 The one API shift HTTP/3 forces: TCP gives an ordered byte stream, so HTTP/1.1 and
 HTTP/2 take `receive_data(bytes)`. QUIC is packet-oriented and the transport needs
 to see datagram boundaries (a packet number space is per-datagram, coalesced
-packets share a datagram), so HTTP/3 takes `receive_datagram(bytes)` and emits
-`datagrams_to_send()`. The event side is unchanged.
+packets share a datagram), so HTTP/3 takes `receive_datagram(bytes)`; its
+outbound mirror lands with the write side. The event side is unchanged.
 
 ## Security
 

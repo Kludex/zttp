@@ -24,41 +24,51 @@ pub const ssize = c.Py_ssize_t;
 // the old one, so the same Zig compiles against every supported interpreter.
 pub const T_OBJECT_EX: c_int = if (@hasDecl(c, "Py_T_OBJECT_EX")) c.Py_T_OBJECT_EX else c.T_OBJECT_EX;
 pub const T_BOOL: c_int = if (@hasDecl(c, "Py_T_BOOL")) c.Py_T_BOOL else c.T_BOOL;
+pub const T_UINT: c_int = if (@hasDecl(c, "Py_T_UINT")) c.Py_T_UINT else c.T_UINT;
 pub const READONLY: c_int = if (@hasDecl(c, "Py_READONLY")) c.Py_READONLY else c.READONLY;
 
 // -- reference counting -------------------------------------------------------
 
-// The function forms (Py_IncRef / Py_DecRef) instead of the Py_INCREF / Py_DECREF
-// macros: the macros translate to version-specific struct layout under @cImport
-// (3.12's split ob_refcnt breaks the translation), while the functions take a
-// plain PyObject* on every supported version. Both are NULL-safe.
+// On 3.14+ GIL builds the translated Py_INCREF / Py_DECREF inlines compile to a
+// couple of instructions (immortality check + direct ob_refcnt store) inside
+// this compilation unit, so the hot path skips the out-of-line libpython call.
+// The 3.12/3.13 split ob_refcnt and the free-threaded build's atomic path both
+// break under translate-c, so everything else keeps the NULL-safe function
+// forms (Py_IncRef / Py_DecRef), which take a plain PyObject* on every version.
+const inline_refcount = @hasDecl(c, "Py_INCREF") and !@hasDecl(c, "Py_GIL_DISABLED") and c.PY_VERSION_HEX >= 0x030E0000;
+
 pub inline fn incref(o: anytype) void {
-    c.Py_IncRef(@ptrCast(o));
+    if (comptime inline_refcount) c.Py_INCREF(@ptrCast(o)) else c.Py_IncRef(@ptrCast(o));
 }
 pub inline fn decref(o: anytype) void {
-    c.Py_DecRef(@ptrCast(o));
+    if (comptime inline_refcount) c.Py_DECREF(@ptrCast(o)) else c.Py_DecRef(@ptrCast(o));
 }
 pub inline fn xdecref(o: anytype) void {
-    c.Py_DecRef(@ptrCast(o));
+    if (comptime inline_refcount) c.Py_XDECREF(@ptrCast(o)) else c.Py_DecRef(@ptrCast(o));
 }
 /// Steal a reference into a temporary and decref it (for "use then drop").
 pub inline fn clear(slot: *Object) void {
     const tmp = slot.*;
     slot.* = null;
-    c.Py_DecRef(tmp);
+    xdecref(tmp);
 }
 
 pub inline fn newRef(o: anytype) Object {
+    if (comptime inline_refcount) {
+        const p: Object = @ptrCast(o);
+        c.Py_INCREF(p);
+        return p;
+    }
     return c.Py_NewRef(@ptrCast(o));
 }
 
 // -- singletons ---------------------------------------------------------------
 
 pub inline fn none() Object {
-    return c.Py_NewRef(c.Py_None());
+    return newRef(c.Py_None());
 }
 pub inline fn boolean(v: bool) Object {
-    return c.Py_NewRef(if (v) c.Py_True() else c.Py_False());
+    return newRef(if (v) c.Py_True() else c.Py_False());
 }
 pub inline fn isNone(o: Object) bool {
     return o == c.Py_None();
@@ -120,16 +130,33 @@ pub fn asBytes(o: Object) ?[]const u8 {
 pub fn newList(len: ssize) Object {
     return c.PyList_New(len);
 }
+// SET_ITEM on a fresh, fully-overwritten container is a direct ob_item store -
+// the same store the C macros perform. The macros themselves translate
+// unreliably (3.10's macro form and PyTuple's flexible-array ob_item both
+// defeat translate-c), so the store is written out against the translated
+// structs, which are plain declarations on every supported version.
+const inline_list_set = @hasDecl(c, "PyListObject");
+const inline_tuple_set = @hasDecl(c, "PyTupleObject");
+
 /// Store `item` at `idx`, stealing its reference (PyList_SET_ITEM semantics).
+/// Only valid for freshly created, not-yet-shared lists with empty slots.
 pub fn listSet(list: Object, idx: ssize, item: Object) void {
-    _ = c.PyList_SetItem(list, idx, item);
+    if (comptime inline_list_set) {
+        const l: [*c]c.PyListObject = @ptrCast(list);
+        l.*.ob_item[@as(usize, @intCast(idx))] = item;
+    } else _ = c.PyList_SetItem(list, idx, item);
 }
 pub fn tupleNew(len: ssize) Object {
     return c.PyTuple_New(len);
 }
 /// Store `item` at `idx`, stealing its reference (PyTuple_SET_ITEM semantics).
+/// Only valid for freshly created, not-yet-shared tuples with empty slots.
 pub fn tupleSet(tuple: Object, idx: ssize, item: Object) void {
-    _ = c.PyTuple_SetItem(tuple, idx, item);
+    if (comptime inline_tuple_set) {
+        const t: [*c]c.PyTupleObject = @ptrCast(tuple);
+        const items: [*c]Object = @ptrCast(&t.*.ob_item);
+        items[@as(usize, @intCast(idx))] = item;
+    } else _ = c.PyTuple_SetItem(tuple, idx, item);
 }
 
 // -- attribute & call helpers -------------------------------------------------

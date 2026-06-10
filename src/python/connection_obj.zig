@@ -34,8 +34,12 @@ const HTTP3: c_long = 3;
 /// state the send path needs (the request method the next response answers, the
 /// keep-alive / upgrade signals captured at parse time).
 const H1Engine = struct {
-    reader: *Reader,
-    writer: *Writer,
+    /// Embedded by value: the engine is one allocation, so constructing a
+    /// Connection does not pay a separate heap allocation for the Reader.
+    reader: Reader,
+    /// Created on the first send_* call: server connections that only parse
+    /// never pay the Writer's allocation.
+    writer: ?*Writer = null,
     /// The method of the message the next response answers (server: the parsed
     /// request; client: the request we sent), so the connection auto-derives
     /// bodyless framing. Cleared per cycle by start_next_cycle.
@@ -45,6 +49,12 @@ const H1Engine = struct {
     /// they outlive the head buffer. `upgrade_obj` is held Python bytes (or null).
     should_close: bool = false,
     upgrade_obj: py.Object = null,
+    /// Single-copy body path: when a fed buffer's prefix is a Content-Length
+    /// body, the bytes object is held here (incref'd, its memory stable)
+    /// instead of being copied into the reader; next_event materialises Data
+    /// events straight from it. `pending` is the not-yet-consumed remainder.
+    pending_obj: py.Object = null,
+    pending: []const u8 = &.{},
 
     fn rememberMethod(self: *H1Engine, m: []const u8) void {
         if (m.len > self.req_method.len) {
@@ -59,12 +69,75 @@ const H1Engine = struct {
         return self.req_method[0..self.req_method_len];
     }
 
+    /// The writer, created on first use, or null with a Python error set.
+    fn ensureWriter(self: *H1Engine) ?*Writer {
+        if (self.writer) |w| return w;
+        const w = gpa.create(Writer) catch {
+            _ = c.PyErr_NoMemory();
+            return null;
+        };
+        w.* = Writer.init(gpa);
+        self.writer = w;
+        return w;
+    }
+
+    fn stash(self: *H1Engine, obj: py.Object, rest: []const u8) void {
+        py.incref(obj);
+        self.pending_obj = obj;
+        self.pending = rest;
+    }
+
+    fn dropPending(self: *H1Engine) void {
+        py.xdecref(self.pending_obj);
+        self.pending_obj = null;
+        self.pending = &.{};
+    }
+
+    /// Move the stashed remainder into the reader's own buffer (the slow path
+    /// the stash bypassed). Returns false with a Python error set on failure.
+    fn flushPending(self: *H1Engine) bool {
+        if (self.pending_obj == null) return true;
+        const rest = self.pending;
+        defer self.dropPending();
+        self.reader.feed(rest) catch |err| {
+            _ = exceptions.raiseParse(err);
+            return false;
+        };
+        return true;
+    }
+
+    /// Feeds smaller than this take the plain buffered path: the head-split
+    /// scan below costs one extra pass over the head, which only pays for
+    /// itself when a sizeable body follows.
+    const head_split_min_feed = 1024;
+
+    fn receiveData(self: *H1Engine, data: []const u8, obj: py.Object) py.Object {
+        if (!self.flushPending()) return null;
+        if (data.len > 0 and self.reader.backlogEmpty()) {
+            if (self.reader.bodyLengthRemaining() != null) {
+                self.stash(obj, data);
+                return py.none();
+            }
+            if (data.len >= head_split_min_feed and self.reader.atMessageStart()) {
+                if (core.h1.reader.findHeadEnd(data)) |head_end| {
+                    self.reader.feed(data[0..head_end]) catch |err| return exceptions.raiseParse(err);
+                    if (head_end < data.len) self.stash(obj, data[head_end..]);
+                    return py.none();
+                }
+            }
+        }
+        self.reader.feed(data) catch |err| return exceptions.raiseParse(err);
+        return py.none();
+    }
+
     fn deinit(self: *H1Engine) void {
         self.reader.deinit();
-        gpa.destroy(self.reader);
-        self.writer.deinit();
-        gpa.destroy(self.writer);
+        if (self.writer) |w| {
+            w.deinit();
+            gpa.destroy(w);
+        }
         py.xdecref(self.upgrade_obj);
+        py.xdecref(self.pending_obj);
     }
 };
 
@@ -198,6 +271,11 @@ const H3Engine = struct {
                 return c.PyErr_NoMemory();
             };
             h.* = H3Connection.init(gpa, q);
+            // The HTTP/3 read demo delivers request data in the Application space
+            // (STREAM is illegal in Initial). Until the Python adapter drives the
+            // TLS handshake, install the deterministic test 1-RTT keys so a 1-RTT
+            // request packet (coalesced after the bootstrap Initial) decrypts.
+            core.quic.connection.testInstallAppKeys(q);
             self.qc = q;
             self.h3 = h;
         }
@@ -243,7 +321,11 @@ const Engine = union(enum) {
 
 const ConnectionObject = extern struct {
     ob_base: c.PyObject,
+    /// Points into `engine_storage` when live, null once torn down. The engine
+    /// lives inside the PyObject so constructing a Connection costs no separate
+    /// heap allocation for it.
     engine: ?*Engine,
+    engine_storage: [@sizeOf(Engine)]u8 align(@alignOf(Engine)),
 };
 
 var connection_type: py.Object = null;
@@ -396,11 +478,23 @@ var stream_spec = py.Spec{
 fn parseArgs(args: ?*c.PyObject, kwds: ?*c.PyObject, role: *Role, protocol_out: *c_long, fixed: ?c_long) bool {
     var role_val: c_long = 0;
     var protocol_val: c_long = fixed orelse HTTP1;
-    // The kwlist parameter type differs across CPython versions (char** in 3.12,
-    // const char* const* in 3.13+), so build a plain C-pointer array and ptrCast
-    // it to whatever the translated signature expects.
-    var kwlist = [_][*c]u8{ @constCast("role"), @constCast("protocol"), null };
-    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", @ptrCast(&kwlist), &role_val, &protocol_val) == 0) return false;
+    const positional = if (kwds == null) c.PyTuple_Size(args) else -1;
+    if (positional == 1 or positional == 2) {
+        // The common positional forms skip PyArg_ParseTupleAndKeywords, which
+        // costs more than the rest of construction combined.
+        role_val = c.PyLong_AsLong(c.PyTuple_GetItem(args, 0));
+        if (role_val == -1 and c.PyErr_Occurred() != null) return false;
+        if (positional == 2) {
+            protocol_val = c.PyLong_AsLong(c.PyTuple_GetItem(args, 1));
+            if (protocol_val == -1 and c.PyErr_Occurred() != null) return false;
+        }
+    } else {
+        // The kwlist parameter type differs across CPython versions (char** in 3.12,
+        // const char* const* in 3.13+), so build a plain C-pointer array and ptrCast
+        // it to whatever the translated signature expects.
+        var kwlist = [_][*c]u8{ @constCast("role"), @constCast("protocol"), null };
+        if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", @ptrCast(&kwlist), &role_val, &protocol_val) == 0) return false;
+    }
     role.* = switch (role_val) {
         SERVER => .server,
         CLIENT => .client,
@@ -435,10 +529,11 @@ fn allocAndBuild(tp: ?*c.PyTypeObject, role: Role, protocol_val: c_long) py.Obje
     if (obj == null) return null;
     const self: *ConnectionObject = @ptrCast(obj);
     self.engine = null;
-    const engine = buildEngine(role, protocol_val) orelse {
+    const engine: *Engine = @ptrCast(@alignCast(&self.engine_storage));
+    if (!buildEngine(engine, role, protocol_val)) {
         py.decref(obj);
         return null;
-    };
+    }
     self.engine = engine;
     return obj;
 }
@@ -484,60 +579,38 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     return allocAndBuild(tp, role, HTTP3);
 }
 
-fn buildEngine(role: Role, protocol_val: c_long) ?*Engine {
-    const engine = gpa.create(Engine) catch {
-        _ = c.PyErr_NoMemory();
-        return null;
-    };
-
+fn buildEngine(engine: *Engine, role: Role, protocol_val: c_long) bool {
     if (protocol_val == HTTP3) {
         // The QUIC + HTTP/3 engine is built lazily on the first datagram.
         engine.* = .{ .h3 = .{} };
-        return engine;
+        return true;
     }
 
     if (protocol_val == HTTP2) {
         const conn = gpa.create(H2Connection) catch {
-            gpa.destroy(engine);
             _ = c.PyErr_NoMemory();
-            return null;
+            return false;
         };
         conn.* = H2Connection.init(gpa, if (role == .server) H2Role.server else H2Role.client);
         const writer = gpa.create(H2Writer) catch {
             conn.deinit();
             gpa.destroy(conn);
-            gpa.destroy(engine);
             _ = c.PyErr_NoMemory();
-            return null;
+            return false;
         };
         writer.* = H2Writer.init(gpa, if (role == .server) core.h2.writer.Role.server else core.h2.writer.Role.client);
         engine.* = .{ .h2 = .{ .conn = conn, .writer = writer } };
-        return engine;
+        return true;
     }
 
-    const reader = gpa.create(Reader) catch {
-        gpa.destroy(engine);
-        _ = c.PyErr_NoMemory();
-        return null;
-    };
-    reader.* = Reader.init(gpa, role);
-    const writer = gpa.create(Writer) catch {
-        reader.deinit();
-        gpa.destroy(reader);
-        gpa.destroy(engine);
-        _ = c.PyErr_NoMemory();
-        return null;
-    };
-    writer.* = Writer.init(gpa);
-    engine.* = .{ .h1 = .{ .reader = reader, .writer = writer } };
-    return engine;
+    engine.* = .{ .h1 = .{ .reader = Reader.init(gpa, role) } };
+    return true;
 }
 
 fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     if (self.engine) |engine| {
         engine.deinit();
-        gpa.destroy(engine);
     }
     py.freeInstance(@ptrCast(self));
 }
@@ -573,10 +646,7 @@ fn receive_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Objec
             e.conn.feed(bytes) catch |err| return exceptions.raiseH2(err);
             return py.none();
         },
-        .h1 => |*e| {
-            e.reader.feed(bytes) catch |err| return exceptions.raiseParse(err); // MessageTooLong -> RemoteProtocolError
-            return py.none();
-        },
+        .h1 => |*e| return e.receiveData(bytes, arg),
         .h3 => return py.raiseRuntime("receive_data is not valid for an HTTP/3 connection; use receive_datagram"),
     }
 }
@@ -604,17 +674,50 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
             return events_obj.fromH2Event(ev);
         },
         .h1 => |*e| {
-            const ev = e.reader.nextEvent() catch |err| return exceptions.raiseParse(err);
-            if (ev == .request) {
-                e.rememberMethod(ev.request.method);
-                e.should_close = e.reader.shouldClose();
-                py.xdecref(e.upgrade_obj);
-                if (e.reader.upgrade()) |u| {
-                    e.upgrade_obj = py.fromBytes(u);
-                    if (e.upgrade_obj == null) return null; // propagate the pending MemoryError
-                } else e.upgrade_obj = null;
+            while (true) {
+                const ev = e.reader.nextEvent() catch |err| {
+                    e.dropPending();
+                    return exceptions.raiseParse(err);
+                };
+                if (ev == .need_data and e.pending_obj != null) {
+                    if (e.reader.backlogEmpty()) {
+                        if (e.reader.bodyLengthRemaining()) |rem| {
+                            // Materialise body bytes straight from the stashed
+                            // buffer - the one copy - and account for them.
+                            const take: usize = @intCast(@min(rem, @as(u64, e.pending.len)));
+                            const out = events_obj.fromH1Event(.{ .data = .{ .data = e.pending[0..take] } });
+                            if (out == null) return null;
+                            e.reader.skipBodyLength(take);
+                            e.pending = e.pending[take..];
+                            if (e.pending.len == 0) {
+                                e.dropPending();
+                            } else if (e.reader.bodyLengthRemaining() == null) {
+                                // The remainder is the next pipelined message.
+                                if (!e.flushPending()) {
+                                    py.decref(out);
+                                    return null;
+                                }
+                            }
+                            return out;
+                        }
+                    }
+                    // The stash cannot be consumed in place (chunked body,
+                    // message done, or buffered bytes precede it): buffer it
+                    // and ask the reader again.
+                    if (!e.flushPending()) return null;
+                    continue;
+                }
+                if (ev == .request) {
+                    e.rememberMethod(ev.request.method);
+                    e.should_close = e.reader.shouldClose();
+                    py.xdecref(e.upgrade_obj);
+                    if (e.reader.upgrade()) |u| {
+                        e.upgrade_obj = py.fromBytes(u);
+                        if (e.upgrade_obj == null) return null; // propagate the pending MemoryError
+                    } else e.upgrade_obj = null;
+                }
+                return events_obj.fromH1Event(ev);
             }
-            return events_obj.fromH1Event(ev);
         },
     }
 }
@@ -749,7 +852,8 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
             return makeStream(self_obj, id);
         },
         .h1 => |*e| {
-            e.writer.sendRequest(mb, tb, vb, hdrs.headers) catch |err| return raiseWrite(err);
+            const w = e.ensureWriter() orelse return null;
+            w.sendRequest(mb, tb, vb, hdrs.headers) catch |err| return raiseWrite(err);
             e.rememberMethod(mb);
             e.reader.setRequestMethod(mb);
             return py.none();
@@ -774,7 +878,8 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     const header_slice = if (hdrs) |h| h.headers else &.{};
 
     const rb = core.h1.writer.reasonPhrase(@intCast(status));
-    e.writer.sendResponse("1.1", @intCast(status), rb, header_slice, e.method()) catch |err| return raiseWrite(err);
+    const w = e.ensureWriter() orelse return null;
+    w.sendResponse("1.1", @intCast(status), rb, header_slice, e.method()) catch |err| return raiseWrite(err);
     return py.none();
 }
 
@@ -786,12 +891,13 @@ fn send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
     if (status < 100 or status > 199) return py.raiseValue("informational status code must be in 100..199");
     if (status == 101) return py.raiseValue("101 Switching Protocols is a terminal upgrade response, not interim");
+    const w = e.ensureWriter() orelse return null;
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
-        e.writer.sendInformational(@intCast(status), &.{}) catch |err| return raiseWrite(err);
+        w.sendInformational(@intCast(status), &.{}) catch |err| return raiseWrite(err);
     } else {
         var hdrs = borrowHeaders(hdrs_seq) orelse return null;
         defer hdrs.deinit();
-        e.writer.sendInformational(@intCast(status), hdrs.headers) catch |err| return raiseWrite(err);
+        w.sendInformational(@intCast(status), hdrs.headers) catch |err| return raiseWrite(err);
     }
     return py.none();
 }
@@ -800,7 +906,8 @@ fn send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const e = h1(self) orelse return null; // HTTP/2 sends body via a Stream
     const data = py.asBytes(arg) orelse return null;
-    e.writer.sendData(data) catch |err| return raiseWrite(err);
+    const w = e.ensureWriter() orelse return null;
+    w.sendData(data) catch |err| return raiseWrite(err);
     return py.none();
 }
 
@@ -809,12 +916,13 @@ fn end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Objec
     const e = h1(self) orelse return null; // HTTP/2 ends a message via a Stream
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
+    const w = e.ensureWriter() orelse return null;
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
-        e.writer.endMessage(&.{}) catch |err| return raiseWrite(err);
+        w.endMessage(&.{}) catch |err| return raiseWrite(err);
     } else {
         var hdrs = borrowHeaders(hdrs_seq) orelse return null;
         defer hdrs.deinit();
-        e.writer.endMessage(hdrs.headers) catch |err| return raiseWrite(err);
+        w.endMessage(hdrs.headers) catch |err| return raiseWrite(err);
     }
     return py.none();
 }
@@ -824,14 +932,14 @@ fn data_to_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
     const pending = switch (engine.*) {
         .h2 => |*e| e.writer.pending(),
-        .h1 => |*e| e.writer.pending(),
+        .h1 => |*e| if (e.writer) |w| w.pending() else "",
         .h3 => return py.raiseRuntime("the HTTP/3 write side is not implemented yet"),
     };
     const out = py.fromBytes(pending);
     if (out == null) return null;
     switch (engine.*) {
         .h2 => |*e| e.writer.clear(),
-        .h1 => |*e| e.writer.clear(),
+        .h1 => |*e| if (e.writer) |w| w.clear(),
         .h3 => unreachable,
     }
     return out;

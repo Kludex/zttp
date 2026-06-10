@@ -162,3 +162,55 @@ def test_invalid_role_rejected() -> None:
 def test_remote_is_subclass_of_protocol_error() -> None:
     assert issubclass(zttp.RemoteProtocolError, zttp.ProtocolError)
     assert issubclass(zttp.LocalProtocolError, zttp.ProtocolError)
+
+
+def test_body_and_pipelined_request_in_one_feed() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(
+        b"POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nfirstPOST /b HTTP/1.1\r\nContent-Length: 6\r\n\r\nsecond"
+    )
+    events = list(drain(conn))
+    assert events[0].target == b"/a"
+    assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == b"first"
+    conn.start_next_cycle()
+    events = list(drain(conn))
+    assert events[0].target == b"/b"
+    assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == b"second"
+
+
+def test_second_feed_arrives_before_first_is_drained() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nhello")
+    conn.receive_data(b"world")
+    events = list(drain(conn))
+    assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == b"helloworld"
+    assert isinstance(events[-1], zttp.EndOfMessage)
+
+
+def test_body_fed_in_pieces_with_draining_between() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n")
+    assert isinstance(next(drain(conn)), zttp.Request)
+    body = b""
+    for piece in (b"abc", b"def", b"ghi"):
+        conn.receive_data(piece)
+        body += b"".join(e.data for e in drain(conn) if isinstance(e, zttp.Data))
+    assert body == b"abcdefghi"
+
+
+def test_garbage_after_complete_message_raises_on_next_cycle() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nokNOT HTTP\x00\r\n\r\n")
+    events = list(drain(conn))
+    assert isinstance(events[-1], zttp.EndOfMessage)
+    conn.start_next_cycle()
+    with pytest.raises(zttp.RemoteProtocolError):
+        drain_all(conn)
+
+
+def test_large_body_round_trips_unchanged() -> None:
+    body = bytes(range(256)) * 256  # 64KB, every byte value
+    raw = b"POST /up HTTP/1.1\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    events = parse_request(raw)
+    assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == body
+    assert isinstance(events[-1], zttp.EndOfMessage)

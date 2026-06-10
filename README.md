@@ -52,10 +52,11 @@ h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)  # HTTP/2
 h3 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)  # HTTP/3
 ```
 
-On **HTTP/2**, one connection multiplexes many requests, so every event carries a
-`stream_id` and you send on a `Stream` handle. Outbound flow control is handled
-for you: `send_data` emits what the peer's window allows and parks the rest until
-credit arrives.
+On **HTTP/2**, one connection multiplexes many requests, so the `Request` /
+`Response` / `Data` / `EndOfMessage` events carry a `stream_id` and you send on
+a `Stream` handle (connection-level control events like `Settings` and `Ping`
+have no stream to name). Outbound flow control is handled for you: `send_data`
+emits what the peer's window allows and parks the rest until credit arrives.
 
 ```python
 stream = h2.stream(request.stream_id)
@@ -85,12 +86,12 @@ identical data, median of 15 interleaved batches:
 
 | Workload          | zttp         | httptools    | zttp vs httptools |
 | ----------------- | -----------: | -----------: | ----------------: |
-| Simple GET        | ~1.11M req/s | ~1.11M req/s | **~1.0x**         |
-| POST + JSON body  | ~1.27M req/s | ~1.30M req/s | **~1.0x**         |
+| Simple GET        | ~1.24M req/s | ~1.07M req/s | **~1.16x**        |
+| POST + JSON body  | ~1.42M req/s | ~1.25M req/s | **~1.14x**        |
 
-zttp keeps pace with a C parser while staying sans-IO and event-based, and is
-roughly 15x faster than the pure-Python alternative. Run it yourself:
-`./scripts/bench`.
+zttp beats a C parser on 13 of the benchmark suite's 14 workloads while staying
+sans-IO and event-based, and is roughly 15x faster than the pure-Python
+alternative. Run it yourself: `./scripts/bench`.
 
 ## Why it is fast
 

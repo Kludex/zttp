@@ -164,6 +164,31 @@ pub const Reader = struct {
         return self.conn_should_close;
     }
 
+    /// True when every buffered byte has been consumed.
+    pub fn backlogEmpty(self: *const Reader) bool {
+        return self.buf.items.len == self.consumed;
+    }
+
+    /// True when the reader is waiting for the head of a new message.
+    pub fn atMessageStart(self: *const Reader) bool {
+        return self.state == .head;
+    }
+
+    /// Bytes still expected of a Content-Length body, or null when the reader
+    /// is not mid-way through one.
+    pub fn bodyLengthRemaining(self: *const Reader) ?u64 {
+        return if (self.state == .body_length and self.body_remaining > 0) self.body_remaining else null;
+    }
+
+    /// Account for `n` body bytes the caller delivered to the application out
+    /// of band, without buffering them. Only valid while `bodyLengthRemaining`
+    /// is non-null and `n` is at most that remainder.
+    pub fn skipBodyLength(self: *Reader, n: u64) void {
+        std.debug.assert(self.state == .body_length and n <= self.body_remaining);
+        self.body_remaining -= n;
+        if (self.body_remaining == 0) self.state = .eom_pending;
+    }
+
     /// The `Upgrade` value of the most recently parsed request iff its
     /// `Connection` header listed the `upgrade` token; else null. The slice is
     /// borrowed from the head buffer - read it right after the Request event.
@@ -395,7 +420,7 @@ pub const Reader = struct {
 
 /// Find the byte offset just past the blank line terminating the header block,
 /// i.e. the length of the head. Recognizes both CRLFCRLF and bare LFLF.
-fn findHeadEnd(region: []const u8) ?usize {
+pub fn findHeadEnd(region: []const u8) ?usize {
     var i: usize = 0;
     while (i < region.len) {
         // Look for LF, then test what precedes/follows for the blank line.
@@ -737,6 +762,45 @@ fn driveReader(input: []const u8) void {
 // A deterministic property test: run many adversarial and pseudo-random inputs
 // through driveReader and assert it never panics. This is the always-on
 // regression net; coverage-guided fuzzing (`zig build fuzz`) layers on top.
+test "skipBodyLength accounts for out-of-band body bytes" {
+    var r = Reader.init(t.allocator, .server);
+    defer r.deinit();
+    try r.feed("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n");
+    try t.expect((try r.nextEvent()) == .request);
+    try t.expectEqual(@as(?u64, 10), r.bodyLengthRemaining());
+    try t.expect(r.backlogEmpty());
+
+    r.skipBodyLength(4);
+    try t.expectEqual(@as(?u64, 6), r.bodyLengthRemaining());
+    r.skipBodyLength(6);
+    try t.expectEqual(@as(?u64, null), r.bodyLengthRemaining());
+    try t.expect((try r.nextEvent()) == .end_of_message);
+}
+
+test "skipBodyLength interleaves with buffered body bytes" {
+    var r = Reader.init(t.allocator, .server);
+    defer r.deinit();
+    try r.feed("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n\r\nabcd");
+    try t.expect((try r.nextEvent()) == .request);
+    const d = try r.nextEvent();
+    try t.expectEqualStrings("abcd", d.data.data);
+    try t.expect(r.backlogEmpty());
+    r.skipBodyLength(4);
+    try t.expect((try r.nextEvent()) == .end_of_message);
+}
+
+test "atMessageStart and backlogEmpty track parser progress" {
+    var r = Reader.init(t.allocator, .server);
+    defer r.deinit();
+    try t.expect(r.atMessageStart());
+    try r.feed("GET / HT");
+    try t.expect(r.atMessageStart());
+    try t.expect(!r.backlogEmpty());
+    try r.feed("TP/1.1\r\nHost: x\r\n\r\n");
+    try t.expect((try r.nextEvent()) == .request);
+    try t.expect(!r.atMessageStart());
+}
+
 test "fuzz: reader never panics on adversarial inputs" {
     const seeds = [_][]const u8{
         "",
