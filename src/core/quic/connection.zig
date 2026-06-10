@@ -6,12 +6,11 @@
 //! the HTTP/3 layer. It is sans-IO: bytes and a monotonic `now` in, transport
 //! state and (eventually) datagrams out, no socket.
 //!
-//! Scope: the Initial packet-number space is wired end-to-end, which exercises the
-//! whole pipeline (header protection, AEAD, framing, ack/stream state) with the
-//! deterministic Initial keys. The Handshake and Application spaces install their
-//! keys through the same `installKeys` seam once the TLS 1.3 handshake driver
-//! lands; that negotiation is the follow-up, mirroring how HTTP/2 staged its write
-//! side.
+//! Scope: all three packet-number spaces are wired. The TLS 1.3 handshake runs
+//! over CRYPTO frames and installs the Handshake and Application keys through the
+//! `installKeys` seam; `buildPacket` is the one send primitive (CRYPTO, ACK, and
+//! STREAM all funnel through it), so STREAM data ships only in the Application
+//! space once 1-RTT keys exist - never in an Initial packet.
 
 const std = @import("std");
 const constants = @import("constants.zig");
@@ -80,6 +79,7 @@ pub const Connection = struct {
     conn_received_total: u64 = 0,
     conn_consumed_total: u64 = 0,
     streams: std.AutoHashMapUnmanaged(u64, *stream.RecvStream) = .empty,
+    send_streams: std.AutoHashMapUnmanaged(u64, *stream.SendStream) = .empty,
     /// Built datagrams waiting to be drained by `datagramsToSend` (one contiguous
     /// buffer; `out_lengths` records each datagram's byte length in order).
     out: std.ArrayListUnmanaged(u8) = .empty,
@@ -146,6 +146,12 @@ pub const Connection = struct {
             self.gpa.destroy(s.*);
         }
         self.streams.deinit(self.gpa);
+        var sit = self.send_streams.valueIterator();
+        while (sit.next()) |s| {
+            s.*.deinit();
+            self.gpa.destroy(s.*);
+        }
+        self.send_streams.deinit(self.gpa);
         self.out.deinit(self.gpa);
         self.out_lengths.deinit(self.gpa);
         for (&self.spaces) |*s| s.deinit(self.gpa);
@@ -218,6 +224,62 @@ pub const Connection = struct {
     pub fn clearSend(self: *Connection) void {
         self.out.clearRetainingCapacity();
         self.out_lengths.clearRetainingCapacity();
+    }
+
+    // ---- STREAM send -----------------------------------------------------------
+
+    fn sendStream(self: *Connection, id: u64) Error!*stream.SendStream {
+        if (self.send_streams.get(id)) |s| return s;
+        const s = try self.gpa.create(stream.SendStream);
+        s.* = stream.SendStream.init(self.gpa);
+        self.send_streams.put(self.gpa, id, s) catch {
+            s.deinit();
+            self.gpa.destroy(s);
+            return error.OutOfMemory;
+        };
+        return s;
+    }
+
+    /// Queue `data` (and/or a FIN) to be sent on stream `id`. `flushSend` packetizes
+    /// the queue once the Application keys exist. Writing after a FIN is rejected.
+    pub fn sendStreamData(self: *Connection, id: u64, data: []const u8, fin: bool) Error!void {
+        const s = try self.sendStream(id);
+        s.write(data, fin) catch |e| switch (e) {
+            error.FinalSizeError => return error.FinalSizeError,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+
+    /// Whether any stream has bytes (or a FIN) still to send.
+    pub fn hasPendingSend(self: *Connection) bool {
+        var it = self.send_streams.valueIterator();
+        while (it.next()) |s| if (s.*.pending()) return true;
+        return false;
+    }
+
+    /// Packetize queued stream data into Application (1-RTT) datagrams, one STREAM
+    /// frame per packet. STREAM is legal only in the Application space (RFC 9000
+    /// 12.4), so nothing flows until the handshake installs the 1-RTT send keys -
+    /// the structural fix for shipping STREAM data in Initial packets.
+    pub fn flushSend(self: *Connection, now: u64) Error!void {
+        const space = Space.application;
+        const st = &self.spaces[@intFromEnum(space)];
+        if (st.send_keys == null) return; // no 1-RTT keys yet: nothing can be sent
+        // A conservative single-packet budget; one STREAM frame per packet for now.
+        const room = constants.MIN_INITIAL_DATAGRAM - 64;
+        var it = self.send_streams.iterator();
+        while (it.next()) |entry| {
+            const id = entry.key_ptr.*;
+            const s = entry.value_ptr.*;
+            while (s.pending()) {
+                const chunk = s.peek(room) orelse break;
+                var frames: std.ArrayListUnmanaged(u8) = .empty;
+                defer frames.deinit(self.gpa);
+                frame.encodeStream(&frames, self.gpa, id, chunk.offset, chunk.data, chunk.fin) catch return error.OutOfMemory;
+                try self.buildPacket(space, frames.items, true, now);
+                s.commit(chunk.data.len, chunk.fin);
+            }
+        }
     }
 
     // ---- TLS handshake drive ---------------------------------------------------
@@ -853,4 +915,85 @@ test "a malformed ClientHello (no supported_versions) poisons the connection" {
     const dgram = try testBuildInitial(gpa, &dcid, .client, 0, frames.items);
     defer gpa.free(dgram);
     try testing.expectError(error.ProtocolViolation, server.receiveDatagram(dgram, 1000));
+}
+
+// ---- STREAM send tests -----------------------------------------------------
+
+test "queued stream data flushes into a 1-RTT datagram a peer reassembles" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48 };
+
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    // Nothing to flush until data is queued.
+    try testing.expect(!sender.hasPendingSend());
+    try sender.sendStreamData(1, "hello over quic", true); // server-initiated bidi id 1
+    try testing.expect(sender.hasPendingSend());
+
+    try sender.flushSend(1000);
+    try testing.expectEqual(@as(usize, 1), sender.datagramLengths().len);
+    try testing.expect(!sender.hasPendingSend()); // fully drained
+
+    // A peer with the matching Application keys decrypts and reassembles it.
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    testInstallAppKeys(&peer);
+    try peer.receiveDatagram(sender.datagramsToSend(), 2000);
+    try testing.expectEqualStrings("hello over quic", peer.streamData(1));
+    try testing.expect(peer.streamFinished(1));
+}
+
+test "flushSend is a no-op until the Application keys are installed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x51, 0x52, 0x53, 0x54 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    // No app keys yet (no handshake): queued data cannot leave - the #64 P1 fix.
+    try conn.sendStreamData(1, "held", false);
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len);
+    try testing.expect(conn.hasPendingSend()); // still queued
+
+    // Once 1-RTT keys exist, the same queue flushes.
+    testInstallAppKeys(&conn);
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len);
+}
+
+test "a large stream send is chunked across multiple packets" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x61, 0x62, 0x63, 0x64 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    const big = [_]u8{0x7a} ** 4000; // larger than one packet's room
+    try sender.sendStreamData(1, &big, true);
+    try sender.flushSend(1000);
+    try testing.expect(sender.datagramLengths().len > 1); // split into multiple packets
+
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    testInstallAppKeys(&peer);
+    // Each built packet is its own UDP datagram (a short header runs to the
+    // datagram end), so the peer is fed them one at a time, sliced by the lengths.
+    const buf = sender.datagramsToSend();
+    var off: usize = 0;
+    for (sender.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+    try testing.expectEqual(@as(usize, big.len), peer.streamData(1).len);
+    try testing.expect(peer.streamFinished(1));
+}
+
+test "writing after a FIN is a final-size error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x71, 0x72, 0x73, 0x74 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    try conn.sendStreamData(1, "done", true);
+    try testing.expectError(error.FinalSizeError, conn.sendStreamData(1, "more", false));
 }

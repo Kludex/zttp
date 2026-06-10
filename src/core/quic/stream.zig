@@ -180,6 +180,64 @@ pub const RecvStream = struct {
     }
 };
 
+/// The send side of one stream: a queue of outbound bytes the connection drains
+/// into STREAM frames. It tracks the offset of the next unsent byte and whether a
+/// FIN is owed, mirroring RecvStream but for the write direction.
+pub const SendStream = struct {
+    gpa: std.mem.Allocator,
+    /// Bytes queued but not yet framed (drained from the front as they are sent).
+    unsent: std.ArrayListUnmanaged(u8) = .empty,
+    /// The offset of the first byte still in `unsent` - what a STREAM frame for the
+    /// next chunk carries.
+    send_offset: u64 = 0,
+    /// The application has finished writing; a FIN is owed on the last frame.
+    fin: bool = false,
+    /// The FIN has been emitted on a frame, so the stream is fully sent.
+    fin_sent: bool = false,
+
+    pub fn init(gpa: std.mem.Allocator) SendStream {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *SendStream) void {
+        self.unsent.deinit(self.gpa);
+    }
+
+    /// Queue `data` to be sent and/or mark the stream finished. Writing after the
+    /// stream has been finished (FIN owed or sent) would push bytes past the
+    /// declared final size (RFC 9000 4.5), so it is rejected.
+    pub fn write(self: *SendStream, data: []const u8, fin: bool) Error!void {
+        if (self.fin and (data.len != 0 or !fin)) return error.FinalSizeError;
+        self.unsent.appendSlice(self.gpa, data) catch return error.OutOfMemory;
+        if (fin) self.fin = true;
+    }
+
+    /// Whether anything still needs to leave: buffered bytes, or an owed FIN.
+    pub fn pending(self: *const SendStream) bool {
+        return self.unsent.items.len > 0 or (self.fin and !self.fin_sent);
+    }
+
+    /// The next chunk to frame, capped at `max` bytes. Returns the offset, the
+    /// chunk (a slice into `unsent`, valid until the next `commit`), and whether
+    /// this chunk carries the FIN. Call `commit` once the chunk is framed.
+    pub const Chunk = struct { offset: u64, data: []const u8, fin: bool };
+    pub fn peek(self: *const SendStream, max: usize) ?Chunk {
+        const n = @min(max, self.unsent.items.len);
+        const carries_fin = self.fin and !self.fin_sent and n == self.unsent.items.len;
+        if (n == 0 and !carries_fin) return null;
+        return .{ .offset = self.send_offset, .data = self.unsent.items[0..n], .fin = carries_fin };
+    }
+
+    /// Drop the `n` bytes a framed chunk consumed and, if it carried the FIN, mark
+    /// the FIN sent. `n` must be the length of the chunk returned by `peek`.
+    pub fn commit(self: *SendStream, n: usize, sent_fin: bool) void {
+        std.mem.copyForwards(u8, self.unsent.items[0 .. self.unsent.items.len - n], self.unsent.items[n..]);
+        self.unsent.shrinkRetainingCapacity(self.unsent.items.len - n);
+        self.send_offset += n;
+        if (sent_fin) self.fin_sent = true;
+    }
+};
+
 test "stream-id typing reads the low two bits" {
     try std.testing.expectEqual(StreamType.client_bidi, StreamType.of(0));
     try std.testing.expectEqual(StreamType.server_bidi, StreamType.of(1));
@@ -246,4 +304,53 @@ test "a conflicting FIN offset is rejected" {
     defer s.deinit();
     _ = try s.push(0, "abcde", true); // final size 5
     try std.testing.expectError(error.FinalSizeError, s.push(0, "abc", true)); // fin at 3
+}
+
+test "SendStream drains queued bytes in offset-ordered chunks" {
+    const gpa = std.testing.allocator;
+    var s = SendStream.init(gpa);
+    defer s.deinit();
+    try s.write("hello world", false);
+    try std.testing.expect(s.pending());
+
+    const c1 = s.peek(5).?; // capped at 5
+    try std.testing.expectEqual(@as(u64, 0), c1.offset);
+    try std.testing.expectEqualStrings("hello", c1.data);
+    try std.testing.expect(!c1.fin);
+    s.commit(c1.data.len, false);
+
+    const c2 = s.peek(100).?;
+    try std.testing.expectEqual(@as(u64, 5), c2.offset);
+    try std.testing.expectEqualStrings(" world", c2.data);
+    s.commit(c2.data.len, false);
+    try std.testing.expect(!s.pending());
+}
+
+test "SendStream carries the FIN on the final chunk and forbids later writes" {
+    const gpa = std.testing.allocator;
+    var s = SendStream.init(gpa);
+    defer s.deinit();
+    try s.write("data", true); // bytes + FIN
+    const c = s.peek(100).?;
+    try std.testing.expect(c.fin);
+    s.commit(c.data.len, true);
+    try std.testing.expect(!s.pending()); // FIN sent, nothing left
+
+    // Writing after FIN would exceed the final size.
+    try std.testing.expectError(error.FinalSizeError, s.write("x", false));
+    // An empty, idempotent FIN write is allowed.
+    try s.write("", true);
+}
+
+test "SendStream owes a FIN even with no bytes" {
+    const gpa = std.testing.allocator;
+    var s = SendStream.init(gpa);
+    defer s.deinit();
+    try s.write("", true); // pure FIN
+    try std.testing.expect(s.pending());
+    const c = s.peek(100).?;
+    try std.testing.expectEqual(@as(usize, 0), c.data.len);
+    try std.testing.expect(c.fin);
+    s.commit(0, true);
+    try std.testing.expect(!s.pending());
 }
