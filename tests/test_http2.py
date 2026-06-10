@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import pytest
+from inline_snapshot import snapshot
 
 import zttp
 
@@ -563,6 +564,4 @@ def test_h2_head_response_with_content_length_is_not_a_stream_error() -> None:
     client.receive_data(frame(0x04, 0, 0, b""))  # server SETTINGS stand-in
     client.receive_data(server.data_to_send())
     events = [type(e).__name__ for e in drain_h2(client)]
-    assert "Response" in events
-    assert "EndOfMessage" in events
-    assert "RstStream" not in events
+    assert events == snapshot(["Settings", "Settings", "Response", "EndOfMessage"])

@@ -38,6 +38,7 @@ Issues = "https://github.com/Kludex/zttp/issues"
 dev = [
     "pytest>=8.0",
     "coverage>=7.0",
+    "inline-snapshot>=0.13",
     "ruff",
     "mypy",
 ]
