@@ -29,37 +29,46 @@ pub const READONLY: c_int = if (@hasDecl(c, "Py_READONLY")) c.Py_READONLY else c
 
 // -- reference counting -------------------------------------------------------
 
-// The function forms (Py_IncRef / Py_DecRef) instead of the Py_INCREF / Py_DECREF
-// macros: the macros translate to version-specific struct layout under @cImport
-// (3.12's split ob_refcnt breaks the translation), while the functions take a
-// plain PyObject* on every supported version. Both are NULL-safe.
+// On 3.14+ GIL builds the translated Py_INCREF / Py_DECREF inlines compile to a
+// couple of instructions (immortality check + direct ob_refcnt store) inside
+// this compilation unit, so the hot path skips the out-of-line libpython call.
+// The 3.12/3.13 split ob_refcnt and the free-threaded build's atomic path both
+// break under translate-c, so everything else keeps the NULL-safe function
+// forms (Py_IncRef / Py_DecRef), which take a plain PyObject* on every version.
+const inline_refcount = @hasDecl(c, "Py_INCREF") and !@hasDecl(c, "Py_GIL_DISABLED") and c.PY_VERSION_HEX >= 0x030E0000;
+
 pub inline fn incref(o: anytype) void {
-    c.Py_IncRef(@ptrCast(o));
+    if (comptime inline_refcount) c.Py_INCREF(@ptrCast(o)) else c.Py_IncRef(@ptrCast(o));
 }
 pub inline fn decref(o: anytype) void {
-    c.Py_DecRef(@ptrCast(o));
+    if (comptime inline_refcount) c.Py_DECREF(@ptrCast(o)) else c.Py_DecRef(@ptrCast(o));
 }
 pub inline fn xdecref(o: anytype) void {
-    c.Py_DecRef(@ptrCast(o));
+    if (comptime inline_refcount) c.Py_XDECREF(@ptrCast(o)) else c.Py_DecRef(@ptrCast(o));
 }
 /// Steal a reference into a temporary and decref it (for "use then drop").
 pub inline fn clear(slot: *Object) void {
     const tmp = slot.*;
     slot.* = null;
-    c.Py_DecRef(tmp);
+    xdecref(tmp);
 }
 
 pub inline fn newRef(o: anytype) Object {
+    if (comptime inline_refcount) {
+        const p: Object = @ptrCast(o);
+        c.Py_INCREF(p);
+        return p;
+    }
     return c.Py_NewRef(@ptrCast(o));
 }
 
 // -- singletons ---------------------------------------------------------------
 
 pub inline fn none() Object {
-    return c.Py_NewRef(c.Py_None());
+    return newRef(c.Py_None());
 }
 pub inline fn boolean(v: bool) Object {
-    return c.Py_NewRef(if (v) c.Py_True() else c.Py_False());
+    return newRef(if (v) c.Py_True() else c.Py_False());
 }
 pub inline fn isNone(o: Object) bool {
     return o == c.Py_None();
