@@ -93,10 +93,8 @@ pub const Connection = struct {
     conn_recv_window: i32 = constants.DEFAULT_WINDOW_SIZE,
     conn_send_window: i32 = constants.DEFAULT_WINDOW_SIZE,
     highest_peer_id: u32 = 0,
-    /// High-water of the client's own (odd) stream ids it has opened to send. Lets
-    /// the client read path tell a response for a still-live stream from a stray
-    /// response for a stream it already reset/closed (the client analogue of
-    /// highest_peer_id, which only tracks peer-initiated ids).
+    /// High-water of the client's own opened ids (highest_peer_id's local analogue),
+    /// so a response for a reset stream is recognized as closed, not a new stream.
     highest_local_id: u32 = 0,
     /// Rapid-reset churn budgets: total streams ever opened and total resets.
     /// These count streams that no longer exist (evicted), so unlike the live
@@ -348,11 +346,7 @@ pub const Connection = struct {
 
     /// Is `id` a peer-initiated stream that has never been opened (idle)? An id
     /// above the highest one we have seen open is idle; at/below is closed.
-    /// Is `id` a stream that has never been opened (idle)? An id is idle only if it
-    /// is above BOTH high-water marks: peer-initiated streams (highest_peer_id) and
-    /// the client's own opened streams (highest_local_id). An id at/below either is
-    /// a stream that was opened and is now closed/evicted - stray frames on it are
-    /// tolerated, not a connection error.
+    /// Idle = never opened by either side; at/below either high-water is closed.
     fn isIdle(self: *const Connection, id: u32) bool {
         return id > self.highest_peer_id and id > self.highest_local_id;
     }
@@ -448,13 +442,9 @@ pub const Connection = struct {
                 return error.ProtocolError;
             }
         } else if (self.role == .client) {
-            // A client reads HEADERS as a response on a stream IT opened: the id
-            // must be odd (client-initiated, 5.1.1) and not server-pushed (push is
-            // out of scope). An id at/below the local high-water that is no longer
-            // in the map is one we already reset/closed; decode the block to keep
-            // the HPACK table in sync but surface nothing. A genuinely new id has
-            // its stream created here for the response (the H2 write path opens it
-            // on request).
+            // A client reads a response on a stream it opened (odd id, 5.1.1). An id
+            // at/below the local high-water but gone from the map was already reset:
+            // decode for HPACK sync but surface nothing. A new id opens its stream.
             if (id % 2 == 0) return error.ProtocolError;
             if (id <= self.highest_local_id) {
                 ignored = true;
@@ -518,9 +508,7 @@ pub const Connection = struct {
         };
 
         if (ignored) {
-            // A response for a client stream we already reset: the block was decoded
-            // to keep the HPACK table in sync, but the stream is gone - surface
-            // nothing (we already sent RST_STREAM for it).
+            // Response for an already-reset stream: decoded for HPACK sync, dropped.
             return;
         }
 
@@ -1366,13 +1354,10 @@ test "a request pseudo-header in a response resets the stream" {
 test "a response for a client-reset stream is ignored, not surfaced or re-opened" {
     var c = Connection.init(testing.allocator, .client);
     defer c.deinit();
-    // The client opens stream 1 to send, then resets it locally.
     try c.registerSendStream(1);
     c.localReset(1);
     try testing.expectEqual(@as(usize, 0), c.streams.count());
-    // An in-flight response head + body for stream 1 then arrives. The head is
-    // decoded (HPACK sync) but surfaces nothing, and the stray DATA is a tolerated
-    // stream error - never a Response/Data event or a re-opened stream.
+    // An in-flight response for the reset stream must surface no response/data.
     var frames: std.ArrayList(u8) = .empty;
     defer frames.deinit(testing.allocator);
     try frameBytes(&frames, .headers, Flags.end_headers, 1, &STATUS_200_BLOCK);
@@ -1381,8 +1366,6 @@ test "a response for a client-reset stream is ignored, not surfaced or re-opened
     while (true) {
         const ev = try c.nextEvent();
         if (ev == .need_data) break;
-        // The only events allowed are RST_STREAM (the client telling the peer the
-        // stream is closed); never a response or data.
         try testing.expect(ev != .response and ev != .data);
     }
     try testing.expectEqual(@as(usize, 0), c.streams.count()); // not re-opened

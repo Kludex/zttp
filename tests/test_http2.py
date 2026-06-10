@@ -459,8 +459,7 @@ def test_h2_close_on_an_http1_connection_is_an_error() -> None:
 
 
 def test_h2_response_after_stream_reset_is_ignored() -> None:
-    # A client that reset its own stream must not surface an in-flight response for
-    # it (the reset id is closed, not a fresh stream to re-open).
+    # The reset id is closed, not a fresh stream to re-open.
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
     opener = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
     opener.send_request(b"GET", b"/", b"2", [(b"host", b"x")]).end_message()
@@ -479,5 +478,4 @@ def test_h2_response_after_stream_reset_is_ignored() -> None:
 
     client.receive_data(response)
     events = list(drain_h2(client))
-    # The response head and body are dropped; nothing is surfaced for the reset id.
     assert not any(isinstance(e, (zttp.Response, zttp.Data)) for e in events)
