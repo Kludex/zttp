@@ -9,6 +9,7 @@ CLIENT: Final[int]
 # Literal-typed so Connection(role, HTTP2) selects the H2Connection __new__ overload.
 HTTP1: Final = 1
 HTTP2: Final = 2
+HTTP3: Final = 3
 
 class Request:
     method: bytes
@@ -86,9 +87,12 @@ class Stream:
     def end_message(self, trailers: list[tuple[bytes, bytes]] | None = ..., /) -> None: ...
 
 class Connection:
-    # The read API, shared by both protocols. Constructing a Connection returns
-    # the protocol-specific subtype (H1Connection / H2Connection): the send surface
-    # differs, so each is its own type rather than methods that raise at runtime.
+    # The read API, shared by every protocol. Constructing a Connection returns the
+    # protocol-specific subtype (H1Connection / H2Connection / H3Connection): the
+    # send surface differs, so each is its own type rather than methods that raise
+    # at runtime.
+    @overload
+    def __new__(cls, role: int, protocol: Literal[3]) -> H3Connection: ...
     @overload
     def __new__(cls, role: int, protocol: Literal[2]) -> H2Connection: ...
     @overload
@@ -114,3 +118,7 @@ class H2Connection(Connection):
         self, method: bytes, target: bytes, version: bytes, headers: list[tuple[bytes, bytes]]
     ) -> Stream: ...
     def stream(self, stream_id: int, /) -> Stream: ...
+
+class H3Connection(Connection):
+    # Server read path only: fed by UDP datagrams rather than a byte stream.
+    def receive_datagram(self, datagram: bytes, /) -> None: ...

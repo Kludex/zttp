@@ -6,6 +6,8 @@ const c = py.c;
 const core = @import("core");
 const ParseError = core.errors.ParseError;
 const H2Error = core.h2.connection.H2Error;
+const QuicError = core.quic.connection.Error;
+const H3Error = core.h3.connection.Error;
 
 pub var ProtocolError: py.Object = null;
 pub var RemoteProtocolError: py.Object = null;
@@ -53,4 +55,27 @@ pub fn raiseH2(e: H2Error) py.Object {
         error.EnhanceYourCalm => "HTTP/2 flood detected (enhance your calm)",
     };
     return py.raise(RemoteProtocolError, msg);
+}
+
+/// Map a QUIC transport error onto RemoteProtocolError. OutOfMemory becomes a
+/// MemoryError; the rest are remote protocol violations (a dropped packet is not
+/// surfaced here - the connection swallows it - so it never reaches this).
+pub fn raiseQuic(e: QuicError) py.Object {
+    const msg: [*c]const u8 = switch (e) {
+        error.OutOfMemory => return c.PyErr_NoMemory(),
+        error.Dropped => "QUIC packet dropped",
+        error.ProtocolViolation => "QUIC protocol violation",
+        error.FlowControlError => "QUIC flow-control error",
+        error.StreamLimitError => "QUIC stream limit exceeded",
+        error.FinalSizeError => "QUIC final size error",
+    };
+    return py.raise(RemoteProtocolError, msg);
+}
+
+/// Map an HTTP/3 connection error onto RemoteProtocolError.
+pub fn raiseH3(e: H3Error) py.Object {
+    return switch (e) {
+        error.OutOfMemory => c.PyErr_NoMemory(),
+        error.H3Error => py.raise(RemoteProtocolError, "HTTP/3 protocol error"),
+    };
 }

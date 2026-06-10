@@ -1,0 +1,292 @@
+//! The QUIC frame codec (RFC 9000 section 19): a pure, zero-copy parser over the
+//! decrypted payload of a packet. A packet payload is a sequence of frames; this
+//! decodes them one at a time. Like h2/frame.zig it never owns bytes - a parsed
+//! frame's `data`/`token`/`reason` slices point INTO the fed payload - and it
+//! knows nothing about crypto, streams, or flow control; the connection layer
+//! composes it. That boundary is what makes it independently fuzzable.
+
+const std = @import("std");
+const varint = @import("varint.zig");
+const constants = @import("constants.zig");
+
+const FrameType = constants.FrameType;
+
+pub const Error = error{
+    /// The frame is truncated within the payload (a length/varint runs past the
+    /// end). Inside a decrypted packet this is FRAME_ENCODING_ERROR, not NeedData
+    /// - a packet is atomic, so there is no "feed more".
+    Truncated,
+    /// A structurally invalid frame: an unknown type, a reserved bit set, or a
+    /// field that violates a frame-specific rule (RFC 9000 19).
+    FrameEncodingError,
+};
+
+/// One decoded ACK range: `gap` unacked packets then `len`+1 acked (RFC 9000
+/// 19.3). Kept as raw fields; the recovery layer folds them into its ack set.
+pub const AckRange = struct {
+    gap: u64,
+    len: u64,
+};
+
+/// A parsed frame. A tagged union mirroring the RFC 9000 frame catalogue; the
+/// variants the read path acts on carry their fields, and the many pure-signal
+/// frames (PING, HANDSHAKE_DONE, ...) are bare tags.
+pub const Frame = union(enum) {
+    padding: usize, // a run of PADDING octets, collapsed to its count
+    ping,
+    ack: struct { largest: u64, delay: u64, first_range: u64, ranges: []const u8 }, // ranges left raw; decoded lazily
+    reset_stream: struct { stream_id: u64, error_code: u64, final_size: u64 },
+    stop_sending: struct { stream_id: u64, error_code: u64 },
+    crypto: struct { offset: u64, data: []const u8 },
+    new_token: struct { token: []const u8 },
+    stream: struct { stream_id: u64, offset: u64, data: []const u8, fin: bool },
+    max_data: u64,
+    max_stream_data: struct { stream_id: u64, max: u64 },
+    max_streams: struct { bidi: bool, max: u64 },
+    data_blocked: u64,
+    stream_data_blocked: struct { stream_id: u64, limit: u64 },
+    streams_blocked: struct { bidi: bool, limit: u64 },
+    new_connection_id: struct { seq: u64, retire_prior_to: u64, cid: []const u8, token: []const u8 },
+    retire_connection_id: u64,
+    path_challenge: [8]u8,
+    path_response: [8]u8,
+    connection_close: struct { app: bool, error_code: u64, frame_type: u64, reason: []const u8 },
+    handshake_done,
+};
+
+/// A decoded frame plus how many octets it consumed, so the caller can advance.
+pub const Decoded = struct {
+    frame: Frame,
+    len: usize,
+};
+
+const Cursor = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    fn vint(self: *Cursor) Error!u64 {
+        const d = varint.decode(self.buf[self.pos..]) catch return error.Truncated;
+        self.pos += d.len;
+        return d.value;
+    }
+
+    fn take(self: *Cursor, n: usize) Error![]const u8 {
+        if (self.pos + n > self.buf.len) return error.Truncated;
+        const s = self.buf[self.pos .. self.pos + n];
+        self.pos += n;
+        return s;
+    }
+
+    fn byte(self: *Cursor) Error!u8 {
+        if (self.pos >= self.buf.len) return error.Truncated;
+        const b = self.buf[self.pos];
+        self.pos += 1;
+        return b;
+    }
+};
+
+/// Decode the frame at the start of `buf`. PADDING runs are collapsed into one
+/// `padding` frame so a packet full of padding does not yield thousands of
+/// events. Returns Truncated if any field runs past the payload end.
+pub fn decode(buf: []const u8) Error!Decoded {
+    if (buf.len == 0) return error.Truncated;
+    var cur = Cursor{ .buf = buf };
+    const raw = try cur.vint();
+
+    if (raw == @intFromEnum(FrameType.padding)) {
+        while (cur.pos < buf.len and buf[cur.pos] == 0x00) cur.pos += 1;
+        return .{ .frame = .{ .padding = cur.pos }, .len = cur.pos };
+    }
+    if (raw >= constants.STREAM_BASE and raw <= constants.STREAM_BASE + 0x07) {
+        return decodeStream(&cur, raw);
+    }
+
+    const ftype: FrameType = @enumFromInt(raw);
+    const frame: Frame = switch (ftype) {
+        .ping => .ping,
+        .ack, .ack_ecn => try decodeAck(&cur, ftype == .ack_ecn),
+        .reset_stream => .{ .reset_stream = .{ .stream_id = try cur.vint(), .error_code = try cur.vint(), .final_size = try cur.vint() } },
+        .stop_sending => .{ .stop_sending = .{ .stream_id = try cur.vint(), .error_code = try cur.vint() } },
+        .crypto => blk: {
+            const offset = try cur.vint();
+            const dlen = try cur.vint();
+            break :blk .{ .crypto = .{ .offset = offset, .data = try cur.take(@intCast(dlen)) } };
+        },
+        .new_token => blk: {
+            const tlen = try cur.vint();
+            if (tlen == 0) return error.FrameEncodingError; // RFC 9000 19.7: token MUST NOT be empty
+            break :blk .{ .new_token = .{ .token = try cur.take(@intCast(tlen)) } };
+        },
+        .max_data => .{ .max_data = try cur.vint() },
+        .max_stream_data => .{ .max_stream_data = .{ .stream_id = try cur.vint(), .max = try cur.vint() } },
+        .max_streams_bidi => .{ .max_streams = .{ .bidi = true, .max = try cur.vint() } },
+        .max_streams_uni => .{ .max_streams = .{ .bidi = false, .max = try cur.vint() } },
+        .data_blocked => .{ .data_blocked = try cur.vint() },
+        .stream_data_blocked => .{ .stream_data_blocked = .{ .stream_id = try cur.vint(), .limit = try cur.vint() } },
+        .streams_blocked_bidi => .{ .streams_blocked = .{ .bidi = true, .limit = try cur.vint() } },
+        .streams_blocked_uni => .{ .streams_blocked = .{ .bidi = false, .limit = try cur.vint() } },
+        .new_connection_id => try decodeNewCid(&cur),
+        .retire_connection_id => .{ .retire_connection_id = try cur.vint() },
+        .path_challenge => .{ .path_challenge = (try cur.take(8))[0..8].* },
+        .path_response => .{ .path_response = (try cur.take(8))[0..8].* },
+        .connection_close => try decodeClose(&cur, false),
+        .connection_close_app => try decodeClose(&cur, true),
+        .handshake_done => .handshake_done,
+        .stream, .padding, _ => return error.FrameEncodingError,
+    };
+    return .{ .frame = frame, .len = cur.pos };
+}
+
+fn decodeStream(cur: *Cursor, raw: u64) Error!Decoded {
+    const has_off = (raw & constants.STREAM_OFF) != 0;
+    const has_len = (raw & constants.STREAM_LEN) != 0;
+    const fin = (raw & constants.STREAM_FIN) != 0;
+    const stream_id = try cur.vint();
+    const offset = if (has_off) try cur.vint() else 0;
+    const data = if (has_len) blk: {
+        const dlen = try cur.vint();
+        break :blk try cur.take(@intCast(dlen));
+    } else cur.buf[cur.pos..]; // no length => the frame runs to the packet end
+    if (!has_len) cur.pos = cur.buf.len;
+    return .{ .frame = .{ .stream = .{ .stream_id = stream_id, .offset = offset, .data = data, .fin = fin } }, .len = cur.pos };
+}
+
+fn decodeAck(cur: *Cursor, ecn: bool) Error!Frame {
+    const largest = try cur.vint();
+    const delay = try cur.vint();
+    const range_count = try cur.vint();
+    const first_range = try cur.vint();
+    const ranges_start = cur.pos;
+    var i: u64 = 0;
+    while (i < range_count) : (i += 1) {
+        _ = try cur.vint(); // gap
+        _ = try cur.vint(); // ack range length
+    }
+    const ranges = cur.buf[ranges_start..cur.pos];
+    if (ecn) {
+        _ = try cur.vint(); // ECT0
+        _ = try cur.vint(); // ECT1
+        _ = try cur.vint(); // ECN-CE
+    }
+    return .{ .ack = .{ .largest = largest, .delay = delay, .first_range = first_range, .ranges = ranges } };
+}
+
+fn decodeNewCid(cur: *Cursor) Error!Frame {
+    const seq = try cur.vint();
+    const retire_prior_to = try cur.vint();
+    if (retire_prior_to > seq) return error.FrameEncodingError; // RFC 9000 19.15
+    const cid_len = try cur.byte();
+    if (cid_len == 0 or cid_len > constants.MAX_CID_LEN) return error.FrameEncodingError;
+    const cid = try cur.take(cid_len);
+    const token = try cur.take(16); // stateless reset token is exactly 16 octets
+    return .{ .new_connection_id = .{ .seq = seq, .retire_prior_to = retire_prior_to, .cid = cid, .token = token } };
+}
+
+fn decodeClose(cur: *Cursor, app: bool) Error!Frame {
+    const error_code = try cur.vint();
+    const frame_type = if (app) 0 else try cur.vint();
+    const rlen = try cur.vint();
+    const reason = try cur.take(@intCast(rlen));
+    return .{ .connection_close = .{ .app = app, .error_code = error_code, .frame_type = frame_type, .reason = reason } };
+}
+
+/// Iterate the ranges of a parsed ACK frame. The recovery layer walks these to
+/// learn which packet numbers the peer acknowledged.
+pub fn ackRanges(ack_ranges: []const u8) AckRangeIterator {
+    return .{ .buf = ack_ranges };
+}
+
+pub const AckRangeIterator = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    pub fn next(self: *AckRangeIterator) ?AckRange {
+        if (self.pos >= self.buf.len) return null;
+        const gap = varint.decode(self.buf[self.pos..]) catch return null;
+        self.pos += gap.len;
+        const len = varint.decode(self.buf[self.pos..]) catch return null;
+        self.pos += len.len;
+        return .{ .gap = gap.value, .len = len.value };
+    }
+};
+
+test "decode a PING frame" {
+    const d = try decode(&.{0x01});
+    try std.testing.expect(d.frame == .ping);
+    try std.testing.expectEqual(@as(usize, 1), d.len);
+}
+
+test "PADDING collapses a run" {
+    const d = try decode(&.{ 0x00, 0x00, 0x00, 0x01 });
+    try std.testing.expectEqual(@as(usize, 3), d.frame.padding);
+    try std.testing.expectEqual(@as(usize, 3), d.len);
+}
+
+test "decode a STREAM frame with offset, length, and FIN" {
+    // type 0x0f (OFF|LEN|FIN), id=4, off=8, len=3, "abc"
+    const d = try decode(&.{ 0x0f, 0x04, 0x08, 0x03, 'a', 'b', 'c' });
+    const s = d.frame.stream;
+    try std.testing.expectEqual(@as(u64, 4), s.stream_id);
+    try std.testing.expectEqual(@as(u64, 8), s.offset);
+    try std.testing.expectEqualStrings("abc", s.data);
+    try std.testing.expect(s.fin);
+}
+
+test "decode a STREAM frame without length runs to the end" {
+    // type 0x08 (no OFF, no LEN, no FIN), id=0, then the rest is data
+    const d = try decode(&.{ 0x08, 0x00, 'h', 'i' });
+    const s = d.frame.stream;
+    try std.testing.expectEqual(@as(u64, 0), s.offset);
+    try std.testing.expectEqualStrings("hi", s.data);
+    try std.testing.expect(!s.fin);
+}
+
+test "decode a CRYPTO frame" {
+    const d = try decode(&.{ 0x06, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o' });
+    const cr = d.frame.crypto;
+    try std.testing.expectEqual(@as(u64, 0), cr.offset);
+    try std.testing.expectEqualStrings("hello", cr.data);
+}
+
+test "decode an ACK frame and walk its ranges" {
+    // largest=10, delay=0, range_count=1, first_range=2, [gap=1, len=3]
+    const d = try decode(&.{ 0x02, 0x0a, 0x00, 0x01, 0x02, 0x01, 0x03 });
+    const ack = d.frame.ack;
+    try std.testing.expectEqual(@as(u64, 10), ack.largest);
+    try std.testing.expectEqual(@as(u64, 2), ack.first_range);
+    var it = ackRanges(ack.ranges);
+    const r = it.next().?;
+    try std.testing.expectEqual(@as(u64, 1), r.gap);
+    try std.testing.expectEqual(@as(u64, 3), r.len);
+    try std.testing.expect(it.next() == null);
+}
+
+test "decode MAX_STREAMS variants" {
+    const bidi = try decode(&.{ 0x12, 0x3f }); // max = 63 (1-byte varint)
+    try std.testing.expect(bidi.frame.max_streams.bidi);
+    try std.testing.expectEqual(@as(u64, 63), bidi.frame.max_streams.max);
+    try std.testing.expect(!(try decode(&.{ 0x13, 0x3f })).frame.max_streams.bidi);
+}
+
+test "decode a transport CONNECTION_CLOSE" {
+    // error=0x0a (protocol_violation), frame_type=0, reason "no"
+    const d = try decode(&.{ 0x1c, 0x0a, 0x00, 0x02, 'n', 'o' });
+    const cc = d.frame.connection_close;
+    try std.testing.expect(!cc.app);
+    try std.testing.expectEqual(@as(u64, 0x0a), cc.error_code);
+    try std.testing.expectEqualStrings("no", cc.reason);
+}
+
+test "truncated frame is rejected" {
+    try std.testing.expectError(error.Truncated, decode(&.{0x06})); // CRYPTO with no offset
+    try std.testing.expectError(error.Truncated, decode(&.{ 0x06, 0x00, 0x05, 'h' })); // claims 5, has 1
+}
+
+test "empty NEW_TOKEN is a frame encoding error" {
+    try std.testing.expectError(error.FrameEncodingError, decode(&.{ 0x07, 0x00 }));
+}
+
+test "NEW_CONNECTION_ID with retire_prior_to past seq is rejected" {
+    // seq=1, retire_prior_to=2 (invalid), ...
+    try std.testing.expectError(error.FrameEncodingError, decode(&.{ 0x18, 0x01, 0x02 }));
+}

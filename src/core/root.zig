@@ -6,6 +6,8 @@ pub const events = @import("events.zig");
 pub const scanner = @import("scanner.zig");
 pub const h1 = @import("h1/root.zig");
 pub const h2 = @import("h2/root.zig");
+pub const quic = @import("quic/root.zig");
+pub const h3 = @import("h3/root.zig");
 
 test {
     _ = tables;
@@ -14,4 +16,6 @@ test {
     _ = scanner;
     _ = h1;
     _ = h2;
+    _ = quic;
+    _ = h3;
 }
