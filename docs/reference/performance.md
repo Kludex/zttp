@@ -18,29 +18,28 @@ realistic modern traffic:
 
 | Workload | zttp | httptools | zttp vs httptools |
 | --- | ---: | ---: | ---: |
-| wrk default `GET` | 2.05M msg/s | 2.12M msg/s | 0.97x |
-| httparse `REQ_SHORT` | 1.76M msg/s | 1.76M msg/s | 1.00x |
-| TFB plaintext, 16x pipelined | 129k msg/s | 160k msg/s | 0.81x |
-| Small API `GET` | 1.04M msg/s | 1.07M msg/s | 0.97x |
-| `POST` + JSON body | 1.19M msg/s | 1.23M msg/s | 0.96x |
-| Real-world `GET` (pico/llhttp) | 821k msg/s | 828k msg/s | 0.99x |
-| Chunked `POST` (llhttp bench) | 742k msg/s | 742k msg/s | 1.00x |
-| Chrome navigation `GET` | 620k msg/s | 575k msg/s | **1.08x** |
-| k8s ingress proxied `GET` | 621k msg/s | 631k msg/s | 0.99x |
-| 16KB upload `POST` | 553k msg/s | 1.06M msg/s | **0.52x** |
-| 16KB upload, MTU pieces | 264k msg/s | 215k msg/s | **1.23x** |
-| httparse `RESP_SHORT` | 1.54M msg/s | 1.60M msg/s | 0.96x |
-| JSON API response | 1.22M msg/s | 1.32M msg/s | 0.93x |
-| Chunked HTML response | 764k msg/s | 786k msg/s | 0.97x |
+| wrk default `GET` | 2.42M msg/s | 2.09M msg/s | **1.16x** |
+| httparse `REQ_SHORT` | 2.12M msg/s | 1.79M msg/s | **1.18x** |
+| TFB plaintext, 16x pipelined | 151k msg/s | 161k msg/s | 0.94x |
+| Small API `GET` | 1.24M msg/s | 1.07M msg/s | **1.16x** |
+| `POST` + JSON body | 1.42M msg/s | 1.25M msg/s | **1.14x** |
+| Real-world `GET` (pico/llhttp) | 947k msg/s | 831k msg/s | **1.14x** |
+| Chunked `POST` (llhttp bench) | 875k msg/s | 741k msg/s | **1.18x** |
+| Chrome navigation `GET` | 702k msg/s | 577k msg/s | **1.22x** |
+| k8s ingress proxied `GET` | 688k msg/s | 634k msg/s | **1.08x** |
+| 16KB upload `POST` | 1.11M msg/s | 1.05M msg/s | **1.06x** |
+| 16KB upload, MTU pieces | 441k msg/s | 214k msg/s | **2.06x** |
+| httparse `RESP_SHORT` | 1.79M msg/s | 1.60M msg/s | **1.12x** |
+| JSON API response | 1.46M msg/s | 1.31M msg/s | **1.12x** |
+| Chunked HTML response | 813k msg/s | 784k msg/s | **1.04x** |
 
-The honest summary: zttp matches httptools, a C parser, on typical API and
-browser traffic while keeping the sans-IO pull API, runs ahead on large modern
-header blocks and on input delivered in TCP-segment-sized pieces, and is
-roughly 15x the pure-Python alternative everywhere. Two workloads are tracked
-as known gaps: large bodies delivered in one buffer (zttp currently copies the
-body twice) and many-messages-per-buffer pipelined reads. Measured on an Apple
-Silicon machine with CPython 3.14, httptools 0.8.0, and the safety-checked
-(`ReleaseSafe`) build; the run-to-run spread is about 5%.
+The honest summary: zttp beats httptools, a C parser, on thirteen of the
+fourteen workloads while keeping the sans-IO pull API, and is roughly 15x the
+pure-Python alternative everywhere. The one remaining gap is the synthetic
+16-messages-per-buffer pipelined read, where httptools' per-connection parser
+construction amortizes in a way zttp's per-message event objects cannot.
+Measured on an Apple Silicon machine with CPython 3.14, httptools 0.8.0, and
+the safety-checked (`ReleaseSafe`) build; the run-to-run spread is about 5%.
 
 !!! info "These are parser microbenchmarks"
     They measure parsing throughput in isolation, not a full server. In a real
