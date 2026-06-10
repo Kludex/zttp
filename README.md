@@ -52,10 +52,11 @@ h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)  # HTTP/2
 h3 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)  # HTTP/3
 ```
 
-On **HTTP/2**, one connection multiplexes many requests, so every event carries a
-`stream_id` and you send on a `Stream` handle. Outbound flow control is handled
-for you: `send_data` emits what the peer's window allows and parks the rest until
-credit arrives.
+On **HTTP/2**, one connection multiplexes many requests, so the `Request` /
+`Response` / `Data` / `EndOfMessage` events carry a `stream_id` and you send on
+a `Stream` handle (connection-level control events like `Settings` and `Ping`
+have no stream to name). Outbound flow control is handled for you: `send_data`
+emits what the peer's window allows and parks the rest until credit arrives.
 
 ```python
 stream = h2.stream(request.stream_id)
