@@ -8,11 +8,10 @@
 > **zttp** is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
 
 A [sans-IO](https://sans-io.readthedocs.io/) HTTP/1.1, HTTP/2, and HTTP/3 parser
-for Python, with a core written in [Zig](https://ziglang.org). It is to
-[h11](https://github.com/python-hyper/h11) what [zloop](https://github.com/Kludex/zloop)
-is to asyncio: the same clean, event-based API, with a hand-written Zig engine
-underneath that is fast enough to be the HTTP parser in
-[uvicorn](https://github.com/encode/uvicorn). It has no dependencies.
+for Python, with a core written in [Zig](https://ziglang.org). It offers the same
+clean, event-based API as [h11](https://github.com/python-hyper/h11), with a
+hand-written Zig engine underneath that is fast enough to be the HTTP parser in
+[uvicorn](https://github.com/encode/uvicorn). **It has no dependencies.**
 
 ## Sans-IO
 
