@@ -82,14 +82,16 @@ h3.next_event()  # the same Request / Data / EndOfMessage, tagged with stream_id
 
 Against httptools on the same requests (macOS arm64, CPython 3.14, httptools
 0.8.0, the safety-checked `ReleaseSafe` build), both verified to extract
-identical data:
+identical data, median of 15 interleaved batches:
 
 | Workload          | zttp         | httptools    | zttp vs httptools |
 | ----------------- | -----------: | -----------: | ----------------: |
-| Simple GET        | ~1.16M req/s | ~1.2M req/s  | **~0.97x**        |
-| POST + JSON body  | ~4.9M req/s  | ~2.4M req/s  | **~2.0x**         |
+| Simple GET        | ~1.24M req/s | ~1.07M req/s | **~1.16x**        |
+| POST + JSON body  | ~1.42M req/s | ~1.25M req/s | **~1.14x**        |
 
-Run it yourself: `./scripts/bench`.
+zttp beats a C parser on 13 of the benchmark suite's 14 workloads while staying
+sans-IO and event-based, and is roughly 15x faster than the pure-Python
+alternative. Run it yourself: `./scripts/bench`.
 
 ## Why it is fast
 

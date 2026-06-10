@@ -6,4 +6,4 @@
 set -x
 
 HATCH_ZIG_BUILD_MODE=ReleaseSafe uv sync --all-groups
-uv run --no-sync python bench.py
+uv run --no-sync python bench.py "$@"
