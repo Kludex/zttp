@@ -45,6 +45,12 @@ const H1Engine = struct {
     /// they outlive the head buffer. `upgrade_obj` is held Python bytes (or null).
     should_close: bool = false,
     upgrade_obj: py.Object = null,
+    /// Single-copy body path: when a fed buffer's prefix is a Content-Length
+    /// body, the bytes object is held here (incref'd, its memory stable)
+    /// instead of being copied into the reader; next_event materialises Data
+    /// events straight from it. `pending` is the not-yet-consumed remainder.
+    pending_obj: py.Object = null,
+    pending: []const u8 = &.{},
 
     fn rememberMethod(self: *H1Engine, m: []const u8) void {
         if (m.len > self.req_method.len) {
@@ -59,12 +65,62 @@ const H1Engine = struct {
         return self.req_method[0..self.req_method_len];
     }
 
+    fn stash(self: *H1Engine, obj: py.Object, rest: []const u8) void {
+        py.incref(obj);
+        self.pending_obj = obj;
+        self.pending = rest;
+    }
+
+    fn dropPending(self: *H1Engine) void {
+        py.xdecref(self.pending_obj);
+        self.pending_obj = null;
+        self.pending = &.{};
+    }
+
+    /// Move the stashed remainder into the reader's own buffer (the slow path
+    /// the stash bypassed). Returns false with a Python error set on failure.
+    fn flushPending(self: *H1Engine) bool {
+        if (self.pending_obj == null) return true;
+        const rest = self.pending;
+        defer self.dropPending();
+        self.reader.feed(rest) catch |err| {
+            _ = exceptions.raiseParse(err);
+            return false;
+        };
+        return true;
+    }
+
+    /// Feeds smaller than this take the plain buffered path: the head-split
+    /// scan below costs one extra pass over the head, which only pays for
+    /// itself when a sizeable body follows.
+    const head_split_min_feed = 1024;
+
+    fn receiveData(self: *H1Engine, data: []const u8, obj: py.Object) py.Object {
+        if (!self.flushPending()) return null;
+        if (data.len > 0 and self.reader.backlogEmpty()) {
+            if (self.reader.bodyLengthRemaining() != null) {
+                self.stash(obj, data);
+                return py.none();
+            }
+            if (data.len >= head_split_min_feed and self.reader.atMessageStart()) {
+                if (core.h1.reader.findHeadEnd(data)) |head_end| {
+                    self.reader.feed(data[0..head_end]) catch |err| return exceptions.raiseParse(err);
+                    if (head_end < data.len) self.stash(obj, data[head_end..]);
+                    return py.none();
+                }
+            }
+        }
+        self.reader.feed(data) catch |err| return exceptions.raiseParse(err);
+        return py.none();
+    }
+
     fn deinit(self: *H1Engine) void {
         self.reader.deinit();
         gpa.destroy(self.reader);
         self.writer.deinit();
         gpa.destroy(self.writer);
         py.xdecref(self.upgrade_obj);
+        py.xdecref(self.pending_obj);
     }
 };
 
@@ -573,10 +629,7 @@ fn receive_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Objec
             e.conn.feed(bytes) catch |err| return exceptions.raiseH2(err);
             return py.none();
         },
-        .h1 => |*e| {
-            e.reader.feed(bytes) catch |err| return exceptions.raiseParse(err); // MessageTooLong -> RemoteProtocolError
-            return py.none();
-        },
+        .h1 => |*e| return e.receiveData(bytes, arg),
         .h3 => return py.raiseRuntime("receive_data is not valid for an HTTP/3 connection; use receive_datagram"),
     }
 }
@@ -604,17 +657,50 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
             return events_obj.fromH2Event(ev);
         },
         .h1 => |*e| {
-            const ev = e.reader.nextEvent() catch |err| return exceptions.raiseParse(err);
-            if (ev == .request) {
-                e.rememberMethod(ev.request.method);
-                e.should_close = e.reader.shouldClose();
-                py.xdecref(e.upgrade_obj);
-                if (e.reader.upgrade()) |u| {
-                    e.upgrade_obj = py.fromBytes(u);
-                    if (e.upgrade_obj == null) return null; // propagate the pending MemoryError
-                } else e.upgrade_obj = null;
+            while (true) {
+                const ev = e.reader.nextEvent() catch |err| {
+                    e.dropPending();
+                    return exceptions.raiseParse(err);
+                };
+                if (ev == .need_data and e.pending_obj != null) {
+                    if (e.reader.backlogEmpty()) {
+                        if (e.reader.bodyLengthRemaining()) |rem| {
+                            // Materialise body bytes straight from the stashed
+                            // buffer - the one copy - and account for them.
+                            const take: usize = @intCast(@min(rem, @as(u64, e.pending.len)));
+                            const out = events_obj.fromH1Event(.{ .data = .{ .data = e.pending[0..take] } });
+                            if (out == null) return null;
+                            e.reader.skipBodyLength(take);
+                            e.pending = e.pending[take..];
+                            if (e.pending.len == 0) {
+                                e.dropPending();
+                            } else if (e.reader.bodyLengthRemaining() == null) {
+                                // The remainder is the next pipelined message.
+                                if (!e.flushPending()) {
+                                    py.decref(out);
+                                    return null;
+                                }
+                            }
+                            return out;
+                        }
+                    }
+                    // The stash cannot be consumed in place (chunked body,
+                    // message done, or buffered bytes precede it): buffer it
+                    // and ask the reader again.
+                    if (!e.flushPending()) return null;
+                    continue;
+                }
+                if (ev == .request) {
+                    e.rememberMethod(ev.request.method);
+                    e.should_close = e.reader.shouldClose();
+                    py.xdecref(e.upgrade_obj);
+                    if (e.reader.upgrade()) |u| {
+                        e.upgrade_obj = py.fromBytes(u);
+                        if (e.upgrade_obj == null) return null; // propagate the pending MemoryError
+                    } else e.upgrade_obj = null;
+                }
+                return events_obj.fromH1Event(ev);
             }
-            return events_obj.fromH1Event(ev);
         },
     }
 }
