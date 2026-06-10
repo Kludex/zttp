@@ -157,32 +157,6 @@ var window_update_members = [_]py.MemberDef{
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 
-// -- event shell cache ----------------------------------------------------------
-
-// next_event allocates one event object that callers typically drop before the
-// next call, so one cached shell per hot type recycles nearly every alloc/free
-// pair. The slot is swapped atomically, so it stays correct on free-threaded
-// builds; the dealloc path nulls every field before stashing.
-var request_cache: py.Object = null;
-var response_cache: py.Object = null;
-var data_cache: py.Object = null;
-var eom_cache: py.Object = null;
-
-fn cacheTake(slot: *py.Object, tp: py.Object) py.Object {
-    if (@atomicRmw(py.Object, slot, .Xchg, null, .acq_rel)) |shell| {
-        c.Py_SET_REFCNT(shell, 1);
-        py.gcTrack(shell);
-        return shell;
-    }
-    return py.allocInstance(tp);
-}
-
-fn cacheStash(slot: *py.Object, o: py.Object) void {
-    if (@atomicRmw(py.Object, slot, .Xchg, o, .acq_rel)) |evicted| {
-        py.freeInstance(evicted);
-    }
-}
-
 // -- dealloc ------------------------------------------------------------------
 
 fn deallocRequest(o: ?*c.PyObject) callconv(.c) void {
@@ -195,15 +169,7 @@ fn deallocRequest(o: ?*c.PyObject) callconv(.c) void {
     py.xdecref(s.http_version);
     py.xdecref(s.headers);
     py.xdecref(s.stream_id);
-    s.method = null;
-    s.target = null;
-    s.path = null;
-    s.query = null;
-    s.http_version = null;
-    s.headers = null;
-    s.stream_id = null;
-    s.expect_continue = 0;
-    cacheStash(&request_cache, @ptrCast(s));
+    py.freeInstance(@ptrCast(s));
 }
 fn deallocResponse(o: ?*c.PyObject) callconv(.c) void {
     const s: *ResponseObject = @ptrCast(o.?);
@@ -213,30 +179,21 @@ fn deallocResponse(o: ?*c.PyObject) callconv(.c) void {
     py.xdecref(s.http_version);
     py.xdecref(s.headers);
     py.xdecref(s.stream_id);
-    s.status_code = null;
-    s.reason = null;
-    s.http_version = null;
-    s.headers = null;
-    s.stream_id = null;
-    cacheStash(&response_cache, @ptrCast(s));
+    py.freeInstance(@ptrCast(s));
 }
 fn deallocData(o: ?*c.PyObject) callconv(.c) void {
     const s: *DataObject = @ptrCast(o.?);
     py.gcUntrack(s);
     py.xdecref(s.data);
     py.xdecref(s.stream_id);
-    s.data = null;
-    s.stream_id = null;
-    cacheStash(&data_cache, @ptrCast(s));
+    py.freeInstance(@ptrCast(s));
 }
 fn deallocEom(o: ?*c.PyObject) callconv(.c) void {
     const s: *EndOfMessageObject = @ptrCast(o.?);
     py.gcUntrack(s);
     py.xdecref(s.trailers);
     py.xdecref(s.stream_id);
-    s.trailers = null;
-    s.stream_id = null;
-    cacheStash(&eom_cache, @ptrCast(s));
+    py.freeInstance(@ptrCast(s));
 }
 fn deallocRstStream(o: ?*c.PyObject) callconv(.c) void {
     const s: *RstStreamObject = @ptrCast(o.?);
@@ -788,7 +745,7 @@ fn u32Obj(v: u32) py.Object {
 }
 
 fn makeRequest(r: events.Request) py.Object {
-    const o = cacheTake(&request_cache, request_type);
+    const o = py.allocInstance(request_type);
     if (o == null) return null;
     const s: *RequestObject = @ptrCast(o);
     s.method = py.fromBytes(r.method);
@@ -807,7 +764,7 @@ fn makeRequest(r: events.Request) py.Object {
 }
 
 fn makeResponse(r: events.Response) py.Object {
-    const o = cacheTake(&response_cache, response_type);
+    const o = py.allocInstance(response_type);
     if (o == null) return null;
     const s: *ResponseObject = @ptrCast(o);
     s.status_code = py.fromU16(r.status_code);
@@ -823,7 +780,7 @@ fn makeResponse(r: events.Response) py.Object {
 }
 
 fn makeData(d: events.Data) py.Object {
-    const o = cacheTake(&data_cache, data_type);
+    const o = py.allocInstance(data_type);
     if (o == null) return null;
     const s: *DataObject = @ptrCast(o);
     s.data = py.fromBytes(d.data);
@@ -836,7 +793,7 @@ fn makeData(d: events.Data) py.Object {
 }
 
 fn makeEom(e: events.EndOfMessage) py.Object {
-    const o = cacheTake(&eom_cache, end_of_message_type);
+    const o = py.allocInstance(end_of_message_type);
     if (o == null) return null;
     const s: *EndOfMessageObject = @ptrCast(o);
     s.trailers = buildHeaders(e.trailers);
