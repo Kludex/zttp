@@ -92,6 +92,10 @@ pub const Connection = struct {
     streams: std.AutoHashMapUnmanaged(u32, Stream) = .empty,
     conn_recv_window: i32 = constants.DEFAULT_WINDOW_SIZE,
     conn_send_window: i32 = constants.DEFAULT_WINDOW_SIZE,
+    /// Connection-level receive bytes consumed since the last WINDOW_UPDATE we sent.
+    /// The window is refilled immediately on consume (the core surfaces DATA at
+    /// once), and this accumulates what to advertise back, flushed by a threshold.
+    conn_recv_credit: u32 = 0,
     highest_peer_id: u32 = 0,
     /// High-water of the client's own opened ids (highest_peer_id's local analogue),
     /// so a response for a reset stream is recognized as closed, not a new stream.
@@ -386,6 +390,11 @@ pub const Connection = struct {
             return;
         }
         s.recordData(content.len);
+        // Refill the receive windows immediately (the data is surfaced now) and
+        // accumulate the consumed length to advertise back via WINDOW_UPDATE.
+        self.conn_recv_window += @intCast(f.header.length);
+        self.conn_recv_credit +|= f.header.length;
+        s.creditRecvWindow(f.header.length);
         if (content.len > 0) self.push(.{ .data = .{ .data = content, .stream_id = f.header.stream_id } });
         s.recvApply(.data, end_stream);
         if (end_stream) {
@@ -781,6 +790,27 @@ pub const Connection = struct {
     /// WINDOW_UPDATE or an INITIAL_WINDOW_SIZE change credits a send window.
     /// Flushing mutates only each stream's own fields and the writer (never the
     /// map's shape), so iterating value pointers in place is safe.
+    /// Emit WINDOW_UPDATE frames to advertise the receive credit accumulated as
+    /// DATA was consumed, so the peer's send window never drains to a stall. A
+    /// connection-level update (stream 0) plus one per stream that has consumed
+    /// at least `threshold` bytes; the connection update fires on the same
+    /// threshold against its own accumulator. Auto-replenish to full is the
+    /// pragmatic default for a core that surfaces DATA immediately.
+    pub fn flushRecvWindows(self: *Connection, writer: *writer_mod.Writer) writer_mod.WriteError!void {
+        const threshold: u32 = @intCast(@divTrunc(constants.DEFAULT_WINDOW_SIZE, 2));
+        if (self.conn_recv_credit >= threshold) {
+            try writer.sendWindowUpdate(0, self.conn_recv_credit);
+            self.conn_recv_credit = 0;
+        }
+        var it = self.streams.valueIterator();
+        while (it.next()) |strm| {
+            if (strm.recv_credit >= threshold) {
+                try writer.sendWindowUpdate(strm.id, strm.recv_credit);
+                strm.recv_credit = 0;
+            }
+        }
+    }
+
     pub fn flushSendable(self: *Connection, writer: *writer_mod.Writer) writer_mod.WriteError!void {
         // Flush every stream, then evict the ones that fully closed in a SEPARATE
         // pass. Removing entries while the value iterator is live would be fragile
@@ -1905,6 +1935,56 @@ test "fuzz: H2 connection never panics on adversarial frame streams" {
             if (ev == .need_data) break;
         }
     }
+}
+
+test "consumed DATA refills the receive window and accrues credit to advertise" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var w = writer_mod.Writer.init(testing.allocator, .server);
+    defer w.deinit();
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    try input.appendSlice(testing.allocator, constants.CLIENT_PREFACE);
+    try frameBytes(&input, .settings, 0, 0, &.{});
+    try frameBytes(&input, .headers, Flags.end_headers, 1, &GET_BLOCK); // open, no END_STREAM
+    // Three DATA frames totaling 48000 bytes, past the half-window threshold.
+    const chunk = [_]u8{'x'} ** 16000;
+    var k: usize = 0;
+    while (k < 3) : (k += 1) try frameBytes(&input, .data, 0, 1, &chunk);
+    try c.feed(input.items);
+    while (true) {
+        const ev = try c.nextEvent();
+        if (ev == .need_data) break;
+    }
+    // The window was refilled on consume, so it never dropped below the start.
+    try testing.expectEqual(constants.DEFAULT_WINDOW_SIZE, c.conn_recv_window);
+    try testing.expectEqual(@as(u32, 48000), c.conn_recv_credit);
+    try testing.expectEqual(@as(u32, 48000), c.streams.getPtr(1).?.recv_credit);
+    // Flushing emits WINDOW_UPDATEs and clears the accumulators.
+    try c.flushRecvWindows(&w);
+    try testing.expectEqual(@as(u32, 0), c.conn_recv_credit);
+    try testing.expectEqual(@as(u32, 0), c.streams.getPtr(1).?.recv_credit);
+}
+
+test "a small body stays under the window-update threshold" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var w = writer_mod.Writer.init(testing.allocator, .server);
+    defer w.deinit();
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    try input.appendSlice(testing.allocator, constants.CLIENT_PREFACE);
+    try frameBytes(&input, .settings, 0, 0, &.{});
+    try frameBytes(&input, .headers, Flags.end_headers, 1, &GET_BLOCK);
+    try frameBytes(&input, .data, Flags.end_stream, 1, "hello");
+    try c.feed(input.items);
+    while (true) {
+        const ev = try c.nextEvent();
+        if (ev == .need_data) break;
+    }
+    const before = w.pending().len;
+    try c.flushRecvWindows(&w); // below threshold -> nothing emitted
+    try testing.expectEqual(before, w.pending().len);
 }
 
 fn driveConnection(input: []const u8) void {

@@ -45,6 +45,8 @@ pub const Stream = struct {
     /// check against 2^31-1 is done in i64 by the caller before narrowing.
     recv_window: i32,
     send_window: i32,
+    /// Receive bytes consumed on this stream since the last WINDOW_UPDATE we sent.
+    recv_credit: u32 = 0,
     /// Declared Content-Length (if any) and bytes of DATA seen, for the
     /// h2->h1 smuggling guard (validated at END_STREAM).
     content_length: ?u64 = null,
@@ -171,6 +173,13 @@ pub const Stream = struct {
         }
         self.recv_window -= @intCast(len);
         return Transition.ok;
+    }
+
+    /// Refill the receive window by `len` (the data was just consumed) and record
+    /// the same amount as credit to advertise back via WINDOW_UPDATE.
+    pub fn creditRecvWindow(self: *Stream, len: u32) void {
+        self.recv_window += @intCast(len);
+        self.recv_credit +|= len;
     }
 
     /// Apply a WINDOW_UPDATE increment to the send window. A zero increment is a

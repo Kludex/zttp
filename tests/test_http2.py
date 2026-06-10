@@ -389,17 +389,18 @@ def test_full_body_round_trips_across_window_updates() -> None:
     assert bytes(body) == b"abcdefghij"
 
 
-def _frames(data: bytes) -> list[tuple[int, int, bytes]]:
-    """Parse (type, stream_id, payload) tuples, skipping a leading client preface."""
+def _frames(data: bytes) -> list[tuple[int, int, int, bytes]]:
+    """Parse (type, flags, stream_id, payload) tuples, skipping a leading preface."""
     if data.startswith(PREFACE):
         data = data[len(PREFACE) :]
-    out: list[tuple[int, int, bytes]] = []
+    out: list[tuple[int, int, int, bytes]] = []
     i = 0
     while i + 9 <= len(data):
         length = int.from_bytes(data[i : i + 3], "big")
         ftype = data[i + 3]
+        flags = data[i + 4]
         sid = int.from_bytes(data[i + 5 : i + 9], "big") & 0x7FFFFFFF
-        out.append((ftype, sid, data[i + 9 : i + 9 + length]))
+        out.append((ftype, flags, sid, data[i + 9 : i + 9 + length]))
         i += 9 + length
     return out
 
@@ -411,7 +412,7 @@ def test_h2_stream_reset_sends_rst_stream() -> None:
 
     rst = [f for f in _frames(client.data_to_send()) if f[0] == 0x03]
     assert len(rst) == 1
-    _, sid, payload = rst[0]
+    _, _, sid, payload = rst[0]
     assert sid == stream.stream_id
     assert int.from_bytes(payload, "big") == 0x08  # CANCEL
 
@@ -422,7 +423,7 @@ def test_h2_stream_reset_accepts_an_explicit_code() -> None:
     stream.reset(0x01)  # PROTOCOL_ERROR
 
     rst = [f for f in _frames(client.data_to_send()) if f[0] == 0x03]
-    assert int.from_bytes(rst[0][2], "big") == 0x01
+    assert int.from_bytes(rst[0][3], "big") == 0x01
 
 
 def test_h2_close_sends_goaway_with_the_highest_peer_stream() -> None:
@@ -435,7 +436,7 @@ def test_h2_close_sends_goaway_with_the_highest_peer_stream() -> None:
     server.close()  # graceful: NO_ERROR, last_stream_id auto
     goaway = [f for f in _frames(server.data_to_send()) if f[0] == 0x07]
     assert len(goaway) == 1
-    _, _, payload = goaway[0]
+    _, _, _, payload = goaway[0]
     last_stream_id = int.from_bytes(payload[0:4], "big")
     error_code = int.from_bytes(payload[4:8], "big")
     assert last_stream_id == 1  # the one request it processed
@@ -447,7 +448,7 @@ def test_h2_close_accepts_an_explicit_code_and_last_stream_id() -> None:
     server.close(0x0B, 0)  # ENHANCE_YOUR_CALM, last_stream_id 0
 
     goaway = [f for f in _frames(server.data_to_send()) if f[0] == 0x07]
-    payload = goaway[0][2]
+    payload = goaway[0][3]
     assert int.from_bytes(payload[0:4], "big") == 0
     assert int.from_bytes(payload[4:8], "big") == 0x0B
 
@@ -479,3 +480,71 @@ def test_h2_response_after_stream_reset_is_ignored() -> None:
     client.receive_data(response)
     events = list(drain_h2(client))
     assert not any(isinstance(e, (zttp.Response, zttp.Data)) for e in events)
+
+
+def test_h2_peer_settings_is_auto_acked() -> None:
+    conn = server_with()  # preface + an empty peer SETTINGS
+    list(drain_h2(conn))
+    ack = [f for f in _frames(conn.data_to_send()) if f[0] == 0x04 and f[1] & 0x01]
+    assert len(ack) == 1  # SETTINGS frame with the ACK flag set
+
+
+def test_h2_peer_ping_is_auto_acked_with_the_same_payload() -> None:
+    conn = server_with()
+    list(drain_h2(conn))
+    conn.data_to_send()  # flush the SETTINGS ack
+    conn.receive_data(frame(0x06, 0, 0, b"PINGDATA"))  # a PING request (not an ack)
+    list(drain_h2(conn))
+    ack = [f for f in _frames(conn.data_to_send()) if f[0] == 0x06 and f[1] & 0x01]
+    assert len(ack) == 1
+    assert ack[0][3] == b"PINGDATA"  # the opaque data is echoed
+
+
+def test_h2_a_ping_ack_is_not_re_acked() -> None:
+    conn = server_with()
+    list(drain_h2(conn))
+    conn.data_to_send()
+    conn.receive_data(frame(0x06, 0x01, 0, b"ACKDATA0"))  # a PING with the ACK flag
+    list(drain_h2(conn))
+    assert [f for f in _frames(conn.data_to_send()) if f[0] == 0x06] == []
+
+
+def test_h2_consumed_receive_window_is_replenished() -> None:
+    conn = server_with(frame(0x01, END_HEADERS, 1, GET_BLOCK))  # open stream 1
+    list(drain_h2(conn))
+    conn.data_to_send()
+    # Three 16 KiB DATA frames (48 KiB) cross the half-window replenish threshold.
+    for _ in range(3):
+        conn.receive_data(frame(0x00, 0, 1, b"x" * 16000))
+    list(drain_h2(conn))
+    updates = [f for f in _frames(conn.data_to_send()) if f[0] == 0x08]
+    by_stream = {sid: int.from_bytes(payload, "big") for _, _, sid, payload in updates}
+    assert by_stream.get(0) == 48000  # connection-level (stream 0)
+    assert by_stream.get(1) == 48000  # the stream
+
+
+def test_h2_a_small_body_does_not_trigger_a_window_update() -> None:
+    conn = server_with(frame(0x01, END_HEADERS, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    conn.data_to_send()
+    conn.receive_data(frame(0x00, END_STREAM, 1, b"hello"))  # tiny body, below threshold
+    list(drain_h2(conn))
+    assert [f for f in _frames(conn.data_to_send()) if f[0] == 0x08] == []
+
+
+def test_h2_padding_only_data_still_replenishes_the_window() -> None:
+    # DATA frames of pure padding consume window but surface no Data event; the
+    # window must still be advertised back, or the peer's send window stalls.
+    conn = server_with(frame(0x01, END_HEADERS, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    conn.data_to_send()
+    PADDED = 0x08
+    padding_only = bytes([255]) + b"\x00" * 255  # 256-byte frame, zero content
+    for _ in range(140):  # 140 * 256 = 35840 bytes, past the 32 KiB threshold
+        conn.receive_data(frame(0x00, PADDED, 1, padding_only))
+    events = list(drain_h2(conn))
+    assert not any(isinstance(e, zttp.Data) for e in events)  # nothing surfaced
+    updates = [f for f in _frames(conn.data_to_send()) if f[0] == 0x08]
+    by_stream = {sid: int.from_bytes(payload, "big") for _, _, sid, payload in updates}
+    assert by_stream.get(0, 0) >= 32768  # connection window advertised
+    assert by_stream.get(1, 0) >= 32768  # stream window advertised

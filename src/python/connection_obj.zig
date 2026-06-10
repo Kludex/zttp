@@ -135,8 +135,23 @@ const H2Engine = struct {
 
     /// Drain parked DATA that a freshly-parsed WINDOW_UPDATE / SETTINGS credit now
     /// permits. Called from next_event after such an event is produced.
-    fn flushSendable(self: *H2Engine) core.h2.writer.WriteError!void {
-        try self.conn.flushSendable(self.writer);
+    /// Auto-handle the connection-management frames RFC 9113 expects a peer to
+    /// answer without app involvement: ACK the peer's SETTINGS and PING, and
+    /// advertise consumed receive window via WINDOW_UPDATE. The serialized frames
+    /// land in the writer buffer for the next data_to_send.
+    fn autoRespond(self: *H2Engine, ev: events.H2Event) core.h2.writer.WriteError!void {
+        switch (ev) {
+            .settings => try self.writer.sendSettingsAck(),
+            .ping => |p| if (!p.ack) try self.writer.sendPingAck(p.opaque_data),
+            else => {},
+        }
+        // Advertise consumed receive window. Not gated on the .data event: a DATA
+        // frame of pure padding consumes window but surfaces no event, so flushing
+        // here (threshold-checked, idempotent) keeps the peer's send window open.
+        try self.conn.flushRecvWindows(self.writer);
+        // A parsed WINDOW_UPDATE / SETTINGS may have credited a send window; drain
+        // any DATA parked waiting for it.
+        if (ev == .window_update or ev == .settings) try self.conn.flushSendable(self.writer);
     }
 
     fn deinit(self: *H2Engine) void {
@@ -482,11 +497,7 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     switch (engine.*) {
         .h2 => |*e| {
             const ev = e.conn.nextEvent() catch |err| return exceptions.raiseH2(err);
-            // A parsed WINDOW_UPDATE / SETTINGS may have credited a send window;
-            // drain any DATA that was parked waiting for it. The bytes land in the
-            // writer's buffer for the next data_to_send.
-            if (ev == .window_update or ev == .settings)
-                e.flushSendable() catch |err| return h2RaiseWrite(err);
+            e.autoRespond(ev) catch |err| return h2RaiseWrite(err);
             return events_obj.fromH2Event(ev);
         },
         .h1 => |*e| {
