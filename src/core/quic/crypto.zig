@@ -74,10 +74,13 @@ pub const InitialKeys = struct {
 };
 
 /// HKDF-Expand-Label (RFC 8446 7.1) over a SHA-256 PRK, the TLS 1.3 / QUIC label
-/// construction: the info is length-prefixed "tls13 "+label and context.
-fn expandLabelPrk(out: []u8, prk: [Hkdf.prk_length]u8, comptime label: []const u8, context: []const u8) void {
-    var info: [512]u8 = undefined;
+/// construction: the info is length-prefixed "tls13 "+label and context. Public so
+/// the TLS 1.3 key schedule (tls/) shares this one label construction.
+pub fn expandLabelPrk(out: []u8, prk: [Hkdf.prk_length]u8, comptime label: []const u8, context: []const u8) void {
+    var info: [2 + 1 + 255 + 1 + 255]u8 = undefined; // the maximum legal HkdfLabel (RFC 8446 7.1)
     const full_label = "tls13 " ++ label;
+    comptime std.debug.assert(full_label.len <= 255);
+    std.debug.assert(context.len <= 255);
     var i: usize = 0;
     info[i] = @intCast(out.len >> 8);
     info[i + 1] = @intCast(out.len & 0xff);
@@ -94,8 +97,9 @@ fn expandLabelPrk(out: []u8, prk: [Hkdf.prk_length]u8, comptime label: []const u
 }
 
 /// Expand-Label over a 32-byte secret (the common case): re-extract is not
-/// needed because a traffic secret already has PRK length.
-fn expandLabel(out: []u8, secret: [32]u8, comptime label: []const u8, context: []const u8) void {
+/// needed because a traffic secret already has PRK length. Public so the TLS 1.3
+/// key schedule's Derive-Secret (Expand-Label over the transcript hash) reuses it.
+pub fn expandLabel(out: []u8, secret: [32]u8, comptime label: []const u8, context: []const u8) void {
     expandLabelPrk(out, secret, label, context);
 }
 

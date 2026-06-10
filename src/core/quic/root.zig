@@ -13,6 +13,7 @@ pub const recovery = @import("recovery.zig");
 pub const flow = @import("flow.zig");
 pub const stream = @import("stream.zig");
 pub const connection = @import("connection.zig");
+pub const tls = @import("tls/root.zig");
 
 test {
     _ = varint;
@@ -25,4 +26,5 @@ test {
     _ = flow;
     _ = stream;
     _ = connection;
+    _ = tls;
 }
