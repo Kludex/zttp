@@ -387,3 +387,72 @@ def test_full_body_round_trips_across_window_updates() -> None:
         list(drain_h2(conn))
         rounds += 1
     assert bytes(body) == b"abcdefghij"
+
+
+def _frames(data: bytes) -> list[tuple[int, int, bytes]]:
+    """Parse (type, stream_id, payload) tuples, skipping a leading client preface."""
+    if data.startswith(PREFACE):
+        data = data[len(PREFACE) :]
+    out: list[tuple[int, int, bytes]] = []
+    i = 0
+    while i + 9 <= len(data):
+        length = int.from_bytes(data[i : i + 3], "big")
+        ftype = data[i + 3]
+        sid = int.from_bytes(data[i + 5 : i + 9], "big") & 0x7FFFFFFF
+        out.append((ftype, sid, data[i + 9 : i + 9 + length]))
+        i += 9 + length
+    return out
+
+
+def test_h2_stream_reset_sends_rst_stream() -> None:
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    stream = client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
+    stream.reset()  # defaults to CANCEL
+
+    rst = [f for f in _frames(client.data_to_send()) if f[0] == 0x03]
+    assert len(rst) == 1
+    _, sid, payload = rst[0]
+    assert sid == stream.stream_id
+    assert int.from_bytes(payload, "big") == 0x08  # CANCEL
+
+
+def test_h2_stream_reset_accepts_an_explicit_code() -> None:
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    stream = client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
+    stream.reset(0x01)  # PROTOCOL_ERROR
+
+    rst = [f for f in _frames(client.data_to_send()) if f[0] == 0x03]
+    assert int.from_bytes(rst[0][2], "big") == 0x01
+
+
+def test_h2_close_sends_goaway_with_the_highest_peer_stream() -> None:
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    client.send_request(b"GET", b"/", b"2", [(b"host", b"x")]).end_message()
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    server.receive_data(client.data_to_send())
+    list(drain_h2(server))
+
+    server.close()  # graceful: NO_ERROR, last_stream_id auto
+    goaway = [f for f in _frames(server.data_to_send()) if f[0] == 0x07]
+    assert len(goaway) == 1
+    _, _, payload = goaway[0]
+    last_stream_id = int.from_bytes(payload[0:4], "big")
+    error_code = int.from_bytes(payload[4:8], "big")
+    assert last_stream_id == 1  # the one request it processed
+    assert error_code == 0  # NO_ERROR
+
+
+def test_h2_close_accepts_an_explicit_code_and_last_stream_id() -> None:
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    server.close(0x0B, 0)  # ENHANCE_YOUR_CALM, last_stream_id 0
+
+    goaway = [f for f in _frames(server.data_to_send()) if f[0] == 0x07]
+    payload = goaway[0][2]
+    assert int.from_bytes(payload[0:4], "big") == 0
+    assert int.from_bytes(payload[4:8], "big") == 0x0B
+
+
+def test_h2_close_on_an_http1_connection_is_an_error() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(AttributeError):
+        conn.close()

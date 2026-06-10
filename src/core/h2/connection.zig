@@ -737,6 +737,19 @@ pub const Connection = struct {
         self.openStream(id) catch return error.OutOfMemory;
     }
 
+    /// Account for a locally-initiated RST_STREAM: the stream is terminally closed,
+    /// so drop it from the map (the caller serializes the RST_STREAM frame itself).
+    /// A no-op on an unknown id.
+    pub fn localReset(self: *Connection, id: u32) void {
+        self.evictStream(id);
+    }
+
+    /// The highest peer-initiated stream id seen so far - the natural last-stream-id
+    /// for a GOAWAY (everything above it was never processed).
+    pub fn lastPeerStreamId(self: *const Connection) u32 {
+        return self.highest_peer_id;
+    }
+
     /// Queue outbound body bytes on `id`, emitting as much as the connection and
     /// stream send windows (and the peer's max frame) allow, parking the rest.
     pub fn sendStreamData(self: *Connection, writer: *writer_mod.Writer, id: u32, data: []const u8, end_stream: bool) writer_mod.WriteError!void {
