@@ -58,3 +58,31 @@ def consume(data: bytes) -> None:
         _drive(role, chunks)
     except ALLOWED:
         return
+
+
+# A valid client preface + empty SETTINGS frame: enough to push the mutated tail
+# past the handshake and into the connection/HPACK/frame/stream state machine.
+H2_PREAMBLE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+H2_PREFIX = H2_PREAMBLE + b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+
+
+def _drive_h2(role: int, chunks: list[bytes]) -> None:
+    conn = zttp.Connection(role, protocol=zttp.HTTP2)
+    # A client has no inbound preface; only a server consumes it.
+    conn.receive_data(H2_PREFIX if role == zttp.SERVER else H2_PREFIX[len(H2_PREAMBLE) :])
+    for chunk in chunks:
+        conn.receive_data(chunk)
+        while True:
+            event = conn.next_event()
+            if event is zttp.NEED_DATA or event is zttp.CONNECTION_CLOSED:
+                break
+
+
+def consume_h2(data: bytes) -> None:
+    """H2 fuzz iteration: drive the HTTP/2 engine. Raises only on a real bug."""
+    role = ROLES[data[0] & 1] if data else zttp.SERVER
+    chunks = _split(data[1:] if data else data)
+    try:
+        _drive_h2(role, chunks)
+    except ALLOWED:
+        return

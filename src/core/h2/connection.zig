@@ -570,6 +570,7 @@ pub const Connection = struct {
 
         for (headers) |h| {
             if (h.name.len == 0) return error.Malformed;
+            if (!validValue(h.value)) return error.Malformed; // CR/LF/NUL/control in value
             if (h.name[0] == ':') {
                 if (seen_regular) return error.Malformed; // pseudo after regular
                 if (eql(h.name, ":method")) {
@@ -605,6 +606,9 @@ pub const Connection = struct {
 
         if (method == null or path == null or scheme == null) return error.Malformed;
         const target = path.?;
+        // RFC 9113 8.3.1: :path must be non-empty for http/https (the empty/CONNECT
+        // and asterisk-form carve-outs are *, which is non-empty, so this is enough).
+        if (target.len == 0) return error.Malformed;
         const q = std.mem.indexOfScalar(u8, target, '?');
         const req_path = if (q) |i| target[0..i] else target;
         const req_query = if (q) |i| target[i + 1 ..] else target[target.len..];
@@ -649,6 +653,7 @@ pub const Connection = struct {
             if (h.name[0] == ':') {
                 if (seen_regular) return error.Malformed; // pseudo after regular
                 if (!eql(h.name, ":status")) return error.Malformed; // request pseudo or unknown
+                // :status is digit-checked below, so it cannot carry a control byte.
                 if (status != null) return error.Malformed;
                 if (h.value.len != 3) return error.Malformed;
                 var code: u16 = 0;
@@ -664,6 +669,7 @@ pub const Connection = struct {
             }
             seen_regular = true;
             if (!isValidFieldName(h.name)) return error.Malformed;
+            if (!validValue(h.value)) return error.Malformed; // CR/LF/NUL/control in value
             if (isConnectionSpecific(h.name)) return error.Malformed;
             if (eql(h.name, "content-length")) {
                 const cl = parseU64(h.value) orelse return error.Malformed;
@@ -835,12 +841,30 @@ fn isValidFieldName(name: []const u8) bool {
     return true;
 }
 
+/// A legal field value (RFC 9113 8.2.1): no CR/LF/NUL or other control and no
+/// DEL (obs-text 0x80-0xFF and inner SP/HTAB are allowed), and no leading or
+/// trailing whitespace. The same rule the H2 write path enforces, so a value the
+/// read side accepts the write side can re-serialize without splitting or being
+/// silently re-trimmed by a peer.
+fn validValue(value: []const u8) bool {
+    for (value) |ch| {
+        if (!tables.is_field_vchar[ch]) return false;
+    }
+    if (value.len > 0) {
+        const first = value[0];
+        const last = value[value.len - 1];
+        if (first == ' ' or first == '\t' or last == ' ' or last == '\t') return false;
+    }
+    return true;
+}
+
 /// Trailers (RFC 9113 8.1): no pseudo-header may appear, and every name must be
 /// a valid lowercase field name. Connection-specific fields are likewise barred.
 fn validTrailers(headers: []const events.Header) bool {
     for (headers) |h| {
         if (h.name.len == 0 or h.name[0] == ':') return false;
         if (!isValidFieldName(h.name)) return false;
+        if (!validValue(h.value)) return false;
         if (isConnectionSpecific(h.name)) return false;
     }
     return true;
@@ -1284,6 +1308,191 @@ test "a pseudo-header in trailers is rejected" {
     try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
     try testing.expectEqual(std.meta.Tag(Event).data, std.meta.activeTag(try c.nextEvent()));
     try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "a CR in a regular header value resets the stream" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // :method GET, :scheme http, :path /, then literal "x-evil: a\rb".
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x06 } ++ "x-evil".* ++ [_]u8{ 0x03, 'a', 0x0D, 'b' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    const ev = try c.nextEvent();
+    try testing.expectEqual(@as(u32, 1), ev.rst_stream.stream_id);
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), ev.rst_stream.error_code);
+}
+
+test "an LF in a regular header value resets the stream" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x06 } ++ "x-evil".* ++ [_]u8{ 0x03, 'a', 0x0A, 'b' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "a NUL in a regular header value resets the stream" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x06 } ++ "x-evil".* ++ [_]u8{ 0x03, 'a', 0x00, 'b' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "a CRLF in :path resets the stream" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // :method GET, :scheme http, then a literal :path value "/\r\n".
+    const block = [_]u8{ 0x82, 0x86, 0x00, 0x05 } ++ ":path".* ++ [_]u8{ 0x03, '/', 0x0D, 0x0A };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    const ev = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(ev));
+}
+
+test "a CRLF in :authority resets the stream" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // :method GET, :scheme http, :path /, then a literal :authority "evil\r\n".
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x0a } ++ ":authority".* ++ [_]u8{ 0x06, 'e', 'v', 'i', 'l', 0x0D, 0x0A };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "a control byte in a trailer value resets the stream" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &GET_BLOCK); // open, no END_STREAM
+    try frameBytes(&frames, .data, 0, 1, "body");
+    // Trailer "x-checksum: a\x00b" - a NUL in the value.
+    const trailer = [_]u8{ 0x00, 0x0a } ++ "x-checksum".* ++ [_]u8{ 0x03, 'a', 0x00, 'b' };
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &trailer);
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).data, std.meta.activeTag(try c.nextEvent()));
+    const ev = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(ev));
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), ev.rst_stream.error_code);
+}
+
+test "an empty :path is malformed and resets the stream" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // :method GET, :scheme http, then a literal :path with an empty value.
+    const block = [_]u8{ 0x82, 0x86, 0x00, 0x05 } ++ ":path".* ++ [_]u8{0x00};
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    const ev = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(ev));
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), ev.rst_stream.error_code);
+}
+
+test "an obs-text value (0x80-0xFF) is accepted" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // A full GET request plus a literal "x-obs: \x80\xFF" (obs-text, legal).
+    const block = GET_BLOCK ++ [_]u8{ 0x00, 0x05 } ++ "x-obs".* ++ [_]u8{ 0x02, 0x80, 0xFF };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    const req = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
+    try testing.expectEqualStrings("x-obs", req.request.headers[0].name);
+    try testing.expectEqualStrings(&[_]u8{ 0x80, 0xFF }, req.request.headers[0].value);
+}
+
+test "a trailing-whitespace value resets the stream (RFC 9113 8.2.1)" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // :method GET, :scheme http, :path /, then literal "x-test: val " (trailing SP).
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x06 } ++ "x-test".* ++ [_]u8{ 0x04, 'v', 'a', 'l', ' ' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    const ev = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(ev));
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), ev.rst_stream.error_code);
+}
+
+test "a leading-whitespace value resets the stream (RFC 9113 8.2.1)" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // literal "x-test: \tval" (leading HTAB).
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x06 } ++ "x-test".* ++ [_]u8{ 0x04, 0x09, 'v', 'a', 'l' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "an inner-whitespace value is accepted (only edge OWS is rejected)" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // literal "x-test: a b" - an inner SP is legal (e.g. media-type parameters).
+    const block = GET_BLOCK ++ [_]u8{ 0x00, 0x06 } ++ "x-test".* ++ [_]u8{ 0x03, 'a', ' ', 'b' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    const req = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
+    try testing.expectEqualStrings("a b", req.request.headers[0].value);
+}
+
+test "fuzz: H2 connection never panics on adversarial frame streams" {
+    const seeds = [_][]const u8{
+        &[_]u8{ 0x00, 0x00, 0x03, 0x01, 0x05, 0x00, 0x00, 0x00, 0x01, 0x82, 0x86, 0x84 }, // HEADERS GET
+        &[_]u8{ 0x00, 0x00, 0x04, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x08 }, // RST_STREAM
+        &([_]u8{ 0x00, 0x00, 0x08, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00 } ++ [_]u8{0} ** 8), // PING
+        &[_]u8{ 0x00, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 'h', 'e', 'l', 'l', 'o' }, // DATA END_STREAM
+        &[_]u8{ 0xff, 0xff, 0xff, 0x01, 0x04, 0x00, 0x00, 0x00, 0x01 }, // over-long HEADERS length
+        &[_]u8{ 0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x7f, 0xff, 0xff, 0xff }, // WINDOW_UPDATE
+    };
+    var rng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const r = rng.random();
+    var k: usize = 0;
+    while (k < 2000) : (k += 1) {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(testing.allocator);
+        try input.appendSlice(testing.allocator, constants.CLIENT_PREFACE);
+        try frameBytes(&input, .settings, 0, 0, &.{});
+        const n = r.intRangeAtMost(usize, 1, 6);
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            const seed = try testing.allocator.dupe(u8, seeds[r.intRangeLessThan(usize, 0, seeds.len)]);
+            defer testing.allocator.free(seed);
+            if (seed.len != 0 and r.boolean()) seed[r.intRangeLessThan(usize, 0, seed.len)] = r.int(u8);
+            try input.appendSlice(testing.allocator, seed);
+        }
+        var c = Connection.init(testing.allocator, .server);
+        defer c.deinit();
+        c.limits.max_buffer = 1 << 20;
+        c.feed(input.items) catch continue;
+        var iter: usize = 0;
+        while (iter < input.items.len + 16) : (iter += 1) {
+            const ev = c.nextEvent() catch break;
+            if (ev == .need_data) break;
+        }
+    }
 }
 
 fn driveConnection(input: []const u8) void {

@@ -126,8 +126,8 @@ const H2Engine = struct {
 
     /// Drain parked DATA that a freshly-parsed WINDOW_UPDATE / SETTINGS credit now
     /// permits. Called from next_event after such an event is produced.
-    fn flushSendable(self: *H2Engine) void {
-        self.conn.flushSendable(self.writer) catch {};
+    fn flushSendable(self: *H2Engine) core.h2.writer.WriteError!void {
+        try self.conn.flushSendable(self.writer);
     }
 
     fn deinit(self: *H2Engine) void {
@@ -561,7 +561,8 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
             // A parsed WINDOW_UPDATE / SETTINGS may have credited a send window;
             // drain any DATA that was parked waiting for it. The bytes land in the
             // writer's buffer for the next data_to_send.
-            if (ev == .window_update or ev == .settings) e.flushSendable();
+            if (ev == .window_update or ev == .settings)
+                e.flushSendable() catch |err| return h2RaiseWrite(err);
             return events_obj.fromH2Event(ev);
         },
         .h1 => |*e| {
@@ -570,7 +571,10 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
                 e.rememberMethod(ev.request.method);
                 e.should_close = e.reader.shouldClose();
                 py.xdecref(e.upgrade_obj);
-                e.upgrade_obj = if (e.reader.upgrade()) |u| py.fromBytes(u) else null;
+                if (e.reader.upgrade()) |u| {
+                    e.upgrade_obj = py.fromBytes(u);
+                    if (e.upgrade_obj == null) return null; // propagate the pending MemoryError
+                } else e.upgrade_obj = null;
             }
             return events_obj.fromH1Event(ev);
         },
