@@ -234,6 +234,21 @@ pub fn encodeAck(
     try varint.append(out, gpa, first_range);
 }
 
+/// Append a CRYPTO frame (RFC 9000 19.6): the handshake byte stream for one
+/// packet-number space, carrying `data` at `offset`. Unlike STREAM there are no
+/// flags and the length is always present.
+pub fn encodeCrypto(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    offset: u64,
+    data: []const u8,
+) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.crypto));
+    try varint.append(out, gpa, offset);
+    try varint.append(out, gpa, data.len);
+    try out.appendSlice(gpa, data);
+}
+
 /// Iterate the ranges of a parsed ACK frame. The recovery layer walks these to
 /// learn which packet numbers the peer acknowledged.
 pub fn ackRanges(ack_ranges: []const u8) AckRangeIterator {
@@ -371,6 +386,17 @@ test "encodeAck round-trips through decode" {
     try std.testing.expectEqual(@as(u64, 2), ack.first_range);
     var it = ackRanges(ack.ranges);
     try std.testing.expect(it.next() == null); // no additional ranges
+}
+
+test "encodeCrypto round-trips through decode" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodeCrypto(&out, gpa, 64, "hello");
+    const d = try decode(out.items);
+    try std.testing.expectEqual(@as(u64, 64), d.frame.crypto.offset);
+    try std.testing.expectEqualStrings("hello", d.frame.crypto.data);
+    try std.testing.expectEqual(out.items.len, d.len);
 }
 
 test "two encoded frames decode back to back in one payload" {
