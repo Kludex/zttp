@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import pytest
+from inline_snapshot import snapshot
 
 import zttp
 
@@ -548,3 +549,19 @@ def test_h2_padding_only_data_still_replenishes_the_window() -> None:
     by_stream = {sid: int.from_bytes(payload, "big") for _, _, sid, payload in updates}
     assert by_stream.get(0, 0) >= 32768  # connection window advertised
     assert by_stream.get(1, 0) >= 32768  # stream window advertised
+
+
+def test_h2_head_response_with_content_length_is_not_a_stream_error() -> None:
+    # A HEAD response carries content-length but no body (RFC 9110 8.6); the
+    # content-length vs data-seen check must be skipped, not reset the stream.
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    client.send_request(b"HEAD", b"/", b"2", [(b"host", b"x")]).end_message()
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    server.receive_data(client.data_to_send())
+    list(drain_h2(server))
+    server.stream(1).send_response(200, [(b"content-length", b"1234")])
+    server.stream(1).end_message()
+    client.receive_data(frame(0x04, 0, 0, b""))  # server SETTINGS stand-in
+    client.receive_data(server.data_to_send())
+    events = [type(e).__name__ for e in drain_h2(client)]
+    assert events == snapshot(["Settings", "Settings", "Response", "EndOfMessage"])
