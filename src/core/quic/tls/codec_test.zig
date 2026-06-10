@@ -34,6 +34,10 @@ fn buildClientHello(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pu
     return buildClientHelloEx(out, gpa, pubkey, false);
 }
 
+fn buildClientHelloWithExtras(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pubkey: [32]u8, extras: []const u8) !void {
+    return buildClientHelloFull(out, gpa, pubkey, false, extras);
+}
+
 const wire = @import("wire.zig");
 
 fn emitKeyShare(w: wire.Writer, pubkey: [32]u8) !void {
@@ -49,6 +53,10 @@ fn emitKeyShare(w: wire.Writer, pubkey: [32]u8) !void {
 }
 
 fn buildClientHelloEx(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pubkey: [32]u8, dup_key_share: bool) !void {
+    return buildClientHelloFull(out, gpa, pubkey, dup_key_share, &.{});
+}
+
+fn buildClientHelloFull(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pubkey: [32]u8, dup_key_share: bool, extras: []const u8) !void {
     const w = wire.Writer{ .out = out, .gpa = gpa };
     try w.u8v(0x01); // client_hello
     const msg = try w.open(3);
@@ -90,6 +98,7 @@ fn buildClientHelloEx(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, 
     const qtp = try w.open(2);
     try w.bytes(&[_]u8{ 0x01, 0x02, 0x40, 0x01 });
     try w.close(qtp);
+    try w.bytes(extras); // raw extra extension bytes, for adversarial tests
     try w.close(exts);
     try w.close(msg);
 }
@@ -173,6 +182,19 @@ test "a duplicate key_share extension is rejected" {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(testing.allocator);
     try buildClientHelloEx(&buf, testing.allocator, pubkey, true); // emit key_share twice
+    try testing.expectError(error.EncodingError, client_hello.parse(buf.items));
+}
+
+test "a duplicate unknown extension is rejected (RFC 8446 4.2, all types)" {
+    var pubkey: [32]u8 = undefined;
+    _ = try hex(&pubkey, RFC_CLIENT_PUBKEY);
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(testing.allocator);
+    // A valid CH plus two copies of the same unrecognized extension (type 0xABCD).
+    try buildClientHelloWithExtras(&buf, testing.allocator, pubkey, &.{
+        0xAB, 0xCD, 0x00, 0x00, // unknown ext, empty body
+        0xAB, 0xCD, 0x00, 0x00, // the duplicate
+    });
     try testing.expectError(error.EncodingError, client_hello.parse(buf.items));
 }
 

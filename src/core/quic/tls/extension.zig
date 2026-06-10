@@ -38,10 +38,15 @@ pub const Extension = union(enum) {
     unknown: ExtType,
 };
 
+/// One decoded extension plus its raw type, so the caller can dedup over the wire
+/// type (RFC 8446 4.2 forbids duplicates for ALL types, known or not).
+pub const Decoded = struct { ext_type: u16, ext: Extension };
+
 /// Decode one extension from a Reader scoped to the extensions block. The body is
 /// carved to exactly extension_data first, so no decoder can read a sibling.
-pub fn decode(r: *wire.Reader) wire.Error!Extension {
-    const ty: ExtType = @enumFromInt(try r.readU16());
+pub fn decode(r: *wire.Reader) wire.Error!Decoded {
+    const raw = try r.readU16();
+    const ty: ExtType = @enumFromInt(raw);
     var body = try r.vector(2); // extension_data<0..2^16-1>
     const ext: Extension = switch (ty) {
         .server_name => .{ .server_name = try decodeSni(&body) },
@@ -51,10 +56,10 @@ pub fn decode(r: *wire.Reader) wire.Error!Extension {
         .supported_versions => .{ .supported_versions = try decodeSupportedVersions(&body) },
         .key_share => .{ .key_share = try decodeKeyShare(&body) },
         .quic_transport_parameters => .{ .quic_transport_parameters = try body.take(body.remaining()) },
-        _ => return .{ .unknown = ty }, // body already consumed by vector(2); nothing to validate
+        _ => return .{ .ext_type = raw, .ext = .{ .unknown = ty } }, // body consumed; nothing to validate
     };
     try body.expectEnd(); // trailing bytes inside a known extension are illegal
-    return ext;
+    return .{ .ext_type = raw, .ext = ext };
 }
 
 /// A u16-length-prefixed list of u16 values (NamedGroup / SignatureScheme). Returns
@@ -120,16 +125,16 @@ const testing = std.testing;
 
 test "an unknown extension is consumed and reported, not parsed" {
     var r = wire.Reader{ .buf = &.{ 0xFF, 0xFF, 0x00, 0x02, 0xAA, 0xBB } }; // type 0xFFFF, 2-byte body
-    const ext = try decode(&r);
-    try testing.expect(ext == .unknown);
-    try testing.expectEqual(@as(u16, 0xFFFF), @intFromEnum(ext.unknown));
+    const d = try decode(&r);
+    try testing.expectEqual(@as(u16, 0xFFFF), d.ext_type);
+    try testing.expect(d.ext == .unknown);
     try testing.expectEqual(@as(usize, 0), r.remaining()); // body fully consumed
 }
 
 test "key_share returns the first x25519 32-byte point" {
     var b = [_]u8{ 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 } ++ ([_]u8{0x42} ** 32);
     var r = wire.Reader{ .buf = &b };
-    const ext = try decode(&r);
+    const ext = (try decode(&r)).ext;
     try testing.expectEqual(X25519, ext.key_share.group);
     try testing.expectEqualSlices(u8, &([_]u8{0x42} ** 32), ext.key_share.key);
 }
@@ -147,7 +152,7 @@ test "a zero-length ALPN protocol name is rejected" {
 
 test "supported_versions reports TLS 1.3 presence" {
     var yes = wire.Reader{ .buf = &.{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 } };
-    try testing.expect((try decode(&yes)).supported_versions);
+    try testing.expect((try decode(&yes)).ext.supported_versions);
     var no = wire.Reader{ .buf = &.{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x03 } };
-    try testing.expect(!(try decode(&no)).supported_versions);
+    try testing.expect(!(try decode(&no)).ext.supported_versions);
 }

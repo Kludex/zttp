@@ -17,7 +17,7 @@ const SUITE_AES128_GCM_SHA256: u16 = 0x1301;
 pub const ClientHello = struct {
     raw: []const u8, // type || u24 len || body, for transcript.update
     random: [32]u8,
-    legacy_session_id: []const u8, // 0 or 32 bytes; echoed verbatim in ServerHello
+    legacy_session_id: []const u8, // always empty in QUIC; echoed verbatim in ServerHello
     cipher_suites: []const u8, // raw u16 list
     client_key_share: [32]u8, // x25519 public key -> keyshare.shared
     key_share_group: u16, // X25519
@@ -45,17 +45,21 @@ pub fn parse(buf: []const u8) wire.Error!Decoded {
     if (try r.readU16() != 0x0303) return error.EncodingError; // legacy_version MUST be 1.2
     const random = (try r.take(32))[0..32].*;
     const session_id = (try r.vector(1)).buf;
-    if (session_id.len != 0 and session_id.len != 32) return error.EncodingError;
+    if (session_id.len != 0) return error.EncodingError; // RFC 9001 8.4: empty in QUIC
     const cipher_suites = (try r.vector(2)).buf;
     if (cipher_suites.len == 0 or cipher_suites.len % 2 != 0) return error.EncodingError;
     const compression = (try r.vector(1)).buf;
     if (compression.len != 1 or compression[0] != 0x00) return error.EncodingError;
 
     var fields = Fields{};
+    var seen = std.StaticBitSet(0x1_0000).initEmpty(); // every ext_type seen, RFC 8446 4.2
     var exts = try r.vector(2); // extensions<8..2^16-1>
     try r.expectEnd();
     while (exts.remaining() != 0) {
-        try fields.apply(try extension.decode(&exts));
+        const d = try extension.decode(&exts);
+        if (seen.isSet(d.ext_type)) return error.EncodingError; // no duplicate of ANY type
+        seen.set(d.ext_type);
+        fields.apply(d.ext);
     }
     return .{
         .value = try fields.finish(raw, random, session_id, cipher_suites),
@@ -63,10 +67,10 @@ pub fn parse(buf: []const u8) wire.Error!Decoded {
     };
 }
 
-/// Accumulates the extensions, rejecting duplicates, and gates the whole message
-/// on the single-suite policy in `finish` - the one place every must-have check lives.
+/// Accumulates the extensions and gates the whole message on the single-suite
+/// policy in `finish` - the one place every must-have check lives. Duplicate
+/// rejection happens in `parse` over the raw ext_type, so `apply` just stores.
 const Fields = struct {
-    seen: std.EnumSet(extension.ExtType) = .{},
     key_share: ?extension.KeyShareEntry = null,
     supported_groups: ?[]const u8 = null,
     sig_algs: ?[]const u8 = null,
@@ -75,19 +79,7 @@ const Fields = struct {
     alpn: ?[]const u8 = null,
     qtp: ?[]const u8 = null,
 
-    fn apply(self: *Fields, ext: extension.Extension) wire.Error!void {
-        const ty: extension.ExtType = switch (ext) {
-            .server_name => .server_name,
-            .supported_groups => .supported_groups,
-            .signature_algorithms => .signature_algorithms,
-            .alpn => .alpn,
-            .supported_versions => .supported_versions,
-            .key_share => .key_share,
-            .quic_transport_parameters => .quic_transport_parameters,
-            .unknown => return, // ignore unrecognized; do not track for dup-detection
-        };
-        if (self.seen.contains(ty)) return error.EncodingError; // RFC 8446 4.2: no dup extensions
-        self.seen.insert(ty);
+    fn apply(self: *Fields, ext: extension.Extension) void {
         switch (ext) {
             .key_share => |k| self.key_share = k,
             .supported_groups => |g| self.supported_groups = g,
@@ -96,7 +88,7 @@ const Fields = struct {
             .server_name => |n| self.sni = if (n.len == 0) null else n,
             .alpn => |a| self.alpn = a,
             .quic_transport_parameters => |q| self.qtp = q,
-            .unknown => unreachable,
+            .unknown => {}, // ignored; dedup already happened in parse
         }
     }
 
