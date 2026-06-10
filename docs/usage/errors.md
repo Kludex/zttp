@@ -54,7 +54,7 @@ What zttp rejects (a partial list):
 !!! info "Strict CRLF"
     A bare `LF` (without the preceding `CR`) is a known smuggling vector when a
     strict front-end and a lenient back-end disagree on where a line ends. zttp
-    rejects it by default, matching h11's stance.
+    rejects it by default.
 
 ## `LocalProtocolError`: you are wrong
 

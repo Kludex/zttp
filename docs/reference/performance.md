@@ -10,18 +10,18 @@ number.
 
 ## The numbers
 
-Parsing the same requests through zttp, [httptools](https://github.com/MagicStack/httptools)
-(the parser uvicorn uses), and [h11](https://github.com/python-hyper/h11), with
-all three driven to extract the **same** information (method, headers, body):
+Parsing the same requests through zttp and
+[httptools](https://github.com/MagicStack/httptools) (the parser uvicorn uses),
+with both driven to extract the **same** information (method, headers, body):
 
-| Workload | zttp | httptools | h11 | zttp vs httptools |
-| --- | ---: | ---: | ---: | ---: |
-| Simple `GET` (7 headers) | ~1.1M req/s | ~0.87M req/s | ~57k req/s | **~1.25x** |
-| `POST` + JSON body | ~5.0M req/s | ~1.8M req/s | ~0.6M req/s | **~2.7x** |
+| Workload | zttp | httptools | zttp vs httptools |
+| --- | ---: | ---: | ---: |
+| Simple `GET` (7 headers) | ~1.16M req/s | ~1.2M req/s | **~0.97x** |
+| `POST` + JSON body | ~4.9M req/s | ~2.4M req/s | **~2.0x** |
 
-zttp is faster than httptools on both, and roughly an order of magnitude faster
-than h11. Measured on an Apple Silicon machine with CPython 3.14 and the
-safety-checked (`ReleaseSafe`) build.
+zttp matches httptools on the small `GET` and roughly doubles it as soon as a
+body is involved. Measured on an Apple Silicon machine with CPython 3.14,
+httptools 0.8.0, and the safety-checked (`ReleaseSafe`) build.
 
 !!! info "These are parser microbenchmarks"
     They measure parsing throughput in isolation, not a full server. In a real
@@ -30,10 +30,10 @@ safety-checked (`ReleaseSafe`) build.
 
 ## Run it yourself
 
-The benchmark lives in `bench.py` and compares all three parsers:
+The benchmark lives in `bench.py`:
 
 ```console
-uv run --group bench python bench.py
+./scripts/bench
 ```
 
 It feeds each parser identical bytes and verifies they extract identical data
@@ -51,10 +51,9 @@ before timing, so the comparison is apples to apples.
 ## The honest caveat: safety has a cost
 
 zttp ships in Zig's `ReleaseSafe` mode, which keeps bounds and overflow checks on.
-The unchecked `ReleaseFast` mode is roughly 10% faster again, but for a parser
+The unchecked `ReleaseFast` mode is a few percent faster again, but for a parser
 eating untrusted network bytes, those checks turn a would-be memory bug into a
-clean trap. We chose safety, and zttp still beats httptools. That trade is the
-right one for this library.
+clean trap. We chose safety. That trade is the right one for this library.
 
 !!! tip
     If you have a workload where the last 10% matters and you trust your input,
