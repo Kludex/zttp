@@ -143,9 +143,12 @@ const H2Engine = struct {
         switch (ev) {
             .settings => try self.writer.sendSettingsAck(),
             .ping => |p| if (!p.ack) try self.writer.sendPingAck(p.opaque_data),
-            .data => try self.conn.flushRecvWindows(self.writer),
             else => {},
         }
+        // Advertise consumed receive window. Not gated on the .data event: a DATA
+        // frame of pure padding consumes window but surfaces no event, so flushing
+        // here (threshold-checked, idempotent) keeps the peer's send window open.
+        try self.conn.flushRecvWindows(self.writer);
         // A parsed WINDOW_UPDATE / SETTINGS may have credited a send window; drain
         // any DATA parked waiting for it.
         if (ev == .window_update or ev == .settings) try self.conn.flushSendable(self.writer);

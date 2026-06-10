@@ -530,3 +530,21 @@ def test_h2_a_small_body_does_not_trigger_a_window_update() -> None:
     conn.receive_data(frame(0x00, END_STREAM, 1, b"hello"))  # tiny body, below threshold
     list(drain_h2(conn))
     assert [f for f in _frames(conn.data_to_send()) if f[0] == 0x08] == []
+
+
+def test_h2_padding_only_data_still_replenishes_the_window() -> None:
+    # DATA frames of pure padding consume window but surface no Data event; the
+    # window must still be advertised back, or the peer's send window stalls.
+    conn = server_with(frame(0x01, END_HEADERS, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    conn.data_to_send()
+    PADDED = 0x08
+    padding_only = bytes([255]) + b"\x00" * 255  # 256-byte frame, zero content
+    for _ in range(140):  # 140 * 256 = 35840 bytes, past the 32 KiB threshold
+        conn.receive_data(frame(0x00, PADDED, 1, padding_only))
+    events = list(drain_h2(conn))
+    assert not any(isinstance(e, zttp.Data) for e in events)  # nothing surfaced
+    updates = [f for f in _frames(conn.data_to_send()) if f[0] == 0x08]
+    by_stream = {sid: int.from_bytes(payload, "big") for _, _, sid, payload in updates}
+    assert by_stream.get(0, 0) >= 32768  # connection window advertised
+    assert by_stream.get(1, 0) >= 32768  # stream window advertised
