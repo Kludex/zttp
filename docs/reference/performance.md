@@ -5,7 +5,7 @@ icon: lucide/gauge
 # Performance
 
 The point of writing a parser in Zig is to be fast. Here's where zttp stands, how
-it's measured, and the caveats - because a benchmark with no methodology is just a
+it's measured, and the caveats, because a benchmark with no methodology is just a
 number.
 
 ## The numbers
@@ -24,7 +24,7 @@ than h11. Measured on an Apple Silicon machine with CPython 3.14 and the
 safety-checked (`ReleaseSafe`) build.
 
 !!! info "These are parser microbenchmarks"
-    They measure parsing throughput in isolation - not a full server. In a real
+    They measure parsing throughput in isolation, not a full server. In a real
     application the parser is one slice of the request cost; treat these as the
     ceiling the parser contributes, not end-to-end numbers.
 
@@ -45,13 +45,13 @@ before timing, so the comparison is apples to apples.
   branch-light array lookups, not per-byte conditionals.
 * **One `Data` event per body span.** httptools copies the body per callback, and
   uvicorn then concatenates; zttp slices the buffer once.
-* **The header list is built in Zig.** No per-header Python callback - the whole
+* **The header list is built in Zig.** No per-header Python callback: the whole
   `list[tuple[bytes, bytes]]` is constructed in the extension.
 
 ## The honest caveat: safety has a cost
 
 zttp ships in Zig's `ReleaseSafe` mode, which keeps bounds and overflow checks on.
-The unchecked `ReleaseFast` mode is roughly 10% faster again - but for a parser
+The unchecked `ReleaseFast` mode is roughly 10% faster again, but for a parser
 eating untrusted network bytes, those checks turn a would-be memory bug into a
 clean trap. We chose safety, and zttp still beats httptools. That trade is the
 right one for this library.

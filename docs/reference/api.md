@@ -9,7 +9,7 @@ importable straight from `zttp` (e.g. `from zttp import Connection`).
 
 ## Connection
 
-`zttp.Connection` is the base - the read side, shared by both protocols.
+`zttp.Connection` is the base: the read side, shared by both protocols.
 Constructing one returns the subclass for the protocol you picked: an
 `H1Connection` (the default) or an `H2Connection`, so the send surface you get
 matches the protocol.
@@ -20,7 +20,7 @@ matches the protocol.
 
 ::: zttp.H2Connection
 
-A `Stream` is the per-stream send handle on an HTTP/2 connection - see
+A `Stream` is the per-stream send handle on an HTTP/2 connection; see
 [HTTP/2](../usage/http2.md).
 
 ::: zttp.Stream
@@ -29,10 +29,10 @@ A `Stream` is the per-stream send handle on an HTTP/2 connection - see
 
 A `Connection`'s role and protocol are fixed at construction:
 
-- `zttp.SERVER` - you receive requests, send responses.
-- `zttp.CLIENT` - you send requests, receive responses.
-- `zttp.HTTP1` *(default)* - one message at a time; you send on the connection.
-- `zttp.HTTP2` - multiplexed streams; you send on a `Stream`.
+- `zttp.SERVER`: you receive requests, send responses.
+- `zttp.CLIENT`: you send requests, receive responses.
+- `zttp.HTTP1` *(default)*: one message at a time; you send on the connection.
+- `zttp.HTTP2`: multiplexed streams; you send on a `Stream`.
 
 ## Events
 
@@ -66,7 +66,7 @@ the ones that matter on its own; they're here when you want visibility.
 
 | Value | Meaning |
 | --- | --- |
-| `zttp.NEED_DATA` | No complete event yet - feed more bytes. Compare with `is`. |
+| `zttp.NEED_DATA` | No complete event yet; feed more bytes. Compare with `is`. |
 | `zttp.CONNECTION_CLOSED` | The peer closed the connection. Compare with `is`. |
 
 ## Exceptions

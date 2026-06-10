@@ -6,8 +6,8 @@ icon: lucide/network
 
 You already know the zttp API: feed bytes with `receive_data`, pull events with
 `next_event`, ask for bytes with `data_to_send`. **HTTP/2 is the same API.** You
-opt in with one argument, and the events you already know - `Request`,
-`Response`, `Data`, `EndOfMessage` - come back, now tagged with the stream they
+opt in with one argument, and the events you already know (`Request`,
+`Response`, `Data`, `EndOfMessage`) come back, now tagged with the stream they
 belong to.
 
 ```python
@@ -22,7 +22,7 @@ conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)  # (1)!
 !!! note "Prior knowledge"
     zttp speaks HTTP/2 over a plain connection (the *prior-knowledge* mode, and
     what you get after ALPN or an upgrade negotiates `h2`). zttp does no I/O and
-    no TLS - it parses and serializes the HTTP/2 framing once you have the bytes.
+    no TLS: it parses and serializes the HTTP/2 framing once you have the bytes.
 
 ## Two connections, one base
 
@@ -42,7 +42,7 @@ isinstance(h2, zttp.Connection)  #> True  (3)!
 ```
 
 1.  An `H1Connection`: the message-scoped send API you saw in
-    [Sending](sending.md) - `send_response`, `send_data`, `end_message`.
+    [Sending](sending.md): `send_response`, `send_data`, `end_message`.
 
 2.  An `H2Connection`: everything is **stream-scoped**, so it has no connection-level
     `send_data`. You send on a [`Stream`](#streams) instead.
@@ -52,7 +52,7 @@ isinstance(h2, zttp.Connection)  #> True  (3)!
 
 !!! tip "Your editor knows"
     Because they're distinct types, calling `h2.send_data(...)` is a **type
-    error**, not a runtime surprise - your editor flags it before you run.
+    error**, not a runtime surprise: your editor flags it before you run.
     HTTP/2 has no single "current message" to send on, so the method simply
     isn't there.
 
@@ -75,24 +75,24 @@ while True:
         print(event.method, event.target, event.stream_id)  # (2)!
 ```
 
-1.  The bytes off the wire - HTTP/2 frames, not text. Feed whole or in fragments,
+1.  The bytes off the wire: HTTP/2 frames, not text. Feed whole or in fragments,
     same as always.
 
 2.  `event.stream_id` tells you which stream this `Request` arrived on. On
     HTTP/1.1 it's `0`; on HTTP/2 it's the real id, and every `Data` /
     `EndOfMessage` for that request carries the same id.
 
-A **client** reads the mirror image - `Response` events instead of `Request` -
+A **client** reads the mirror image (`Response` events instead of `Request`),
 again tagged with the `stream_id` of the request they answer.
 
 ## Streams
 
-In HTTP/2 you don't send "on the connection" - you send **on a stream**. A
+In HTTP/2 you don't send "on the connection": you send **on a stream**. A
 `Stream` is a small handle with the send API scoped to one stream:
 
-* `send_response(status, headers=None)` - a response head.
-* `send_data(data)` - body bytes (flow-controlled, see [below](#flow-control)).
-* `end_message(trailers=None)` - finish the message.
+* `send_response(status, headers=None)`: a response head.
+* `send_data(data)`: body bytes (flow-controlled, see [below](#flow-control)).
+* `end_message(trailers=None)`: finish the message.
 
 The connection owns the real stream state; the `Stream` is just a typed handle to
 it. You get one in two ways, depending on who opens the stream.
@@ -116,7 +116,7 @@ print(client.data_to_send())  # the HTTP/2 frames to put on the wire
 
 1.  `send_request` opens the stream and returns its `Stream`. The version arg is
     ignored (it's always `2`), and `:authority` is derived from your `host`
-    header - so a request you'd build for HTTP/1.1 works unchanged.
+    header, so a request you'd build for HTTP/1.1 works unchanged.
 
 2.  From here you talk to the **stream**, not the connection: `stream.send_data`,
     `stream.end_message`.
@@ -141,7 +141,7 @@ stream.end_message()
 print(server.data_to_send())
 ```
 
-1.  `drain` is just a loop over `next_event` until `NEED_DATA` - the events carry
+1.  `drain` is just a loop over `next_event` until `NEED_DATA`: the events carry
     the `stream_id` you need.
 
 2.  `conn.stream(id)` returns the handle for that stream. The connection already
@@ -149,7 +149,7 @@ print(server.data_to_send())
 
 !!! tip "Many streams at once"
     Because each `Stream` names its own id, you can answer requests in **any
-    order** - hold a handle per in-flight request and respond as each is ready.
+    order**: hold a handle per in-flight request and respond as each is ready.
     Two requests arriving before you answer either is the normal HTTP/2 case, and
     routing the responses is just `server.stream(s1)` and `server.stream(s2)`.
 
@@ -157,7 +157,7 @@ print(server.data_to_send())
 
 HTTP/2 has per-stream and per-connection **send windows**: the peer tells you how
 many body bytes it's willing to receive, and you mustn't send past that. zttp
-handles this for you - and keeps it sans-IO.
+handles this for you, and keeps it sans-IO.
 
 When you call `stream.send_data`, zttp emits as many bytes as the window allows
 and **parks the rest**. As the peer grants more window (it sends you
@@ -179,7 +179,7 @@ for event in drain(server):
 more = server.data_to_send()                 # (3)!  the parked bytes, now freed
 ```
 
-1.  You hand zttp the whole body. It never blocks and never drops anything - it
+1.  You hand zttp the whole body. It never blocks and never drops anything: it
     sends what fits and remembers the rest.
 
 2.  The credit arrives as ordinary inbound bytes. No special call.
@@ -187,7 +187,7 @@ more = server.data_to_send()                 # (3)!  the parked bytes, now freed
 3.  The bytes the window now permits are waiting for you, framed and ready.
 
 !!! note "Buffering is not I/O"
-    Parking bytes until the window opens is bookkeeping, not I/O - zttp still
+    Parking bytes until the window opens is bookkeeping, not I/O: zttp still
     never touches a socket, never blocks, and never waits. *When* to ask for more
     window and what your event loop does meanwhile stays yours; zttp only decides
     *how many bytes may leave now*. That's the sans-IO line. See
@@ -208,8 +208,8 @@ can observe (and react to) what the peer is doing:
 | `Goaway` | The peer is shutting the connection down. |
 
 They flow out of `next_event` like any other event. Most applications can ignore
-them - zttp acts on the ones that matter (crediting windows, releasing parked
-data) on its own - but they're there when you need visibility.
+them, since zttp acts on the ones that matter (crediting windows, releasing
+parked data) on its own, but they're there when you need visibility.
 
 ## Where to go next
 
@@ -219,7 +219,7 @@ data) on its own - but they're there when you need visibility.
 
     ---
 
-    The HTTP/1.1 write side, in full - the foundation the `Stream` API mirrors.
+    The HTTP/1.1 write side, in full: the foundation the `Stream` API mirrors.
 
 -   :material-alert-circle: **[Errors](errors.md)**
 
