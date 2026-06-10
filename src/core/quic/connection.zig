@@ -72,6 +72,12 @@ pub const Connection = struct {
     conn_received_total: u64 = 0,
     conn_consumed_total: u64 = 0,
     streams: std.AutoHashMapUnmanaged(u64, *stream.RecvStream) = .empty,
+    send_streams: std.AutoHashMapUnmanaged(u64, *stream.SendStream) = .empty,
+    /// Datagrams built by the send path, waiting to be drained by datagramsToSend.
+    out: std.ArrayListUnmanaged(u8) = .empty,
+    /// Per-datagram boundaries into `out` (each entry is a datagram length), so the
+    /// drain API can hand them out one UDP payload at a time.
+    out_lengths: std.ArrayListUnmanaged(usize) = .empty,
     closed: bool = false,
 
     /// `client_dcid` is the destination connection id on the client's first
@@ -105,6 +111,14 @@ pub const Connection = struct {
             self.gpa.destroy(s.*);
         }
         self.streams.deinit(self.gpa);
+        var sit = self.send_streams.valueIterator();
+        while (sit.next()) |s| {
+            s.*.deinit();
+            self.gpa.destroy(s.*);
+        }
+        self.send_streams.deinit(self.gpa);
+        self.out.deinit(self.gpa);
+        self.out_lengths.deinit(self.gpa);
         for (&self.spaces) |*s| s.deinit(self.gpa);
     }
 
@@ -278,6 +292,116 @@ pub const Connection = struct {
         }
         return n;
     }
+
+    // -- send path -----------------------------------------------------------
+    //
+    // Queue outbound stream bytes, then `flushSend` packetizes them: frame the
+    // STREAM data, build a packet header, place the packet number, seal (AEAD),
+    // and apply header protection - the inverse of the receive path, and exactly
+    // what testBuildInitial does inline. Sent packets are registered with recovery
+    // and congestion so incoming ACKs keep the in-flight set consistent;
+    // retransmission/PTO are a follow-up. The built datagrams drain through
+    // `datagramsToSend`.
+
+    fn sendStream(self: *Connection, id: u64) Error!*stream.SendStream {
+        if (self.send_streams.get(id)) |s| return s;
+        const s = try self.gpa.create(stream.SendStream);
+        s.* = stream.SendStream.init(self.gpa);
+        self.send_streams.put(self.gpa, id, s) catch {
+            s.deinit();
+            self.gpa.destroy(s);
+            return error.OutOfMemory;
+        };
+        return s;
+    }
+
+    /// Queue `data` (and/or a FIN) to be sent on stream `id`. Call `flushSend` to
+    /// turn the queue into datagrams.
+    pub fn sendStreamData(self: *Connection, id: u64, data: []const u8, fin: bool) Error!void {
+        const s = try self.sendStream(id);
+        try s.write(data, fin);
+    }
+
+    /// Whether any stream still has bytes (or an owed FIN) waiting to be sent.
+    pub fn hasPendingSend(self: *Connection) bool {
+        var it = self.send_streams.valueIterator();
+        while (it.next()) |s| if (s.*.pending()) return true;
+        return false;
+    }
+
+    /// Packetize the queued stream data into datagrams (Initial space, one STREAM
+    /// frame per packet for now). Each packet is sealed and header-protected and
+    /// appended to the outbound queue. Idempotent when nothing is pending.
+    pub fn flushSend(self: *Connection) Error!void {
+        const space = Space.initial;
+        const st = &self.spaces[@intFromEnum(space)];
+        const keys = st.send_keys orelse return; // no send keys for this space yet
+
+        var it = self.send_streams.iterator();
+        while (it.next()) |entry| {
+            const id = entry.key_ptr.*;
+            const s = entry.value_ptr.*;
+            while (s.pending()) {
+                // Leave room for the frame header overhead and the AEAD tag inside
+                // a conservative max datagram; one STREAM frame per packet for now.
+                const room = constants.MIN_INITIAL_DATAGRAM - 64;
+                const chunk = s.peek(room) orelse break;
+                try self.buildStreamPacket(keys, st, id, chunk);
+                s.commit(chunk.data.len, chunk.fin);
+            }
+        }
+    }
+
+    /// Build one Initial-space packet carrying a single STREAM frame, seal and
+    /// protect it, and append it (and its length) to the outbound queue.
+    fn buildStreamPacket(self: *Connection, keys: crypto.Keys, st: *SpaceState, id: u64, chunk: stream.SendStream.Chunk) Error!void {
+        // Frame the STREAM data.
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(self.gpa);
+        frame.encodeStream(&frames, self.gpa, id, chunk.offset, chunk.data, chunk.fin) catch return error.OutOfMemory;
+
+        const pn = st.next_pn;
+        const pn_len: usize = 1; // 1-byte pn for the first cut (matches testBuildInitial)
+        const length = pn_len + frames.items.len + crypto.TAG_LEN;
+
+        // Header through the Length field (Initial: empty scid/token here).
+        var hdr: std.ArrayListUnmanaged(u8) = .empty;
+        defer hdr.deinit(self.gpa);
+        const pn_offset = packet.writeLongHeader(&hdr, self.gpa, .initial, constants.VERSION_1, self.dcid, &.{}, &.{}, length, pn_len) catch return error.OutOfMemory;
+        packet.writePacketNumber(&hdr, self.gpa, pn, pn_len) catch return error.OutOfMemory;
+
+        // Assemble: header(incl pn) + sealed(frames). seal writes ciphertext+tag.
+        const start = self.out.items.len;
+        self.out.appendSlice(self.gpa, hdr.items) catch return error.OutOfMemory;
+        const ct = self.out.addManyAsSlice(self.gpa, frames.items.len + crypto.TAG_LEN) catch return error.OutOfMemory;
+        _ = crypto.seal(keys, pn, hdr.items, frames.items, ct);
+        crypto.protectHeader(keys.hp, self.out.items[start..], pn_offset, true) catch return error.ProtocolViolation;
+
+        const datagram_len = self.out.items.len - start;
+        self.out_lengths.append(self.gpa, datagram_len) catch return error.OutOfMemory;
+
+        // Register the sent packet so an incoming ACK clears the in-flight set.
+        st.rec.onSent(self.gpa, .{ .pn = pn, .sent_time = 0, .size = datagram_len, .ack_eliciting = true, .in_flight = true }) catch return error.OutOfMemory;
+        self.cc.onSent(datagram_len);
+        st.next_pn += 1;
+    }
+
+    /// The built datagrams as one contiguous buffer; pair with `datagramLengths`
+    /// to split it into individual UDP payloads. Valid until `clearSend`.
+    pub fn datagramsToSend(self: *Connection) []const u8 {
+        return self.out.items;
+    }
+
+    /// The byte length of each queued datagram, in order.
+    pub fn datagramLengths(self: *Connection) []const usize {
+        return self.out_lengths.items;
+    }
+
+    /// Drop the drained datagrams (the integrator has sent them).
+    pub fn clearSend(self: *Connection) void {
+        self.out.clearRetainingCapacity();
+        self.out_lengths.clearRetainingCapacity();
+    }
 };
 
 const testing = std.testing;
@@ -360,6 +484,68 @@ test "consume re-grants connection flow-control credit" {
     try testing.expectEqualStrings("abc", conn.streamData(0));
     conn.consumeStream(0, 3);
     try testing.expectEqualStrings("", conn.streamData(0));
+}
+
+test "a server-sent STREAM round-trips to a peer client" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    // The server queues a response on stream 0 and packetizes it.
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    try server.sendStreamData(0, "hi", true);
+    try server.flushSend();
+    const lengths = server.datagramLengths();
+    try testing.expectEqual(@as(usize, 1), lengths.len);
+    const dgram = server.datagramsToSend();
+
+    // A peer client (same dcid -> same Initial keys) decrypts and reassembles it.
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+    try client.receiveDatagram(dgram, 1000);
+    try testing.expectEqualStrings("hi", client.streamData(0));
+    try testing.expect(client.streamFinished(0));
+}
+
+test "flushSend with nothing queued is a no-op" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    try testing.expect(!conn.hasPendingSend());
+    try conn.flushSend();
+    try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len);
+}
+
+test "a multi-chunk response round-trips in order" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    // Two writes on the same stream: the second carries the FIN. They share one
+    // flush, so two STREAM frames at offsets 0 and 5 reassemble to "helloworld".
+    try server.sendStreamData(3, "hello", false);
+    try server.sendStreamData(3, "world", true);
+    try server.flushSend();
+    const dgram = server.datagramsToSend();
+
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+    try client.receiveDatagram(dgram, 1000);
+    try testing.expectEqualStrings("helloworld", client.streamData(3));
+    try testing.expect(client.streamFinished(3));
+}
+
+test "clearSend drops the drained datagrams" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x05, 0x06, 0x07, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    try conn.sendStreamData(0, "x", true);
+    try conn.flushSend();
+    try testing.expect(conn.datagramsToSend().len > 0);
+    conn.clearSend();
+    try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len);
+    try testing.expectEqual(@as(usize, 0), conn.datagramLengths().len);
 }
 
 test "connection flow control sums across streams" {
