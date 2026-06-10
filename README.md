@@ -79,15 +79,16 @@ h3.next_event()  # the same Request / Data / EndOfMessage, tagged with stream_id
 
 ## Performance
 
-Against httptools on the same requests (macOS arm64, CPython 3.14,
-`ReleaseFast`), both verified to extract identical data:
+Against httptools on the same requests (macOS arm64, CPython 3.14, httptools
+0.8.0, the safety-checked `ReleaseSafe` build), both verified to extract
+identical data:
 
-| Workload          | zttp        | httptools    | Speedup    |
-| ----------------- | -----------: | -----------: | ---------: |
-| Simple GET        | ~1.25M req/s | ~880k req/s  | **1.41x**  |
-| POST + JSON body  | ~6.7M req/s  | ~1.84M req/s | **3.62x**  |
+| Workload          | zttp         | httptools    | zttp vs httptools |
+| ----------------- | -----------: | -----------: | ----------------: |
+| Simple GET        | ~1.16M req/s | ~1.2M req/s  | **~0.97x**        |
+| POST + JSON body  | ~4.9M req/s  | ~2.4M req/s  | **~2.0x**         |
 
-Run it yourself: `uv run --group bench python bench.py`.
+Run it yourself: `./scripts/bench`.
 
 ## Why it is fast
 

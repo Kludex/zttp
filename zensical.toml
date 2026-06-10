@@ -1,6 +1,6 @@
 [project]
 site_name = "zttp"
-site_description = "A sans-IO HTTP/1.1 and HTTP/2 parser for Python with a Zig core."
+site_description = "A sans-IO HTTP/1.1, HTTP/2, and HTTP/3 parser for Python with a Zig core."
 site_author = "Marcelo Trylesinski"
 #site_url = "https://zttp.dev/"
 repo_url = "https://github.com/Kludex/zttp"
@@ -19,11 +19,13 @@ nav = [
     "usage/parsing.md",
     "usage/sending.md",
     "usage/http2.md",
+    "usage/http3.md",
     "usage/errors.md",
   ] },
   { "Architecture" = [
     "architecture/overview.md",
     "architecture/sans-io.md",
+    "architecture/http3.md",
   ] },
   { "Reference" = [
     "reference/performance.md",

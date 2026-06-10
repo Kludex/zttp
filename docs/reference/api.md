@@ -9,16 +9,18 @@ importable straight from `zttp` (e.g. `from zttp import Connection`).
 
 ## Connection
 
-`zttp.Connection` is the base: the read side, shared by both protocols.
+`zttp.Connection` is the base: the read side, shared by every protocol.
 Constructing one returns the subclass for the protocol you picked: an
-`H1Connection` (the default) or an `H2Connection`, so the send surface you get
-matches the protocol.
+`H1Connection` (the default), an `H2Connection`, or an `H3Connection`, so the
+send surface you get matches the protocol.
 
 ::: zttp.Connection
 
 ::: zttp.H1Connection
 
 ::: zttp.H2Connection
+
+::: zttp.H3Connection
 
 A `Stream` is the per-stream send handle on an HTTP/2 connection; see
 [HTTP/2](../usage/http2.md).
@@ -33,11 +35,13 @@ A `Connection`'s role and protocol are fixed at construction:
 - `zttp.CLIENT`: you send requests, receive responses.
 - `zttp.HTTP1` *(default)*: one message at a time; you send on the connection.
 - `zttp.HTTP2`: multiplexed streams; you send on a `Stream`.
+- `zttp.HTTP3`: the same streams over QUIC; you feed UDP datagrams with
+  `receive_datagram` (see [HTTP/3](../usage/http3.md)).
 
 ## Events
 
-[`next_event`](#zttp.Connection.next_event) returns one of these. On HTTP/2 each
-also carries a `.stream_id`.
+[`next_event`](#zttp.Connection.next_event) returns one of these. On HTTP/2 and
+HTTP/3 each also carries a `.stream_id`.
 
 ::: zttp.Request
 
