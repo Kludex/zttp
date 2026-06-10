@@ -56,10 +56,13 @@ Bottom-up, the pieces are:
   short-header (1-RTT) packet formats, packet-number encoding/decoding, and the
   QUIC frame codec (the ~20 frame types: PADDING, PING, ACK, CRYPTO, STREAM,
   RESET_STREAM, MAX_DATA, CONNECTION_CLOSE, ...).
-* **`crypto`** - the AEAD packet protection (header protection + payload
-  encryption) keyed off the TLS 1.3 handshake, and the handshake state machine
-  itself driven through QUIC's CRYPTO frames. This is the load-bearing security
-  layer: a bug here is a transport-security bug, not just a parse bug.
+* **`crypto`** - the AEAD packet protection: header protection and payload
+  encryption (AES-128-GCM / HKDF-SHA256 on `std.crypto`), with the deterministic
+  Initial keys matching RFC 9001 appendix A byte for byte. This is the
+  load-bearing security layer: a bug here is a transport-security bug, not just a
+  parse bug. The Handshake and Application key spaces install through an
+  `installKeys` seam; the TLS 1.3 handshake driver that derives them through
+  QUIC's CRYPTO frames is the follow-up, so only the Initial space is keyed today.
 * **`recovery`** - RFC 9002 loss detection: per-packet-number-space ack tracking,
   RTT estimation, the probe-timeout (PTO) timer, and which packets to retransmit.
 * **`congestion`** - the NewReno controller (slow start, congestion avoidance,
@@ -87,10 +90,12 @@ multiplexing, no flow control, no `PING`; those moved down into QUIC).
   streams. The first byte of each uni stream is a varint stream type.
 * **`qpack/`** - QPACK (RFC 9204), the HTTP/3 header compression. Like HPACK but
   redesigned so head-of-line blocking across QUIC streams is avoidable: a static
-  table, a Huffman code (the same one as HPACK, Appendix B of RFC 7541), and a
-  dynamic table whose updates ride dedicated encoder/decoder streams. The decoder
-  must handle the "blocked stream" case where a request references a dynamic-table
-  entry that hasn't arrived yet.
+  table, a Huffman code (the same one as HPACK, Appendix B of RFC 7541), and -
+  full QPACK only - a dynamic table whose updates ride dedicated encoder/decoder
+  streams. The decoder here covers the static table and literals; the dynamic
+  table is intentionally disabled (we advertise `QPACK_MAX_TABLE_CAPACITY = 0`, so
+  a conformant peer must not emit dynamic references), which also sidesteps the
+  "blocked stream" case. Enabling the dynamic table is a follow-up.
 * **`connection`** - the orchestrator: classifies incoming streams, runs the
   SETTINGS exchange, reassembles HEADERS (QPACK-decoded) + DATA into the shared
   `Request` / `Data` / `EndOfMessage` events, and surfaces the H3 control events.
@@ -144,5 +149,8 @@ connection terminally.
 QUIC and HTTP/3 are large. The work lands bottom-up - varints and packets first,
 then crypto, then recovery and congestion, then streams, then the HTTP/3 framing
 and QPACK on top - each layer tested in isolation before the next builds on it.
-The server read path comes first (the uvicorn-critical direction), mirroring how
-HTTP/2 was staged.
+The server read path landed first (the uvicorn-critical direction), mirroring how
+HTTP/2 was staged: a real client Initial datagram is decrypted and decoded into
+request events through the public `receive_datagram` / `next_event` API. The TLS
+1.3 handshake driver (only the Initial key space is wired today), the QPACK
+dynamic table, and the client read path are the remaining work.

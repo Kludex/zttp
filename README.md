@@ -96,11 +96,13 @@ integrator is responsible for.
 - **HTTP/3** - a from-scratch QUIC transport in the Zig core (packets, RFC 9001
   packet protection on `std.crypto`, loss recovery, NewReno congestion control,
   flow control, and stream reassembly) plus the HTTP/3 framing and QPACK, surfaced
-  through the same event API (`Connection(role, protocol=zttp.HTTP3)`); events carry
-  a `stream_id`. The server read path is implemented and tested end-to-end in the
-  core (a real client Initial is decrypted and a GET/POST decoded into events); the
-  TLS 1.3 handshake driver, the QPACK dynamic table, and the Python adapter are
-  next. *(in progress)*
+  through the same event API (`Connection(role, protocol=zttp.HTTP3)`);
+  `receive_datagram` / `datagrams_to_send` carry the UDP payloads and events carry
+  a `stream_id`. The server read path is implemented end-to-end - through Python, a
+  real client Initial datagram is decrypted and decoded into request events. The
+  TLS 1.3 handshake driver (only the Initial key space is wired today) and the
+  client read path are next; the QPACK dynamic table is intentionally disabled (we
+  advertise `MAX_TABLE_CAPACITY = 0`). *(in progress)*
 
 ## Status
 
