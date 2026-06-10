@@ -93,11 +93,9 @@ pub const Connection = struct {
     conn_recv_window: i32 = constants.DEFAULT_WINDOW_SIZE,
     conn_send_window: i32 = constants.DEFAULT_WINDOW_SIZE,
     highest_peer_id: u32 = 0,
-    /// O(1) live-stream count (streams in a concurrency-counting state). Kept in
-    /// step with the map: ++ on idle->open insertion, -- on eviction of a closed
-    /// stream. Replaces the old O(map-size) liveStreamCount scan.
-    live_streams: u32 = 0,
     /// Rapid-reset churn budgets: total streams ever opened and total resets.
+    /// These count streams that no longer exist (evicted), so unlike the live
+    /// concurrency count they are real state, not derivable from the map.
     streams_opened: u64 = 0,
     stream_resets: u64 = 0,
 
@@ -452,7 +450,7 @@ pub const Connection = struct {
             // connection-global dynamic table in sync, but refuse the request
             // (RST_STREAM REFUSED_STREAM) and never surface it. No stream record
             // is inserted, so the map cannot grow under a refused-stream flood.
-            refused = self.live_streams >= self.limits.max_concurrent_streams;
+            refused = self.liveStreamCount() >= self.limits.max_concurrent_streams;
             if (!refused) {
                 try self.openPeerStream(id);
             }
@@ -763,7 +761,7 @@ pub const Connection = struct {
         while (it.next()) |e| {
             try self.flushStreamPtr(writer, e.value_ptr);
             const st = e.value_ptr;
-            if (st.state == .closed and st.send_pending.items.len == 0 and !st.send_end_pending) {
+            if (st.isFullyClosed()) {
                 self.evict_scratch.append(self.gpa, e.key_ptr.*) catch return error.OutOfMemory;
             }
         }
@@ -795,7 +793,7 @@ pub const Connection = struct {
             off += chunk;
             if (end) {
                 s.send_end_pending = false;
-                s.sendEndStream();
+                s.sendApply(true);
             }
         }
         // Drop the bytes we emitted; keep what the window could not admit.
@@ -809,7 +807,7 @@ pub const Connection = struct {
         if (s.send_pending.items.len == 0 and s.send_end_pending) {
             try writer.writeDataFrame(id, &.{}, true);
             s.send_end_pending = false;
-            s.sendEndStream();
+            s.sendApply(true);
         }
     }
 
@@ -827,15 +825,14 @@ pub const Connection = struct {
     /// Insert a stream and move it idle->open. Maintains the live counter and the
     /// total-streams churn cap (CVE-2023-44487). Every counted insertion goes
     /// through here so live_streams and streams_opened stay exact.
-    /// Insert a stream and move it idle->open, keeping the live counter exact.
-    /// The single insertion point; the trusted send path and the peer-driven read
-    /// path both route through it. The total-streams churn cap is enforced only on
-    /// the peer path (openPeerStream), never here - the local app is not the
-    /// adversary, so a client/server opening many streams to send is not abuse.
+    /// Insert a stream and move it idle->open. The single insertion point; the
+    /// trusted send path and the peer-driven read path both route through it. The
+    /// total-streams churn cap is enforced only on the peer path (openPeerStream),
+    /// never here - the local app is not the adversary, so a client/server opening
+    /// many streams to send is not abuse.
     fn openStream(self: *Connection, id: u32) H2Error!void {
         self.streams.put(self.gpa, id, Stream.init(id, self.local_settings.initial_window_size, self.peer_settings.initial_window_size)) catch return error.MessageTooLong;
         self.streams.getPtr(id).?.recvApply(.headers, false); // idle -> open
-        self.live_streams += 1;
     }
 
     /// Open a PEER-initiated stream, enforcing the total-streams churn cap
@@ -846,19 +843,27 @@ pub const Connection = struct {
         self.streams_opened += 1;
     }
 
-    /// Remove a stream from the map, keeping live_streams exact. Safe to call on a
-    /// closed entry: the null path in handleData/handleWindowUpdate/handleRstStream
-    /// classifies an evicted (id <= highest_peer_id) stream as closed, not idle.
+    /// Remove a stream from the map. Safe to call on a closed entry: the null path
+    /// in handleData/handleWindowUpdate/handleRstStream classifies an evicted
+    /// (id <= highest_peer_id) stream as closed, not idle.
     fn evictStream(self: *Connection, id: u32) void {
         if (self.streams.fetchRemove(id)) |kv| {
             var s = kv.value;
-            // Every map entry was counted once in openStream and this is its sole
-            // removal, so the decrement is unconditional - the stream's state is
-            // already .closed here, so countsTowardConcurrency() would wrongly
-            // skip it.
-            self.live_streams -= 1;
             s.deinit(self.gpa);
         }
+    }
+
+    /// Streams currently counting toward MAX_CONCURRENT_STREAMS (open or
+    /// half-closed). Derived from the map rather than cached: the map is bounded by
+    /// max_concurrent_streams plus a few in-flight, so the scan is cheap and there
+    /// is no counter to drift out of sync.
+    fn liveStreamCount(self: *Connection) u32 {
+        var n: u32 = 0;
+        var it = self.streams.valueIterator();
+        while (it.next()) |s| {
+            if (s.countsTowardConcurrency()) n += 1;
+        }
+        return n;
     }
 
     /// Evict a stream that has reached the fully-closed terminal state with no
@@ -869,7 +874,7 @@ pub const Connection = struct {
     /// finish comes from max_concurrent_streams and the churn caps, not eviction.
     fn maybeEvictDone(self: *Connection, id: u32) void {
         const s = self.streams.getPtr(id) orelse return;
-        if (s.state == .closed and s.send_pending.items.len == 0 and !s.send_end_pending) self.evictStream(id);
+        if (s.isFullyClosed()) self.evictStream(id);
     }
 
     /// Charge one stream reset against the churn budget (CVE-2023-44487).
@@ -1241,7 +1246,7 @@ test "over the concurrency cap, a request is refused not surfaced" {
     try testing.expectEqual(@as(u32, 3), refused.rst_stream.stream_id);
     try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.refused_stream)), refused.rst_stream.error_code);
     // The refused stream left no record, so only stream 1 is tracked.
-    try testing.expectEqual(@as(u32, 1), c.live_streams);
+    try testing.expectEqual(@as(u32, 1), c.liveStreamCount());
 }
 
 // A client's inbound handshake is just the server's SETTINGS - no preface to
@@ -1568,7 +1573,7 @@ test "rapid open+RST churn keeps the stream map and live counter bounded" {
     }
     try testing.expect(seen >= 100); // at least the 100 rst_stream echoes surfaced
     try testing.expectEqual(@as(usize, 0), c.streams.count());
-    try testing.expectEqual(@as(u32, 0), c.live_streams);
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
 }
 
 test "a late WINDOW_UPDATE or RST on an evicted closed stream is tolerated" {
@@ -1588,7 +1593,7 @@ test "a late WINDOW_UPDATE or RST on an evicted closed stream is tolerated" {
     try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
     try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
     try testing.expectEqual(Event.need_data, try c.nextEvent());
-    try testing.expectEqual(@as(u32, 0), c.live_streams);
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
 }
 
 test "DATA on an evicted closed stream is a stream error STREAM_CLOSED" {
@@ -1607,7 +1612,7 @@ test "DATA on an evicted closed stream is a stream error STREAM_CLOSED" {
     try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.stream_closed)), stale.rst_stream.error_code);
 }
 
-test "live_streams matches reality across read-completion and reset" {
+test "the live-stream count matches reality across read-completion and reset" {
     var c = Connection.init(testing.allocator, .server);
     defer c.deinit();
     var frames: std.ArrayList(u8) = .empty;
@@ -1623,7 +1628,7 @@ test "live_streams matches reality across read-completion and reset" {
     try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent())); // 3 request
     try testing.expectEqual(Event.need_data, try c.nextEvent());
     // Both count: stream 1 (half_closed_remote, awaiting response) and stream 3 (open).
-    try testing.expectEqual(@as(u32, 2), c.live_streams);
+    try testing.expectEqual(@as(u32, 2), c.liveStreamCount());
     try testing.expectEqual(@as(usize, 2), c.streams.count());
     // Now RST stream 3: it is evicted; stream 1 still lingers awaiting its response.
     var more: std.ArrayList(u8) = .empty;
@@ -1631,7 +1636,7 @@ test "live_streams matches reality across read-completion and reset" {
     try frameBytes(&more, .rst_stream, 0, 3, &[_]u8{ 0x00, 0x00, 0x00, 0x08 });
     try c.feed(more.items);
     try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
-    try testing.expectEqual(@as(u32, 1), c.live_streams);
+    try testing.expectEqual(@as(u32, 1), c.liveStreamCount());
     try testing.expectEqual(@as(usize, 1), c.streams.count());
 }
 
@@ -1713,10 +1718,10 @@ test "half-closed-remote requests count toward concurrency until the response fi
     // half-closed-remote streams still occupy concurrency slots.
     try testing.expectEqual(@as(usize, 4), requests);
     try testing.expectEqual(@as(usize, 6), refusals);
-    try testing.expectEqual(@as(u32, 4), c.live_streams);
+    try testing.expectEqual(@as(u32, 4), c.liveStreamCount());
 }
 
-test "a request+response cycle returns live_streams to zero" {
+test "a request+response cycle returns the live-stream count to zero" {
     var c = Connection.init(testing.allocator, .server);
     defer c.deinit();
     var w = writer_mod.Writer.init(testing.allocator, .server);
@@ -1731,12 +1736,12 @@ test "a request+response cycle returns live_streams to zero" {
     try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
     try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
     try testing.expectEqual(Event.need_data, try c.nextEvent());
-    try testing.expectEqual(@as(u32, 1), c.live_streams); // still awaiting the response
+    try testing.expectEqual(@as(u32, 1), c.liveStreamCount()); // still awaiting the response
     // The app responds: register the send, then a body with END_STREAM. Once the
     // response drains the stream reaches .closed and is evicted - back to zero.
     try w.sendResponse(1, 200, &.{}, false);
     try c.sendStreamData(&w, 1, "hi", true);
-    try testing.expectEqual(@as(u32, 0), c.live_streams);
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
     try testing.expectEqual(@as(usize, 0), c.streams.count());
 }
 
@@ -1765,7 +1770,7 @@ test "many request+response cycles do not leak the concurrency budget" {
         try testing.expectEqual(Event.need_data, try c.nextEvent());
         try w.sendResponse(id, 200, &.{}, false);
         try c.sendStreamData(&w, id, "ok", true);
-        try testing.expectEqual(@as(u32, 0), c.live_streams); // never accumulates
+        try testing.expectEqual(@as(u32, 0), c.liveStreamCount()); // never accumulates
         id += 2;
     }
     try testing.expectEqual(@as(usize, 0), c.streams.count());
