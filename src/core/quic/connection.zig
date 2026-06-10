@@ -261,6 +261,10 @@ pub const Connection = struct {
     /// frame per packet. STREAM is legal only in the Application space (RFC 9000
     /// 12.4), so nothing flows until the handshake installs the 1-RTT send keys -
     /// the structural fix for shipping STREAM data in Initial packets.
+    ///
+    /// `commit` drops each chunk from the SendStream once it is framed, so a packet
+    /// lost in flight is NOT retransmitted: loss-recovery for STREAM data (tracking
+    /// sent-but-unacked ranges and requeueing on loss/PTO) is a deliberate follow-up.
     pub fn flushSend(self: *Connection, now: u64) Error!void {
         const space = Space.application;
         const st = &self.spaces[@intFromEnum(space)];
