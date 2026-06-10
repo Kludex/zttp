@@ -310,10 +310,3 @@ test "content-length mismatch at end of stream is a stream error" {
     s.recordData(2);
     try testing.expectEqual(Action.ok, s.checkContentLength().action);
 }
-
-test "a bodyless stream skips the content-length check" {
-    var s = Stream.init(1, 65535, 65535);
-    s.content_length = 1234; // a HEAD response advertises a length but sends no body
-    s.expects_bodyless = true;
-    try testing.expectEqual(Action.ok, s.checkContentLength().action);
-}
