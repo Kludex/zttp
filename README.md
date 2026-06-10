@@ -5,17 +5,18 @@
 </p>
 
 > [!WARNING]
-> zttp is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
+> **zttp** is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
 
-A [sans-IO](https://sans-io.readthedocs.io/) HTTP parser for Python, with a core
-written in [Zig](https://ziglang.org). It is to [h11](https://github.com/python-hyper/h11)
-what [zloop](https://github.com/Kludex/zloop) is to asyncio: the same clean,
-event-based API, with a hand-written Zig engine underneath - fast enough to be
-usable as the HTTP/1.1 parser in [uvicorn](https://github.com/encode/uvicorn).
+A [sans-IO](https://sans-io.readthedocs.io/) HTTP/1.1, HTTP/2, and HTTP/3 parser
+for Python, with a core written in [Zig](https://ziglang.org). It is to
+[h11](https://github.com/python-hyper/h11) what [zloop](https://github.com/Kludex/zloop)
+is to asyncio: the same clean, event-based API, with a hand-written Zig engine
+underneath that is fast enough to be the HTTP parser in
+[uvicorn](https://github.com/encode/uvicorn). It has no dependencies.
 
 ## Sans-IO
 
-zttp does no I/O. You feed it bytes and pull out events; you ask it for bytes to
+**zttp** does no I/O. You feed it bytes and pull out events; you ask it for bytes to
 send. It never touches a socket. This is the h11 model:
 
 ```python
@@ -77,37 +78,8 @@ defaults to Zig's safety-checked `ReleaseSafe` mode. Malformed input raises
 The parser has been through two adversarial security audits (a code review and a
 CVE-driven review against real HTTP-parser CVEs across Node, Go, Python, Rust, and
 C servers); `zig build fuzz` runs the adversarial-input net over the core. See
-[THREAT_MODEL.md](THREAT_MODEL.md) for what zttp defends against and what the
+[THREAT_MODEL.md](THREAT_MODEL.md) for what **zttp** defends against and what the
 integrator is responsible for.
-
-## Roadmap
-
-- **HTTP/1.1** - request and response parsing, chunked transfer-coding,
-  trailers, keep-alive, the bidirectional connection state machine. *(done)*
-- **Connection state policy** - h11-parity state machine guards on the read side
-  (reject body bytes after a `close`, enforce request/response pairing).
-- **uvicorn integration** - an `HttpToolsProtocol`-style adapter so uvicorn can
-  use zttp unchanged.
-- **HTTP/2** - HPACK, the frame layer, and the multiplexed connection state
-  machine in the Zig core, surfaced through the same event API
-  (`Connection(role, protocol=zttp.HTTP2)`); events carry a `stream_id`. Both
-  read paths (server requests, client responses) and the full write side - a
-  `Stream` handle per stream, with outbound flow control - are implemented. *(done)*
-- **HTTP/3** - a from-scratch QUIC transport in the Zig core (packets, RFC 9001
-  packet protection on `std.crypto`, loss recovery, NewReno congestion control,
-  flow control, and stream reassembly) plus the HTTP/3 framing and QPACK, surfaced
-  through the same event API (`Connection(role, protocol=zttp.HTTP3)`);
-  `receive_datagram` / `datagrams_to_send` carry the UDP payloads and events carry
-  a `stream_id`. The server read path is implemented end-to-end - through Python, a
-  real client Initial datagram is decrypted and decoded into request events. The
-  TLS 1.3 handshake driver (only the Initial key space is wired today), the write
-  side, and the client read path are next; the QPACK dynamic table is intentionally
-  disabled (we advertise `MAX_TABLE_CAPACITY = 0`). *(in progress)*
-
-## Status
-
-Alpha. The HTTP/1.1 parser and serializer are implemented and tested; the API
-may still change.
 
 ## License
 
