@@ -1726,6 +1726,43 @@ test "late DATA after a response is registered is a stream error STREAM_CLOSED" 
     try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.stream_closed)), ev.rst_stream.error_code);
 }
 
+test "fuzz: H2 connection never panics on adversarial frame streams" {
+    const seeds = [_][]const u8{
+        &[_]u8{ 0x00, 0x00, 0x03, 0x01, 0x05, 0x00, 0x00, 0x00, 0x01, 0x82, 0x86, 0x84 }, // HEADERS GET
+        &[_]u8{ 0x00, 0x00, 0x04, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x08 }, // RST_STREAM
+        &([_]u8{ 0x00, 0x00, 0x08, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00 } ++ [_]u8{0} ** 8), // PING
+        &[_]u8{ 0x00, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 'h', 'e', 'l', 'l', 'o' }, // DATA END_STREAM
+        &[_]u8{ 0xff, 0xff, 0xff, 0x01, 0x04, 0x00, 0x00, 0x00, 0x01 }, // over-long HEADERS length
+        &[_]u8{ 0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x7f, 0xff, 0xff, 0xff }, // WINDOW_UPDATE
+    };
+    var rng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const r = rng.random();
+    var k: usize = 0;
+    while (k < 2000) : (k += 1) {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(testing.allocator);
+        try input.appendSlice(testing.allocator, constants.CLIENT_PREFACE);
+        try frameBytes(&input, .settings, 0, 0, &.{});
+        const n = r.intRangeAtMost(usize, 1, 6);
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            const seed = try testing.allocator.dupe(u8, seeds[r.intRangeLessThan(usize, 0, seeds.len)]);
+            defer testing.allocator.free(seed);
+            if (seed.len != 0 and r.boolean()) seed[r.intRangeLessThan(usize, 0, seed.len)] = r.int(u8);
+            try input.appendSlice(testing.allocator, seed);
+        }
+        var c = Connection.init(testing.allocator, .server);
+        defer c.deinit();
+        c.limits.max_buffer = 1 << 20;
+        c.feed(input.items) catch continue;
+        var iter: usize = 0;
+        while (iter < input.items.len + 16) : (iter += 1) {
+            const ev = c.nextEvent() catch break;
+            if (ev == .need_data) break;
+        }
+    }
+}
+
 fn driveConnection(input: []const u8) void {
     var c = Connection.init(testing.allocator, .server);
     defer c.deinit();
