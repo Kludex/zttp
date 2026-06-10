@@ -22,7 +22,7 @@ const RequestObject = extern struct {
     query: py.Object,
     http_version: py.Object,
     headers: py.Object,
-    stream_id: py.Object,
+    stream_id: c_uint,
     expect_continue: c_char,
 };
 
@@ -32,19 +32,19 @@ const ResponseObject = extern struct {
     reason: py.Object,
     http_version: py.Object,
     headers: py.Object,
-    stream_id: py.Object,
+    stream_id: c_uint,
 };
 
 const DataObject = extern struct {
     ob_base: c.PyObject,
     data: py.Object,
-    stream_id: py.Object,
+    stream_id: c_uint,
 };
 
 const EndOfMessageObject = extern struct {
     ob_base: c.PyObject,
     trailers: py.Object,
-    stream_id: py.Object,
+    stream_id: c_uint,
 };
 
 // The five HTTP/2 control events. Each holds plain Python ints/bytes.
@@ -109,7 +109,7 @@ var request_members = [_]py.MemberDef{
     member("query", @offsetOf(RequestObject, "query")),
     member("http_version", @offsetOf(RequestObject, "http_version")),
     member("headers", @offsetOf(RequestObject, "headers")),
-    member("stream_id", @offsetOf(RequestObject, "stream_id")),
+    .{ .name = "stream_id", .type = py.T_UINT, .offset = @intCast(@offsetOf(RequestObject, "stream_id")), .flags = py.READONLY, .doc = null },
     .{ .name = "expect_continue", .type = py.T_BOOL, .offset = @intCast(@offsetOf(RequestObject, "expect_continue")), .flags = py.READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
@@ -118,17 +118,17 @@ var response_members = [_]py.MemberDef{
     member("reason", @offsetOf(ResponseObject, "reason")),
     member("http_version", @offsetOf(ResponseObject, "http_version")),
     member("headers", @offsetOf(ResponseObject, "headers")),
-    member("stream_id", @offsetOf(ResponseObject, "stream_id")),
+    .{ .name = "stream_id", .type = py.T_UINT, .offset = @intCast(@offsetOf(ResponseObject, "stream_id")), .flags = py.READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var data_members = [_]py.MemberDef{
     member("data", @offsetOf(DataObject, "data")),
-    member("stream_id", @offsetOf(DataObject, "stream_id")),
+    .{ .name = "stream_id", .type = py.T_UINT, .offset = @intCast(@offsetOf(DataObject, "stream_id")), .flags = py.READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var eom_members = [_]py.MemberDef{
     member("trailers", @offsetOf(EndOfMessageObject, "trailers")),
-    member("stream_id", @offsetOf(EndOfMessageObject, "stream_id")),
+    .{ .name = "stream_id", .type = py.T_UINT, .offset = @intCast(@offsetOf(EndOfMessageObject, "stream_id")), .flags = py.READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var rst_stream_members = [_]py.MemberDef{
@@ -168,7 +168,6 @@ fn deallocRequest(o: ?*c.PyObject) callconv(.c) void {
     py.xdecref(s.query);
     py.xdecref(s.http_version);
     py.xdecref(s.headers);
-    py.xdecref(s.stream_id);
     py.freeInstance(@ptrCast(s));
 }
 fn deallocResponse(o: ?*c.PyObject) callconv(.c) void {
@@ -178,21 +177,18 @@ fn deallocResponse(o: ?*c.PyObject) callconv(.c) void {
     py.xdecref(s.reason);
     py.xdecref(s.http_version);
     py.xdecref(s.headers);
-    py.xdecref(s.stream_id);
     py.freeInstance(@ptrCast(s));
 }
 fn deallocData(o: ?*c.PyObject) callconv(.c) void {
     const s: *DataObject = @ptrCast(o.?);
     py.gcUntrack(s);
     py.xdecref(s.data);
-    py.xdecref(s.stream_id);
     py.freeInstance(@ptrCast(s));
 }
 fn deallocEom(o: ?*c.PyObject) callconv(.c) void {
     const s: *EndOfMessageObject = @ptrCast(o.?);
     py.gcUntrack(s);
     py.xdecref(s.trailers);
-    py.xdecref(s.stream_id);
     py.freeInstance(@ptrCast(s));
 }
 fn deallocRstStream(o: ?*c.PyObject) callconv(.c) void {
@@ -250,7 +246,7 @@ fn visitObj(obj: py.Object, visit: c.visitproc, arg: ?*anyopaque) c_int {
 
 fn traverseRequest(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const s: *RequestObject = @ptrCast(o.?);
-    inline for (.{ s.method, s.target, s.path, s.query, s.http_version, s.headers, s.stream_id }) |f| {
+    inline for (.{ s.method, s.target, s.path, s.query, s.http_version, s.headers }) |f| {
         const r = visitObj(f, visit, arg);
         if (r != 0) return r;
     }
@@ -264,12 +260,11 @@ fn clearRequest(o: ?*c.PyObject) callconv(.c) c_int {
     py.clear(&s.query);
     py.clear(&s.http_version);
     py.clear(&s.headers);
-    py.clear(&s.stream_id);
     return 0;
 }
 fn traverseResponse(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const s: *ResponseObject = @ptrCast(o.?);
-    inline for (.{ s.status_code, s.reason, s.http_version, s.headers, s.stream_id }) |f| {
+    inline for (.{ s.status_code, s.reason, s.http_version, s.headers }) |f| {
         const r = visitObj(f, visit, arg);
         if (r != 0) return r;
     }
@@ -281,12 +276,11 @@ fn clearResponse(o: ?*c.PyObject) callconv(.c) c_int {
     py.clear(&s.reason);
     py.clear(&s.http_version);
     py.clear(&s.headers);
-    py.clear(&s.stream_id);
     return 0;
 }
 fn traverseData(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const s: *DataObject = @ptrCast(o.?);
-    inline for (.{ s.data, s.stream_id }) |f| {
+    inline for (.{s.data}) |f| {
         const r = visitObj(f, visit, arg);
         if (r != 0) return r;
     }
@@ -295,12 +289,11 @@ fn traverseData(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(
 fn clearData(o: ?*c.PyObject) callconv(.c) c_int {
     const s: *DataObject = @ptrCast(o.?);
     py.clear(&s.data);
-    py.clear(&s.stream_id);
     return 0;
 }
 fn traverseEom(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const s: *EndOfMessageObject = @ptrCast(o.?);
-    inline for (.{ s.trailers, s.stream_id }) |f| {
+    inline for (.{s.trailers}) |f| {
         const r = visitObj(f, visit, arg);
         if (r != 0) return r;
     }
@@ -309,7 +302,6 @@ fn traverseEom(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.
 fn clearEom(o: ?*c.PyObject) callconv(.c) c_int {
     const s: *EndOfMessageObject = @ptrCast(o.?);
     py.clear(&s.trailers);
-    py.clear(&s.stream_id);
     return 0;
 }
 fn traverseRstStream(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
@@ -757,9 +749,9 @@ fn makeRequest(r: events.Request) py.Object {
     s.query = if (r.query.len == 0) py.newRef(empty_bytes) else py.fromBytes(r.query);
     s.http_version = internFrom(&INTERNED_VERSIONS, &interned_versions, r.http_version) orelse py.fromBytes(r.http_version);
     s.headers = buildHeaders(r.headers);
-    s.stream_id = u32Obj(r.stream_id);
+    s.stream_id = r.stream_id;
     s.expect_continue = @intFromBool(r.expect_continue);
-    if (s.method == null or s.target == null or s.path == null or s.query == null or s.http_version == null or s.headers == null or s.stream_id == null) {
+    if (s.method == null or s.target == null or s.path == null or s.query == null or s.http_version == null or s.headers == null) {
         py.decref(o);
         return null;
     }
@@ -774,8 +766,8 @@ fn makeResponse(r: events.Response) py.Object {
     s.reason = internFrom(&INTERNED_REASONS, &interned_reasons, r.reason) orelse py.fromBytes(r.reason);
     s.http_version = internFrom(&INTERNED_VERSIONS, &interned_versions, r.http_version) orelse py.fromBytes(r.http_version);
     s.headers = buildHeaders(r.headers);
-    s.stream_id = u32Obj(r.stream_id);
-    if (s.status_code == null or s.reason == null or s.http_version == null or s.headers == null or s.stream_id == null) {
+    s.stream_id = r.stream_id;
+    if (s.status_code == null or s.reason == null or s.http_version == null or s.headers == null) {
         py.decref(o);
         return null;
     }
@@ -787,8 +779,8 @@ fn makeData(d: events.Data) py.Object {
     if (o == null) return null;
     const s: *DataObject = @ptrCast(o);
     s.data = py.fromBytes(d.data);
-    s.stream_id = u32Obj(d.stream_id);
-    if (s.data == null or s.stream_id == null) {
+    s.stream_id = d.stream_id;
+    if (s.data == null) {
         py.decref(o);
         return null;
     }
@@ -800,8 +792,8 @@ fn makeEom(e: events.EndOfMessage) py.Object {
     if (o == null) return null;
     const s: *EndOfMessageObject = @ptrCast(o);
     s.trailers = buildHeaders(e.trailers);
-    s.stream_id = u32Obj(e.stream_id);
-    if (s.trailers == null or s.stream_id == null) {
+    s.stream_id = e.stream_id;
+    if (s.trailers == null) {
         py.decref(o);
         return null;
     }
