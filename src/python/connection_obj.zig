@@ -255,6 +255,11 @@ const H3Engine = struct {
                 return c.PyErr_NoMemory();
             };
             h.* = H3Connection.init(gpa, q);
+            // The HTTP/3 read demo delivers request data in the Application space
+            // (STREAM is illegal in Initial). Until the Python adapter drives the
+            // TLS handshake, install the deterministic test 1-RTT keys so a 1-RTT
+            // request packet (coalesced after the bootstrap Initial) decrypts.
+            core.quic.connection.testInstallAppKeys(q);
             self.qc = q;
             self.h3 = h;
         }

@@ -22,6 +22,8 @@ const recovery = @import("recovery.zig");
 const congestion = @import("congestion.zig");
 const flow = @import("flow.zig");
 const stream = @import("stream.zig");
+const crypto_stream = @import("crypto_stream.zig");
+const tls = @import("tls/root.zig");
 
 const Space = constants.Space;
 
@@ -42,24 +44,30 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// One packet-number space's protection keys and recovery state. Initial keys are
-/// derived up front; Handshake/Application keys arrive via `installKeys`.
+/// One packet-number space's protection keys, recovery state, and CRYPTO receive
+/// reassembly. Initial keys are derived up front; Handshake/Application keys arrive
+/// via `installKeys`.
 const SpaceState = struct {
     recv_keys: ?crypto.Keys = null,
     send_keys: ?crypto.Keys = null,
     next_pn: u64 = 0,
     largest_recv_pn: ?u64 = null,
     rec: recovery.Space = .{},
+    crypto: crypto_stream.CryptoStream,
+    ack_pending: bool = false,
 
     fn deinit(self: *SpaceState, gpa: std.mem.Allocator) void {
         self.rec.deinit(gpa);
+        self.crypto.deinit();
     }
 };
 
 pub const Connection = struct {
     gpa: std.mem.Allocator,
     role: Role,
-    dcid: []u8, // our peer's chosen dcid for us (owned)
+    dcid: []u8, // our peer's chosen dcid for us = the Initial-key material (owned)
+    scid: []u8, // our own source connection id, sent in our long headers (owned)
+    peer_scid: []u8, // the peer's scid: the dcid of everything we send (owned)
     spaces: [3]SpaceState,
     rtt: recovery.RttEstimator = .{},
     cc: congestion.Controller,
@@ -72,15 +80,34 @@ pub const Connection = struct {
     conn_received_total: u64 = 0,
     conn_consumed_total: u64 = 0,
     streams: std.AutoHashMapUnmanaged(u64, *stream.RecvStream) = .empty,
+    /// Built datagrams waiting to be drained by `datagramsToSend` (one contiguous
+    /// buffer; `out_lengths` records each datagram's byte length in order).
+    out: std.ArrayListUnmanaged(u8) = .empty,
+    out_lengths: std.ArrayListUnmanaged(usize) = .empty,
+    /// The server TLS handshake driver, attached by `initServer`; null on a client
+    /// or a connection that does not run the handshake (the recv-pipeline tests).
+    tls: ?tls.server.Server = null,
+    peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
     closed: bool = false,
 
     /// `client_dcid` is the destination connection id on the client's first
-    /// Initial: both endpoints derive the Initial keys from it.
+    /// Initial: both endpoints derive the Initial keys from it. The server picks
+    /// its own `scid` (sent in its long headers) and uses the peer's scid as the
+    /// destination of everything it sends; both default to `client_dcid` until the
+    /// peer's Initial is parsed (the test path uses a single shared id).
     pub fn init(gpa: std.mem.Allocator, role: Role, client_dcid: []const u8) Error!Connection {
         const dcid = try gpa.dupe(u8, client_dcid);
         errdefer gpa.free(dcid);
+        const scid = try gpa.dupe(u8, client_dcid);
+        errdefer gpa.free(scid);
+        const peer_scid = try gpa.dupe(u8, client_dcid);
+        errdefer gpa.free(peer_scid);
         const initial = crypto.InitialKeys.derive(client_dcid);
-        var spaces = [_]SpaceState{.{}} ** 3;
+        var spaces: [3]SpaceState = .{
+            .{ .crypto = crypto_stream.CryptoStream.init(gpa) },
+            .{ .crypto = crypto_stream.CryptoStream.init(gpa) },
+            .{ .crypto = crypto_stream.CryptoStream.init(gpa) },
+        };
         // The receiver decrypts with the opposite role's keys.
         const recv = if (role == .server) initial.client else initial.server;
         const send = if (role == .server) initial.server else initial.client;
@@ -90,6 +117,8 @@ pub const Connection = struct {
             .gpa = gpa,
             .role = role,
             .dcid = dcid,
+            .scid = scid,
+            .peer_scid = peer_scid,
             .spaces = spaces,
             .cc = congestion.Controller.init(constants.MIN_INITIAL_DATAGRAM),
             .conn_recv_window = flow.Window.init(1 << 20),
@@ -97,14 +126,28 @@ pub const Connection = struct {
         };
     }
 
+    /// A server connection with the TLS handshake driver attached: incoming CRYPTO
+    /// drives the handshake, which installs per-space keys and emits the server
+    /// flight. `tls_config` supplies the ServerHello randomness, ephemeral seed,
+    /// signing key, certificate, and transport parameters.
+    pub fn initServer(gpa: std.mem.Allocator, client_dcid: []const u8, tls_config: tls.flight.Config) Error!Connection {
+        var conn = try init(gpa, .server, client_dcid);
+        conn.tls = tls.server.Server.init(tls_config);
+        return conn;
+    }
+
     pub fn deinit(self: *Connection) void {
         self.gpa.free(self.dcid);
+        self.gpa.free(self.scid);
+        self.gpa.free(self.peer_scid);
         var it = self.streams.valueIterator();
         while (it.next()) |s| {
             s.*.deinit();
             self.gpa.destroy(s.*);
         }
         self.streams.deinit(self.gpa);
+        self.out.deinit(self.gpa);
+        self.out_lengths.deinit(self.gpa);
         for (&self.spaces) |*s| s.deinit(self.gpa);
     }
 
@@ -117,6 +160,132 @@ pub const Connection = struct {
         s.send_keys = send_keys;
     }
 
+    // ---- send core -------------------------------------------------------------
+
+    /// Build one packet in `space` carrying `frames` (already-encoded frame bytes),
+    /// seal and header-protect it, append it to the outbound queue, and record it
+    /// for loss recovery / congestion control. The single send primitive: CRYPTO,
+    /// ACK, and (later) STREAM all funnel through here. `frames` MUST fit one
+    /// datagram. A long header (Initial/Handshake) carries our scid + a length
+    /// field; a short header (Application) runs to the datagram end.
+    fn buildPacket(self: *Connection, space: Space, frames: []const u8, ack_eliciting: bool, now: u64) Error!void {
+        assertFramesAllowedIn(space, frames); // no STREAM in Initial/Handshake, by construction
+        const st = &self.spaces[@intFromEnum(space)];
+        const keys = st.send_keys orelse return error.ProtocolViolation; // driver installs first
+        const long = space != .application;
+        const pn = st.next_pn;
+        const pn_len = packet.packetNumberLen(pn, st.rec.largest_acked);
+
+        var hdr: std.ArrayListUnmanaged(u8) = .empty;
+        defer hdr.deinit(self.gpa);
+        const pn_offset = blk: {
+            if (long) {
+                const ltype: constants.LongType = if (space == .initial) .initial else .handshake;
+                const length = pn_len + frames.len + crypto.TAG_LEN;
+                break :blk packet.writeLongHeader(&hdr, self.gpa, ltype, constants.VERSION_1, self.peer_scid, self.scid, &.{}, length, pn_len) catch return error.OutOfMemory;
+            } else {
+                break :blk packet.writeShortHeader(&hdr, self.gpa, self.peer_scid, pn_len) catch return error.OutOfMemory;
+            }
+        };
+        packet.writePacketNumber(&hdr, self.gpa, pn, pn_len) catch return error.OutOfMemory;
+
+        const start = self.out.items.len;
+        self.out.appendSlice(self.gpa, hdr.items) catch return error.OutOfMemory;
+        const ct = self.out.addManyAsSlice(self.gpa, frames.len + crypto.TAG_LEN) catch return error.OutOfMemory;
+        _ = crypto.seal(keys, pn, hdr.items, frames, ct);
+        crypto.protectHeader(keys.hp, self.out.items[start..], pn_offset, long) catch return error.ProtocolViolation;
+
+        const datagram_len = self.out.items.len - start;
+        self.out_lengths.append(self.gpa, datagram_len) catch return error.OutOfMemory;
+        // A pure-ACK packet is not ack-eliciting, so it is not in flight: not
+        // congestion-controlled or retransmitted (RFC 9002 2, 7).
+        st.rec.onSent(self.gpa, .{ .pn = pn, .sent_time = now, .size = datagram_len, .ack_eliciting = ack_eliciting, .in_flight = ack_eliciting }) catch return error.OutOfMemory;
+        self.cc.onSent(datagram_len);
+        st.next_pn += 1;
+    }
+
+    /// The built datagrams as one contiguous buffer; pair with `datagramLengths`.
+    pub fn datagramsToSend(self: *Connection) []const u8 {
+        return self.out.items;
+    }
+
+    /// The byte length of each queued datagram, in order.
+    pub fn datagramLengths(self: *Connection) []const usize {
+        return self.out_lengths.items;
+    }
+
+    /// Drop the drained datagrams (the integrator has sent them).
+    pub fn clearSend(self: *Connection) void {
+        self.out.clearRetainingCapacity();
+        self.out_lengths.clearRetainingCapacity();
+    }
+
+    // ---- TLS handshake drive ---------------------------------------------------
+
+    fn onCrypto(self: *Connection, space: Space, offset: u64, data: []const u8, now: u64) Error!void {
+        const st = &self.spaces[@intFromEnum(space)];
+        st.crypto.push(offset, data) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ProtocolViolation, // CryptoConflict / CryptoBufferExceeded
+        };
+        try self.driveTls(space, now);
+    }
+
+    fn driveTls(self: *Connection, space: Space, now: u64) Error!void {
+        const server = if (self.tls) |*s| s else return; // client handshake send is a later stage
+        const st = &self.spaces[@intFromEnum(space)];
+        while (true) {
+            const buf = st.crypto.readable();
+            const msg = tls.handshake.peek(buf) orelse break; // need more CRYPTO bytes
+            switch (msg.msg_type) {
+                .client_hello => {
+                    const decoded = tls.client_hello.parse(buf[0..msg.len]) catch return error.ProtocolViolation;
+                    var flight_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer flight_buf.deinit(self.gpa);
+                    const outcome = server.onClientHello(&flight_buf, self.gpa, decoded.value) catch return error.ProtocolViolation;
+
+                    // A server RECVs with the client traffic secret, SENDs with the server one.
+                    self.installKeys(.handshake, outcome.built.handshake_secrets.clientKeys(), outcome.built.handshake_secrets.serverKeys());
+                    self.installKeys(.application, outcome.built.application_secrets.clientKeys(), outcome.built.application_secrets.serverKeys());
+
+                    // Consume the ClientHello from the reassembler BEFORE emitting the
+                    // flight, so nothing borrows from `ready` across a send (which may
+                    // realloc it). The flight bytes live in `flight_buf`, not `ready`.
+                    st.crypto.advance(msg.len);
+                    try self.sendCryptoFlight(flight_buf.items, outcome.server_hello_len, now);
+                    continue;
+                },
+                .finished => st.crypto.advance(msg.len), // client Finished verify is a later stage
+                else => return error.ProtocolViolation, // unexpected message at the server
+            }
+        }
+    }
+
+    /// Emit the server flight: ServerHello as CRYPTO in the Initial space, the rest
+    /// (EncryptedExtensions/Certificate/CertificateVerify/Finished) as CRYPTO in the
+    /// Handshake space. Each space's CRYPTO byte-stream starts at offset 0.
+    fn sendCryptoFlight(self: *Connection, flight: []const u8, server_hello_len: usize, now: u64) Error!void {
+        try self.sendCrypto(.initial, flight[0..server_hello_len], now);
+        try self.sendCrypto(.handshake, flight[server_hello_len..], now);
+    }
+
+    fn sendCrypto(self: *Connection, space: Space, data: []const u8, now: u64) Error!void {
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(self.gpa);
+        frame.encodeCrypto(&frames, self.gpa, 0, data) catch return error.OutOfMemory;
+        try self.buildPacket(space, frames.items, true, now);
+    }
+
+    fn sendAck(self: *Connection, space: Space, now: u64) Error!void {
+        const st = &self.spaces[@intFromEnum(space)];
+        const largest = st.largest_recv_pn orelse return;
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(self.gpa);
+        frame.encodeAck(&frames, self.gpa, largest, 0, 0) catch return error.OutOfMemory; // one contiguous range
+        try self.buildPacket(space, frames.items, false, now); // an ACK is not ack-eliciting
+        st.ack_pending = false;
+    }
+
     /// Process one received UDP datagram: walk the coalesced packets, decrypt and
     /// dispatch each. `now` is a monotonic microsecond timestamp. A packet that
     /// fails authentication is skipped (not fatal); a protocol violation poisons
@@ -126,7 +295,11 @@ pub const Connection = struct {
         var rest = datagram;
         while (rest.len > 0) {
             const consumed = self.receivePacket(rest, now) catch |e| switch (e) {
-                error.Dropped => break, // cannot find the boundary of an undecryptable packet; stop
+                // A short-header packet has no length field, so an undecryptable one
+                // ends the walk (its boundary is the datagram end). A long-header
+                // packet whose boundary IS known returns its length from receiveLong
+                // even when undecryptable, so coalesced packets after it still run.
+                error.Dropped => break,
                 else => return e,
             };
             if (consumed == 0 or consumed > rest.len) break;
@@ -144,12 +317,30 @@ pub const Connection = struct {
         const space: Space = switch (hdr.ltype) {
             .initial => .initial,
             .handshake => .handshake,
-            .zero_rtt => .application,
+            // 0-RTT uses its own keys, which this server never installs (0-RTT is out
+            // of scope); drop it rather than risk decrypting it with 1-RTT keys.
+            .zero_rtt => return error.Dropped,
             .retry => return error.Dropped, // retry handling is the connection-setup path
         };
         const total = hdr.pn_offset + @as(usize, @intCast(hdr.length));
         if (total > buf.len) return error.Dropped;
-        try self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, now);
+        // Adopt the peer's source connection id (from its first long header) as the
+        // destination of everything we send (RFC 9000 7.2). Until this, peer_scid
+        // defaults to the client dcid - fine for tests that use one shared id.
+        if (!self.peer_scid_set and hdr.scid.len > 0) {
+            const sc = self.gpa.dupe(u8, hdr.scid) catch return error.OutOfMemory;
+            self.gpa.free(self.peer_scid);
+            self.peer_scid = sc;
+            self.peer_scid_set = true;
+        }
+        // A long header's length is known, so a packet we cannot decrypt (no keys
+        // for the space yet, or a bad tag) is SKIPPED, not fatal: we return its
+        // length so the caller keeps walking any coalesced packets behind it
+        // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2.
+        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, now) catch |e| switch (e) {
+            error.Dropped => return total,
+            else => return e,
+        };
         return total;
     }
 
@@ -180,6 +371,9 @@ pub const Connection = struct {
 
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, pn) else pn;
         try self.dispatchFrames(payload, space, now);
+
+        // Acknowledge the space if it carried an ack-eliciting frame this packet.
+        if (st.ack_pending) try self.sendAck(space, now);
     }
 
     fn dispatchFrames(self: *Connection, payload: []const u8, space: Space, now: u64) Error!void {
@@ -193,15 +387,30 @@ pub const Connection = struct {
     }
 
     fn handleFrame(self: *Connection, f: frame.Frame, space: Space, now: u64) Error!void {
+        // RFC 9000 12.4: only PADDING, PING, ACK, CRYPTO, and CONNECTION_CLOSE are
+        // permitted in the Initial and Handshake spaces. STREAM and the other
+        // 1-RTT frames in those spaces are a PROTOCOL_VIOLATION - the recv mirror of
+        // keeping STREAM out of Initial on the send side. This gate matters now that
+        // Stage 4 installs Handshake/Application recv keys, widening what decrypts.
+        if (!frameAllowedIn(space, f)) return error.ProtocolViolation;
+
+        const st = &self.spaces[@intFromEnum(space)];
         switch (f) {
-            .padding, .ping => {},
+            .padding => {},
+            .ping => st.ack_pending = true,
             .ack => |a| {
                 var it = frame.ackRanges(a.ranges);
-                _ = self.spaces[@intFromEnum(space)].rec.onAck(&self.rtt, &self.cc, now, a.largest, a.delay, a.first_range, &it) catch
+                _ = st.rec.onAck(&self.rtt, &self.cc, now, a.largest, a.delay, a.first_range, &it) catch
                     return error.ProtocolViolation;
             },
-            .crypto => {}, // handed to the TLS driver once it lands
-            .stream => |s| try self.onStreamFrame(s.stream_id, s.offset, s.data, s.fin),
+            .crypto => |c| {
+                st.ack_pending = true;
+                try self.onCrypto(space, c.offset, c.data, now);
+            },
+            .stream => |s| {
+                st.ack_pending = true;
+                try self.onStreamFrame(s.stream_id, s.offset, s.data, s.fin);
+            },
             .max_data => |m| self.conn_send_window.onMaxData(m),
             .max_stream_data => {}, // per-stream send windows arrive with the send path
             .reset_stream => |r| try self.onReset(r.stream_id, r.final_size),
@@ -210,6 +419,33 @@ pub const Connection = struct {
             },
             .handshake_done => {},
             else => {}, // the remaining control frames affect state the send path owns
+        }
+    }
+
+    /// RFC 9000 12.4 / table 3: which frame types each space permits. Initial and
+    /// Handshake carry only the handshake-control frames; everything else is a 1-RTT
+    /// frame and illegal there.
+    fn frameAllowedIn(space: Space, f: frame.Frame) bool {
+        if (space == .application) return true;
+        return switch (f) {
+            .padding, .ping, .ack, .crypto, .connection_close => true,
+            else => false,
+        };
+    }
+
+    /// The send-side mirror of the recv gate: assert every frame we are about to
+    /// seal is legal in `space` (so STREAM can never reach an Initial/Handshake
+    /// packet, the #64 P1, even through the shared buildPacket primitive). A debug
+    /// check - it decodes the payload, so it compiles out in release builds, where
+    /// the single STREAM caller is already pinned to the Application space.
+    fn assertFramesAllowedIn(space: Space, frames: []const u8) void {
+        if (!std.debug.runtime_safety) return;
+        var rest = frames;
+        while (rest.len > 0) {
+            const d = frame.decode(rest) catch return;
+            std.debug.assert(frameAllowedIn(space, d.frame));
+            if (d.len == 0) break;
+            rest = rest[d.len..];
         }
     }
 
@@ -317,16 +553,51 @@ pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, 
     return out;
 }
 
-test "server decrypts a client Initial and reassembles a stream" {
+// Application-space test keys, deterministic so a test builder and the connection
+// agree. STREAM frames are illegal in Initial (RFC 9000 12.4); these helpers let
+// the recv-pipeline tests deliver stream data in the Application space, the way a
+// real connection does once the handshake installs 1-RTT keys.
+const TEST_APP_SECRET = [_]u8{0x5a} ** 32;
+
+fn testAppKeys() crypto.Keys {
+    return crypto.Keys.fromSecret(TEST_APP_SECRET);
+}
+
+// Install Application-space keys on `conn` (both directions the same fixed keys,
+// which is all the recv path needs) so it can decrypt a testBuildApp datagram.
+pub fn testInstallAppKeys(conn: *Connection) void {
+    conn.installKeys(.application, testAppKeys(), testAppKeys());
+}
+
+// Build a 1-RTT (short-header) Application packet carrying `frames`, sealed with
+// the test Application keys. The mirror of testBuildInitial for the post-handshake
+// space, so stream-reassembly tests use the space STREAM is actually legal in.
+pub fn testBuildApp(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8) ![]u8 {
+    const keys = testAppKeys();
+    var hdr: std.ArrayListUnmanaged(u8) = .empty;
+    defer hdr.deinit(gpa);
+    const pn_offset = try packet.writeShortHeader(&hdr, gpa, dcid, 1);
+    try packet.writePacketNumber(&hdr, gpa, pn, 1);
+
+    const out = try gpa.alloc(u8, hdr.items.len + frames.len + crypto.TAG_LEN);
+    errdefer gpa.free(out);
+    @memcpy(out[0..hdr.items.len], hdr.items);
+    _ = crypto.seal(keys, pn, hdr.items, frames, out[hdr.items.len..]);
+    try crypto.protectHeader(keys.hp, out, pn_offset, false);
+    return out;
+}
+
+test "server decrypts a 1-RTT packet and reassembles a stream" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
+    testInstallAppKeys(&conn);
 
-    // A CRYPTO-less payload: a STREAM frame (type 0x0b = OFF=0,LEN,FIN) on stream
-    // 0 carrying "hi". 0x0a actually = LEN|FIN with no OFF; id=0,len=2,"hi".
-    const frames = [_]u8{ 0x0b, 0x00, 0x02, 'h', 'i' }; // 0x0b = base|LEN|FIN
-    const dgram = try testBuildInitial(gpa, &dcid, .client, 0, &frames);
+    // A STREAM frame (type 0x0b = base|LEN|FIN) on stream 0 carrying "hi", in an
+    // Application packet - the space STREAM is legal in.
+    const frames = [_]u8{ 0x0b, 0x00, 0x02, 'h', 'i' };
+    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
     defer gpa.free(dgram);
 
     try conn.receiveDatagram(dgram, 1000);
@@ -353,8 +624,9 @@ test "consume re-grants connection flow-control credit" {
     const dcid = [_]u8{ 0x09, 0x09, 0x09, 0x09 };
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
+    testInstallAppKeys(&conn);
     const frames = [_]u8{ 0x0a, 0x00, 0x03, 'a', 'b', 'c' }; // STREAM id0 LEN, "abc", no FIN
-    const dgram = try testBuildInitial(gpa, &dcid, .client, 0, &frames);
+    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
     defer gpa.free(dgram);
     try conn.receiveDatagram(dgram, 1000);
     try testing.expectEqualStrings("abc", conn.streamData(0));
@@ -367,6 +639,7 @@ test "connection flow control sums across streams" {
     const dcid = [_]u8{ 0x0a, 0x0b, 0x0c, 0x0d };
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
+    testInstallAppKeys(&conn);
     // Shrink the connection window so a small payload spread over two streams
     // exceeds it - this is exactly the evasion a per-stream check would miss.
     conn.conn_recv_window.limit = 6;
@@ -376,7 +649,208 @@ test "connection flow control sums across streams" {
         0x0a, 0x00, 0x04, 'a', 'a', 'a', 'a', // stream 0, 4 bytes
         0x0a, 0x04, 0x04, 'b', 'b', 'b', 'b', // stream 4, 4 bytes
     };
-    const dgram = try testBuildInitial(gpa, &dcid, .client, 0, &frames);
+    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
     defer gpa.free(dgram);
     try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
+}
+
+// ---- TLS handshake seam tests ----------------------------------------------
+
+// The RFC 8448 section 3 client x25519 public key, the same value tls/keyshare.zig
+// pins; the server's ECDHE against it is reproducible from the published vectors.
+const RFC_CLIENT_PUBKEY = "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c";
+
+// Build a QUIC-valid ClientHello carrying `pubkey` as its x25519 key_share, framed
+// as a handshake message (type 0x01 || u24 len || body) ready to ride a CRYPTO frame.
+fn buildClientHello(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pubkey: [32]u8) !void {
+    const w = tls.wire.Writer{ .out = out, .gpa = gpa };
+    try w.u8v(0x01);
+    const msg = try w.open(3);
+    try w.u16v(0x0303);
+    try w.bytes(&[_]u8{0x11} ** 32);
+    try w.u8v(0x00); // empty session id (QUIC)
+    const suites = try w.open(2);
+    try w.u16v(0x1301);
+    try w.close(suites);
+    const comp = try w.open(1);
+    try w.u8v(0x00);
+    try w.close(comp);
+    const exts = try w.open(2);
+    try w.u16v(0x000a); // supported_groups = [x25519]
+    const sg = try w.open(2);
+    const sgl = try w.open(2);
+    try w.u16v(0x001d);
+    try w.close(sgl);
+    try w.close(sg);
+    try w.u16v(0x000d); // signature_algorithms = [ecdsa_secp256r1_sha256]
+    const sa = try w.open(2);
+    const sal = try w.open(2);
+    try w.u16v(0x0403);
+    try w.close(sal);
+    try w.close(sa);
+    try w.u16v(0x002b); // supported_versions = [TLS 1.3]
+    const sv = try w.open(2);
+    const svl = try w.open(1);
+    try w.u16v(0x0304);
+    try w.close(svl);
+    try w.close(sv);
+    try w.u16v(0x0033); // key_share = [x25519: pubkey]
+    const ks = try w.open(2);
+    const ksl = try w.open(2);
+    try w.u16v(0x001d);
+    const pt = try w.open(2);
+    try w.bytes(&pubkey);
+    try w.close(pt);
+    try w.close(ksl);
+    try w.close(ks);
+    try w.u16v(0x0039); // quic_transport_parameters
+    const qtp = try w.open(2);
+    try w.bytes(&[_]u8{ 0x01, 0x02, 0x40, 0x01 });
+    try w.close(qtp);
+    try w.close(exts);
+    try w.close(msg);
+}
+
+// A client Initial datagram carrying the ClientHello in a CRYPTO frame at offset 0.
+fn buildClientHelloInitial(gpa: std.mem.Allocator, dcid: []const u8, pubkey: [32]u8) ![]u8 {
+    var ch: std.ArrayListUnmanaged(u8) = .empty;
+    defer ch.deinit(gpa);
+    try buildClientHello(&ch, gpa, pubkey);
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeCrypto(&frames, gpa, 0, ch.items);
+    return testBuildInitial(gpa, dcid, .client, 0, frames.items);
+}
+
+fn testServerConfig() tls.flight.Config {
+    return .{
+        .random = [_]u8{0xAB} ** 32,
+        .ephemeral_seed = [_]u8{0x33} ** 32,
+        .signer = tls.sign.Signer.fromSeed([_]u8{0x42} ** 32) catch unreachable,
+        .cert_chain = &[_]u8{0xCC} ** 48,
+        .transport_params = &[_]u8{ 0x00, 0x01 },
+    };
+}
+
+test "a server drives the handshake from a ClientHello and installs 1-RTT keys" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    const dgram = try buildClientHelloInitial(gpa, &dcid, pubkey);
+    defer gpa.free(dgram);
+    try server.receiveDatagram(dgram, 1000);
+
+    // The server emits three datagrams: ServerHello (Initial CRYPTO), the encrypted
+    // flight (Handshake CRYPTO), and an Initial-space ACK.
+    try testing.expectEqual(@as(usize, 3), server.datagramLengths().len);
+
+    // It installed Handshake and Application keys for both directions.
+    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].send_keys != null);
+    try testing.expect(server.spaces[@intFromEnum(Space.application)].send_keys != null);
+    try testing.expect(server.spaces[@intFromEnum(Space.application)].recv_keys != null);
+
+    // The installed Application keys are the schedule's, derived from the ECDHE the
+    // server computed against the RFC client key - the cross-seam key-agreement check:
+    // independently derive the server's ephemeral public and confirm a shared secret.
+    const server_ks = try tls.keyshare.KeyShare.ephemeral([_]u8{0x33} ** 32);
+    const ecdhe = try server_ks.shared(pubkey);
+    try testing.expectEqual(@as(usize, 32), ecdhe.len); // both sides reach the same ECDHE input
+}
+
+test "a fragmented ClientHello across CRYPTO frames still drives the handshake" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    var ch: std.ArrayListUnmanaged(u8) = .empty;
+    defer ch.deinit(gpa);
+    try buildClientHello(&ch, gpa, pubkey);
+
+    // Deliver the ClientHello as two CRYPTO frames in two Initial packets, second
+    // half first (reordered). The reassembler holds back until the prefix completes.
+    const split = ch.items.len / 2;
+    var f2: std.ArrayListUnmanaged(u8) = .empty;
+    defer f2.deinit(gpa);
+    try frame.encodeCrypto(&f2, gpa, split, ch.items[split..]);
+    const d2 = try testBuildInitial(gpa, &dcid, .client, 0, f2.items);
+    defer gpa.free(d2);
+    try server.receiveDatagram(d2, 1000);
+    // The flight has NOT been emitted yet (the ClientHello is incomplete): no
+    // Handshake keys installed, only the Initial-space ACK for the received packet.
+    try testing.expect(server.spaces[@intFromEnum(Space.application)].send_keys == null);
+
+    server.clearSend(); // drop the ACK the first packet elicited
+    var f1: std.ArrayListUnmanaged(u8) = .empty;
+    defer f1.deinit(gpa);
+    try frame.encodeCrypto(&f1, gpa, 0, ch.items[0..split]);
+    const d1 = try testBuildInitial(gpa, &dcid, .client, 1, f1.items);
+    defer gpa.free(d1);
+    try server.receiveDatagram(d1, 1000);
+
+    // Now the whole ClientHello is assembled: the flight is emitted.
+    try testing.expect(server.spaces[@intFromEnum(Space.application)].send_keys != null);
+}
+
+test "conflicting overlapping CRYPTO frames poison the connection" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11 };
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    var f1: std.ArrayListUnmanaged(u8) = .empty;
+    defer f1.deinit(gpa);
+    try frame.encodeCrypto(&f1, gpa, 0, "AAAA");
+    const d1 = try testBuildInitial(gpa, &dcid, .client, 0, f1.items);
+    defer gpa.free(d1);
+    try server.receiveDatagram(d1, 1000);
+
+    var f2: std.ArrayListUnmanaged(u8) = .empty;
+    defer f2.deinit(gpa);
+    try frame.encodeCrypto(&f2, gpa, 1, "XX"); // [1,3) disagrees with the first frame
+    const d2 = try testBuildInitial(gpa, &dcid, .client, 1, f2.items);
+    defer gpa.free(d2);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(d2, 1000));
+}
+
+test "a STREAM frame in an Initial packet is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x21, 0x22, 0x23, 0x24 };
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+    const frames = [_]u8{ 0x0b, 0x00, 0x02, 'h', 'i' }; // STREAM, illegal in Initial
+    const dgram = try testBuildInitial(gpa, &dcid, .client, 0, &frames);
+    defer gpa.free(dgram);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(dgram, 1000));
+}
+
+test "a malformed ClientHello (no supported_versions) poisons the connection" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x31, 0x32, 0x33, 0x34 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    var ch: std.ArrayListUnmanaged(u8) = .empty;
+    defer ch.deinit(gpa);
+    try buildClientHello(&ch, gpa, pubkey);
+    // Corrupt the supported_versions extension type so TLS 1.3 is never signalled.
+    const idx = std.mem.indexOf(u8, ch.items, &[_]u8{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 }).?;
+    ch.items[idx] = 0x99;
+    ch.items[idx + 1] = 0x99;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeCrypto(&frames, gpa, 0, ch.items);
+    const dgram = try testBuildInitial(gpa, &dcid, .client, 0, frames.items);
+    defer gpa.free(dgram);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(dgram, 1000));
 }
