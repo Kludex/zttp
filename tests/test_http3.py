@@ -4,12 +4,14 @@ import pytest
 
 import zttp
 
-# A real QUIC Initial datagram carrying a complete HTTP/3 GET request on stream 0:
-# the client dcid is 11 22 33 44, and the HEADERS frame's QPACK block is
-# :method GET, :scheme https, :path /, :authority "x". Generated from the Zig
-# transport's test builder (testBuildInitial) so it decrypts under the RFC 9001
-# Initial keys the adapter derives from the dcid in the packet.
-GET_DATAGRAM = bytes.fromhex("cf00000001041122334400001eec32112effa6556376739d2118dab345addaf64c2a56d1b6ff7a76860c06")
+# A QUIC datagram coalescing a bootstrap Initial (a PING, which establishes the
+# client dcid 11 22 33 44) and a 1-RTT packet carrying a complete HTTP/3 GET
+# request on stream 0 (HEADERS: :method GET, :scheme https, :path /, :authority
+# "x"). STREAM frames are illegal in Initial (RFC 9000 12.4), so request data
+# rides the Application space; the adapter installs the deterministic test 1-RTT
+# keys until it drives the real handshake. Generated from the Zig transport's
+# test builders (testBuildInitial + testBuildApp).
+GET_DATAGRAM = bytes.fromhex("cb00000001041122334400002503391124feae5563a7a45c7119a2ac826e2902aeed3285921485b19e31d5895764ce99219b4111223344d5873c1ca2ad7e827da34fc75fb850c4431c3430c66c9b3844ba46ebfb0f")
 
 
 def test_http3_constant_exists() -> None:
