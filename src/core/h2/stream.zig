@@ -142,6 +142,16 @@ pub const Stream = struct {
         };
     }
 
+    /// Apply the local side sending END_STREAM (the send-side mirror of
+    /// halfCloseRemote): open -> half_closed_local, half_closed_remote -> closed.
+    pub fn sendEndStream(self: *Stream) void {
+        self.state = switch (self.state) {
+            .open => .half_closed_local,
+            .half_closed_remote => .closed,
+            else => self.state,
+        };
+    }
+
     /// Account for inbound DATA against the receive window. Returns a transition:
     /// a window overrun is a connection FLOW_CONTROL_ERROR. `len` is the full
     /// frame payload length (including padding), which is what counts against the
