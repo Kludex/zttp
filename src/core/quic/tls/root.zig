@@ -17,6 +17,7 @@ pub const extension = @import("extension.zig");
 pub const handshake = @import("handshake.zig");
 pub const client_hello = @import("client_hello.zig");
 pub const flight = @import("flight.zig");
+pub const server = @import("server.zig");
 
 test {
     _ = transcript;
@@ -29,6 +30,7 @@ test {
     _ = handshake;
     _ = client_hello;
     _ = flight;
+    _ = server;
 }
 
 // End-to-end codec tests, pinned where possible to the RFC 8448 section 3 trace.
@@ -139,8 +141,8 @@ test "parse surfaces the byte-exact x25519 key_share that drives the RFC ECDHE s
     // key reproduce the published ECDHE secret keyshare/schedule are pinned to.
     var server_sk: [32]u8 = undefined;
     _ = try hex(&server_sk, RFC_SERVER_PRIVKEY);
-    const server = keyshare.KeyShare{ .public_key = undefined, .secret_key = server_sk };
-    const secret = try server.shared(d.value.client_key_share);
+    const server_kp = keyshare.KeyShare{ .public_key = undefined, .secret_key = server_sk };
+    const secret = try server_kp.shared(d.value.client_key_share);
     var want: [32]u8 = undefined;
     _ = try hex(&want, RFC_ECDHE);
     try testing.expectEqualSlices(u8, &want, &secret);
