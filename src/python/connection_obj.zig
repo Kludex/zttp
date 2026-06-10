@@ -34,7 +34,9 @@ const HTTP3: c_long = 3;
 /// state the send path needs (the request method the next response answers, the
 /// keep-alive / upgrade signals captured at parse time).
 const H1Engine = struct {
-    reader: *Reader,
+    /// Embedded by value: the engine is one allocation, so constructing a
+    /// Connection does not pay a separate heap allocation for the Reader.
+    reader: Reader,
     writer: *Writer,
     /// The method of the message the next response answers (server: the parsed
     /// request; client: the request we sent), so the connection auto-derives
@@ -116,7 +118,6 @@ const H1Engine = struct {
 
     fn deinit(self: *H1Engine) void {
         self.reader.deinit();
-        gpa.destroy(self.reader);
         self.writer.deinit();
         gpa.destroy(self.writer);
         py.xdecref(self.upgrade_obj);
@@ -299,7 +300,11 @@ const Engine = union(enum) {
 
 const ConnectionObject = extern struct {
     ob_base: c.PyObject,
+    /// Points into `engine_storage` when live, null once torn down. The engine
+    /// lives inside the PyObject so constructing a Connection costs no separate
+    /// heap allocation for it.
     engine: ?*Engine,
+    engine_storage: [@sizeOf(Engine)]u8 align(@alignOf(Engine)),
 };
 
 var connection_type: py.Object = null;
@@ -452,11 +457,23 @@ var stream_spec = py.Spec{
 fn parseArgs(args: ?*c.PyObject, kwds: ?*c.PyObject, role: *Role, protocol_out: *c_long, fixed: ?c_long) bool {
     var role_val: c_long = 0;
     var protocol_val: c_long = fixed orelse HTTP1;
-    // The kwlist parameter type differs across CPython versions (char** in 3.12,
-    // const char* const* in 3.13+), so build a plain C-pointer array and ptrCast
-    // it to whatever the translated signature expects.
-    var kwlist = [_][*c]u8{ @constCast("role"), @constCast("protocol"), null };
-    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", @ptrCast(&kwlist), &role_val, &protocol_val) == 0) return false;
+    const positional = if (kwds == null) c.PyTuple_Size(args) else -1;
+    if (positional == 1 or positional == 2) {
+        // The common positional forms skip PyArg_ParseTupleAndKeywords, which
+        // costs more than the rest of construction combined.
+        role_val = c.PyLong_AsLong(c.PyTuple_GetItem(args, 0));
+        if (role_val == -1 and c.PyErr_Occurred() != null) return false;
+        if (positional == 2) {
+            protocol_val = c.PyLong_AsLong(c.PyTuple_GetItem(args, 1));
+            if (protocol_val == -1 and c.PyErr_Occurred() != null) return false;
+        }
+    } else {
+        // The kwlist parameter type differs across CPython versions (char** in 3.12,
+        // const char* const* in 3.13+), so build a plain C-pointer array and ptrCast
+        // it to whatever the translated signature expects.
+        var kwlist = [_][*c]u8{ @constCast("role"), @constCast("protocol"), null };
+        if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", @ptrCast(&kwlist), &role_val, &protocol_val) == 0) return false;
+    }
     role.* = switch (role_val) {
         SERVER => .server,
         CLIENT => .client,
@@ -491,10 +508,11 @@ fn allocAndBuild(tp: ?*c.PyTypeObject, role: Role, protocol_val: c_long) py.Obje
     if (obj == null) return null;
     const self: *ConnectionObject = @ptrCast(obj);
     self.engine = null;
-    const engine = buildEngine(role, protocol_val) orelse {
+    const engine: *Engine = @ptrCast(@alignCast(&self.engine_storage));
+    if (!buildEngine(engine, role, protocol_val)) {
         py.decref(obj);
         return null;
-    };
+    }
     self.engine = engine;
     return obj;
 }
@@ -540,60 +558,43 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     return allocAndBuild(tp, role, HTTP3);
 }
 
-fn buildEngine(role: Role, protocol_val: c_long) ?*Engine {
-    const engine = gpa.create(Engine) catch {
-        _ = c.PyErr_NoMemory();
-        return null;
-    };
-
+fn buildEngine(engine: *Engine, role: Role, protocol_val: c_long) bool {
     if (protocol_val == HTTP3) {
         // The QUIC + HTTP/3 engine is built lazily on the first datagram.
         engine.* = .{ .h3 = .{} };
-        return engine;
+        return true;
     }
 
     if (protocol_val == HTTP2) {
         const conn = gpa.create(H2Connection) catch {
-            gpa.destroy(engine);
             _ = c.PyErr_NoMemory();
-            return null;
+            return false;
         };
         conn.* = H2Connection.init(gpa, if (role == .server) H2Role.server else H2Role.client);
         const writer = gpa.create(H2Writer) catch {
             conn.deinit();
             gpa.destroy(conn);
-            gpa.destroy(engine);
             _ = c.PyErr_NoMemory();
-            return null;
+            return false;
         };
         writer.* = H2Writer.init(gpa, if (role == .server) core.h2.writer.Role.server else core.h2.writer.Role.client);
         engine.* = .{ .h2 = .{ .conn = conn, .writer = writer } };
-        return engine;
+        return true;
     }
 
-    const reader = gpa.create(Reader) catch {
-        gpa.destroy(engine);
-        _ = c.PyErr_NoMemory();
-        return null;
-    };
-    reader.* = Reader.init(gpa, role);
     const writer = gpa.create(Writer) catch {
-        reader.deinit();
-        gpa.destroy(reader);
-        gpa.destroy(engine);
         _ = c.PyErr_NoMemory();
-        return null;
+        return false;
     };
     writer.* = Writer.init(gpa);
-    engine.* = .{ .h1 = .{ .reader = reader, .writer = writer } };
-    return engine;
+    engine.* = .{ .h1 = .{ .reader = Reader.init(gpa, role), .writer = writer } };
+    return true;
 }
 
 fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     if (self.engine) |engine| {
         engine.deinit();
-        gpa.destroy(engine);
     }
     py.freeInstance(@ptrCast(self));
 }
