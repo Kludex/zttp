@@ -37,13 +37,16 @@ SEEDS = (
     b"\r\n\n: \r\n\x00\xff",
 )
 
-# H2 wire fragments: preface + empty SETTINGS, then a HEADERS frame whose HPACK
-# block is fully indexed (:method GET, :scheme http, :path /) with END_HEADERS.
+# Post-handshake H2 frames only: consume_h2 already prepends the preface + empty
+# SETTINGS, so seeding the handshake here would make the parser treat the second
+# preface as a frame header and bail before reaching these frames. HEADERS with a
+# fully-indexed HPACK block (:method GET, :scheme http, :path /, END_HEADERS), a
+# DATA frame, a RST_STREAM, and a WINDOW_UPDATE - all on stream 1.
 H2_SEEDS = (
-    b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
-    b"\x00\x00\x00\x04\x00\x00\x00\x00\x00",
-    b"\x00\x00\x03\x01\x05\x00\x00\x00\x01\x82\x86\x84",
+    b"\x00\x00\x03\x01\x04\x00\x00\x00\x01\x82\x86\x84",
+    b"\x00\x00\x05\x00\x01\x00\x00\x00\x01hello",
     b"\x00\x00\x04\x03\x00\x00\x00\x00\x01\x00\x00\x00\x08",
+    b"\x00\x00\x04\x08\x00\x00\x00\x00\x01\x00\x00\x00\x10",
 )
 
 ORACLES: tuple[Callable[[bytes], None], ...] = (consume, consume_h2, roundtrip)
