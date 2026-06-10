@@ -584,6 +584,38 @@ const INTERNED_NAMES = [_][]const u8{
     "Transfer-Encoding",
 };
 
+// The same trick for header values: the values of the connection-management
+// and content-negotiation headers are drawn from a tiny fixed vocabulary, so
+// the common ones get a pre-built PyBytes too (exact-bytes match only).
+const INTERNED_VALUES = [_][]const u8{
+    "1",
+    "*/*",
+    "cors",
+    "none",
+    "close",
+    "empty",
+    "https",
+    "chunked",
+    "Upgrade",
+    "no-cache",
+    "identity",
+    "navigate",
+    "document",
+    "text/html",
+    "websocket",
+    "max-age=0",
+    "keep-alive",
+    "text/plain",
+    "same-origin",
+    "gzip, deflate",
+    "en-US,en;q=0.9",
+    "XMLHttpRequest",
+    "application/json",
+    "gzip, deflate, br",
+    "gzip, deflate, br, zstd",
+    "application/x-www-form-urlencoded",
+};
+
 // The request/status line draws from even smaller fixed sets: the standard
 // methods, the two HTTP/1.x versions, and the stock reason phrases. Same deal -
 // one PyBytes each at module init, returned on an exact-bytes match.
@@ -606,6 +638,7 @@ const INTERNED_REASONS = [_][]const u8{
 };
 
 var interned: [INTERNED_NAMES.len]py.Object = @splat(null);
+var interned_values: [INTERNED_VALUES.len]py.Object = @splat(null);
 var interned_methods: [INTERNED_METHODS.len]py.Object = @splat(null);
 var interned_versions: [INTERNED_VERSIONS.len]py.Object = @splat(null);
 var interned_reasons: [INTERNED_REASONS.len]py.Object = @splat(null);
@@ -615,6 +648,10 @@ fn buildInternTable() bool {
     inline for (INTERNED_NAMES, 0..) |name, i| {
         interned[i] = py.fromBytes(name);
         if (interned[i] == null) return false;
+    }
+    inline for (INTERNED_VALUES, 0..) |value, i| {
+        interned_values[i] = py.fromBytes(value);
+        if (interned_values[i] == null) return false;
     }
     inline for (INTERNED_METHODS, 0..) |m, i| {
         interned_methods[i] = py.fromBytes(m);
@@ -661,6 +698,20 @@ fn internName(name: []const u8) ?py.Object {
     }
 }
 
+fn internValue(value: []const u8) ?py.Object {
+    switch (value.len) {
+        inline 1...33 => |L| {
+            inline for (INTERNED_VALUES, 0..) |cand, i| {
+                if (comptime cand.len == L) {
+                    if (value[0] == cand[0] and std.mem.eql(u8, value, cand)) return py.newRef(interned_values[i]);
+                }
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
 // -- header list materialisation ----------------------------------------------
 
 /// Build a Python list of (name, value) bytes tuples from the core headers.
@@ -669,7 +720,7 @@ fn buildHeaders(hdrs: []const events.Header) py.Object {
     if (list == null) return null;
     for (hdrs, 0..) |h, i| {
         const name = internName(h.name) orelse py.fromBytes(h.name);
-        const value = py.fromBytes(h.value);
+        const value = internValue(h.value) orelse py.fromBytes(h.value);
         if (name == null or value == null) {
             py.xdecref(name);
             py.xdecref(value);
