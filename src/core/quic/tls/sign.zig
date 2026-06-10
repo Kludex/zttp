@@ -12,6 +12,13 @@ const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 /// SignatureScheme ecdsa_secp256r1_sha256 (RFC 8446 4.2.3).
 pub const SCHEME: u16 = 0x0403;
 
+/// The widest DER ECDSA signature, the scratch a builder sizes for `sign`.
+pub const SIG_DER_MAX = Ecdsa.Signature.der_encoded_length_max;
+
+/// The SEC1-uncompressed public point length (0x04 || X || Y), what a Certificate
+/// message carries for ecdsa_secp256r1.
+pub const PUBLIC_SEC1_LEN = Ecdsa.PublicKey.uncompressed_sec1_encoded_length;
+
 /// The 64 spaces + context label + separator prefixed to the transcript hash
 /// before signing (RFC 8446 4.4.3). "server" side, hence the server label.
 const SERVER_CONTEXT = (" " ** 64) ++ "TLS 1.3, server CertificateVerify" ++ "\x00";
@@ -27,14 +34,14 @@ pub const Signer = struct {
 
     /// The SEC1-uncompressed public point (0x04 || X || Y), what a server
     /// Certificate message carries for ecdsa_secp256r1.
-    pub fn publicKeySec1(self: Signer) [Ecdsa.PublicKey.uncompressed_sec1_encoded_length]u8 {
+    pub fn publicKeySec1(self: Signer) [PUBLIC_SEC1_LEN]u8 {
         return self.key_pair.public_key.toUncompressedSec1();
     }
 
     /// Sign the CertificateVerify content for a transcript hash, returning the
     /// DER-encoded ECDSA signature the message carries (RFC 8446 4.4.3). The
     /// caller copies the returned slice; it points into `buf`.
-    pub fn sign(self: Signer, transcript_hash: [transcript.LEN]u8, buf: *[Ecdsa.Signature.der_encoded_length_max]u8) ![]u8 {
+    pub fn sign(self: Signer, transcript_hash: [transcript.LEN]u8, buf: *[SIG_DER_MAX]u8) ![]u8 {
         const sig = try self.key_pair.sign(&content(transcript_hash), null);
         return sig.toDer(buf);
     }
