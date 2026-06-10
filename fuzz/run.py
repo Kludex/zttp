@@ -21,7 +21,7 @@ import traceback
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
-from fuzz.harness import consume
+from fuzz.harness import consume, consume_h2
 from fuzz.roundtrip import roundtrip
 
 CORPUS = Path(__file__).parent / "corpus"
@@ -37,7 +37,16 @@ SEEDS = (
     b"\r\n\n: \r\n\x00\xff",
 )
 
-ORACLES: tuple[Callable[[bytes], None], ...] = (consume, roundtrip)
+# H2 wire fragments: preface + empty SETTINGS, then a HEADERS frame whose HPACK
+# block is fully indexed (:method GET, :scheme http, :path /) with END_HEADERS.
+H2_SEEDS = (
+    b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+    b"\x00\x00\x00\x04\x00\x00\x00\x00\x00",
+    b"\x00\x00\x03\x01\x05\x00\x00\x00\x01\x82\x86\x84",
+    b"\x00\x00\x04\x03\x00\x00\x00\x00\x01\x00\x00\x00\x08",
+)
+
+ORACLES: tuple[Callable[[bytes], None], ...] = (consume, consume_h2, roundtrip)
 
 
 def _mutate(rng: random.Random, sample: bytes) -> bytes:
@@ -64,9 +73,11 @@ def _mutate(rng: random.Random, sample: bytes) -> bytes:
 def _inputs(rng: random.Random, runs: int) -> Iterator[bytes]:
     for _ in range(runs):
         roll = rng.random()
-        if roll < 0.5:
+        if roll < 0.4:
             yield _mutate(rng, rng.choice(SEEDS))
-        elif roll < 0.75:
+        elif roll < 0.65:
+            yield _mutate(rng, b"".join(H2_SEEDS) + rng.randbytes(rng.randint(0, 32)))
+        elif roll < 0.8:
             yield rng.randbytes(rng.randint(0, 256))
         else:
             yield _mutate(rng, b"".join(rng.sample(SEEDS, rng.randint(1, 3))))
