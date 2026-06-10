@@ -203,6 +203,7 @@ RESP_JSON = (
     b"\r\n" + RESP_JSON_BODY
 )
 
+
 # A chunked HTML page: the streaming-response framing path.
 def _chunk(data: bytes) -> bytes:
     return f"{len(data):x}".encode() + b"\r\n" + data + b"\r\n"
