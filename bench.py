@@ -49,6 +49,27 @@ POST = (
     b"\r\n" + BODY
 )
 
+# The real-world browser request from picohttpparser's bench.c, byte for byte.
+# httparse and llhttp benchmark against the same fixture, so results on this
+# workload are directly comparable to published parser benchmarks.
+PICO = (
+    b"GET /wp-content/uploads/2010/03/hello-kitty-darth-vader-pink.jpg HTTP/1.1\r\n"
+    b"Host: www.kittyhell.com\r\n"
+    b"User-Agent: Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10.6; ja-JP-mac; rv:1.9.2.3) "
+    b"Gecko/20100401 Firefox/3.6.3 Pathtraq/0.9\r\n"
+    b"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+    b"Accept-Language: ja,en-us;q=0.7,en;q=0.3\r\n"
+    b"Accept-Encoding: gzip,deflate\r\n"
+    b"Accept-Charset: Shift_JIS,utf-8;q=0.7,*;q=0.7\r\n"
+    b"Keep-Alive: 115\r\n"
+    b"Connection: keep-alive\r\n"
+    b"Cookie: wp_ozh_wsa_visits=2; wp_ozh_wsa_visit_lasttime=xxxxxxxxxx; "
+    b"__utma=xxxxxxxxx.xxxxxxxxxx.xxxxxxxxxx.xxxxxxxxxx.xxxxxxxxxx.x; "
+    b"__utmz=xxxxxxxxx.xxxxxxxxxx.x.x.utmccn=(referral)|utmcsr=reader.livedoor.com|"
+    b"utmcct=/reader/|utmcmd=referral\r\n"
+    b"\r\n"
+)
+
 Extracted = tuple[bytes, list[tuple[bytes, bytes]], bytes]
 
 
@@ -212,6 +233,7 @@ def main() -> None:
     )
     bench("simple GET", SIMPLE, args.batch, args.repeats)
     bench("POST + body", POST, args.batch, args.repeats)
+    bench("real-world GET (picohttpparser fixture)", PICO, args.batch, args.repeats)
 
 
 if __name__ == "__main__":
