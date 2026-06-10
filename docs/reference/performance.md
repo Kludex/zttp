@@ -16,12 +16,13 @@ with both driven to extract the **same** information (method, headers, body):
 
 | Workload | zttp | httptools | zttp vs httptools |
 | --- | ---: | ---: | ---: |
-| Simple `GET` (7 headers) | ~1.16M req/s | ~1.2M req/s | **~0.97x** |
-| `POST` + JSON body | ~4.9M req/s | ~2.4M req/s | **~2.0x** |
+| Simple `GET` (7 headers) | ~1.11M req/s | ~1.11M req/s | **~1.0x** |
+| `POST` + JSON body | ~1.27M req/s | ~1.30M req/s | **~1.0x** |
 
-zttp matches httptools on the small `GET` and roughly doubles it as soon as a
-body is involved. Measured on an Apple Silicon machine with CPython 3.14,
-httptools 0.8.0, and the safety-checked (`ReleaseSafe`) build.
+zttp matches httptools, a C parser, on both workloads, while keeping the
+sans-IO pull API, and is roughly 15x faster than the pure-Python alternative.
+Measured on an Apple Silicon machine with CPython 3.14, httptools 0.8.0, and
+the safety-checked (`ReleaseSafe`) build; the run-to-run spread is about 5%.
 
 !!! info "These are parser microbenchmarks"
     They measure parsing throughput in isolation, not a full server. In a real
@@ -37,7 +38,10 @@ The benchmark lives in `bench.py`:
 ```
 
 It feeds each parser identical bytes and verifies they extract identical data
-before timing, so the comparison is apples to apples.
+before timing, so the comparison is apples to apples. Each parser runs many
+short batches, interleaved round-robin so thermal drift and scheduler placement
+hit all parsers equally, with the GC disabled while a batch is timed; the
+headline is the median batch and the spread is printed alongside it.
 
 ## Why it's fast
 

@@ -1,13 +1,25 @@
 """Compare zttp against httptools and h11 on request parsing throughput.
 
 Each parser consumes the same raw bytes and is driven to extract the same
-information (method, headers, body) so the comparison reflects real work, not
-just feed_data overhead.
+information (method, headers, body), verified before timing, so the comparison
+reflects real work, not just feed_data overhead.
+
+Methodology: every parser runs many short batches, interleaved round-robin so
+thermal drift and scheduler placement hit all parsers equally, with the GC
+disabled while a batch is timed. The headline number is the median batch, with
+the spread reported so noise is visible instead of hidden.
 """
 
 from __future__ import annotations
 
+import argparse
+import gc
+import statistics
+import sys
 import time
+from collections.abc import Callable
+from importlib.metadata import version
+from typing import Protocol
 
 import h11
 import httptools
@@ -27,15 +39,21 @@ SIMPLE = (
 )
 
 # A POST with a JSON body.
+BODY = b'{"username": "alice", "password": "correcthorsebattery"}'
 POST = (
     b"POST /api/v1/login HTTP/1.1\r\n"
     b"Host: api.example.com\r\n"
     b"Content-Type: application/json\r\n"
-    b"Content-Length: 53\r\n"
+    b"Content-Length: " + str(len(BODY)).encode() + b"\r\n"
     b"Connection: keep-alive\r\n"
-    b"\r\n"
-    b'{"username": "alice", "password": "correcthorsebattery"}'[:53]
+    b"\r\n" + BODY
 )
+
+Extracted = tuple[bytes, list[tuple[bytes, bytes]], bytes]
+
+
+class Runner(Protocol):
+    def __call__(self, data: bytes, n: int) -> None: ...
 
 
 class HttptoolsProto:
@@ -91,30 +109,110 @@ def run_zttp(data: bytes, n: int) -> None:
                 break
 
 
-def time_it(fn, data: bytes, n: int) -> float:
-    fn(data, 1000)  # warmup
-    best = min(timed(fn, data, n) for _ in range(5))
-    return best
+def extract_httptools(data: bytes) -> Extracted:
+    p = HttptoolsProto()
+    parser = httptools.HttpRequestParser(p)
+    parser.feed_data(data)
+    return parser.get_method(), p.headers, p.body
 
 
-def timed(fn, data: bytes, n: int) -> float:
-    t0 = time.perf_counter()
-    fn(data, n)
-    return time.perf_counter() - t0
+def extract_h11(data: bytes) -> Extracted:
+    conn = h11.Connection(h11.SERVER)
+    conn.receive_data(data)
+    method, headers, body = b"", [], b""
+    while True:
+        ev = conn.next_event()
+        if isinstance(ev, h11.Request):
+            method, headers = ev.method, list(ev.headers)
+        elif isinstance(ev, h11.Data):
+            body += ev.data
+        elif ev is h11.NEED_DATA or isinstance(ev, h11.EndOfMessage):
+            break
+    return method, headers, body
 
 
-def bench(name: str, data: bytes, n: int) -> None:
-    print(f"\n== {name} ({n:,} iterations) ==")
-    results = {}
-    for label, fn in (("zttp", run_zttp), ("httptools", run_httptools), ("h11", run_h11)):
-        dt = time_it(fn, data, n)
-        rate = n / dt
-        results[label] = rate
-        print(f"  {label:>10}: {dt * 1e3:8.2f} ms  {rate:12,.0f} req/s")
-    base = results["httptools"]
-    print(f"  -> zttp is {results['zttp'] / base:.2f}x httptools, {results['zttp'] / results['h11']:.2f}x h11")
+def extract_zttp(data: bytes) -> Extracted:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(data)
+    method, headers, body = b"", [], b""
+    while True:
+        ev = conn.next_event()
+        if isinstance(ev, zttp.Request):
+            method, headers = ev.method, ev.headers
+        elif isinstance(ev, zttp.Data):
+            body += ev.data
+        elif ev is zttp.NEED_DATA or isinstance(ev, zttp.EndOfMessage):
+            break
+    return method, headers, body
+
+
+PARSERS: list[tuple[str, Runner, Callable[[bytes], Extracted]]] = [
+    ("zttp", run_zttp, extract_zttp),
+    ("httptools", run_httptools, extract_httptools),
+    ("h11", run_h11, extract_h11),
+]
+
+
+def verify(data: bytes) -> None:
+    def normalized(extracted: Extracted) -> tuple[bytes, list[tuple[bytes, bytes]], bytes]:
+        method, headers, body = extracted
+        return method, sorted((name.lower(), value) for name, value in headers), body
+
+    reference = normalized(PARSERS[0][2](data))
+    for label, _, extract in PARSERS[1:]:
+        got = normalized(extract(data))
+        if got != reference:
+            raise AssertionError(f"{label} extracted {got!r}, zttp extracted {reference!r}")
+
+
+def timed(fn: Runner, data: bytes, n: int) -> float:
+    gc.collect()
+    gc.disable()
+    try:
+        t0 = time.perf_counter()
+        fn(data, n)
+        return time.perf_counter() - t0
+    finally:
+        gc.enable()
+
+
+def bench(name: str, data: bytes, batch: int, repeats: int) -> None:
+    verify(data)
+    total = batch * repeats
+    print(f"\n== {name} ({repeats} batches of {batch:,}, {total:,} iterations per parser) ==")
+
+    for _, fn, _ in PARSERS:
+        fn(data, 2_000)  # warmup: caches, allocator, JIT-ish lazy init
+
+    samples: dict[str, list[float]] = {label: [] for label, _, _ in PARSERS}
+    for _ in range(repeats):
+        for label, fn, _ in PARSERS:
+            samples[label].append(timed(fn, data, batch))
+
+    rates = {}
+    for label, batches in samples.items():
+        per_batch = [batch / dt for dt in batches]
+        median = statistics.median(per_batch)
+        spread = (max(per_batch) - min(per_batch)) / median * 100
+        rates[label] = median
+        print(f"  {label:>10}: {median:12,.0f} req/s  (median of {repeats}, spread {spread:4.1f}%)")
+
+    print(f"  -> zttp is {rates['zttp'] / rates['httptools']:.2f}x httptools, {rates['zttp'] / rates['h11']:.2f}x h11")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--batch", type=int, default=20_000, help="iterations per timed batch")
+    parser.add_argument("--repeats", type=int, default=15, help="timed batches per parser")
+    args = parser.parse_args()
+
+    print(
+        f"CPython {sys.version.split()[0]}, zttp {version('zttp')}, "
+        f"httptools {version('httptools')}, h11 {version('h11')}"
+    )
+    bench("simple GET", SIMPLE, args.batch, args.repeats)
+    bench("POST + body", POST, args.batch, args.repeats)
 
 
 if __name__ == "__main__":
-    bench("simple GET", SIMPLE, 200_000)
-    bench("POST + body", POST, 200_000)
+    main()
