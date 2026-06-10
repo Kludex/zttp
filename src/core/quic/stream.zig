@@ -205,8 +205,11 @@ pub const SendStream = struct {
         self.unsent.deinit(self.gpa);
     }
 
-    /// Queue `data` to be sent and/or mark the stream finished.
+    /// Queue `data` to be sent and/or mark the stream finished. Writing after the
+    /// stream has been finished (FIN owed or sent) would push bytes past the
+    /// declared final size (RFC 9000 4.5), so it is rejected.
     pub fn write(self: *SendStream, data: []const u8, fin: bool) Error!void {
+        if (self.fin and (data.len != 0 or !fin)) return error.FinalSizeError;
         self.unsent.appendSlice(self.gpa, data) catch return error.OutOfMemory;
         if (fin) self.fin = true;
     }

@@ -331,8 +331,10 @@ pub const Connection = struct {
 
     /// Packetize the queued stream data into datagrams (Initial space, one STREAM
     /// frame per packet for now). Each packet is sealed and header-protected and
-    /// appended to the outbound queue. Idempotent when nothing is pending.
-    pub fn flushSend(self: *Connection) Error!void {
+    /// appended to the outbound queue. `now` is the monotonic microsecond send
+    /// time, recorded so an incoming ACK measures RTT correctly. Idempotent when
+    /// nothing is pending.
+    pub fn flushSend(self: *Connection, now: u64) Error!void {
         const space = Space.initial;
         const st = &self.spaces[@intFromEnum(space)];
         const keys = st.send_keys orelse return; // no send keys for this space yet
@@ -346,7 +348,7 @@ pub const Connection = struct {
                 // a conservative max datagram; one STREAM frame per packet for now.
                 const room = constants.MIN_INITIAL_DATAGRAM - 64;
                 const chunk = s.peek(room) orelse break;
-                try self.buildStreamPacket(keys, st, id, chunk);
+                try self.buildStreamPacket(keys, st, id, chunk, now);
                 s.commit(chunk.data.len, chunk.fin);
             }
         }
@@ -354,14 +356,16 @@ pub const Connection = struct {
 
     /// Build one Initial-space packet carrying a single STREAM frame, seal and
     /// protect it, and append it (and its length) to the outbound queue.
-    fn buildStreamPacket(self: *Connection, keys: crypto.Keys, st: *SpaceState, id: u64, chunk: stream.SendStream.Chunk) Error!void {
+    fn buildStreamPacket(self: *Connection, keys: crypto.Keys, st: *SpaceState, id: u64, chunk: stream.SendStream.Chunk, now: u64) Error!void {
         // Frame the STREAM data.
         var frames: std.ArrayListUnmanaged(u8) = .empty;
         defer frames.deinit(self.gpa);
         frame.encodeStream(&frames, self.gpa, id, chunk.offset, chunk.data, chunk.fin) catch return error.OutOfMemory;
 
         const pn = st.next_pn;
-        const pn_len: usize = 1; // 1-byte pn for the first cut (matches testBuildInitial)
+        // The packet number needs enough bytes that the peer's window resolves it
+        // unambiguously against the largest it has acked (RFC 9000 17.1).
+        const pn_len = packet.packetNumberLen(pn, st.rec.largest_acked);
         const length = pn_len + frames.items.len + crypto.TAG_LEN;
 
         // Header through the Length field (Initial: empty scid/token here).
@@ -380,8 +384,9 @@ pub const Connection = struct {
         const datagram_len = self.out.items.len - start;
         self.out_lengths.append(self.gpa, datagram_len) catch return error.OutOfMemory;
 
-        // Register the sent packet so an incoming ACK clears the in-flight set.
-        st.rec.onSent(self.gpa, .{ .pn = pn, .sent_time = 0, .size = datagram_len, .ack_eliciting = true, .in_flight = true }) catch return error.OutOfMemory;
+        // Register the sent packet so an incoming ACK clears the in-flight set and
+        // measures RTT against the real send time.
+        st.rec.onSent(self.gpa, .{ .pn = pn, .sent_time = now, .size = datagram_len, .ack_eliciting = true, .in_flight = true }) catch return error.OutOfMemory;
         self.cc.onSent(datagram_len);
         st.next_pn += 1;
     }
@@ -493,7 +498,7 @@ test "a server-sent STREAM round-trips to a peer client" {
     var server = try Connection.init(gpa, .server, &dcid);
     defer server.deinit();
     try server.sendStreamData(0, "hi", true);
-    try server.flushSend();
+    try server.flushSend(1000);
     const lengths = server.datagramLengths();
     try testing.expectEqual(@as(usize, 1), lengths.len);
     const dgram = server.datagramsToSend();
@@ -512,7 +517,7 @@ test "flushSend with nothing queued is a no-op" {
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
     try testing.expect(!conn.hasPendingSend());
-    try conn.flushSend();
+    try conn.flushSend(1000);
     try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len);
 }
 
@@ -525,7 +530,7 @@ test "a multi-chunk response round-trips in order" {
     // flush, so two STREAM frames at offsets 0 and 5 reassemble to "helloworld".
     try server.sendStreamData(3, "hello", false);
     try server.sendStreamData(3, "world", true);
-    try server.flushSend();
+    try server.flushSend(1000);
     const dgram = server.datagramsToSend();
 
     var client = try Connection.init(gpa, .client, &dcid);
@@ -535,13 +540,81 @@ test "a multi-chunk response round-trips in order" {
     try testing.expect(client.streamFinished(3));
 }
 
+test "a response larger than one packet splits and reassembles in order" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    // 3000 bytes forces more than one packet (room is ~1136), so later STREAM
+    // frames carry a nonzero offset - exercising the OFF-bit and cross-packet
+    // offset accounting.
+    var body: [3000]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @intCast(i % 251);
+    try server.sendStreamData(0, &body, true);
+    try server.flushSend(1000);
+    const lengths = server.datagramLengths();
+    try testing.expect(lengths.len >= 3);
+
+    // Feed each datagram to the peer client separately (one UDP payload at a time).
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+    const all = server.datagramsToSend();
+    var off: usize = 0;
+    for (lengths) |len| {
+        try client.receiveDatagram(all[off .. off + len], 1000);
+        off += len;
+    }
+    try testing.expectEqualSlices(u8, &body, client.streamData(0));
+    try testing.expect(client.streamFinished(0));
+}
+
+test "packet numbers past one byte still decrypt on the peer" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+    // Send 200 single-byte responses, each its own flush, so the packet number
+    // climbs past 127 and pn_len grows to 2. Each must still decrypt on the peer.
+    var k: usize = 0;
+    while (k < 200) : (k += 1) {
+        const id: u64 = @as(u64, k) * 4; // distinct client-initiated bidi stream ids
+        try server.sendStreamData(id, "x", true);
+        try server.flushSend(1000);
+        const lengths = server.datagramLengths();
+        const all = server.datagramsToSend();
+        var off: usize = 0;
+        for (lengths) |len| {
+            try client.receiveDatagram(all[off .. off + len], 1000);
+            off += len;
+        }
+        try testing.expectEqualStrings("x", client.streamData(id));
+        server.clearSend();
+    }
+    // The server's Initial-space packet number is now past the 1-byte boundary.
+    try testing.expect(server.spaces[@intFromEnum(Space.initial)].next_pn > 127);
+}
+
+test "writing after a FIN is a final-size error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    try conn.sendStreamData(0, "done", true); // FIN
+    // Data after the FIN would push past the final size: rejected.
+    try testing.expectError(error.FinalSizeError, conn.sendStreamData(0, "more", false));
+    // A bare repeat FIN with no new bytes is harmless and idempotent.
+    try conn.sendStreamData(0, "", true);
+}
+
 test "clearSend drops the drained datagrams" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x05, 0x06, 0x07, 0x08 };
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
     try conn.sendStreamData(0, "x", true);
-    try conn.flushSend();
+    try conn.flushSend(1000);
     try testing.expect(conn.datagramsToSend().len > 0);
     conn.clearSend();
     try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len);
