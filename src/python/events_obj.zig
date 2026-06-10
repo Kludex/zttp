@@ -592,14 +592,63 @@ const INTERNED_NAMES = [_][]const u8{
     "Transfer-Encoding",
 };
 
+// The request/status line draws from even smaller fixed sets: the standard
+// methods, the two HTTP/1.x versions, and the stock reason phrases. Same deal -
+// one PyBytes each at module init, returned on an exact-bytes match.
+const INTERNED_METHODS = [_][]const u8{ "GET", "POST", "HEAD", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH" };
+const INTERNED_VERSIONS = [_][]const u8{ "1.1", "1.0" };
+const INTERNED_REASONS = [_][]const u8{
+    "OK",
+    "Created",
+    "Accepted",
+    "No Content",
+    "Moved Permanently",
+    "Found",
+    "Not Modified",
+    "Bad Request",
+    "Unauthorized",
+    "Forbidden",
+    "Not Found",
+    "Internal Server Error",
+    "Service Unavailable",
+};
+
 var interned: [INTERNED_NAMES.len]py.Object = @splat(null);
+var interned_methods: [INTERNED_METHODS.len]py.Object = @splat(null);
+var interned_versions: [INTERNED_VERSIONS.len]py.Object = @splat(null);
+var interned_reasons: [INTERNED_REASONS.len]py.Object = @splat(null);
+var empty_bytes: py.Object = null;
 
 fn buildInternTable() bool {
     inline for (INTERNED_NAMES, 0..) |name, i| {
         interned[i] = py.fromBytes(name);
         if (interned[i] == null) return false;
     }
-    return true;
+    inline for (INTERNED_METHODS, 0..) |m, i| {
+        interned_methods[i] = py.fromBytes(m);
+        if (interned_methods[i] == null) return false;
+    }
+    inline for (INTERNED_VERSIONS, 0..) |v, i| {
+        interned_versions[i] = py.fromBytes(v);
+        if (interned_versions[i] == null) return false;
+    }
+    inline for (INTERNED_REASONS, 0..) |r, i| {
+        interned_reasons[i] = py.fromBytes(r);
+        if (interned_reasons[i] == null) return false;
+    }
+    empty_bytes = py.fromBytes("");
+    return empty_bytes != null;
+}
+
+/// A new reference to the cached PyBytes for `s` if it matches a table entry
+/// exactly, else null. The tables are small enough that a length + first-byte
+/// gated linear scan beats fancier dispatch.
+fn internFrom(comptime table: []const []const u8, cache: *const [table.len]py.Object, s: []const u8) ?py.Object {
+    if (s.len == 0) return null;
+    inline for (table, 0..) |cand, i| {
+        if (s.len == cand.len and s[0] == cand[0] and std.mem.eql(u8, s, cand)) return py.newRef(cache[i]);
+    }
+    return null;
 }
 
 /// A new reference to the cached PyBytes for `name` if it matches an interned
@@ -697,11 +746,16 @@ fn makeRequest(r: events.Request) py.Object {
     const o = py.allocInstance(request_type);
     if (o == null) return null;
     const s: *RequestObject = @ptrCast(o);
-    s.method = py.fromBytes(r.method);
+    s.method = internFrom(&INTERNED_METHODS, &interned_methods, r.method) orelse py.fromBytes(r.method);
     s.target = py.fromBytes(r.target);
-    s.path = py.fromBytes(r.path);
-    s.query = py.fromBytes(r.query);
-    s.http_version = py.fromBytes(r.http_version);
+    // With no query string the parser hands path and target as the same slice,
+    // so the immutable target bytes can simply be shared.
+    s.path = if (s.target != null and r.path.ptr == r.target.ptr and r.path.len == r.target.len)
+        py.newRef(s.target)
+    else
+        py.fromBytes(r.path);
+    s.query = if (r.query.len == 0) py.newRef(empty_bytes) else py.fromBytes(r.query);
+    s.http_version = internFrom(&INTERNED_VERSIONS, &interned_versions, r.http_version) orelse py.fromBytes(r.http_version);
     s.headers = buildHeaders(r.headers);
     s.stream_id = u32Obj(r.stream_id);
     s.expect_continue = @intFromBool(r.expect_continue);
@@ -717,8 +771,8 @@ fn makeResponse(r: events.Response) py.Object {
     if (o == null) return null;
     const s: *ResponseObject = @ptrCast(o);
     s.status_code = py.fromU16(r.status_code);
-    s.reason = py.fromBytes(r.reason);
-    s.http_version = py.fromBytes(r.http_version);
+    s.reason = internFrom(&INTERNED_REASONS, &interned_reasons, r.reason) orelse py.fromBytes(r.reason);
+    s.http_version = internFrom(&INTERNED_VERSIONS, &interned_versions, r.http_version) orelse py.fromBytes(r.http_version);
     s.headers = buildHeaders(r.headers);
     s.stream_id = u32Obj(r.stream_id);
     if (s.status_code == null or s.reason == null or s.http_version == null or s.headers == null or s.stream_id == null) {
