@@ -270,17 +270,24 @@ pub const Connection = struct {
         const st = &self.spaces[@intFromEnum(space)];
         if (st.send_keys == null) return; // no 1-RTT keys yet: nothing can be sent
         // A conservative single-packet budget; one STREAM frame per packet for now.
-        const room = constants.MIN_INITIAL_DATAGRAM - 64;
+        const packet_room = constants.MIN_INITIAL_DATAGRAM - 64;
         var it = self.send_streams.iterator();
         while (it.next()) |entry| {
             const id = entry.key_ptr.*;
             const s = entry.value_ptr.*;
             while (s.pending()) {
-                const chunk = s.peek(room) orelse break;
+                // Cap the chunk by the connection-level send window (RFC 9000 4.1):
+                // the peer's MAX_DATA grant limits how much STREAM data may be sent.
+                // A chunk that carries only a FIN (no bytes) needs no credit.
+                const credit = self.conn_send_window.available();
+                const room = @min(packet_room, credit);
+                const chunk = s.peek(room) orelse break; // no bytes fit and no FIN owed
+                if (chunk.data.len == 0 and !chunk.fin) break; // out of window: keep the rest queued
                 var frames: std.ArrayListUnmanaged(u8) = .empty;
                 defer frames.deinit(self.gpa);
                 frame.encodeStream(&frames, self.gpa, id, chunk.offset, chunk.data, chunk.fin) catch return error.OutOfMemory;
                 try self.buildPacket(space, frames.items, true, now);
+                self.conn_send_window.onSent(chunk.data.len);
                 s.commit(chunk.data.len, chunk.fin);
             }
         }
@@ -964,6 +971,32 @@ test "flushSend is a no-op until the Application keys are installed" {
     testInstallAppKeys(&conn);
     try conn.flushSend(1000);
     try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len);
+}
+
+test "flushSend never sends past the connection send window, and resumes on MAX_DATA" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x91, 0x92, 0x93, 0x94 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.conn_send_window.limit = 4; // the peer has granted only 4 bytes
+
+    try conn.sendStreamData(1, "abcdefghij", false); // 10 bytes queued
+    try conn.flushSend(1000);
+    // Only the 4 granted bytes left; the rest stays queued.
+    try testing.expectEqual(@as(u64, 4), conn.conn_send_window.sent);
+    try testing.expect(conn.hasPendingSend());
+
+    // A flush with no further credit sends nothing more.
+    conn.clearSend();
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len);
+
+    // The peer raises MAX_DATA; the remaining bytes can now flow.
+    conn.conn_send_window.onMaxData(10);
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(u64, 10), conn.conn_send_window.sent);
+    try testing.expect(!conn.hasPendingSend());
 }
 
 test "a large stream send is chunked across multiple packets" {
