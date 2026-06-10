@@ -202,8 +202,10 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 const testing = std.testing;
 
-// Build a client Initial datagram carrying a STREAM frame on the given bidi
-// stream id whose body is the H3 frames, so a server QUIC+H3 stack decodes it.
+// Build a client 1-RTT datagram carrying a STREAM frame on the given bidi stream
+// id whose body is the H3 frames, so a server QUIC+H3 stack decodes it. H3 request
+// data is application data, so it rides the Application space (STREAM is illegal in
+// Initial); the matching server installs the test app keys via testInstallAppKeys.
 fn buildRequest(gpa: std.mem.Allocator, dcid: []const u8, stream_id: u64, h3_bytes: []const u8) ![]u8 {
     const varint = @import("../quic/varint.zig");
     var sframe: std.ArrayListUnmanaged(u8) = .empty;
@@ -212,7 +214,7 @@ fn buildRequest(gpa: std.mem.Allocator, dcid: []const u8, stream_id: u64, h3_byt
     try varint.append(&sframe, gpa, stream_id);
     try varint.append(&sframe, gpa, h3_bytes.len);
     try sframe.appendSlice(gpa, h3_bytes);
-    return @import("../quic/connection.zig").testBuildInitial(gpa, dcid, .client, 0, sframe.items);
+    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, 0, sframe.items);
 }
 
 test "decode a GET request over HTTP/3" {
@@ -220,6 +222,7 @@ test "decode a GET request over HTTP/3" {
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc); // H3 request data rides the Application space
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -255,6 +258,7 @@ test "a request with a body yields request then data" {
     const dcid = [_]u8{ 0xab, 0xcd, 0xef, 0x01 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc); // H3 request data rides the Application space
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -280,6 +284,7 @@ test "DATA before HEADERS is rejected" {
     const dcid = [_]u8{ 0x07, 0x07, 0x07, 0x07 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc); // H3 request data rides the Application space
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -292,8 +297,8 @@ test "DATA before HEADERS is rejected" {
     try testing.expectError(error.H3Error, h3.pump(0));
 }
 
-// Build an Initial whose STREAM frame carries `h3_bytes` at `offset` on stream 0
-// (the OFF flag is set), with packet number `pn` so a second datagram decrypts.
+// Build a 1-RTT packet whose STREAM frame carries `h3_bytes` at `offset` on stream
+// 0 (the OFF flag is set), with packet number `pn` so a second datagram decrypts.
 fn buildRequestAt(gpa: std.mem.Allocator, dcid: []const u8, offset: u64, pn: u64, h3_bytes: []const u8) ![]u8 {
     const varint = @import("../quic/varint.zig");
     var sframe: std.ArrayListUnmanaged(u8) = .empty;
@@ -303,7 +308,7 @@ fn buildRequestAt(gpa: std.mem.Allocator, dcid: []const u8, offset: u64, pn: u64
     try varint.append(&sframe, gpa, offset);
     try varint.append(&sframe, gpa, h3_bytes.len);
     try sframe.appendSlice(gpa, h3_bytes);
-    return @import("../quic/connection.zig").testBuildInitial(gpa, dcid, .client, pn, sframe.items);
+    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, pn, sframe.items);
 }
 
 test "a request split across two datagrams parses correctly (parsed-offset regression)" {
@@ -311,6 +316,7 @@ test "a request split across two datagrams parses correctly (parsed-offset regre
     const dcid = [_]u8{ 0x55, 0x66, 0x77, 0x88 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc); // H3 request data rides the Application space
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -345,6 +351,7 @@ test "the event arena is reclaimed when the queue drains" {
     const dcid = [_]u8{ 0x21, 0x22, 0x23, 0x24 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc); // H3 request data rides the Application space
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
