@@ -153,6 +153,10 @@ pub const Connection = struct {
     /// A peer STOP_SENDING received before we created the matching send stream (id ->
     /// error code), applied when the stream is lazily created so it is born reset.
     peer_stop_sending: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// Every peer STOP_SENDING received (id -> error code), surfaced to the layer
+    /// above so a response cancellation is observable even when the request side was
+    /// not reset; the layer consumes it via takeStopSending.
+    stop_sending_recv: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Built datagrams waiting to be drained by `datagramsToSend` (one contiguous
     /// buffer; `out_lengths` records each datagram's byte length in order).
     out: std.ArrayListUnmanaged(u8) = .empty,
@@ -275,6 +279,7 @@ pub const Connection = struct {
         self.stop_sending.deinit(self.gpa);
         self.stop_sending_inflight.deinit(self.gpa);
         self.peer_stop_sending.deinit(self.gpa);
+        self.stop_sending_recv.deinit(self.gpa);
         self.retired_recv.deinit(self.gpa);
         self.out.deinit(self.gpa);
         self.out_lengths.deinit(self.gpa);
@@ -1130,13 +1135,30 @@ pub const Connection = struct {
         if (stream.StreamType.of(id) != .client_bidi) return;
         // Charge the stream against the bidi cap before stashing any state for it (RFC
         // 9000 4.6): a STOP_SENDING for a never-seen high id is otherwise an unchecked
-        // way to grow peer_stop_sending unbounded.
+        // way to grow peer_stop_sending / stop_sending_recv unbounded.
         try self.noteClientStream(id);
+        // Record the cancellation so the layer above can surface it (takeStopSending),
+        // even when the request side is never reset - the integrator would otherwise
+        // only discover it as a late error when it tries to send the response.
+        self.stop_sending_recv.put(self.gpa, id, error_code) catch return error.OutOfMemory;
         if (self.send_streams.get(id)) |s| {
             s.reset(error_code);
         } else {
             self.peer_stop_sending.put(self.gpa, id, error_code) catch return error.OutOfMemory;
         }
+    }
+
+    /// The error code of a peer STOP_SENDING received for `id`, or null, WITHOUT
+    /// consuming it (so the caller can retry if surfacing the event fails).
+    pub fn peekStopSending(self: *Connection, id: u64) ?u64 {
+        return self.stop_sending_recv.get(id);
+    }
+
+    /// Take (and clear) the error code of a peer STOP_SENDING received for `id`, or
+    /// null. The layer above surfaces the response cancellation once and consumes it.
+    pub fn takeStopSending(self: *Connection, id: u64) ?u64 {
+        if (self.stop_sending_recv.fetchRemove(id)) |e| return e.value;
+        return null;
     }
 
     /// Whether `id` names a recv stream that already completed and was dropped, so a
@@ -1244,6 +1266,20 @@ pub const Connection = struct {
     pub fn streamIds(self: *Connection, out: []u64) usize {
         var n: usize = 0;
         var it = self.streams.keyIterator();
+        while (it.next()) |k| {
+            if (n >= out.len) break;
+            out[n] = k.*;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Snapshot the ids with an unconsumed peer STOP_SENDING (RFC 9000 19.5), so the
+    /// HTTP/3 layer can surface a response cancellation even for a request whose recv
+    /// stream has already completed and is gone from `streamIds`.
+    pub fn stopSendingIds(self: *Connection, out: []u64) usize {
+        var n: usize = 0;
+        var it = self.stop_sending_recv.keyIterator();
         while (it.next()) |k| {
             if (n >= out.len) break;
             out[n] = k.*;

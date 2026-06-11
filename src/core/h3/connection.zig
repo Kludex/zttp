@@ -216,6 +216,23 @@ pub const Connection = struct {
         var ids: [64]u64 = undefined;
         const n = self.qc.streamIds(&ids);
         for (ids[0..n]) |id| try self.pump(id);
+        // Surface any peer STOP_SENDING (a response cancellation) left for a stream
+        // whose recv side already completed and is gone from streamIds, so a cancelled
+        // GET is reported rather than discovered only when a response write fails.
+        var ss: [64]u64 = undefined;
+        const m = self.qc.stopSendingIds(&ss);
+        for (ss[0..m]) |id| try self.surfaceStopSending(id);
+    }
+
+    /// Emit a one-shot rst_stream event for a peer STOP_SENDING on `id` (consuming it),
+    /// unless the stream is still tracked - in which case pumpRequest surfaces it with
+    /// the right rst_emitted bookkeeping. For a completed/untracked stream there is no
+    /// RequestStream, so the consume itself makes it fire once.
+    fn surfaceStopSending(self: *Connection, id: u64) Error!void {
+        if (self.streams.contains(id)) return; // a live stream: pumpRequest handles it
+        const code = self.qc.peekStopSending(id) orelse return;
+        try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = code } });
+        _ = self.qc.takeStopSending(id); // consume only after the event is queued
     }
 
     pub fn pump(self: *Connection, id: u64) Error!void {
@@ -295,18 +312,26 @@ pub const Connection = struct {
         // what moves its receive state to terminal, which dropStream then reclaims.
         if (consumed_total > 0) self.qc.consumeStream(id, consumed_total);
         // A peer RESET_STREAM cancels the request: surface it as an event (with the
-        // peer's error code) once, before the stream is dropped, so the integrator is
-        // not left waiting on a request that silently vanished. The flag guards against
-        // a re-fire if the stream cannot be dropped yet (e.g. an allocator failure).
-        if (self.qc.streamReset(id) and !rs.rst_emitted) {
-            try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = self.qc.streamResetCode(id) orelse 0 } });
+        // The peer cancelled this stream - by RESET_STREAM on the request side, or by
+        // STOP_SENDING on the response side (it aborted the response, perhaps before we
+        // even started it). Either way surface it once as an rst_stream event so the
+        // integrator stops working on it, rather than discovering the cancellation only
+        // when a later response write fails. The flag guards against a re-fire if the
+        // stream cannot be dropped yet (e.g. an allocator failure).
+        const reset_code = self.qc.streamResetCode(id); // non-destructive
+        const stop_code = self.qc.peekStopSending(id); // non-destructive
+        if ((reset_code != null or stop_code != null) and !rs.rst_emitted) {
+            // Push BEFORE consuming the STOP_SENDING, so an OOM here leaves the code in
+            // place for the next pump to retry rather than losing the cancellation.
+            try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = reset_code orelse stop_code orelse 0 } });
             rs.rst_emitted = true;
+            _ = self.qc.takeStopSending(id); // consume now that the event is queued
         }
-        // Drop the per-stream state on both layers once the request is fully
-        // delivered (EOM) OR the peer reset the stream, so an open-then-reset storm
-        // cannot grow the maps (the memory half of the Rapid-Reset class). The QUIC
-        // send half is retained until its bytes are acked, so a still-in-flight
-        // response is not freed from under recovery.
+        // Drop the per-stream state on both layers once the request is fully delivered
+        // (EOM) OR the peer reset the request side, so an open-then-reset storm cannot
+        // grow the maps (the memory half of the Rapid-Reset class). A STOP_SENDING-only
+        // cancellation leaves the request side open, so the stream stays until the peer
+        // also ends it; the QUIC send half is retained until its bytes are acked.
         if (rs.state == .done or self.qc.streamReset(id)) {
             if (self.qc.dropStream(id)) _ = self.streams.remove(id); // rs dangles after this
         }
@@ -1152,6 +1177,85 @@ test "a peer STOP_SENDING resets our send half" {
         off += len;
     }
     try testing.expect(peer.streamReset(0));
+}
+
+test "a peer STOP_SENDING surfaces an rst_stream event" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xa4, 0xa5, 0xa6, 0xa7 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A full request arrives on stream 0 (the H3 layer now tracks it).
+    var req: std.ArrayListUnmanaged(u8) = .empty;
+    defer req.deinit(gpa);
+    try h3_frame.append(&req, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 });
+    const rdgram = try buildRequest(gpa, &dcid, 0, req.items); // no FIN: request side stays open
+    defer gpa.free(rdgram);
+    try qc.receiveDatagram(rdgram, 1000);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .request);
+
+    // The peer cancels ONLY the response side with STOP_SENDING (no RESET_STREAM).
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x05);
+    try varint.append(&sframe, gpa, 0);
+    try varint.append(&sframe, gpa, 0x10);
+    const sdgram = try quic_conn.testBuildApp(gpa, &dcid, 1, sframe.items);
+    defer gpa.free(sdgram);
+    try qc.receiveDatagram(sdgram, 1100);
+    try h3.pump(0);
+
+    // The cancellation surfaces as an rst_stream event with the peer's code.
+    const ev = h3.nextEvent();
+    try testing.expect(ev == .rst_stream);
+    try testing.expectEqual(@as(u64, 0x10), ev.rst_stream.error_code);
+}
+
+test "a STOP_SENDING after a completed request still surfaces" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xa8, 0xa9, 0xaa, 0xab };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A complete GET (HEADERS + FIN): the request finishes and its stream is dropped.
+    var req: std.ArrayListUnmanaged(u8) = .empty;
+    defer req.deinit(gpa);
+    try h3_frame.append(&req, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 });
+    const rdgram = try buildRequestOnFin(gpa, &dcid, 0, 0, req.items);
+    defer gpa.free(rdgram);
+    try qc.receiveDatagram(rdgram, 1000);
+    try h3.pumpAll();
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expect(h3.nextEvent() == .end_of_message);
+    var ids: [4]u64 = undefined;
+    try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids)); // the stream is gone
+
+    // The peer later cancels the response with STOP_SENDING on the now-gone stream.
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x05);
+    try varint.append(&sframe, gpa, 0);
+    try varint.append(&sframe, gpa, 0x10);
+    const sdgram = try quic_conn.testBuildApp(gpa, &dcid, 1, sframe.items);
+    defer gpa.free(sdgram);
+    try qc.receiveDatagram(sdgram, 1100);
+    try h3.pumpAll();
+
+    // It is still surfaced, even though the stream is no longer tracked.
+    const ev = h3.nextEvent();
+    try testing.expect(ev == .rst_stream);
+    try testing.expectEqual(@as(u64, 0x10), ev.rst_stream.error_code);
+    // And it fires exactly once.
+    try testing.expect(h3.nextEvent() == .need_data);
+    try h3.pumpAll();
+    try testing.expect(h3.nextEvent() == .need_data);
 }
 
 // Build a request datagram on `stream_id` with the FIN bit set, at packet number `pn`.
