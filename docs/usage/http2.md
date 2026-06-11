@@ -24,6 +24,203 @@ exactly as before.
     what you get after ALPN or an upgrade negotiates `h2`). zttp does no I/O and
     no TLS: it parses and serializes the HTTP/2 framing once you have the bytes.
 
+## How HTTP/2 works
+
+You already know HTTP/1.1. You open a connection, you send a request, you
+wait, you get a response back. It is simple, it is text, and you can read
+it with your own eyes.
+
+HTTP/2 keeps the same requests and responses you already know - the same
+methods, the same headers, the same bodies. It changes only *how* they
+travel on the wire. So before you touch the API, let's look at the one
+thing HTTP/2 really changes, and why.
+
+### The problem with HTTP/1.1
+
+Here is the catch with HTTP/1.1: a connection does one exchange at a time.
+
+You send a request, and the connection is busy until the response comes
+back. The next request has to wait its turn.
+
+So if one response is slow or large, every response queued behind it
+waits too. That is **head-of-line blocking** - one slow item at the front
+holds up everyone behind it.
+
+!!! note "But what about keep-alive and pipelining?"
+
+    A common misconception is that HTTP/1.1 can only send one request per
+    connection, ever. It can't - a persistent (keep-alive) connection
+    happily handles many sequential exchanges.
+
+    Pipelining went further and let a client send several requests without
+    waiting. But the responses still had to come back *in request order*,
+    so the head-of-line block just moved onto the responses. It was poorly
+    supported and basically never used.
+
+Because the connection serializes everything, browsers got creative. And
+the workarounds are not pretty:
+
+| Workaround | What it does | Why it hurts |
+| --- | --- | --- |
+| Many connections | Open several TCP connections per origin (browsers cap around 6) | Multiplies handshake cost and memory, and the connections compete for bandwidth |
+| Domain sharding | Spread assets across extra hostnames for even more connections | More handshakes, worse congestion behavior |
+| Inlining and bundling | Data-URI inlining, CSS sprites, concatenating files | One byte changes and the whole bundle re-downloads - caching suffers |
+
+These all exist for one reason: to dodge the one-exchange-at-a-time
+limit. HTTP/2 removes the limit, so the workarounds go away.
+
+### One connection, many streams
+
+Here is the one big idea.
+
+HTTP/2 is **binary** and **framed**. Instead of a text message, the
+connection is a continuous flow of small **frames**. Every frame starts
+with the same fixed 9-octet header: a length, a type, some flags, and a
+**`stream_id`**.
+
+That `stream_id` is the magic. A **stream** is one independent,
+bidirectional conversation - basically one request and its response. Many
+streams live on the same connection at the same time, and because every
+frame is tagged with its `stream_id`, the connection can **interleave**
+frames from different streams as they are ready.
+
+This is **multiplexing**. One connection, many conversations, all in
+flight together.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    Note over C,S: one TCP connection, frames tagged by stream_id
+    C->>S: HEADERS (stream 1)
+    C->>S: HEADERS (stream 3)
+    S->>C: HEADERS (stream 1)
+    S->>C: DATA (stream 3)
+    S->>C: DATA (stream 1)
+    S->>C: DATA (stream 3)
+    S->>C: DATA (stream 1, END_STREAM)
+    S->>C: DATA (stream 3, END_STREAM)
+```
+
+See how stream `1` and stream `3` are mixed together? A slow response on
+stream `1` no longer blocks stream `3`. They share the road, but they no
+longer queue behind each other.
+
+A few rules keep the streams tidy:
+
+| Rule | Detail |
+| --- | --- |
+| Client streams are odd | The client's first request is stream `1`, then `3`, `5`, ... |
+| Server streams are even | These only ever came from server push, which is effectively dead today |
+| Stream `0` is special | It is the connection's control stream - `SETTINGS`, `PING`, `GOAWAY` live here |
+| Ids only go up | Each new `stream_id` must be larger than every id used before it |
+
+Each stream then walks a small lifecycle - `idle`, `open`, `half-closed`
+once one side sends `END_STREAM`, then `closed` - and `RST_STREAM` can
+slam a single stream shut without touching the others.
+
+!!! info "This is why every zttp event carries a `stream_id`"
+
+    Because frames from many streams arrive interleaved, the events zttp
+    hands you are interleaved too. Each one tells you which stream it
+    belongs to, so you can reassemble each request even though they came
+    in mixed together.
+
+### Header compression (HPACK)
+
+Now, those headers.
+
+In HTTP/1.1 every request sends its headers as text, in full, every
+single time. Your cookies, your user-agent, your accept headers - the
+same big blob, repeated on every request. That is a lot of wasted bytes.
+
+HTTP/2 fixes this with **HPACK**, and the idea is lovely: don't send a
+header twice, send a small number that points at it.
+
+HPACK keeps two tables that the encoder and decoder share:
+
+| Table | What's in it |
+| --- | --- |
+| Static table | A fixed, read-only list of 61 common entries (like `:method GET`, `:status 200`, `content-type`) |
+| Dynamic table | Starts empty, fills up at runtime with headers seen on this connection, newest first |
+
+So the first time a header goes by, it gets added to the dynamic table.
+The next time, you just send its index. Tiny.
+
+!!! info "Why this forces a strict wire order"
+
+    The dynamic table is shared, ordered, and stateful - the encoder and
+    decoder must keep *identical* tables. So headers must be encoded and
+    decoded in exactly the order they were sent. You cannot decode a
+    header block out of order, because each entry can shift the table for
+    the next one.
+
+    This is why zttp models an HTTP/2 connection as a single, ordered
+    event queue: the protocol itself is ordered, so the parser has to be
+    too.
+
+### Flow control
+
+There is one more thing to keep streams from stepping on each other:
+**flow control**.
+
+A fast sender shouldn't be able to flood a slow receiver, and one greedy
+stream shouldn't be able to hog the shared connection's buffers. So
+HTTP/2 gives every receiver a credit window at two levels - one per
+stream, and one for the whole connection. A sender may only send `DATA`
+up to the credit it has, and the receiver hands out more credit with
+`WINDOW_UPDATE` frames (on a `stream_id` for that stream, or on stream
+`0` for the connection). The initial window is `65,535` octets, and only
+`DATA` frames are flow-controlled - not your headers or settings.
+
+### The catch - it still rides on TCP
+
+So HTTP/2 gave you multiplexing, and head-of-line blocking is solved.
+Right?
+
+Almost. And this is the most important idea on the page, so stay with me.
+
+HTTP/2 removes head-of-line blocking at the **application layer**. Your
+streams no longer queue behind each other in HTTP terms.
+
+But all of those streams still ride on a *single* TCP connection
+underneath. And TCP has one firm rule: it delivers bytes **in order**, no
+gaps. If one TCP segment is lost, TCP refuses to hand *any* later bytes
+to the application until that segment is retransmitted.
+
+So picture it: a single packet drops. The frames for your other streams
+may have already arrived at the machine - but TCP is holding them hostage
+behind the gap. Every multiplexed stream waits.
+
+!!! warning "Application-layer HOL vs transport-layer HOL"
+
+    This is the distinction to get right:
+
+    - **Application-layer** head-of-line blocking - HTTP/1.1 serializing
+      responses. HTTP/2 *fixes* this with multiplexing.
+    - **Transport-layer** head-of-line blocking - TCP holding back bytes
+      after a lost segment. HTTP/2 *cannot* fix this, because it lives
+      below HTTP/2.
+
+    The frames are independent in HTTP's eyes, but TCP doesn't know that.
+    One lost segment stalls them all.
+
+There is even a stinging consequence: on a lossy network, a single
+multiplexed HTTP/2 connection can do *worse* than several HTTP/1.1
+connections, because with separate connections a loss only stalls one of
+them.
+
+To really kill head-of-line blocking, you have to drop TCP. That is
+exactly what HTTP/3 does - it runs over **QUIC** (built on UDP), where
+each stream is ordered independently, so a loss on one stream no longer
+stalls the rest.
+
+That tee-up matters for zttp: because the head-of-line problem lives in
+the transport, fixing it means the core has to *be* the transport. But
+that is HTTP/3's story. For HTTP/2, the model you now have - a connection
+of `stream_id`-tagged frames, multiplexed, HPACK-compressed, and
+flow-controlled - is exactly what zttp parses for you. Let's see how.
+
 ## Two connections, one base
 
 A connection's *send* surface depends on its protocol, so zttp gives you the
