@@ -173,16 +173,15 @@ pub const Connection = struct {
     /// the PTO ack-delay.
     peer_tp: transport_params.TransportParameters = .{},
     peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
-    /// The source connection id of the peer's first AUTHENTICATED Initial, kept
-    /// verbatim (a zero-length id stays distinguishable from "none seen") so the
-    /// peer's initial_source_connection_id transport parameter can be validated
-    /// against it (RFC 9000 7.3). Committed only after the packet's AEAD opens - a
-    /// spoofed Initial racing the client's must not poison the anchor and kill the
-    /// real handshake. peer_scid cannot serve here: it defaults to the client dcid
-    /// and never adopts an empty id.
-    peer_initial_scid: [20]u8 = undefined,
-    peer_initial_scid_len: u8 = 0,
-    peer_initial_scid_set: bool = false,
+    /// The Source Connection ID of the Initial packet currently being dispatched,
+    /// borrowed from that datagram for the span of `dispatchFrames`. The ClientHello
+    /// handler validates the client's initial_source_connection_id against THIS - the
+    /// id on the very packet that carried the ClientHello (RFC 9000 7.3) - rather
+    /// than a persistent anchor. Initial keys are derivable from the dcid, so a
+    /// pre-committed anchor could be poisoned by a spoofed PADDING-only Initial that
+    /// still opens under AEAD; binding the check to the ClientHello's own packet
+    /// removes that, since a spoof carrying CRYPTO is already fatal on reassembly.
+    dispatch_initial_scid: ?[]const u8 = null,
     handshake_confirmed: bool = false, // the client Finished verified; HANDSHAKE_DONE sent
     /// The connection-level recv window grew enough to advertise a new MAX_DATA
     /// (RFC 9000 4.1); flushSend emits it so the peer is not stalled at its grant.
@@ -832,15 +831,12 @@ pub const Connection = struct {
                         return error.ProtocolViolation;
                     // RFC 9000 7.3/18.2: a client must not send server-only parameters,
                     // must send initial_source_connection_id, and that id must equal the
-                    // Source Connection ID of its first Initial - the handshake-time
-                    // authentication that defeats connection-id spoofing.
+                    // Source Connection ID of the Initial carrying this ClientHello -
+                    // the handshake-time authentication that defeats id spoofing.
                     if (self.peer_tp.has_server_only_param) return error.ProtocolViolation;
                     const iscid = self.peer_tp.initial_scid orelse return error.ProtocolViolation;
-                    if (!self.peer_initial_scid_set or
-                        !std.mem.eql(u8, iscid.slice(), self.peer_initial_scid[0..self.peer_initial_scid_len]))
-                    {
-                        return error.ProtocolViolation;
-                    }
+                    const carrier_scid = self.dispatch_initial_scid orelse return error.ProtocolViolation;
+                    if (!std.mem.eql(u8, iscid.slice(), carrier_scid)) return error.ProtocolViolation;
                     self.conn_send_window.setInitial(self.peer_tp.initial_max_data);
 
                     var flight_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1041,22 +1037,13 @@ pub const Connection = struct {
         const payload = crypto.open(keys, pn, header, ciphertext, plaintext) catch return error.Dropped;
 
         // The packet authenticated: NOW the peer's source connection id can be
-        // trusted. Adopt it as the destination of everything we send (RFC 9000 7.2),
-        // and retain the first Initial's verbatim - including a zero-length one,
-        // which the adoption skips - as the anchor the client's
-        // initial_source_connection_id transport parameter is checked against
-        // (RFC 9000 7.3). This runs before frame dispatch, where that check lives.
+        // trusted. Adopt it as the destination of everything we send (RFC 9000 7.2).
         if (peer_scid_hdr) |scid| {
             if (!self.peer_scid_set and scid.len > 0) {
                 const sc = self.gpa.dupe(u8, scid) catch return error.OutOfMemory;
                 self.gpa.free(self.peer_scid);
                 self.peer_scid = sc;
                 self.peer_scid_set = true;
-            }
-            if (space == .initial and !self.peer_initial_scid_set) {
-                @memcpy(self.peer_initial_scid[0..scid.len], scid); // parseLong caps cids at 20
-                self.peer_initial_scid_len = @intCast(scid.len);
-                self.peer_initial_scid_set = true;
             }
         }
 
@@ -1067,6 +1054,11 @@ pub const Connection = struct {
 
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, pn) else pn;
         st.recv_ranges.add(self.gpa, pn) catch return error.OutOfMemory; // for accurate ACKs
+        // Expose this Initial's scid to the ClientHello handler so it can check the
+        // client's initial_source_connection_id against the carrier packet's id
+        // (RFC 9000 7.3); borrowed for the dispatch only, then cleared.
+        self.dispatch_initial_scid = if (space == .initial) peer_scid_hdr else null;
+        defer self.dispatch_initial_scid = null;
         try self.dispatchFrames(payload, space, now);
 
         // Acknowledge the space if it carried an ack-eliciting frame this packet.
@@ -1355,6 +1347,12 @@ const testing = std.testing;
 // protection. Returns an owned datagram the caller frees. Exposed (test-only) so
 // the HTTP/3 layer's tests can drive a request through the real transport.
 pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
+    return testBuildInitialScid(gpa, dcid, &.{}, sender, pn, frames);
+}
+
+// testBuildInitial with a caller-chosen source connection id, so a test can forge an
+// Initial whose scid differs from the legitimate client's (RFC 9000 7.3 spoofing).
+pub fn testBuildInitialScid(gpa: std.mem.Allocator, dcid: []const u8, scid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
     const keys = blk: {
         const ik = crypto.InitialKeys.derive(dcid);
         break :blk if (sender == .client) ik.client else ik.server;
@@ -1366,7 +1364,8 @@ pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, 
     try hdr_buf.appendSlice(gpa, &[_]u8{ 0, 0, 0, 1 }); // version 1
     try hdr_buf.append(gpa, @intCast(dcid.len));
     try hdr_buf.appendSlice(gpa, dcid);
-    try hdr_buf.append(gpa, 0); // scid len 0
+    try hdr_buf.append(gpa, @intCast(scid.len));
+    try hdr_buf.appendSlice(gpa, scid);
     try hdr_buf.append(gpa, 0); // token len 0 (varint)
     // length = pn(1) + ciphertext(frames + tag)
     const length = 1 + frames.len + crypto.TAG_LEN;
@@ -1971,7 +1970,7 @@ test "a client sending a server-only transport parameter is rejected" {
     try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
 }
 
-test "an unauthenticated Initial does not anchor the peer's connection id" {
+test "a spoofed Initial with a different scid does not break the real handshake" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     var pubkey: [32]u8 = undefined;
@@ -1979,22 +1978,21 @@ test "an unauthenticated Initial does not anchor the peer's connection id" {
     var server = try Connection.initServer(gpa, &dcid, testServerConfig());
     defer server.deinit();
 
-    // An off-path attacker who saw the dcid races the client with a spoofed Initial.
-    // Its tag fails authentication, so it must not commit the connection-id anchor -
-    // otherwise the real client's initial_source_connection_id check would fail and
-    // the spoof would have killed the handshake.
-    const spoof = try buildClientHelloInitial(gpa, &dcid, pubkey);
+    // Initial keys are derivable from the dcid, so an off-path attacker who saw it can
+    // forge a Initial that opens under AEAD with a DIFFERENT scid (aa bb) carrying only
+    // a PING. The connection-id check is bound to the ClientHello's own packet, not a
+    // persistent anchor, so this must not make the real client's check fail later.
+    const spoof = try testBuildInitialScid(gpa, &dcid, &[_]u8{ 0xaa, 0xbb }, .client, 0, &[_]u8{0x01} ** 20);
     defer gpa.free(spoof);
-    spoof[spoof.len - 1] ^= 0xff; // corrupt the AEAD tag
-    try server.receiveDatagram(spoof, 900); // dropped, not fatal
-    try testing.expect(!server.peer_initial_scid_set);
+    try server.receiveDatagram(spoof, 900); // accepted (a valid PING), but does not poison
 
-    // The authentic ClientHello still anchors and completes the flight.
+    // The authentic ClientHello (zero-length scid, matching its empty initial_scid
+    // parameter) still validates and the server flight goes out.
     const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
     defer gpa.free(ch);
     try server.receiveDatagram(ch, 1000);
-    try testing.expect(server.peer_initial_scid_set);
     try testing.expect(server.datagramLengths().len >= 1); // the server flight went out
+    try testing.expect(server.tls.?.state == .flight_sent);
 }
 
 test "a lost handshake CRYPTO packet is retransmitted on loss" {
