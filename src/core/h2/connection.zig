@@ -134,6 +134,11 @@ pub const Connection = struct {
     /// lifetime contract.
     req_headers: std.ArrayList(events.Header) = .empty,
     req_scratch: std.ArrayList(u8) = .empty,
+    /// Owned copy of an h2c-upgrade request's pseudo/regular header bytes. The
+    /// upgrade headers come from the caller (not the wire), so they are copied here
+    /// to outlive initiateUpgradeConnection and stay valid until the events drain.
+    upgrade_store: std.ArrayList(u8) = .empty,
+    upgrade_headers: std.ArrayList(events.Header) = .empty,
 
     failed_with: H2Error = error.ProtocolError,
     eof_seen: bool = false,
@@ -160,6 +165,8 @@ pub const Connection = struct {
         self.fb_buf.deinit(self.gpa);
         self.req_headers.deinit(self.gpa);
         self.req_scratch.deinit(self.gpa);
+        self.upgrade_store.deinit(self.gpa);
+        self.upgrade_headers.deinit(self.gpa);
     }
 
     /// Append received bytes (empty slice signals EOF). Bounded by max_buffer.
@@ -772,6 +779,87 @@ pub const Connection = struct {
         if (self.streams.getPtr(id)) |s| s.expects_bodyless = true;
     }
 
+    pub const UpgradeError = error{ Malformed, OutOfMemory, AlreadyStarted, BadSettings };
+
+    /// Seed an h2c-upgraded request as stream 1, half-closed-remote (RFC 7540 3.2):
+    /// the HTTP/1.1 request the server already parsed becomes the first HTTP/2
+    /// request, complete (no body - any body belonged to the H1 message). The
+    /// caller still feeds the client's connection preface afterwards on the same
+    /// byte stream, so the phase machine is left in await_preface untouched.
+    ///
+    /// `method`/`target`/`scheme`/`authority` and the regular `headers` come from
+    /// the caller; their bytes are copied into upgrade_store so the pushed Request
+    /// outlives this call. The synthesized headers run through collapseRequest, so
+    /// the same validation (and host synthesis) a wire request gets applies here.
+    ///
+    /// `settings` is the DECODED HTTP2-Settings payload from the upgrade request
+    /// (RFC 7540 3.2.1) - the client's settings, applied before stream 1 opens so
+    /// its initial window honors the negotiated value. The client repeats these in
+    /// the SETTINGS frame of its connection preface, which surfaces normally.
+    /// May only be called once, before any frame has been processed.
+    pub fn initiateUpgradeConnection(
+        self: *Connection,
+        method: []const u8,
+        target: []const u8,
+        scheme: []const u8,
+        authority: ?[]const u8,
+        headers: []const events.Header,
+        settings: ?[]const u8,
+    ) UpgradeError!void {
+        if (self.streams_opened != 0 or self.highest_peer_id != 0) return error.AlreadyStarted;
+
+        // Apply the client's upgrade SETTINGS before any stream is created so the
+        // upgraded stream's send window starts from the negotiated initial size.
+        if (settings) |payload| {
+            _ = self.peer_settings.apply(payload) catch return error.BadSettings;
+        }
+
+        self.upgrade_store.clearRetainingCapacity();
+        self.upgrade_headers.clearRetainingCapacity();
+
+        // Size upgrade_store to the full byte total up front so no later append can
+        // reallocate it: every value slice points into this buffer, and a regrow
+        // mid-build would dangle the slices taken before it.
+        var total: usize = method.len + target.len + scheme.len + (if (authority) |a| a.len else 0);
+        for (headers) |h| total += h.name.len + h.value.len;
+        self.upgrade_store.ensureTotalCapacity(self.gpa, total) catch return error.OutOfMemory;
+
+        const copy = struct {
+            fn dup(store: *std.ArrayList(u8), bytes: []const u8) []const u8 {
+                const start = store.items.len;
+                store.appendSliceAssumeCapacity(bytes); // capacity reserved above
+                return store.items[start..];
+            }
+        }.dup;
+
+        try self.upgrade_headers.append(self.gpa, .{ .name = ":method", .value = copy(&self.upgrade_store, method) });
+        try self.upgrade_headers.append(self.gpa, .{ .name = ":path", .value = copy(&self.upgrade_store, target) });
+        try self.upgrade_headers.append(self.gpa, .{ .name = ":scheme", .value = copy(&self.upgrade_store, scheme) });
+        if (authority) |a| {
+            try self.upgrade_headers.append(self.gpa, .{ .name = ":authority", .value = copy(&self.upgrade_store, a) });
+        }
+        for (headers) |h| {
+            const name = copy(&self.upgrade_store, h.name);
+            const value = copy(&self.upgrade_store, h.value);
+            try self.upgrade_headers.append(self.gpa, .{ .name = name, .value = value });
+        }
+
+        const req = self.collapseRequest(self.upgrade_headers.items, 1) catch |e| switch (e) {
+            error.Malformed => return error.Malformed,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+
+        // The first stream can never trip the churn cap; OOM is the only failure.
+        self.openPeerStream(1) catch return error.OutOfMemory;
+        self.highest_peer_id = 1;
+        const s = self.streams.getPtr(1).?;
+        s.headers_done = true;
+        if (req.content_length) |cl| s.content_length = cl;
+        s.recvApply(.headers, true); // idle -> open -> half_closed_remote
+        self.push(.{ .request = req.event });
+        self.push(.{ .end_of_message = .{ .stream_id = 1 } });
+    }
+
     /// Account for a locally-initiated RST_STREAM: the stream is terminally closed,
     /// so drop it from the map (the caller serializes the RST_STREAM frame itself).
     /// A no-op on an unknown id.
@@ -1311,6 +1399,137 @@ test "a bodyless response that ends the stream stops counting toward concurrency
     // A bodyless response head with END_STREAM closes the local side too.
     try c.endResponseStream(1);
     try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
+}
+
+test "h2c upgrade surfaces the request as a complete stream 1" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    const hdrs = [_]events.Header{.{ .name = "user-agent", .value = "curl/8" }};
+    try c.initiateUpgradeConnection("GET", "/upgrade?x=1", "http", "example.com", &hdrs, null);
+
+    const req = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
+    try testing.expectEqualStrings("GET", req.request.method);
+    try testing.expectEqualStrings("/upgrade?x=1", req.request.target);
+    try testing.expectEqualStrings("/upgrade", req.request.path);
+    try testing.expectEqualStrings("x=1", req.request.query);
+    try testing.expectEqual(@as(u32, 1), req.request.stream_id);
+    // :authority became a synthesized host header; the regular header survived.
+    var saw_host = false;
+    var saw_ua = false;
+    for (req.request.headers) |h| {
+        if (std.mem.eql(u8, h.name, "host") and std.mem.eql(u8, h.value, "example.com")) saw_host = true;
+        if (std.mem.eql(u8, h.name, "user-agent") and std.mem.eql(u8, h.value, "curl/8")) saw_ua = true;
+    }
+    try testing.expect(saw_host and saw_ua);
+
+    const eom = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(eom));
+    try testing.expectEqual(@as(u32, 1), eom.end_of_message.stream_id);
+    try testing.expectEqual(@as(u32, 1), c.liveStreamCount());
+}
+
+test "after an h2c upgrade the client preface and a later stream still parse" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    try c.initiateUpgradeConnection("GET", "/", "http", "example.com", &.{}, null);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+
+    // The client still sends the connection preface after the 101 (RFC 7540 3.2),
+    // then a normal request on stream 3.
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 3, &GET_BLOCK);
+    try handshook(&c, frames.items); // feeds preface + SETTINGS + the stream-3 HEADERS
+    const req3 = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req3));
+    try testing.expectEqual(@as(u32, 3), req3.request.stream_id);
+}
+
+test "an upgrade request's bytes survive a later stream's decode (drain discipline)" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    const hdrs = [_]events.Header{.{ .name = "x-marker", .value = "KEEP" }};
+    try c.initiateUpgradeConnection("GET", "/seeded", "http", "example.com", &hdrs, null);
+    // Feed the preface + a stream-3 HEADERS BEFORE draining the upgrade: the
+    // request must still be intact when it surfaces (nextEvent drains the pending
+    // ring fully before decoding the next block, so its slices are materialized
+    // before collapseRequest reuses req_scratch/req_headers for stream 3).
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frames.appendSlice(testing.allocator, constants.CLIENT_PREFACE);
+    try frameBytes(&frames, .settings, 0, 0, &.{});
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 3, &GET_BLOCK);
+    try c.feed(frames.items);
+
+    const req1 = try c.nextEvent();
+    try testing.expectEqualStrings("/seeded", req1.request.target);
+    var saw_marker = false;
+    for (req1.request.headers) |h| {
+        if (std.mem.eql(u8, h.name, "x-marker")) {
+            try testing.expectEqualStrings("KEEP", h.value);
+            saw_marker = true;
+        }
+    }
+    try testing.expect(saw_marker);
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "an h2c upgrade with many large headers does not dangle its slices" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // Enough bytes that upgrade_store would have reallocated mid-build under the
+    // naive append-then-slice approach, corrupting the earlier pseudo-header
+    // slices. The value bytes live in a stable buffer here so they survive.
+    const big = "v" ** 256;
+    var hdrs: [40]events.Header = undefined;
+    for (&hdrs) |*h| h.* = .{ .name = "x-pad", .value = big };
+    try c.initiateUpgradeConnection("GET", "/target", "http", "example.com", &hdrs, null);
+    const req = try c.nextEvent();
+    try testing.expectEqualStrings("GET", req.request.method);
+    try testing.expectEqualStrings("/target", req.request.target);
+    var pad: usize = 0;
+    for (req.request.headers) |h| {
+        if (std.mem.eql(u8, h.name, "x-pad")) {
+            try testing.expectEqualStrings(big, h.value);
+            pad += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 40), pad);
+}
+
+test "a malformed h2c upgrade is rejected" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // A connection-specific header is forbidden in HTTP/2 (RFC 9113 8.2.2).
+    const bad = [_]events.Header{.{ .name = "connection", .value = "keep-alive" }};
+    try testing.expectError(error.Malformed, c.initiateUpgradeConnection("GET", "/", "http", "example.com", &bad, null));
+}
+
+test "upgrading twice is rejected" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    try c.initiateUpgradeConnection("GET", "/", "http", "example.com", &.{}, null);
+    try testing.expectError(error.AlreadyStarted, c.initiateUpgradeConnection("GET", "/", "http", "example.com", &.{}, null));
+}
+
+test "the h2c upgrade SETTINGS set the peer settings and stream-1 window" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // SETTINGS_INITIAL_WINDOW_SIZE (id 4) = 1000 - the client's upgrade setting.
+    const settings = [_]u8{ 0x00, 0x04, 0x00, 0x00, 0x03, 0xE8 };
+    try c.initiateUpgradeConnection("GET", "/", "http", "example.com", &.{}, &settings);
+    try testing.expectEqual(@as(i32, 1000), c.peer_settings.initial_window_size);
+    // Stream 1's send window (what the peer will accept) starts from that value.
+    try testing.expectEqual(@as(?i32, 1000), c.streamSendWindow(1));
+}
+
+test "a malformed upgrade SETTINGS payload is rejected" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    const bad = [_]u8{ 0x00, 0x04, 0x00 }; // not a multiple of 6
+    try testing.expectError(error.BadSettings, c.initiateUpgradeConnection("GET", "/", "http", "example.com", &.{}, &bad));
 }
 
 // A client's inbound handshake is just the server's SETTINGS - no preface to
