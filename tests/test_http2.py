@@ -595,6 +595,25 @@ def test_send_response_end_stream_rides_the_headers_frame() -> None:
     assert len(frames) == 1  # a single HEADERS frame, no trailing DATA
     ftype, flags, sid, _ = frames[0]
     assert ftype == 0x01 and flags & END_STREAM and sid == 1
+    # The END_STREAM head closes the stream locally: it must be evicted, not left
+    # half-closed counting toward MAX_CONCURRENT_STREAMS.
+    assert conn.stream(1).send_window is None
+
+
+def test_bodyless_responses_do_not_exhaust_concurrency() -> None:
+    # Answer many bodyless requests with end_stream=True; each must free its stream
+    # so the connection never refuses a later request (regression: streams used to
+    # linger half-closed and count toward the concurrency cap).
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    conn.receive_data(PREFACE + frame(0x04, 0, 0, b""))
+    list(drain_h2(conn))
+    for sid in range(1, 600, 2):
+        conn.receive_data(frame(0x01, END_HEADERS | END_STREAM, sid, GET_BLOCK))
+        events = [type(e).__name__ for e in drain_h2(conn)]
+        assert "Request" in events
+        assert "RstStream" not in events  # never refused
+        conn.stream(sid).send_response(204, end_stream=True)
+        conn.data_to_send()
 
 
 def test_send_response_without_end_stream_still_needs_a_data_frame() -> None:

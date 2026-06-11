@@ -184,7 +184,11 @@ const H2Engine = struct {
     fn sendResponse(self: *H2Engine, stream_id: u32, status: u16, hdrs: *BorrowedHeaders, end_stream: bool) py.Object {
         if (!self.ensureHandshake()) return null;
         self.writer.sendResponse(stream_id, status, hdrs.headers, end_stream) catch |e| return h2RaiseWrite(e);
-        self.conn.registerSendStream(stream_id) catch return c.PyErr_NoMemory();
+        if (end_stream) {
+            self.conn.endResponseStream(stream_id) catch return c.PyErr_NoMemory();
+        } else {
+            self.conn.registerSendStream(stream_id) catch return c.PyErr_NoMemory();
+        }
         return py.none();
     }
 

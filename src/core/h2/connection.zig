@@ -779,6 +779,17 @@ pub const Connection = struct {
         self.evictStream(id);
     }
 
+    /// Account for a response head that carried END_STREAM on the HEADERS frame
+    /// (a bodyless 204/304/HEAD answer): half-close the local side and evict the
+    /// stream if both directions are now done, exactly as the DATA end path does.
+    /// Without this the stream lingers half_closed_remote and keeps counting
+    /// toward MAX_CONCURRENT_STREAMS. Call after the writer serializes the frame.
+    pub fn endResponseStream(self: *Connection, id: u32) error{OutOfMemory}!void {
+        try self.registerSendStream(id);
+        self.streams.getPtr(id).?.sendApply(true);
+        self.maybeEvictDone(id);
+    }
+
     /// The highest peer-initiated stream id seen so far - the natural last-stream-id
     /// for a GOAWAY (everything above it was never processed).
     pub fn lastPeerStreamId(self: *const Connection) u32 {
@@ -1284,6 +1295,22 @@ test "over the concurrency cap, a request is refused not surfaced" {
     try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.refused_stream)), refused.rst_stream.error_code);
     // The refused stream left no record, so only stream 1 is tracked.
     try testing.expectEqual(@as(u32, 1), c.liveStreamCount());
+}
+
+test "a bodyless response that ends the stream stops counting toward concurrency" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK);
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    // The request half-closed remote; it still counts until the response ends.
+    try testing.expectEqual(@as(u32, 1), c.liveStreamCount());
+    // A bodyless response head with END_STREAM closes the local side too.
+    try c.endResponseStream(1);
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
 }
 
 // A client's inbound handshake is just the server's SETTINGS - no preface to
