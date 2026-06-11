@@ -284,8 +284,13 @@ const H3Engine = struct {
     config: ServerConfig,
     qc: ?*QuicConnection = null,
     h3: ?*H3Connection = null,
+    /// The integrator's clock at the last receive_datagram / handle_timeout. A Stream
+    /// send does not carry its own `now` (the API matches H2's, which has no clock),
+    /// so it packetises against the most recent time the caller gave us.
+    now: u64 = 0,
 
     fn receiveDatagram(self: *H3Engine, dgram: []const u8, now: u64) py.Object {
+        self.now = now;
         if (self.qc == null) {
             // Build the transport from the connection id in the client's first
             // Initial. A non-Initial first datagram has nowhere to take the id from.
@@ -346,29 +351,29 @@ const H3Engine = struct {
     /// Drive a response onto `stream_id`, then packetise so the bytes surface in the
     /// next data_to_send. Send requires 1-RTT keys (the handshake must be complete),
     /// which flushSend enforces by no-op'ing until they exist.
-    fn sendResponse(self: *H3Engine, id: u64, status: u16, headers: []const events.Header, now: u64) py.Object {
+    fn sendResponse(self: *H3Engine, id: u64, status: u16, headers: []const events.Header) py.Object {
         const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
         h.sendResponse(id, status, headers) catch |e| return exceptions.raiseH3(e);
-        return self.flush(now);
+        return self.flush();
     }
 
-    fn sendData(self: *H3Engine, id: u64, data: []const u8, now: u64) py.Object {
+    fn sendData(self: *H3Engine, id: u64, data: []const u8) py.Object {
         const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
         h.sendData(id, data) catch |e| return exceptions.raiseH3(e);
-        return self.flush(now);
+        return self.flush();
     }
 
-    fn endStream(self: *H3Engine, id: u64, now: u64) py.Object {
+    fn endStream(self: *H3Engine, id: u64) py.Object {
         const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
         h.endStream(id) catch |e| return exceptions.raiseH3(e);
-        return self.flush(now);
+        return self.flush();
     }
 
-    fn flush(self: *H3Engine, now: u64) py.Object {
+    fn flush(self: *H3Engine) py.Object {
         // AmplificationLimited is not an error: it means the unvalidated peer's 3x
         // budget is spent, so the bytes stay queued and surface on a later flush once
         // a Handshake packet validates the address. Treat it as a deferred no-send.
-        self.qc.?.flushSend(now) catch |e| switch (e) {
+        self.qc.?.flushSend(self.now) catch |e| switch (e) {
             error.AmplificationLimited => {},
             else => return exceptions.raiseQuic(e),
         };
@@ -381,6 +386,7 @@ const H3Engine = struct {
     }
 
     fn handleTimeout(self: *H3Engine, now: u64) py.Object {
+        self.now = now;
         const q = self.qc orelse return py.none();
         q.onTimeout(now) catch |e| switch (e) {
             error.AmplificationLimited => {},
@@ -388,7 +394,7 @@ const H3Engine = struct {
         };
         // A PTO requeues STREAM data into the send stream; only flushSend packetises
         // it, so the probe surfaces in the next data_to_send rather than stalling.
-        return self.flush(now);
+        return self.flush();
     }
 
     fn isClosed(self: *const H3Engine) bool {
@@ -448,15 +454,23 @@ var stream_type: py.Object = null;
 /// window, pending-DATA buffer, and lifecycle all live in the core - the handle
 /// is a command surface, never its own I/O buffer, so bytes still drain through
 /// the Connection's single data_to_send.
+// The multiplexed engine a Stream handle drives - HTTP/2 or HTTP/3. Both own the
+// per-stream state; the handle is a borrowed, re-validated command surface over
+// whichever the connection runs.
+const StreamEngine = union(enum) {
+    h2: *H2Engine,
+    h3: *H3Engine,
+};
+
 const StreamObject = extern struct {
     ob_base: c.PyObject,
     conn: ?*c.PyObject, // owned reference to the ConnectionObject
-    stream_id: u32,
+    stream_id: u64, // 62-bit for QUIC; 31-bit for HTTP/2
 
-    /// The H2 engine behind the handle, or a Python error if the connection was
-    /// torn down or is not HTTP/2. (A Stream only ever wraps an H2 connection, but
-    /// the connection object can outlive its engine.)
-    fn engine(self: *StreamObject) ?*H2Engine {
+    /// The multiplexed engine behind the handle, or a Python error if the connection
+    /// was torn down or is single-stream (HTTP/1.1). The connection object can outlive
+    /// its engine, so this re-validates on every call.
+    fn engine(self: *StreamObject) ?StreamEngine {
         const conn_obj: *ConnectionObject = @ptrCast(self.conn orelse {
             _ = py.raiseRuntime("connection is closed");
             return null;
@@ -465,20 +479,21 @@ const StreamObject = extern struct {
             _ = py.raiseRuntime("connection is closed");
             return null;
         };
-        switch (eng.*) {
-            .h2 => |*h| return h,
-            else => {
-                _ = py.raiseRuntime("not an HTTP/2 connection");
+        return switch (eng.*) {
+            .h2 => |*h| .{ .h2 = h },
+            .h3 => |*h| .{ .h3 = h },
+            .h1 => {
+                _ = py.raiseRuntime("streams exist only on a multiplexed (HTTP/2 or HTTP/3) connection");
                 return null;
             },
-        }
+        };
     }
 };
 
 /// Build a Stream handle for `stream_id` on `conn_obj` (a ConnectionObject). Holds
 /// an owned reference to the connection. Returns null with a Python error set on
 /// allocation failure. Public so events_obj can attach `event.stream`.
-pub fn makeStream(conn_obj: ?*c.PyObject, stream_id: u32) py.Object {
+pub fn makeStream(conn_obj: ?*c.PyObject, stream_id: u64) py.Object {
     const tp: *c.PyTypeObject = @ptrCast(stream_type);
     const alloc = tp.tp_alloc.?;
     const obj = alloc(tp, 0);
@@ -509,14 +524,20 @@ fn stream_send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c)
         hdrs = borrowHeaders(hdrs_seq) orelse return null;
     }
     var h = hdrs orelse BorrowedHeaders{ .headers = &.{}, .refs = &.{} };
-    return e.sendResponse(self.stream_id, @intCast(status), &h);
+    return switch (e) {
+        .h2 => |x| x.sendResponse(@intCast(self.stream_id), @intCast(status), &h),
+        .h3 => |x| x.sendResponse(self.stream_id, @intCast(status), h.headers),
+    };
 }
 
 fn stream_send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *StreamObject = @ptrCast(self_obj.?);
     const e = self.engine() orelse return null;
     const data = py.asBytes(arg) orelse return null;
-    return e.sendData(self.stream_id, data);
+    return switch (e) {
+        .h2 => |x| x.sendData(@intCast(self.stream_id), data),
+        .h3 => |x| x.sendData(self.stream_id, data),
+    };
 }
 
 fn stream_end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
@@ -525,28 +546,35 @@ fn stream_end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
     if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
-        return py.raise(exceptions.LocalProtocolError, "HTTP/2 send-side trailers are not supported yet");
+        return py.raise(exceptions.LocalProtocolError, "send-side trailers are not supported yet");
     }
-    return e.endStream(self.stream_id);
+    return switch (e) {
+        .h2 => |x| x.endStream(@intCast(self.stream_id)),
+        .h3 => |x| x.endStream(self.stream_id),
+    };
 }
 
 fn stream_reset(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *StreamObject = @ptrCast(self_obj.?);
     const e = self.engine() orelse return null;
+    const h2 = switch (e) {
+        .h2 => |x| x,
+        .h3 => return py.raise(exceptions.LocalProtocolError, "HTTP/3 RESET_STREAM is not supported yet"),
+    };
     var code: c_ulong = @intFromEnum(core.h2.constants.ErrorCode.cancel);
     if (c.PyArg_ParseTuple(args, "|k", &code) == 0) return null;
     if (code > 0xFFFF_FFFF) return py.raiseValue("error code out of range");
-    return e.resetStream(self.stream_id, @intCast(code));
+    return h2.resetStream(@intCast(self.stream_id), @intCast(code));
 }
 
 fn stream_id_get(self_obj: ?*c.PyObject, _: ?*anyopaque) callconv(.c) py.Object {
     const self: *StreamObject = @ptrCast(self_obj.?);
-    return c.PyLong_FromUnsignedLong(self.stream_id);
+    return c.PyLong_FromUnsignedLongLong(self.stream_id);
 }
 
 fn stream_repr(self_obj: ?*c.PyObject) callconv(.c) py.Object {
     const self: *StreamObject = @ptrCast(self_obj.?);
-    return c.PyUnicode_FromFormat("Stream(stream_id=%u)", self.stream_id);
+    return c.PyUnicode_FromFormat("Stream(stream_id=%llu)", self.stream_id);
 }
 
 var stream_methods = [_]py.MethodDef{
@@ -722,9 +750,9 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     var ephemeral_obj: ?*c.PyObject = null;
     var alpn_obj: ?*c.PyObject = null;
     var kwlist = [_][*c]u8{
-        @constCast("role"),   @constCast("protocol"),         @constCast("certificate"),
-        @constCast("private_key"), @constCast("transport_params"), @constCast("random"),
-        @constCast("ephemeral_seed"), @constCast("alpn"),      null,
+        @constCast("role"),           @constCast("protocol"),         @constCast("certificate"),
+        @constCast("private_key"),    @constCast("transport_params"), @constCast("random"),
+        @constCast("ephemeral_seed"), @constCast("alpn"),             null,
     };
     if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$OOOOOO", @ptrCast(&kwlist), &role_val, &protocol_val, &cert_obj, &key_obj, &tp_obj, &random_obj, &ephemeral_obj, &alpn_obj) == 0) return null;
     if (cert_obj == null or key_obj == null or tp_obj == null or random_obj == null or ephemeral_obj == null) {
@@ -1211,22 +1239,19 @@ fn upgrade(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
 fn stream(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
-    switch (engine.*) {
-        .h2 => {},
-        else => return py.raiseRuntime("streams exist only on an HTTP/2 connection"),
-    }
+    // HTTP/2 ids are 31-bit and stream 0 is the connection (RFC 9113 5.1.1); QUIC
+    // (HTTP/3) ids are 62-bit and stream 0 is the first client bidi stream.
+    const max_id: i128, const min_id: i128 = switch (engine.*) {
+        .h2 => .{ 0x7FFF_FFFF, 1 },
+        .h3 => .{ (1 << 62) - 1, 0 },
+        .h1 => return py.raiseRuntime("streams exist only on a multiplexed (HTTP/2 or HTTP/3) connection"),
+    };
     // Parse as long long (64-bit on every platform; c_long is only 32-bit on
-    // Windows, where an id at/above 2^31 would otherwise raise OverflowError from
-    // PyLong_AsLong instead of the range ValueError below).
+    // Windows, where a large id would otherwise raise OverflowError from PyLong_AsLong
+    // instead of the range ValueError below).
     const id = c.PyLong_AsLongLong(arg);
-    if (id <= 0) {
-        if (c.PyErr_Occurred() != null) return null;
-        return py.raiseValue("stream_id must be a positive integer");
-    }
-    // HTTP/2 stream ids are 31-bit (RFC 9113 5.1.1). Reject anything larger before
-    // narrowing to u32, so an out-of-range id raises ValueError rather than
-    // trapping (safe builds) or silently truncating.
-    if (id > 0x7FFF_FFFF) return py.raiseValue("stream_id exceeds the 31-bit HTTP/2 limit");
+    if (id == -1 and c.PyErr_Occurred() != null) return null;
+    if (id < min_id or id > max_id) return py.raiseValue("stream_id out of range for this connection");
     return makeStream(self_obj, @intCast(id));
 }
 
@@ -1268,41 +1293,6 @@ fn h3(self: *ConnectionObject) ?*H3Engine {
             return null;
         },
     }
-}
-
-fn h3_send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
-    const e = h3(@ptrCast(self_obj.?)) orelse return null;
-    var stream_id: c_ulonglong = 0;
-    var status: c_long = 0;
-    var hdrs_seq: ?*c.PyObject = null;
-    var now: c_ulonglong = 0;
-    if (c.PyArg_ParseTuple(args, "Kl|OK", &stream_id, &status, &hdrs_seq, &now) == 0) return null;
-    if (status < 0 or status > 999) return py.raiseValue("status code out of range");
-    var hdrs: ?BorrowedHeaders = null;
-    defer if (hdrs) |*hh| hh.deinit();
-    if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
-        hdrs = borrowHeaders(hdrs_seq) orelse return null;
-    }
-    const h = hdrs orelse BorrowedHeaders{ .headers = &.{}, .refs = &.{} };
-    return e.sendResponse(@intCast(stream_id), @intCast(status), h.headers, @intCast(now));
-}
-
-fn h3_send_data(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
-    const e = h3(@ptrCast(self_obj.?)) orelse return null;
-    var stream_id: c_ulonglong = 0;
-    var data_obj: ?*c.PyObject = null;
-    var now: c_ulonglong = 0;
-    if (c.PyArg_ParseTuple(args, "KO|K", &stream_id, &data_obj, &now) == 0) return null;
-    const data = py.asBytes(data_obj) orelse return null;
-    return e.sendData(@intCast(stream_id), data, @intCast(now));
-}
-
-fn h3_end_stream(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
-    const e = h3(@ptrCast(self_obj.?)) orelse return null;
-    var stream_id: c_ulonglong = 0;
-    var now: c_ulonglong = 0;
-    if (c.PyArg_ParseTuple(args, "K|K", &stream_id, &now) == 0) return null;
-    return e.endStream(@intCast(stream_id), @intCast(now));
 }
 
 fn h3_next_timeout(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
@@ -1358,14 +1348,14 @@ var h2_methods = [_]py.MethodDef{
 
 // HTTP/3: fed by UDP datagrams rather than a byte stream. The QUIC transport and
 // HTTP/3 engine are built lazily on the first datagram; the handshake is driven from
-// the server config supplied at construction. Outgoing datagrams (handshake flight,
-// ACKs, responses) drain through the inherited data_to_send. `now` is the
-// integrator's monotonic clock, in the same unit it later feeds handle_timeout.
+// the server config supplied at construction. Sends go through a Stream handle
+// (conn.stream(id)), exactly like HTTP/2 - the one multiplexed write surface.
+// Outgoing datagrams (handshake flight, ACKs, responses) drain through the inherited
+// data_to_send. `now` is the integrator's monotonic clock, in the same unit it later
+// feeds handle_timeout; a Stream send uses the most recent `now` the caller gave.
 var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "receive_datagram", .ml_meth = receive_datagram, .ml_flags = c.METH_VARARGS, .ml_doc = "Feed one received UDP datagram: receive_datagram(datagram, now=0)." },
-    .{ .ml_name = "send_response", .ml_meth = h3_send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Send a response head on a stream: send_response(stream_id, status, headers=None, now=0)." },
-    .{ .ml_name = "send_data", .ml_meth = h3_send_data, .ml_flags = c.METH_VARARGS, .ml_doc = "Send response body bytes on a stream: send_data(stream_id, data, now=0)." },
-    .{ .ml_name = "end_stream", .ml_meth = h3_end_stream, .ml_flags = c.METH_VARARGS, .ml_doc = "Finish the response on a stream (send the FIN): end_stream(stream_id, now=0)." },
+    .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id (the request's stream_id). The handle is the stream-scoped send surface: send_response / send_data / end_message." },
     .{ .ml_name = "next_timeout", .ml_meth = h3_next_timeout, .ml_flags = c.METH_NOARGS, .ml_doc = "The next loss/PTO deadline (same clock as now), or None if no timer is armed." },
     .{ .ml_name = "handle_timeout", .ml_meth = h3_handle_timeout, .ml_flags = c.METH_O, .ml_doc = "Fire the timer at time now: handle_timeout(now). Re-queues probes; drain them with data_to_send." },
     .{ .ml_name = "is_closed", .ml_meth = h3_is_closed, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection has been closed (a peer CONNECTION_CLOSE was received)." },

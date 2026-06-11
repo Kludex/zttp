@@ -125,8 +125,9 @@ def test_http3_sends_a_response() -> None:
     conn.receive_datagram(GET_REQUEST, 3000)
     conn.data_to_send()
 
-    conn.send_response(0, 200, [(b"content-length", b"0")], 3000)
-    conn.end_stream(0, 3000)
+    stream = conn.stream(0)
+    stream.send_response(200, [(b"content-length", b"0")])
+    stream.end_message()
     # The response leaves as one or more 1-RTT datagrams.
     datagrams = conn.data_to_send()
     assert len(datagrams) >= 1
@@ -138,10 +139,18 @@ def test_next_event_before_any_datagram_is_need_data() -> None:
     assert conn.next_event() is zttp.NEED_DATA
 
 
+def test_http3_sends_through_a_stream_like_http2() -> None:
+    conn = make_server()
+    stream = conn.stream(0)
+    assert isinstance(stream, zttp.Stream)
+    assert stream.stream_id == 0
+
+
 def test_send_before_a_datagram_is_a_protocol_error() -> None:
     conn = make_server()
+    stream = conn.stream(0)
     with pytest.raises(zttp.LocalProtocolError):
-        conn.send_response(0, 200, None, 0)
+        stream.send_response(200)
 
 
 def test_is_closed_starts_false() -> None:
