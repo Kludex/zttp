@@ -182,6 +182,13 @@ def test_close_info_is_none_until_the_peer_closes() -> None:
     assert conn.close_info() is None
 
 
+def test_peer_settings_is_none_until_the_control_stream_arrives() -> None:
+    conn = make_server()
+    assert conn.peer_settings() is None
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    assert conn.peer_settings() is None
+
+
 def test_next_timeout_arms_after_the_handshake_flight() -> None:
     conn = make_server()
     conn.receive_datagram(CLIENT_HELLO, 1000)
