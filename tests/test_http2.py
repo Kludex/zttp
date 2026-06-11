@@ -642,6 +642,52 @@ def test_h2_head_response_with_content_length_is_not_a_stream_error() -> None:
     assert events == snapshot(["Settings", "Settings", "Response", "EndOfMessage"])
 
 
+def _lit(name: bytes, value: bytes) -> bytes:
+    # An HPACK literal header field, never indexed, with a literal name.
+    return bytes([0x00, len(name)]) + name + bytes([len(value)]) + value
+
+
+def _request_block(*extra: tuple[bytes, bytes], method: bytes = b"GET") -> bytes:
+    block = _lit(b":method", method) + _lit(b":path", b"/") + _lit(b":scheme", b"http") + _lit(b":authority", b"x")
+    for name, value in extra:
+        block += _lit(name, value)
+    return block
+
+
+def test_h2_bodyless_request_with_content_length_is_reset() -> None:
+    # A request declaring content-length but sending no DATA is an h2->h1 smuggling
+    # vector (the downgraded h1 request advertises a body that never arrives). It
+    # must be reset even though END_STREAM rode on the HEADERS frame, not DATA.
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, _request_block((b"content-length", b"5"))))
+    events = [type(e).__name__ for e in drain_h2(conn)]
+    assert "RstStream" in events
+    assert "EndOfMessage" not in events
+
+
+def test_h2_content_length_mismatch_via_trailers_is_reset() -> None:
+    # content-length: 5 but only 3 body bytes, with END_STREAM riding on a trailer
+    # block - the mismatch must still be caught (not only on the DATA end path).
+    conn = server_with(
+        frame(0x01, END_HEADERS, 1, _request_block((b"content-length", b"5"), method=b"POST")),
+        frame(0x00, 0, 1, b"abc"),  # 3 bytes, no END_STREAM
+        frame(0x01, END_HEADERS | END_STREAM, 1, _lit(b"x-trailer", b"v")),
+    )
+    events = [type(e).__name__ for e in drain_h2(conn)]
+    assert "RstStream" in events
+    assert "EndOfMessage" not in events
+
+
+def test_h2_matching_content_length_is_accepted() -> None:
+    # The guard must not reject a request whose body matches its content-length.
+    conn = server_with(
+        frame(0x01, END_HEADERS, 1, _request_block((b"content-length", b"3"), method=b"POST")),
+        frame(0x00, END_STREAM, 1, b"abc"),
+    )
+    events = [type(e).__name__ for e in drain_h2(conn)]
+    assert "RstStream" not in events
+    assert "EndOfMessage" in events
+
+
 def test_initiate_connection_emits_the_preface_before_any_send() -> None:
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
     conn.initiate_connection()

@@ -453,13 +453,20 @@ pub const Connection = struct {
         s.creditRecvWindow(f.header.length);
         if (content.len > 0) self.push(.{ .data = .{ .data = content, .stream_id = f.header.stream_id } });
         s.recvApply(.data, end_stream);
-        if (end_stream) {
-            if (s.checkContentLength().action == .stream_error) {
-                self.push(.{ .rst_stream = .{ .stream_id = f.header.stream_id, .error_code = @intFromEnum(ErrorCode.protocol_error) } });
-                return;
-            }
-            self.push(.{ .end_of_message = .{ .stream_id = f.header.stream_id } });
+        if (end_stream) try self.endMessage(s, f.header.stream_id, &.{});
+    }
+
+    /// Finalize a stream at END_STREAM: enforce the Content-Length vs body-seen
+    /// guard (the h2->h1 smuggling defense) on EVERY end path - DATA, a bodyless
+    /// HEADERS, or trailers - then surface end_of_message. A mismatch is a stream
+    /// PROTOCOL_ERROR (RST_STREAM), so a request that lies about its body length
+    /// can never be downgraded to a smuggled HTTP/1.1 message.
+    fn endMessage(self: *Connection, s: *Stream, id: u32, trailers: []const events.Header) H2Error!void {
+        if (s.checkContentLength().action == .stream_error) {
+            try self.resetStream(s, id, .protocol_error);
+            return;
         }
+        self.push(.{ .end_of_message = .{ .trailers = trailers, .stream_id = id } });
     }
 
     fn handleRstStream(self: *Connection, f: frame_mod.Frame) H2Error!void {
@@ -593,7 +600,7 @@ pub const Connection = struct {
                 return;
             }
             s.recvApply(.headers, true);
-            self.push(.{ .end_of_message = .{ .trailers = headers, .stream_id = id } });
+            try self.endMessage(s, id, headers);
             return;
         }
 
@@ -626,7 +633,7 @@ pub const Connection = struct {
             self.push(.{ .response = resp.event });
             if (end_stream) {
                 s.recvApply(.headers, true); // open -> half_closed_remote
-                self.push(.{ .end_of_message = .{ .stream_id = id } });
+                try self.endMessage(s, id, &.{});
             }
             return;
         }
@@ -644,7 +651,7 @@ pub const Connection = struct {
         self.push(.{ .request = req.event });
         if (end_stream) {
             s.recvApply(.headers, true); // open -> half_closed_remote
-            self.push(.{ .end_of_message = .{ .stream_id = id } });
+            try self.endMessage(s, id, &.{});
         }
     }
 
@@ -1452,6 +1459,22 @@ test "conflicting duplicate content-length is malformed" {
     try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
     try handshook(&c, hdr.items);
     try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "a bodyless request that declares content-length is reset (smuggling guard)" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // :method GET, :scheme http, :path /, content-length: 5 - with END_STREAM on the
+    // HEADERS frame and no DATA. data_seen 0 != 5 must reset, even off the DATA path.
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x00, 0x0e } ++ "content-length".* ++ [_]u8{ 0x01, '5' };
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
+    try handshook(&c, hdr.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    const ev = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(ev));
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), ev.rst_stream.error_code);
 }
 
 test "a malformed request closes the stream so later DATA does not reopen it" {
