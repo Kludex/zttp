@@ -138,6 +138,29 @@ def test_bad_preface_raises() -> None:
         conn.next_event()
 
 
+def test_connection_fatal_error_emits_goaway() -> None:
+    # An even-numbered request stream id is a connection PROTOCOL_ERROR; the server
+    # must send a GOAWAY before closing (RFC 9113 5.4.1).
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 2, GET_BLOCK))
+    with pytest.raises(zttp.RemoteProtocolError):
+        list(drain_h2(conn))
+    goaways = [f for f in _frames(conn.data_to_send()) if f[0] == 0x07]
+    assert len(goaways) == 1
+    error_code = int.from_bytes(goaways[0][3][4:8], "big")
+    assert error_code == 0x01  # PROTOCOL_ERROR
+
+
+def test_goaway_is_emitted_only_once() -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 2, GET_BLOCK))
+    with pytest.raises(zttp.RemoteProtocolError):
+        list(drain_h2(conn))
+    conn.data_to_send()  # drains the GOAWAY
+    # Re-raising the latched error must not queue another GOAWAY.
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
+    assert [f for f in _frames(conn.data_to_send()) if f[0] == 0x07] == []
+
+
 def test_partial_feed_resumes() -> None:
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
     data = PREFACE + frame(0x04, 0, 0, b"") + frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK)

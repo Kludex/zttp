@@ -303,6 +303,19 @@ const H2Engine = struct {
         if (ev == .window_update or ev == .settings) try self.conn.flushSendable(self.writer);
     }
 
+    /// Serialize the GOAWAY owed after a connection-fatal error (RFC 9113 5.4.1),
+    /// so data_to_send carries it before the integrator closes. Best-effort: if
+    /// the writer itself OOMs there is nothing useful to do but close.
+    fn emitGoawayIfOwed(self: *H2Engine) void {
+        if (self.conn.takeGoawayOwed()) |code| {
+            if (!self.handshake_sent) {
+                self.writer.sendPreface(&.{}) catch return;
+                self.handshake_sent = true;
+            }
+            self.writer.sendGoaway(self.conn.lastPeerStreamId(), code, &.{}) catch {};
+        }
+    }
+
     fn deinit(self: *H2Engine) void {
         self.conn.deinit();
         gpa.destroy(self.conn);
@@ -1045,7 +1058,10 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     switch (engine.*) {
         .h3 => |*e| return e.nextEvent(),
         .h2 => |*e| {
-            const ev = e.conn.nextEvent() catch |err| return exceptions.raiseH2(err);
+            const ev = e.conn.nextEvent() catch |err| {
+                e.emitGoawayIfOwed(); // queue one GOAWAY for the next data_to_send
+                return exceptions.raiseH2(err);
+            };
             e.autoRespond(ev) catch |err| return h2RaiseWrite(err);
             return events_obj.fromH2Event(ev);
         },

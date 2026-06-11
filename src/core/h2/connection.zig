@@ -66,6 +66,19 @@ pub const H2Error = error{
     EnhanceYourCalm,
 };
 
+/// The RFC 9113 7 error code a connection-fatal H2Error maps to, for the GOAWAY
+/// the integrator sends before closing. MessageTooLong is a resource-limit
+/// breach, so it reports ENHANCE_YOUR_CALM like the other flood defenses.
+pub fn errorCode(e: H2Error) constants.ErrorCode {
+    return switch (e) {
+        error.ProtocolError => .protocol_error,
+        error.FrameSizeError => .frame_size_error,
+        error.CompressionError => .compression_error,
+        error.FlowControlError => .flow_control_error,
+        error.EnhanceYourCalm, error.MessageTooLong => .enhance_your_calm,
+    };
+}
+
 const Phase = enum {
     /// Server: waiting for the 24-byte client preface. Client: about to send its
     /// preface (no inbound preface to await).
@@ -141,6 +154,10 @@ pub const Connection = struct {
     upgrade_headers: std.ArrayList(events.Header) = .empty,
 
     failed_with: H2Error = error.ProtocolError,
+    /// Set to the GOAWAY error code on the FIRST transition to .failed, so the
+    /// integrator can serialize one GOAWAY before closing (RFC 9113 5.4.1).
+    /// Consumed by takeGoawayOwed; re-raising the latched error does not re-set it.
+    goaway_owed: ?constants.ErrorCode = null,
     eof_seen: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, role: Role) Connection {
@@ -183,14 +200,25 @@ pub const Connection = struct {
     }
 
     /// Produce the next event, or `.need_data`. A connection error poisons the
-    /// engine: it is latched and re-raised on every later call (as H1 does).
+    /// engine: it is latched and re-raised on every later call (as H1 does). The
+    /// first failure records the GOAWAY code in goaway_owed (RFC 9113 5.4.1); the
+    /// integrator drains it via takeGoawayOwed and serializes one GOAWAY.
     pub fn nextEvent(self: *Connection) H2Error!Event {
         if (self.phase == .failed) return self.failed_with;
         return self.dispatch() catch |e| {
             self.phase = .failed;
             self.failed_with = e;
+            self.goaway_owed = errorCode(e);
             return e;
         };
+    }
+
+    /// The GOAWAY error code owed after a connection-fatal error, or null. Returns
+    /// it at most once so the integrator sends exactly one GOAWAY.
+    pub fn takeGoawayOwed(self: *Connection) ?constants.ErrorCode {
+        const owed = self.goaway_owed;
+        self.goaway_owed = null;
+        return owed;
     }
 
     fn dispatch(self: *Connection) H2Error!Event {
@@ -1326,6 +1354,31 @@ test "an even-numbered request stream id is a connection error" {
     try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 2, &GET_BLOCK);
     try handshook(&c, hdr.items);
     try testing.expectError(error.ProtocolError, c.nextEvent());
+}
+
+test "a connection-fatal error owes one GOAWAY with the mapped code" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(testing.allocator);
+    try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 2, &GET_BLOCK);
+    try handshook(&c, hdr.items);
+    try testing.expectError(error.ProtocolError, c.nextEvent());
+    // The owed GOAWAY carries PROTOCOL_ERROR and is reported exactly once.
+    try testing.expectEqual(@as(?ErrorCode, .protocol_error), c.takeGoawayOwed());
+    try testing.expectEqual(@as(?ErrorCode, null), c.takeGoawayOwed());
+    // Re-raising the latched error does not re-arm a GOAWAY.
+    try testing.expectError(error.ProtocolError, c.nextEvent());
+    try testing.expectEqual(@as(?ErrorCode, null), c.takeGoawayOwed());
+}
+
+test "errorCode maps each H2Error to its RFC 9113 code" {
+    try testing.expectEqual(ErrorCode.protocol_error, errorCode(error.ProtocolError));
+    try testing.expectEqual(ErrorCode.frame_size_error, errorCode(error.FrameSizeError));
+    try testing.expectEqual(ErrorCode.compression_error, errorCode(error.CompressionError));
+    try testing.expectEqual(ErrorCode.flow_control_error, errorCode(error.FlowControlError));
+    try testing.expectEqual(ErrorCode.enhance_your_calm, errorCode(error.EnhanceYourCalm));
+    try testing.expectEqual(ErrorCode.enhance_your_calm, errorCode(error.MessageTooLong));
 }
 
 test "a field name with a space byte is malformed" {
