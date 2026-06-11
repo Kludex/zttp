@@ -106,6 +106,16 @@ pub const Connection = struct {
         self.arena.deinit();
     }
 
+    /// Fail the connection with an HTTP/3 error: queue a CONNECTION_CLOSE carrying the
+    /// specific application error code (RFC 9114 8.1) so the peer learns which rule
+    /// broke, then surface error.H3Error to the caller. `close` is idempotent, so a
+    /// second failure does not overwrite the first. The integrator drains the close
+    /// via data_to_send.
+    fn fail(self: *Connection, code: h3_error.ErrorCode, reason: []const u8) Error {
+        self.qc.close(true, @intFromEnum(code), reason) catch {};
+        return error.H3Error;
+    }
+
     /// Open our unidirectional control stream and send SETTINGS as its first frame
     /// (RFC 9114 6.2.1, 7.2.4). A conformant peer treats the absence of our SETTINGS
     /// as H3_MISSING_SETTINGS and may refuse to send requests, so this must precede
@@ -209,7 +219,7 @@ pub const Connection = struct {
             u.utype = d.utype;
             consumed += d.len;
             if (d.utype == .control) {
-                if (self.control_recv_id != null) return error.H3Error; // a 2nd control stream
+                if (self.control_recv_id != null) return self.fail(.stream_creation_error, "a second control stream");
                 self.control_recv_id = id;
             }
         }
@@ -231,11 +241,16 @@ pub const Connection = struct {
             // drain it rather than letting its bytes accrete.
             _ => consumed = ready.len,
         }
-        if (consumed > 0) self.qc.consumeStream(id, consumed);
         // Reclaim a finished/reset ignored uni stream so a peer cannot grow the maps
         // by opening-and-finishing many of them. The control stream is critical (RFC
         // 9114 6.2.1) and kept for the connection's life; the rest are disposable.
-        if (u.utype.? != .control and (self.qc.streamFinished(id) or self.qc.streamReset(id))) {
+        const ignored_done = u.utype.? != .control and (self.qc.streamFinished(id) or self.qc.streamReset(id));
+        // Consume even zero bytes when the stream just finished: a bare FIN at the
+        // final offset (arriving in its own frame after the content was already
+        // drained) leaves nothing new to consume, but the consume is what flips the
+        // recv state to terminal so dropStream can reclaim it.
+        if (consumed > 0 or ignored_done) self.qc.consumeStream(id, consumed);
+        if (ignored_done) {
             if (self.qc.dropStream(id)) _ = self.uni_streams.remove(id);
         }
     }
@@ -246,16 +261,16 @@ pub const Connection = struct {
     /// unparsable or duplicate-id SETTINGS is a connection error).
     fn onControlFrame(self: *Connection, u: *UniStream, f: h3_frame.Frame) Error!void {
         if (f.ftype == .settings) {
-            if (u.settings_seen) return error.H3Error; // a second SETTINGS (frame_unexpected)
-            const s = h3_stream.parseSettings(f.payload) catch return error.H3Error; // settings_error
+            if (u.settings_seen) return self.fail(.frame_unexpected, "second SETTINGS");
+            const s = h3_stream.parseSettings(f.payload) catch return self.fail(.settings_error, "malformed SETTINGS");
             u.settings_seen = true;
             self.peer_settings = s;
             return;
         }
-        if (f.ftype == .data or f.ftype == .headers) return error.H3Error; // illegal on control
+        if (f.ftype == .data or f.ftype == .headers) return self.fail(.frame_unexpected, "DATA/HEADERS on the control stream");
         // Any other frame (GOAWAY, MAX_PUSH_ID, grease) before SETTINGS means the
         // first frame was not SETTINGS - missing_settings; after, it is ignored.
-        if (!u.settings_seen) return error.H3Error; // missing_settings
+        if (!u.settings_seen) return self.fail(.missing_settings, "control stream did not begin with SETTINGS");
     }
 
     fn onFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame) Error!void {
@@ -267,16 +282,16 @@ pub const Connection = struct {
                 rs.state = .headers_done;
             },
             .data => {
-                if (rs.state != .headers_done) return error.H3Error; // DATA before HEADERS (RFC 9114 4.1)
-                rs.body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return error.H3Error;
+                if (rs.state != .headers_done) return self.fail(.frame_unexpected, "DATA before HEADERS"); // RFC 9114 4.1
+                rs.body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return self.fail(.message_error, "request body length overflow");
                 // More body than the declared Content-Length is malformed (RFC 9114 4.1.2).
-                if (rs.content_length) |cl| if (rs.body_received > cl) return error.H3Error;
+                if (rs.content_length) |cl| if (rs.body_received > cl) return self.fail(.message_error, "body exceeds Content-Length");
                 const body = try self.dupe(f.payload);
                 try self.push(.{ .data = .{ .data = body, .stream_id = id } });
             },
             // Control-stream frames are not allowed on a request stream (RFC 9114
             // 7.1): H3_FRAME_UNEXPECTED.
-            .cancel_push, .settings, .push_promise, .goaway, .max_push_id => return error.H3Error,
+            .cancel_push, .settings, .push_promise, .goaway, .max_push_id => return self.fail(.frame_unexpected, "control frame on a request stream"),
             // Any other (unknown) frame type, grease or not, MUST be ignored on
             // receipt (RFC 9114 9). The frame is already fully buffered, so the pump
             // loop skips it by Decoded.len.
@@ -1190,6 +1205,41 @@ test "DATA on the control stream is unexpected" {
     try testing.expectError(error.H3Error, h3.pump(2));
 }
 
+test "a control-stream violation closes with the specific H3 error code" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    // First control-stream frame is GOAWAY, not SETTINGS: H3_MISSING_SETTINGS (0x10a).
+    var ctrl: std.ArrayListUnmanaged(u8) = .empty;
+    defer ctrl.deinit(gpa);
+    try ctrl.append(gpa, 0x00);
+    try h3_frame.append(&ctrl, gpa, .goaway, &.{0x00});
+    const dgram = try buildUni(gpa, &dcid, 2, 0, ctrl.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try testing.expectError(error.H3Error, h3.pump(2));
+    try testing.expect(qc.closed);
+
+    // The queued CONNECTION_CLOSE carries the application error H3_MISSING_SETTINGS.
+    // Feed each built datagram separately (an ACK may precede the close packet).
+    var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    quic_conn.testInstallAppKeys(&peer);
+    const buf = qc.datagramsToSend();
+    var off: usize = 0;
+    for (qc.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+    const pc = peer.peer_close.?;
+    try testing.expect(pc.app);
+    try testing.expectEqual(@intFromEnum(h3_error.ErrorCode.missing_settings), pc.error_code);
+}
+
 test "a QPACK encoder stream is drained and ignored" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0xcc, 0xcd, 0xce, 0xcf };
@@ -1226,6 +1276,44 @@ test "a finished ignored uni stream is reclaimed" {
     try h3.pump(2);
 
     // The finished ignored stream is dropped from both maps, not retained.
+    var ids: [4]u64 = undefined;
+    try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
+    try testing.expectEqual(@as(u32, 0), h3.uni_streams.count());
+}
+
+test "an ignored uni stream finished by a separate FIN is still reclaimed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xf5, 0xf6, 0xf7, 0xf8 };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    // Datagram 1: push stream type + 1 byte, no FIN. The content is consumed.
+    var d1: std.ArrayListUnmanaged(u8) = .empty;
+    defer d1.deinit(gpa);
+    try d1.append(gpa, 0x0a); // STREAM, LEN, no FIN
+    try varint.append(&d1, gpa, 2);
+    try varint.append(&d1, gpa, 2);
+    try d1.appendSlice(gpa, &.{ 0x01, 0xaa }); // push type + a byte
+    const dg1 = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 0, d1.items);
+    defer gpa.free(dg1);
+    try qc.receiveDatagram(dg1, 1000);
+    try h3.pump(2);
+
+    // Datagram 2: a bare FIN at offset 2 (no new bytes). The reclamation must still
+    // fire even though this pump consumes nothing new.
+    var d2: std.ArrayListUnmanaged(u8) = .empty;
+    defer d2.deinit(gpa);
+    try d2.append(gpa, 0x0f); // STREAM, OFF|LEN|FIN
+    try varint.append(&d2, gpa, 2);
+    try varint.append(&d2, gpa, 2); // offset 2
+    try varint.append(&d2, gpa, 0); // zero length
+    const dg2 = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 1, d2.items);
+    defer gpa.free(dg2);
+    try qc.receiveDatagram(dg2, 1100);
+    try h3.pump(2);
+
     var ids: [4]u64 = undefined;
     try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
     try testing.expectEqual(@as(u32, 0), h3.uni_streams.count());
