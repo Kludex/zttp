@@ -11,7 +11,9 @@
 //! transport has for each known request stream and advances the per-stream parse.
 
 const std = @import("std");
+const ascii = @import("../ascii.zig");
 const events = @import("../events.zig");
+const fields = @import("../fields.zig");
 const quic_conn = @import("../quic/connection.zig");
 const quic_stream = @import("../quic/stream.zig");
 const h3_frame = @import("frame.zig");
@@ -33,6 +35,10 @@ const ReqState = enum { idle, headers_done, done };
 
 const RequestStream = struct {
     state: ReqState = .idle,
+    /// The declared request body length (RFC 9114 4.1.2), or null if no
+    /// Content-Length was sent. Reconciled against the DATA bytes at the FIN.
+    content_length: ?u64 = null,
+    body_received: u64 = 0,
 };
 
 /// Outbound (response) state per stream, so the send API cannot serialize invalid
@@ -103,6 +109,9 @@ pub const Connection = struct {
             consumed_total += d.len;
         }
         if (self.qc.streamFinished(id) and rs.state == .headers_done) {
+            // Fewer body bytes than the declared Content-Length is malformed (RFC
+            // 9114 4.1.2); the over-count is caught per-DATA above.
+            if (rs.content_length) |cl| if (rs.body_received != cl) return error.H3Error;
             try self.push(.{ .end_of_message = .{ .trailers = &.{}, .stream_id = id } });
             rs.state = .done;
         }
@@ -113,12 +122,15 @@ pub const Connection = struct {
         switch (f.ftype) {
             .headers => {
                 if (rs.state != .idle) return error.H3Error; // trailers after body are a follow-up
-                const req = try self.decodeRequest(id, f.payload);
+                const req = try self.decodeRequest(id, f.payload, rs);
                 try self.push(.{ .request = req });
                 rs.state = .headers_done;
             },
             .data => {
                 if (rs.state != .headers_done) return error.H3Error; // DATA before HEADERS (RFC 9114 4.1)
+                rs.body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return error.H3Error;
+                // More body than the declared Content-Length is malformed (RFC 9114 4.1.2).
+                if (rs.content_length) |cl| if (rs.body_received > cl) return error.H3Error;
                 const body = try self.dupe(f.payload);
                 try self.push(.{ .data = .{ .data = body, .stream_id = id } });
             },
@@ -132,41 +144,61 @@ pub const Connection = struct {
 
     /// Collapse a QPACK-decoded field section into a Request, pulling the four
     /// pseudo-headers into the shared shape and keeping the rest as headers.
-    fn decodeRequest(self: *Connection, id: u64, block: []const u8) Error!events.Request {
-        const fields = self.qpack_dec.decode(block) catch return error.H3Error;
-        var method: []const u8 = "";
-        var path: []const u8 = "";
-        var authority: []const u8 = "";
-        var scheme: []const u8 = "";
+    fn decodeRequest(self: *Connection, id: u64, block: []const u8, rs: *RequestStream) Error!events.Request {
+        const decoded = self.qpack_dec.decode(block) catch return error.H3Error;
+        var method: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var authority: ?[]const u8 = null;
+        var scheme: ?[]const u8 = null;
         var regular: std.ArrayListUnmanaged(Header) = .empty;
         defer regular.deinit(self.gpa);
         var seen_regular = false;
 
-        for (fields) |h| {
+        for (decoded) |h| {
             if (h.name.len > 0 and h.name[0] == ':') {
                 if (seen_regular) return error.H3Error; // pseudo after regular (RFC 9114 4.3)
-                if (eql(h.name, ":method")) method = h.value else if (eql(h.name, ":path")) path = h.value else if (eql(h.name, ":authority")) authority = h.value else if (eql(h.name, ":scheme")) scheme = h.value else return error.H3Error;
+                // A request pseudo-header appears at most once (RFC 9114 4.3.1 ->
+                // RFC 9113 8.3); a duplicate is malformed.
+                const slot = if (eql(h.name, ":method")) &method else if (eql(h.name, ":path")) &path else if (eql(h.name, ":authority")) &authority else if (eql(h.name, ":scheme")) &scheme else return error.H3Error;
+                if (slot.* != null) return error.H3Error;
+                slot.* = h.value;
             } else {
                 seen_regular = true;
+                // RFC 9114 4.2 inherits the HTTP/2 field rules: lowercase token
+                // names, no connection-specific fields, and TE only "trailers".
+                if (!fields.isValidFieldName(h.name)) return error.H3Error;
+                if (!fields.validValue(h.value)) return error.H3Error;
+                if (fields.isConnectionSpecific(h.name)) return error.H3Error;
+                if (eql(h.name, "te") and !eql(h.value, "trailers")) return error.H3Error;
+                if (eql(h.name, "content-length")) {
+                    const cl = ascii.parseDecimal(u64, h.value) orelse return error.H3Error;
+                    // A repeated Content-Length is malformed unless it agrees (RFC 9110).
+                    if (rs.content_length) |prev| {
+                        if (prev != cl) return error.H3Error;
+                    } else rs.content_length = cl;
+                }
                 regular.append(self.gpa, h) catch return error.OutOfMemory;
             }
         }
-        if (method.len == 0 or path.len == 0 or scheme.len == 0) return error.H3Error;
+        const method_v = method orelse return error.H3Error;
+        const path_v = path orelse return error.H3Error;
+        const scheme_v = scheme orelse return error.H3Error;
+        if (method_v.len == 0 or path_v.len == 0 or scheme_v.len == 0) return error.H3Error;
 
         // Materialise everything into the arena so the slices outlive the next
         // QPACK decode (which clears its store).
         const a = self.arena.allocator();
         var headers: std.ArrayListUnmanaged(Header) = .empty;
-        if (authority.len > 0) {
-            headers.append(a, .{ .name = "host", .value = try a.dupe(u8, authority) }) catch return error.OutOfMemory;
+        if (authority) |auth| {
+            if (auth.len > 0) headers.append(a, .{ .name = "host", .value = try a.dupe(u8, auth) }) catch return error.OutOfMemory;
         }
         for (regular.items) |h| {
             headers.append(a, .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) }) catch return error.OutOfMemory;
         }
-        const target = try a.dupe(u8, path);
+        const target = try a.dupe(u8, path_v);
         const q = std.mem.indexOfScalar(u8, target, '?');
         return .{
-            .method = try a.dupe(u8, method),
+            .method = try a.dupe(u8, method_v),
             .target = target,
             .path = if (q) |i| target[0..i] else target,
             .query = if (q) |i| target[i + 1 ..] else target[target.len..],
@@ -352,6 +384,49 @@ test "a request stream id above 2^32 is not truncated" {
     try testing.expectEqual(big_id, ev.request.stream_id);
 }
 
+// Feed a HEADERS frame whose QPACK block is `qpack_block` and return the result of
+// pumping stream 0 - so a malformed-request test asserts the H3Error directly.
+fn pumpHeaders(gpa: std.mem.Allocator, qpack_block: []const u8) Error!void {
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var qc = quic_conn.Connection.init(gpa, .server, &dcid) catch return error.H3Error;
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+    var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer h3_bytes.deinit(gpa);
+    h3_frame.append(&h3_bytes, gpa, .headers, qpack_block) catch return error.H3Error;
+    const dgram = buildRequest(gpa, &dcid, 0, h3_bytes.items) catch return error.H3Error;
+    defer gpa.free(dgram);
+    qc.receiveDatagram(dgram, 1000) catch return error.H3Error;
+    try h3.pump(0);
+}
+
+test "a duplicate request pseudo-header is malformed" {
+    // :method GET twice (RFC 9113 8.3 via RFC 9114 4.3.1).
+    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0xC0 | 17 }));
+}
+
+test "an uppercase field name is malformed" {
+    // literal name "Te" (0x20|2), value "x": a non-lowercase token (RFC 9114 4.2).
+    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 2, 'T', 'e', 0x01, 'x' }));
+}
+
+test "a connection-specific field is malformed" {
+    // literal name "connection" (len 10: 3-bit prefix 7 + continuation 3), value "x".
+    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 7, 0x03, 'c', 'o', 'n', 'n', 'e', 'c', 't', 'i', 'o', 'n', 0x01, 'x' }));
+}
+
+test "TE with a value other than trailers is malformed" {
+    // literal name "te" (0x20|2), value "gzip".
+    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 2, 't', 'e', 0x04, 'g', 'z', 'i', 'p' }));
+}
+
+test "TE trailers is accepted" {
+    // The one legal TE value (RFC 9114 4.2): te: trailers must NOT be rejected.
+    try pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 2, 't', 'e', 0x08, 't', 'r', 'a', 'i', 'l', 'e', 'r', 's' });
+}
+
 test "a request with a body yields request then data" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0xab, 0xcd, 0xef, 0x01 };
@@ -376,6 +451,67 @@ test "a request with a body yields request then data" {
     const data_ev = h3.nextEvent();
     try testing.expect(data_ev == .data);
     try testing.expectEqualStrings("body!", data_ev.data.data);
+}
+
+// Build a request datagram whose STREAM frame sets the FIN bit, so the H3 layer
+// sees the stream end (needed to exercise the Content-Length reconciliation).
+fn buildRequestFin(gpa: std.mem.Allocator, dcid: []const u8, h3_bytes: []const u8) ![]u8 {
+    const varint = @import("../quic/varint.zig");
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x0b); // STREAM, LEN|FIN set, no OFF
+    try varint.append(&sframe, gpa, 0); // stream id 0
+    try varint.append(&sframe, gpa, h3_bytes.len);
+    try sframe.appendSlice(gpa, h3_bytes);
+    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, 0, sframe.items);
+}
+
+// HEADERS for POST / with a content-length header of `cl` (e.g. "5").
+fn postWithContentLength(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, cl: []const u8) !void {
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    defer block.deinit(gpa);
+    try block.appendSlice(gpa, &.{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1 }); // POST https /
+    try block.appendSlice(gpa, &.{ 0x20 | 7, @intCast(14 - 7) }); // literal name len 14
+    try block.appendSlice(gpa, "content-length");
+    try block.append(gpa, @intCast(cl.len)); // value, 7-bit length prefix
+    try block.appendSlice(gpa, cl);
+    try h3_frame.append(out, gpa, .headers, block.items);
+}
+
+test "the body matching Content-Length is accepted, a mismatch is malformed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4 };
+
+    {
+        var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+        defer qc.deinit();
+        quic_conn.testInstallAppKeys(&qc);
+        var h3 = Connection.init(gpa, &qc);
+        defer h3.deinit();
+        var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer h3_bytes.deinit(gpa);
+        try postWithContentLength(&h3_bytes, gpa, "5");
+        try h3_frame.append(&h3_bytes, gpa, .data, "body!");
+        const dgram = try buildRequestFin(gpa, &dcid, h3_bytes.items);
+        defer gpa.free(dgram);
+        try qc.receiveDatagram(dgram, 1000);
+        try h3.pump(0); // 5 bytes == content-length 5: clean EOM
+    }
+    {
+        var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+        defer qc.deinit();
+        quic_conn.testInstallAppKeys(&qc);
+        var h3 = Connection.init(gpa, &qc);
+        defer h3.deinit();
+        var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer h3_bytes.deinit(gpa);
+        try postWithContentLength(&h3_bytes, gpa, "10"); // declares 10, sends 5
+        try h3_frame.append(&h3_bytes, gpa, .data, "body!");
+        const dgram = try buildRequestFin(gpa, &dcid, h3_bytes.items);
+        defer gpa.free(dgram);
+        try qc.receiveDatagram(dgram, 1000);
+        try testing.expectError(error.H3Error, h3.pump(0));
+    }
 }
 
 test "DATA before HEADERS is rejected" {
