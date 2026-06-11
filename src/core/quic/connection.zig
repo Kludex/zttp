@@ -235,9 +235,11 @@ pub const Connection = struct {
         const datagram_len = self.out.items.len - start;
         self.out_lengths.append(self.gpa, datagram_len) catch return error.OutOfMemory;
         // A pure-ACK packet is not ack-eliciting, so it is not in flight: not
-        // congestion-controlled or retransmitted (RFC 9002 2, 7).
+        // congestion-controlled or retransmitted (RFC 9002 2, 7). Only in-flight
+        // packets count toward bytes_in_flight - charging a pure ACK would inflate it
+        // permanently, since the ACK/loss paths only credit back in-flight packets.
         st.rec.onSent(self.gpa, .{ .pn = pn, .sent_time = now, .size = datagram_len, .ack_eliciting = ack_eliciting, .in_flight = ack_eliciting }) catch return error.OutOfMemory;
-        self.cc.onSent(datagram_len);
+        if (ack_eliciting) self.cc.onSent(datagram_len);
         st.next_pn += 1;
         return pn;
     }
@@ -439,18 +441,28 @@ pub const Connection = struct {
     fn sendProbe(self: *Connection, space: Space, pn: u64, now: u64) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
         if (st.stream_sent.get(pn)) |sent| {
-            if (self.send_streams.get(sent.id)) |s| try s.onLost(sent.offset, sent.len, sent.fin);
-            return;
+            if (self.send_streams.get(sent.id)) |s| {
+                try s.onLost(sent.offset, sent.len, sent.fin);
+                // If the original data was already acked, onLost clips the range to
+                // nothing (it is below base_offset) and queues no resend. Fall through
+                // to a PING so a probe still reaches the wire - otherwise the PTO
+                // advanced its backoff/latch with nothing sent and the timer would
+                // spin on an unsatisfiable deadline.
+                if (s.pending()) return;
+            }
         }
-        // No STREAM data to resend (a CRYPTO or PING packet): a PING is a valid probe
-        // that elicits an ACK. Retransmitting lost CRYPTO data on PTO - so the
-        // handshake itself recovers from tail loss - is a separate follow-up; here the
-        // PING at least keeps the timer and recovery loop alive.
+        // No STREAM data to resend (a CRYPTO or PING packet, or an already-acked
+        // range): a PING is a valid probe that elicits an ACK. Retransmitting lost
+        // CRYPTO data on PTO - so the handshake itself recovers from tail loss - is a
+        // separate follow-up; here the PING keeps the timer and recovery loop alive.
         try self.sendPing(space, now);
     }
 
     fn sendPing(self: *Connection, space: Space, now: u64) Error!void {
-        _ = try self.buildPacket(space, &[_]u8{0x01}, true, now); // PING (RFC 9000 19.2)
+        // PING (0x01) plus PADDING (0x00): the padding makes the packet long enough
+        // for the 16-byte header-protection sample (a bare 1-byte PING is too short),
+        // and PADDING is legal in every space. PING makes it ack-eliciting.
+        _ = try self.buildPacket(space, &([_]u8{0x01} ++ [_]u8{0x00} ** 19), true, now);
     }
 
     // ---- TLS handshake drive ---------------------------------------------------
@@ -1413,6 +1425,34 @@ test "onTimeout without an intervening flush does not inflate the backoff" {
     // must not re-fire and double the backoff again: the anchor has not advanced.
     try sender.onTimeout(after_first + 1);
     try testing.expectEqual(after_first, sender.nextTimeout().?);
+}
+
+test "a PTO on a probe whose data was already acked sends a PING, not nothing" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xAB, 0xCD, 0xEF, 0x01 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    try sender.sendStreamData(1, "tail", true);
+    try sender.flushSend(1000); // pn 0 carries [0,4)+FIN
+    const d1 = sender.nextTimeout().?;
+    try sender.onTimeout(d1 + 1); // PTO -> re-queue [0,4)
+    try sender.flushSend(d1 + 2); // probe is pn 1, same range; pn 0 still in flight
+    sender.clearSend();
+
+    // ACK the ORIGINAL (pn 0): its data is now acked, base_offset advances past it.
+    const ack = try buildAppAck(gpa, &dcid, 0, 0, 0);
+    defer gpa.free(ack);
+    try sender.receiveDatagram(ack, d1 + 3); // also releases the latch
+
+    // The probe (pn 1) is still in flight, so a PTO arms for it. Firing it must put
+    // SOMETHING on the wire (a PING, sent inline by sendProbe) - re-queueing the
+    // already-acked range yields no STREAM resend, and a no-send would spin the timer.
+    const d2 = sender.nextTimeout().?;
+    try sender.onTimeout(d2 + 1);
+    try testing.expectEqual(@as(usize, 1), sender.datagramLengths().len); // a PING probe left
+    try testing.expect(!sender.hasPendingSend()); // no STREAM resend was queued
 }
 
 test "ACK progress releases the PTO latch so a later loss can re-fire" {
