@@ -28,7 +28,10 @@ pub const Config = struct {
     ephemeral_seed: [32]u8, // feeds keyshare.ephemeral
     signer: sign.Signer,
     cert_chain: []const u8, // DER cert_data the Certificate message carries
-    alpn: ?[]const u8 = null, // the selected protocol to echo into EncryptedExtensions
+    /// The server's application protocol. When set, the ClientHello must offer it
+    /// (RFC 9001 8.1 makes ALPN mandatory) and it is echoed into
+    /// EncryptedExtensions; null skips negotiation - a transport-test affordance.
+    alpn: ?[]const u8 = null,
     transport_params: []const u8, // server quic_transport_parameters body
 };
 

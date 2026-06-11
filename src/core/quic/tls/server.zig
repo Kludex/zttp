@@ -22,8 +22,9 @@ pub const Error = error{
     /// derive the same handshake secret. The connection maps this to a TLS decrypt
     /// alert / CONNECTION_CLOSE.
     BadFinished,
-    /// The client offered ALPN but none of its protocols match the server's
-    /// configured protocol (RFC 7301 / RFC 9001 8.1: no_application_protocol).
+    /// The client did not offer the server's configured protocol - either its ALPN
+    /// list lacks it or it sent no ALPN at all, which QUIC forbids (RFC 7301 /
+    /// RFC 9001 8.1: no_application_protocol).
     NoAlpnOverlap,
     /// The flight builder could not produce a flight (keyshare/sign failure) or the
     /// built buffer did not start with a ServerHello - a should-never-happen.
@@ -62,13 +63,14 @@ pub const Server = struct {
         ch: client_hello.ClientHello,
     ) Error!Outcome {
         if (self.state != .wait_client_hello) return error.UnexpectedMessage;
-        // ALPN (RFC 9001 8.1, mandatory in QUIC): if the server has a configured
-        // protocol and the client offered an ALPN list, the configured protocol must
-        // appear in it; otherwise the handshake fails with no_application_protocol.
+        // ALPN (RFC 9001 8.1): application-protocol negotiation is mandatory in
+        // QUIC, so with a configured protocol a ClientHello that omits ALPN
+        // entirely fails exactly like one whose list lacks the protocol -
+        // no_application_protocol either way. A null config.alpn skips negotiation,
+        // a test affordance for exercising the transport without an application.
         if (self.config.alpn) |proto| {
-            if (ch.alpn) |offered| {
-                if (!alpnOffers(offered, proto)) return error.NoAlpnOverlap;
-            }
+            const offered = ch.alpn orelse return error.NoAlpnOverlap;
+            if (!alpnOffers(offered, proto)) return error.NoAlpnOverlap;
         }
         self.transcript.update(ch.raw); // CRITICAL: before flight.build (flight.zig contract)
         const view = flight.ClientHelloView{
@@ -198,6 +200,28 @@ test "onClientFinished verifies the client MAC and completes the handshake" {
     try testing.expect(server.state == .complete);
     // A Finished in the complete state is unexpected.
     try testing.expectError(error.UnexpectedMessage, server.onClientFinished(good));
+}
+
+test "a ClientHello without ALPN is rejected when a protocol is configured" {
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c");
+    var ch_buf = std.ArrayListUnmanaged(u8).empty;
+    defer ch_buf.deinit(testing.allocator);
+    try buildMinimalClientHello(&ch_buf, testing.allocator, pubkey); // no ALPN extension at all
+    const decoded = try client_hello.parse(ch_buf.items);
+
+    // ALPN is mandatory in QUIC (RFC 9001 8.1): omitting it fails like no overlap.
+    var server = Server.init(.{
+        .random = [_]u8{0xAB} ** 32,
+        .ephemeral_seed = [_]u8{0x33} ** 32,
+        .signer = try sign.Signer.fromSeed([_]u8{0x42} ** 32),
+        .cert_chain = &[_]u8{0xCC} ** 48,
+        .alpn = "h3",
+        .transport_params = &[_]u8{ 0x00, 0x01 },
+    });
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.NoAlpnOverlap, server.onClientHello(&out, testing.allocator, decoded.value));
 }
 
 test "a configured ALPN absent from the client offer is rejected" {
