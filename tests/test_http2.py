@@ -53,13 +53,11 @@ def _settings_flags(buf: bytes) -> list[int]:
 
 def _own_settings(buf: bytes) -> dict[int, int]:
     # The first non-ACK SETTINGS frame is the server's own preface; decode it.
-    for ftype, flags, _, payload in _frames(buf):
-        if ftype == 0x04 and not flags & 0x01:
-            return {
-                int.from_bytes(payload[j : j + 2], "big"): int.from_bytes(payload[j + 2 : j + 6], "big")
-                for j in range(0, len(payload), 6)
-            }
-    return {}
+    payload = next(p for ftype, flags, _, p in _frames(buf) if ftype == 0x04 and not flags & 0x01)
+    return {
+        int.from_bytes(payload[j : j + 2], "big"): int.from_bytes(payload[j + 2 : j + 6], "big")
+        for j in range(0, len(payload), 6)
+    }
 
 
 def test_handshake_advertises_real_settings() -> None:
