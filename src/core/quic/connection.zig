@@ -169,6 +169,9 @@ pub const Connection = struct {
     /// The connection-level recv window grew enough to advertise a new MAX_DATA
     /// (RFC 9000 4.1); flushSend emits it so the peer is not stalled at its grant.
     max_data_pending: bool = false,
+    /// Enough request streams completed to advertise a higher bidi cap (RFC 9000 4.6);
+    /// flushSend emits a MAX_STREAMS so the peer is not stuck at the old limit.
+    max_streams_pending: bool = false,
     /// Anti-amplification (RFC 9000 8.1): until the client's address is validated, the
     /// server may send at most AMPLIFICATION_FACTOR x the bytes it has received. A
     /// received Handshake packet (only a real client can produce one) validates the
@@ -467,6 +470,19 @@ pub const Connection = struct {
             while (mf.items.len < 20) mf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
             _ = try self.buildPacket(space, mf.items, true, now);
             self.max_data_pending = false;
+        }
+
+        // Advertise a raised bidi-stream cap if one is pending, so a peer serving a long
+        // run of requests is not stuck at the old MAX_STREAMS limit (RFC 9000 4.6).
+        if (self.max_streams_pending) {
+            if (self.bidi_limit) |*limit| {
+                var msf: std.ArrayListUnmanaged(u8) = .empty;
+                defer msf.deinit(self.gpa);
+                frame.encodeMaxStreams(&msf, self.gpa, true, limit.grant()) catch return error.OutOfMemory;
+                while (msf.items.len < 20) msf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+                _ = try self.buildPacket(space, msf.items, true, now);
+            }
+            self.max_streams_pending = false;
         }
 
         // A conservative single-packet budget: one STREAM frame per packet.
@@ -1143,6 +1159,12 @@ pub const Connection = struct {
         _ = self.streams.remove(id);
         s.deinit();
         self.gpa.destroy(s);
+        // A finished request frees a bidi slot: re-advertise a higher cap once the
+        // headroom ahead of the highest opened stream runs low (RFC 9000 4.6), so a
+        // long-lived connection serving many requests is not stranded at the limit.
+        if (self.bidi_limit) |*limit| {
+            if (stream.StreamType.of(id) == .client_bidi and limit.shouldUpdate()) self.max_streams_pending = true;
+        }
         return true;
     }
 
@@ -1500,6 +1522,39 @@ test "consuming stream data advertises a raised MAX_DATA" {
     try conn.flushSend(2000);
     try testing.expect(!conn.max_data_pending); // emitted
     try testing.expect(conn.datagramLengths().len >= 1);
+}
+
+test "completing request streams advertises a raised MAX_STREAMS" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x55, 0x56, 0x57, 0x58 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.bidi_limit = flow.StreamLimit.init(4); // window 4: opening 3 trips the auto-tune
+
+    // Open, drain and drop three request streams (ids 0, 4, 8). Each is one byte with
+    // FIN, consumed to terminal so dropStream reclaims it and frees a bidi slot.
+    var pn: u64 = 0;
+    for ([_]u64{ 0, 4, 8 }) |id| {
+        var sframe: std.ArrayListUnmanaged(u8) = .empty;
+        defer sframe.deinit(gpa);
+        try frame.encodeStream(&sframe, gpa, id, 0, &[_]u8{0x7a}, true);
+        const dgram = try testBuildApp(gpa, &dcid, pn, sframe.items);
+        defer gpa.free(dgram);
+        try conn.receiveDatagram(dgram, 1000);
+        conn.consumeStream(id, 1);
+        try testing.expect(conn.dropStream(id));
+        pn += 1;
+    }
+    conn.clearSend();
+
+    // Three of four opened crossed the auto-tune threshold: a MAX_STREAMS is queued
+    // and flushSend emits it, sliding the cap to opened (3) + window (4).
+    try testing.expect(conn.max_streams_pending);
+    try conn.flushSend(2000);
+    try testing.expect(!conn.max_streams_pending); // emitted
+    try testing.expect(conn.datagramLengths().len >= 1);
+    try testing.expectEqual(@as(u64, 7), conn.bidi_limit.?.max);
 }
 
 // ---- TLS handshake seam tests ----------------------------------------------
