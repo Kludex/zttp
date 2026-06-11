@@ -332,8 +332,11 @@ pub const Connection = struct {
         var acked_pns: std.ArrayListUnmanaged(u64) = .empty;
         defer acked_pns.deinit(self.gpa);
         var it = frame.ackRanges(a.ranges);
+        // onAck's only failure is the acked_pns append, i.e. OutOfMemory - a
+        // malformed range just stops the walk, it never errors. So surface allocator
+        // pressure as OutOfMemory, not a peer protocol error.
         _ = st.rec.onAck(&self.rtt, &self.cc, now, a.largest, a.delay, a.first_range, &it, &acked_pns, self.gpa) catch
-            return error.ProtocolViolation;
+            return error.OutOfMemory;
         for (acked_pns.items) |pn| {
             if (st.stream_sent.fetchRemove(pn)) |e| {
                 if (self.send_streams.get(e.value.id)) |s| try s.onAck(e.value.offset, e.value.len, e.value.fin);
