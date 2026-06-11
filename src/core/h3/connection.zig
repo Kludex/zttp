@@ -91,6 +91,10 @@ pub const Connection = struct {
     pub fn pump(self: *Connection, id: u64) Error!void {
         // Only client-initiated bidirectional streams carry requests here.
         if (quic_stream.StreamType.of(id) != .client_bidi) return;
+        // Don't recreate H3 state for a stream the transport no longer has (retired
+        // after completion/reset): a late frame for it is already ignored there, and
+        // recreating an idle entry here would resurrect it on the H3 map.
+        if (!self.streams.contains(id) and !self.qc.hasStream(id)) return;
         const gop = self.streams.getOrPut(self.gpa, id) catch return error.OutOfMemory;
         if (!gop.found_existing) gop.value_ptr.* = .{};
         const rs = gop.value_ptr;
@@ -115,7 +119,17 @@ pub const Connection = struct {
             try self.push(.{ .end_of_message = .{ .trailers = &.{}, .stream_id = id } });
             rs.state = .done;
         }
+        // Consume BEFORE dropping: consuming the last byte of a finished stream is
+        // what moves its receive state to terminal, which dropStream then reclaims.
         if (consumed_total > 0) self.qc.consumeStream(id, consumed_total);
+        // Drop the per-stream state on both layers once the request is fully
+        // delivered (EOM) OR the peer reset the stream, so an open-then-reset storm
+        // cannot grow the maps (the memory half of the Rapid-Reset class). The QUIC
+        // send half is retained until its bytes are acked, so a still-in-flight
+        // response is not freed from under recovery.
+        if (rs.state == .done or self.qc.streamReset(id)) {
+            if (self.qc.dropStream(id)) _ = self.streams.remove(id); // rs dangles after this
+        }
     }
 
     fn onFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame) Error!void {
@@ -610,6 +624,108 @@ fn pumpFrames(gpa: std.mem.Allocator, h3_bytes: []const u8) Error!void {
     defer gpa.free(dgram);
     qc.receiveDatagram(dgram, 1000) catch return error.H3Error;
     try h3.pump(0);
+}
+
+test "a completed request stream is dropped and a late frame does not resurrect it" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer h3_bytes.deinit(gpa);
+    try h3_frame.append(&h3_bytes, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 });
+    const dgram = try buildRequestFin(gpa, &dcid, h3_bytes.items); // FIN ends the stream
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pump(0);
+
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expect(h3.nextEvent() == .end_of_message);
+    // The fully-delivered stream is dropped from both maps.
+    var ids: [4]u64 = undefined;
+    try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
+
+    try testing.expectEqual(@as(u32, 0), h3.streams.count()); // H3 map also dropped
+
+    // A duplicate datagram for the now-retired stream is ignored: no resurrection on
+    // either layer, no second request event.
+    try qc.receiveDatagram(dgram, 1100);
+    try h3.pump(0);
+    try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
+    try testing.expectEqual(@as(u32, 0), h3.streams.count());
+    try testing.expect(h3.nextEvent() == .need_data);
+}
+
+test "retiring a higher stream id does not block a new lower one" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xf1, 0xf2, 0xf3, 0xf4 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    var req: std.ArrayListUnmanaged(u8) = .empty;
+    defer req.deinit(gpa);
+    try h3_frame.append(&req, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 });
+
+    // Complete stream 4 first (a watermark would now wrongly retire ids <= 4).
+    const on4 = try buildRequestOnFin(gpa, &dcid, 4, 0, req.items);
+    defer gpa.free(on4);
+    try qc.receiveDatagram(on4, 1000);
+    try h3.pump(4);
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expect(h3.nextEvent() == .end_of_message);
+
+    // A brand-new request on the lower stream 0 must still be delivered.
+    const on0 = try buildRequestOnFin(gpa, &dcid, 0, 1, req.items);
+    defer gpa.free(on0);
+    try qc.receiveDatagram(on0, 1100);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .request);
+}
+
+test "a peer reset reclaims the request stream" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xba, 0xbb, 0xbc, 0xbd };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A RESET_STREAM (type 0x04) on stream 0 with final size 0, in a 1-RTT packet.
+    const varint = @import("../quic/varint.zig");
+    var rframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer rframe.deinit(gpa);
+    try rframe.append(gpa, 0x04); // RESET_STREAM
+    try varint.append(&rframe, gpa, 0); // stream id 0
+    try varint.append(&rframe, gpa, 0x10); // application error code
+    try varint.append(&rframe, gpa, 0); // final size 0
+    const dgram = try quic_conn.testBuildApp(gpa, &dcid, 0, rframe.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pump(0);
+
+    // The reset stream is reclaimed (not left to accrete on a reset storm).
+    var ids: [4]u64 = undefined;
+    try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
+}
+
+// Build a request datagram on `stream_id` with the FIN bit set, at packet number `pn`.
+fn buildRequestOnFin(gpa: std.mem.Allocator, dcid: []const u8, stream_id: u64, pn: u64, h3_bytes: []const u8) ![]u8 {
+    const varint = @import("../quic/varint.zig");
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x0b); // STREAM, LEN|FIN set, no OFF
+    try varint.append(&sframe, gpa, stream_id);
+    try varint.append(&sframe, gpa, h3_bytes.len);
+    try sframe.appendSlice(gpa, h3_bytes);
+    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, pn, sframe.items);
 }
 
 test "DATA before HEADERS is rejected" {

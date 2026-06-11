@@ -164,6 +164,12 @@ pub const Connection = struct {
     /// did. Null until a close arrives. `reason` is an owned copy (the decoded slice
     /// points into the datagram), capped so a hostile reason cannot grow it.
     peer_close: ?PeerClose = null,
+    /// The receive-stream ids that completed and were dropped (see dropStream). A late
+    /// frame for one of these is ignored rather than resurrecting the stream. A set,
+    /// not a watermark: stream ids complete out of order, so a watermark would treat a
+    /// legitimate new lower id as retired. One u64 per retired stream is far smaller
+    /// than the RecvStream it replaces, so this still bounds the per-stream memory.
+    retired_recv: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     /// `client_dcid` is the destination connection id on the client's first
     /// Initial: both endpoints derive the Initial keys from it. The server picks
@@ -227,6 +233,7 @@ pub const Connection = struct {
             self.gpa.destroy(s.*);
         }
         self.send_streams.deinit(self.gpa);
+        self.retired_recv.deinit(self.gpa);
         self.out.deinit(self.gpa);
         self.out_lengths.deinit(self.gpa);
         if (self.peer_close) |pc| self.gpa.free(pc.reason);
@@ -466,7 +473,17 @@ pub const Connection = struct {
             return error.OutOfMemory;
         for (acked_pns.items) |pn| {
             if (st.stream_sent.fetchRemove(pn)) |e| {
-                if (self.send_streams.get(e.value.id)) |s| try s.onAck(e.value.offset, e.value.len, e.value.fin);
+                if (self.send_streams.get(e.value.id)) |s| {
+                    try s.onAck(e.value.offset, e.value.len, e.value.fin);
+                    // A response whose every byte and FIN is now acked has nothing
+                    // left to retransmit; reclaim it so a completed stream's send half
+                    // does not linger (dropStream could not free it while in flight).
+                    if (s.fullyAcked()) {
+                        _ = self.send_streams.remove(e.value.id);
+                        s.deinit();
+                        self.gpa.destroy(s);
+                    }
+                }
             }
             if (st.crypto_sent.fetchRemove(pn)) |e| try st.crypto_send.onAck(e.value.offset, e.value.len, false);
         }
@@ -915,6 +932,7 @@ pub const Connection = struct {
     }
 
     fn onStreamFrame(self: *Connection, id: u64, offset: u64, data: []const u8, fin: bool) Error!void {
+        if (self.isRetired(id)) return; // a late frame for a completed-and-dropped stream
         const s = try self.recvStream(id);
         const delta = s.push(offset, data, fin) catch |e| switch (e) {
             error.FinalSizeError => return error.FinalSizeError,
@@ -927,8 +945,16 @@ pub const Connection = struct {
     }
 
     fn onReset(self: *Connection, id: u64, final_size: u64) Error!void {
+        if (self.isRetired(id)) return; // a reset for an already-completed-and-dropped stream
         const s = try self.recvStream(id);
         s.onReset(final_size) catch return error.FinalSizeError;
+    }
+
+    /// Whether `id` names a recv stream that already completed and was dropped, so a
+    /// late frame for it must be ignored rather than resurrecting it (the dropped
+    /// stream's offset accounting is gone, so re-creating it would re-deliver data).
+    fn isRetired(self: *const Connection, id: u64) bool {
+        return self.retired_recv.contains(id);
     }
 
     fn recvStream(self: *Connection, id: u64) Error!*stream.RecvStream {
@@ -941,6 +967,30 @@ pub const Connection = struct {
             return error.OutOfMemory;
         };
         return s;
+    }
+
+    /// Drop a stream's receive state once it is terminal (fully read or reset), so a
+    /// peer that opens-then-resets streams forever cannot grow the streams map
+    /// unbounded (the memory half of the Rapid-Reset class). The send half is dropped
+    /// only when it has no unacked bytes left to retransmit; otherwise it is retained
+    /// until the ACK path frees it. Returns whether the recv stream was dropped.
+    pub fn dropStream(self: *Connection, id: u64) bool {
+        if (self.send_streams.get(id)) |ss| {
+            if (ss.fullyAcked()) {
+                _ = self.send_streams.remove(id);
+                ss.deinit();
+                self.gpa.destroy(ss);
+            }
+        }
+        const s = self.streams.get(id) orelse return false;
+        if (!s.isTerminal()) return false;
+        // Remember the id as retired BEFORE freeing, so a failure to record it leaves
+        // the stream in place rather than dropped-but-resurrectable.
+        self.retired_recv.put(self.gpa, id, {}) catch return false;
+        _ = self.streams.remove(id);
+        s.deinit();
+        self.gpa.destroy(s);
+        return true;
     }
 
     /// The ordered, not-yet-consumed bytes of a stream (empty if none/unknown).
@@ -966,6 +1016,19 @@ pub const Connection = struct {
     pub fn streamFinished(self: *Connection, id: u64) bool {
         if (self.streams.get(id)) |s| return s.isFinished();
         return false;
+    }
+
+    /// Whether the peer reset this receive stream (RFC 9000 19.4). The H3 layer
+    /// surfaces this as a cancelled request and drops the stream.
+    pub fn streamReset(self: *Connection, id: u64) bool {
+        if (self.streams.get(id)) |s| return s.state == .reset_recvd;
+        return false;
+    }
+
+    /// Whether a receive stream currently exists for `id`. A retired (dropped) or
+    /// never-seen id returns false, so the H3 layer does not recreate state for it.
+    pub fn hasStream(self: *Connection, id: u64) bool {
+        return self.streams.contains(id);
     }
 
     /// Snapshot the ids of every stream the transport currently knows about, into
