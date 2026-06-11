@@ -804,23 +804,31 @@ pub const Connection = struct {
 
         self.seed_store.clearRetainingCapacity();
         self.seed_headers.clearRetainingCapacity();
+
+        // Size seed_store to the full byte total up front so no later append can
+        // reallocate it: every value slice points into this buffer, and a regrow
+        // mid-build would dangle the slices taken before it.
+        var total: usize = method.len + target.len + scheme.len + (if (authority) |a| a.len else 0);
+        for (headers) |h| total += h.name.len + h.value.len;
+        self.seed_store.ensureTotalCapacity(self.gpa, total) catch return error.OutOfMemory;
+
         const copy = struct {
-            fn dup(store: *std.ArrayList(u8), gpa: std.mem.Allocator, bytes: []const u8) SeedError![]const u8 {
+            fn dup(store: *std.ArrayList(u8), bytes: []const u8) []const u8 {
                 const start = store.items.len;
-                store.appendSlice(gpa, bytes) catch return error.OutOfMemory;
+                store.appendSliceAssumeCapacity(bytes); // capacity reserved above
                 return store.items[start..];
             }
         }.dup;
 
-        try self.seed_headers.append(self.gpa, .{ .name = ":method", .value = try copy(&self.seed_store, self.gpa, method) });
-        try self.seed_headers.append(self.gpa, .{ .name = ":path", .value = try copy(&self.seed_store, self.gpa, target) });
-        try self.seed_headers.append(self.gpa, .{ .name = ":scheme", .value = try copy(&self.seed_store, self.gpa, scheme) });
+        try self.seed_headers.append(self.gpa, .{ .name = ":method", .value = copy(&self.seed_store, method) });
+        try self.seed_headers.append(self.gpa, .{ .name = ":path", .value = copy(&self.seed_store, target) });
+        try self.seed_headers.append(self.gpa, .{ .name = ":scheme", .value = copy(&self.seed_store, scheme) });
         if (authority) |a| {
-            try self.seed_headers.append(self.gpa, .{ .name = ":authority", .value = try copy(&self.seed_store, self.gpa, a) });
+            try self.seed_headers.append(self.gpa, .{ .name = ":authority", .value = copy(&self.seed_store, a) });
         }
         for (headers) |h| {
-            const name = try copy(&self.seed_store, self.gpa, h.name);
-            const value = try copy(&self.seed_store, self.gpa, h.value);
+            const name = copy(&self.seed_store, h.name);
+            const value = copy(&self.seed_store, h.value);
             try self.seed_headers.append(self.gpa, .{ .name = name, .value = value });
         }
 
@@ -1454,6 +1462,29 @@ test "a seeded request's bytes survive a later stream's decode (drain discipline
     }
     try testing.expect(saw_marker);
     try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "an h2c seed with many large headers does not dangle its slices" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // Enough bytes that seed_store would have reallocated mid-build under the
+    // naive append-then-slice approach, corrupting the earlier pseudo-header
+    // slices. The value bytes live in a stable buffer here so they survive.
+    const big = "v" ** 256;
+    var hdrs: [40]events.Header = undefined;
+    for (&hdrs) |*h| h.* = .{ .name = "x-pad", .value = big };
+    try c.seedUpgradeRequest("GET", "/target", "http", "example.com", &hdrs);
+    const req = try c.nextEvent();
+    try testing.expectEqualStrings("GET", req.request.method);
+    try testing.expectEqualStrings("/target", req.request.target);
+    var pad: usize = 0;
+    for (req.request.headers) |h| {
+        if (std.mem.eql(u8, h.name, "x-pad")) {
+            try testing.expectEqualStrings(big, h.value);
+            pad += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 40), pad);
 }
 
 test "a malformed h2c seed is rejected" {

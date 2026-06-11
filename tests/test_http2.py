@@ -726,6 +726,19 @@ def test_h2c_seed_then_respond_and_continue_with_the_preface() -> None:
     assert req3.stream_id == 3
 
 
+def test_h2c_seed_with_many_large_headers_is_intact() -> None:
+    # Enough header bytes to force the seed byte-store to grow mid-build; the
+    # method/target and every header must survive (regression: a reallocation
+    # used to dangle the slices taken before it).
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    headers = [(b"host", b"example.com")] + [(b"x-pad", b"v" * 256) for _ in range(40)]
+    conn.seed_upgrade_request(b"GET", b"/target", headers)
+    req = next(e for e in drain_h2(conn) if isinstance(e, zttp.Request))
+    assert req.method == b"GET"
+    assert req.target == b"/target"
+    assert sum(1 for k, v in req.headers if k == b"x-pad" and v == b"v" * 256) == 40
+
+
 def test_h2c_seed_rejects_a_forbidden_header() -> None:
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
     with pytest.raises(zttp.LocalProtocolError):
