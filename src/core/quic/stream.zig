@@ -205,6 +205,13 @@ pub const SendStream = struct {
     fin_sent: bool = false, // the FIN has ridden a frame
     fin_acked: bool = false, // the FIN has been acknowledged
     fin_lost: bool = false, // the FIN's packet was lost; it must ride again
+    /// The application asked to abort the sending part (RFC 9000 19.4). Once set, a
+    /// RESET_STREAM replaces any further data; it rides until acked, re-sent on loss.
+    reset_code: ?u64 = null,
+    reset_final_size: u64 = 0, // frozen at reset(): the same final size every retransmit
+    reset_sent: bool = false, // the RESET_STREAM has ridden a frame
+    reset_acked: bool = false, // the RESET_STREAM has been acknowledged
+    reset_lost: bool = false, // its packet was lost; it must ride again
     /// Byte spans below `sent` whose carrying packet was lost: re-framed first.
     /// Sorted by offset, non-overlapping.
     lost: std.ArrayListUnmanaged(Range) = .empty,
@@ -231,14 +238,47 @@ pub const SendStream = struct {
 
     /// Every written byte (and the FIN, if one was written) has been acknowledged,
     /// so nothing remains to retransmit and the stream can be dropped. Acked bytes
-    /// are freed off the front, so an empty buffer means all bytes are acked.
+    /// are freed off the front, so an empty buffer means all bytes are acked. A reset
+    /// stream is done once its RESET_STREAM is acked (the unsent data is abandoned).
     pub fn fullyAcked(self: *const SendStream) bool {
+        if (self.reset_code != null) return self.reset_acked;
         return self.buf.items.len == 0 and (!self.fin or self.fin_acked);
     }
 
+    /// Abort the sending part with `error_code` (RFC 9000 19.4). The first reset wins;
+    /// a later reset is a no-op. The final size is FROZEN here (the bytes written so
+    /// far) so every retransmitted RESET_STREAM carries the same value; a later write
+    /// is rejected (see write), which would otherwise change end() and the final size.
+    pub fn reset(self: *SendStream, error_code: u64) void {
+        if (self.reset_code != null) return;
+        self.reset_final_size = self.end();
+        self.reset_code = error_code;
+    }
+
+    /// A RESET_STREAM frame needs to ride: the stream is reset and the frame has not
+    /// yet been sent, or its packet was lost and it must be re-sent.
+    pub fn resetOwed(self: *const SendStream) bool {
+        return self.reset_code != null and !self.reset_acked and (!self.reset_sent or self.reset_lost);
+    }
+
+    pub fn onResetSent(self: *SendStream) void {
+        self.reset_sent = true;
+        self.reset_lost = false;
+    }
+
+    pub fn onResetAck(self: *SendStream) void {
+        self.reset_acked = true;
+    }
+
+    pub fn onResetLost(self: *SendStream) void {
+        if (!self.reset_acked) self.reset_lost = true;
+    }
+
     /// Queue `data` and/or mark the stream finished. Writing after the stream is
-    /// finished would exceed the final size (RFC 9000 4.5), so it is rejected.
+    /// finished would exceed the final size (RFC 9000 4.5), so it is rejected; a write
+    /// after a reset is likewise rejected (it would move the frozen reset final size).
     pub fn write(self: *SendStream, data: []const u8, fin: bool) Error!void {
+        if (self.reset_code != null and data.len != 0) return error.FinalSizeError;
         if (self.fin and (data.len != 0 or !fin)) return error.FinalSizeError;
         self.buf.appendSlice(self.gpa, data) catch return error.OutOfMemory;
         if (fin) self.fin = true;

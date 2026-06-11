@@ -270,6 +270,23 @@ pub fn encodeMaxStreams(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator
     try varint.append(out, gpa, max);
 }
 
+/// Append a RESET_STREAM frame (RFC 9000 19.4): abruptly terminate the sending part
+/// of `stream_id` with `error_code`, declaring `final_size` as the total bytes sent.
+pub fn encodeResetStream(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, stream_id: u64, error_code: u64, final_size: u64) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.reset_stream));
+    try varint.append(out, gpa, stream_id);
+    try varint.append(out, gpa, error_code);
+    try varint.append(out, gpa, final_size);
+}
+
+/// Append a STOP_SENDING frame (RFC 9000 19.5): ask the peer to stop sending on
+/// `stream_id` with `error_code` (the receiving part is no longer wanted).
+pub fn encodeStopSending(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, stream_id: u64, error_code: u64) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.stop_sending));
+    try varint.append(out, gpa, stream_id);
+    try varint.append(out, gpa, error_code);
+}
+
 /// Append a CONNECTION_CLOSE frame (RFC 9000 19.19). `app` selects the application
 /// variant (0x1d, no frame-type field) over the transport variant (0x1c); the
 /// transport variant names the `frame_type` that triggered the error (0 if none).
@@ -450,6 +467,31 @@ test "encodeCrypto round-trips through decode" {
     const d = try decode(out.items);
     try std.testing.expectEqual(@as(u64, 64), d.frame.crypto.offset);
     try std.testing.expectEqualStrings("hello", d.frame.crypto.data);
+    try std.testing.expectEqual(out.items.len, d.len);
+}
+
+test "encodeResetStream round-trips through decode" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodeResetStream(&out, gpa, 4, 0x010c, 42);
+    const d = try decode(out.items);
+    const r = d.frame.reset_stream;
+    try std.testing.expectEqual(@as(u64, 4), r.stream_id);
+    try std.testing.expectEqual(@as(u64, 0x010c), r.error_code);
+    try std.testing.expectEqual(@as(u64, 42), r.final_size);
+    try std.testing.expectEqual(out.items.len, d.len);
+}
+
+test "encodeStopSending round-trips through decode" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodeStopSending(&out, gpa, 8, 0x010c);
+    const d = try decode(out.items);
+    const s = d.frame.stop_sending;
+    try std.testing.expectEqual(@as(u64, 8), s.stream_id);
+    try std.testing.expectEqual(@as(u64, 0x010c), s.error_code);
     try std.testing.expectEqual(out.items.len, d.len);
 }
 
