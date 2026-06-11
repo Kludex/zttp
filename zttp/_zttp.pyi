@@ -81,6 +81,8 @@ class RemoteProtocolError(ProtocolError): ...
 class LocalProtocolError(ProtocolError): ...
 
 class Stream:
+    # A borrowed, re-validated handle to one multiplexed stream - the single send
+    # surface for both HTTP/2 and HTTP/3. Obtained via conn.stream(stream_id).
     stream_id: int
     send_window: int | None
     pending_bytes: int | None
@@ -98,7 +100,18 @@ class Connection:
     # send surface differs, so each is its own type rather than methods that raise
     # at runtime.
     @overload
-    def __new__(cls, role: int, protocol: Literal[3]) -> H3Connection: ...
+    def __new__(
+        cls,
+        role: int,
+        protocol: Literal[3],
+        *,
+        certificate: bytes,
+        private_key: bytes,
+        transport_params: bytes,
+        random: bytes,
+        ephemeral_seed: bytes,
+        alpn: bytes | None = ...,
+    ) -> H3Connection: ...
     @overload
     def __new__(cls, role: int, protocol: Literal[2]) -> H2Connection: ...
     @overload
@@ -130,5 +143,15 @@ class H2Connection(Connection):
     def has_pending_send(self) -> bool: ...
 
 class H3Connection(Connection):
-    # Server read path only: fed by UDP datagrams rather than a byte stream.
-    def receive_datagram(self, datagram: bytes, /) -> None: ...
+    # Fed by UDP datagrams rather than a byte stream. The QUIC handshake is driven
+    # from the server credentials passed at construction. `now` is the integrator's
+    # monotonic clock. data_to_send returns one bytes per UDP datagram (QUIC datagram
+    # boundaries are semantic), not the byte stream the base returns. Sends go through
+    # a Stream handle (conn.stream(req.stream_id)), the same surface HTTP/2 uses; a
+    # Stream send packetises against the most recent `now`.
+    def data_to_send(self) -> list[bytes]: ...  # type: ignore[override]
+    def receive_datagram(self, datagram: bytes, now: int = ..., /) -> None: ...
+    def stream(self, stream_id: int, /) -> Stream: ...
+    def next_timeout(self) -> int | None: ...
+    def handle_timeout(self, now: int, /) -> None: ...
+    def is_closed(self) -> bool: ...

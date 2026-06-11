@@ -234,6 +234,60 @@ pub fn encodeAck(
     try varint.append(out, gpa, first_range);
 }
 
+/// Append an ACK frame from a received-pn range set (RFC 9000 19.3): largest, delay,
+/// the additional-range count, first_range, then each (gap, range_len) pair. This is
+/// the accurate form - a peer with gaps in what it received needs every range.
+pub fn encodeAckRanges(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    ranges: *const @import("ack_ranges.zig").AckRanges,
+    delay: u64,
+) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.ack));
+    try varint.append(out, gpa, ranges.largest().?);
+    try varint.append(out, gpa, delay);
+    // The additional-range count is written after the extra pairs are sized; encode
+    // the pairs into a scratch list, then emit the count + first_range + pairs.
+    var extra: std.ArrayListUnmanaged(u8) = .empty;
+    defer extra.deinit(gpa);
+    const count = try ranges.encodeExtra(&extra, gpa);
+    try varint.append(out, gpa, count);
+    try varint.append(out, gpa, ranges.firstRange());
+    try out.appendSlice(gpa, extra.items);
+}
+
+/// Append a MAX_DATA frame (RFC 9000 19.9): the new connection-wide limit on the
+/// total stream data the peer may send.
+pub fn encodeMaxData(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, max: u64) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.max_data));
+    try varint.append(out, gpa, max);
+}
+
+/// Append a MAX_STREAMS frame (RFC 9000 19.11): the new cap on the number of streams
+/// of the given directionality the peer may open. `bidi` selects bidirectional.
+pub fn encodeMaxStreams(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, bidi: bool, max: u64) !void {
+    try varint.append(out, gpa, @intFromEnum(if (bidi) FrameType.max_streams_bidi else FrameType.max_streams_uni));
+    try varint.append(out, gpa, max);
+}
+
+/// Append a CONNECTION_CLOSE frame (RFC 9000 19.19). `app` selects the application
+/// variant (0x1d, no frame-type field) over the transport variant (0x1c); the
+/// transport variant names the `frame_type` that triggered the error (0 if none).
+pub fn encodeConnectionClose(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    app: bool,
+    error_code: u64,
+    frame_type: u64,
+    reason: []const u8,
+) !void {
+    try varint.append(out, gpa, @intFromEnum(if (app) FrameType.connection_close_app else FrameType.connection_close));
+    try varint.append(out, gpa, error_code);
+    if (!app) try varint.append(out, gpa, frame_type); // transport variant only
+    try varint.append(out, gpa, reason.len);
+    try out.appendSlice(gpa, reason);
+}
+
 /// Append a CRYPTO frame (RFC 9000 19.6): the handshake byte stream for one
 /// packet-number space, carrying `data` at `offset`. Unlike STREAM there are no
 /// flags and the length is always present.

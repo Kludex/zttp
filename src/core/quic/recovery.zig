@@ -86,6 +86,19 @@ pub const Space = struct {
         self.sent.deinit(gpa);
     }
 
+    /// Discard the space (RFC 9001 4.9): forget every in-flight packet, crediting
+    /// their bytes back to congestion control, and clear all timer state. After
+    /// this the space is dead - no loss, no PTO, no retransmission.
+    pub fn discard(self: *Space, cc: *congestion.Controller) void {
+        for (self.sent.items) |p| {
+            if (p.in_flight) cc.onDiscard(p.size); // remove from bytes_in_flight, no cwnd gain
+        }
+        self.sent.clearRetainingCapacity();
+        self.loss_time = null;
+        self.last_ack_eliciting_sent_time = null;
+        self.pto_count = 0;
+    }
+
     pub fn onSent(self: *Space, gpa: std.mem.Allocator, pkt: SentPacket) !void {
         try self.sent.append(gpa, pkt);
         if (pkt.ack_eliciting) self.last_ack_eliciting_sent_time = pkt.sent_time;
