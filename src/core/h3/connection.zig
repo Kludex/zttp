@@ -191,6 +191,24 @@ pub const Connection = struct {
     }
 
     fn pumpRequest(self: *Connection, id: u64) Error!void {
+        // After we send a GOAWAY (RFC 9114 5.2) we have promised not to process a
+        // request stream at or above the advertised id, so a racing or non-compliant
+        // peer that opens one gets no Request event - its bytes are drained (so flow
+        // control is re-granted and the stream is reclaimed) but never surfaced. The
+        // client retries such requests on a fresh connection. A stream we already
+        // began before the GOAWAY is left to complete (it is below the id, or already
+        // tracked).
+        if (self.goaway_sent) |limit| {
+            if (id >= limit and !self.streams.contains(id)) {
+                const pending = self.qc.streamData(id).len;
+                const finished = self.qc.streamFinished(id) or self.qc.streamReset(id);
+                // Drain its bytes (re-grant flow control); consume even zero on a bare
+                // FIN so the recv state reaches terminal and dropStream can reclaim it.
+                if (pending > 0 or finished) self.qc.consumeStream(id, pending);
+                if (finished) _ = self.qc.dropStream(id);
+                return;
+            }
+        }
         // Don't recreate H3 state for a stream the transport no longer has (retired
         // after completion/reset): a late frame for it is already ignored there, and
         // recreating an idle entry here would resurrect it on the H3 map.
@@ -1154,6 +1172,39 @@ test "shutdown rejects a non-request-stream id" {
     // An id past the 62-bit varint range is rejected before any control stream opens.
     try testing.expectError(error.H3Error, h3.shutdown((1 << 62)));
     try testing.expectEqual(@as(usize, 0), qc.datagramsToSend().len); // nothing was sent
+}
+
+test "after GOAWAY a request at or above the id is not processed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x6c, 0x6d, 0x6e, 0x6f };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    var req: std.ArrayListUnmanaged(u8) = .empty;
+    defer req.deinit(gpa);
+    try h3_frame.append(&req, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 });
+
+    try h3.shutdown(8); // we will not process request stream 8 or higher
+
+    // A request on stream 8 (>= the GOAWAY id) is drained, not surfaced.
+    const on8 = try buildRequestOnFin(gpa, &dcid, 8, 0, req.items);
+    defer gpa.free(on8);
+    try qc.receiveDatagram(on8, 1000);
+    try h3.pump(8);
+    try testing.expect(h3.nextEvent() == .need_data); // no request event
+    var ids: [8]u64 = undefined;
+    try testing.expect(qc.streamIds(&ids) == 0); // and the stream is reclaimed
+    try testing.expectEqual(@as(u32, 0), h3.streams.count());
+
+    // A request on stream 0 (below the id) is still processed normally.
+    const on0 = try buildRequestOnFin(gpa, &dcid, 0, 1, req.items);
+    defer gpa.free(on0);
+    try qc.receiveDatagram(on0, 1100);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .request);
 }
 
 test "the response send API rejects invalid sequences and inputs" {
