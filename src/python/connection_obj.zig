@@ -769,7 +769,7 @@ fn borrowHeaders(seq: py.Object) ?BorrowedHeaders {
         }
         const name = c.PySequence_GetItem(item, 0);
         const value = c.PySequence_GetItem(item, 1);
-        py.decref(item); // the pair tuple itself is not needed past this point
+        py.decref(item);
         refs[i * 2] = name; // held (may be null; xdecref-safe) so the buffer survives
         refs[i * 2 + 1] = value;
         if (name == null or value == null) {
@@ -812,7 +812,7 @@ fn h2SplitAuthority(headers: []events.Header, out: *[]events.Header) []const u8 
     for (headers) |h| {
         if (asciiEqlIgnoreCase(h.name, "host") or asciiEqlIgnoreCase(h.name, ":authority")) {
             if (authority.len == 0) authority = h.value;
-            continue; // dropped from the regular list
+            continue;
         }
         headers[n] = h;
         n += 1;

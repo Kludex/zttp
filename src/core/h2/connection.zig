@@ -186,7 +186,6 @@ pub const Connection = struct {
     }
 
     fn dispatch(self: *Connection) H2Error!Event {
-        // Drain any buffered events from the previous frame first.
         if (self.pending_len > 0) return self.popPending();
 
         if (self.consumed >= COMPACT_THRESHOLD and self.consumed * 2 >= self.buf.items.len) self.compact();
@@ -506,7 +505,7 @@ pub const Connection = struct {
         const is_trailer = self.fb_is_trailer;
         const refused = self.fb_refused;
         const ignored = self.fb_ignored;
-        self.fb_stream = null; // block closed
+        self.fb_stream = null;
 
         // Always decode (even when refused/malformed) to keep the dynamic table
         // in sync; a decode failure is connection-fatal COMPRESSION_ERROR.

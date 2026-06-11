@@ -111,8 +111,8 @@ amortized O(n). A peer cannot force an allocation larger than `max_buffer`.
 ### Terminal errors (anti-desync)
 
 A parse error **poisons the connection permanently**: every subsequent
-`next_event()` re-raises it, and `start_next_cycle()` / `reset()` cannot revive a
-failed connection. A desynchronized byte stream can never be re-parsed as if it
+`next_event()` re-raises it, and `start_next_cycle()` cannot revive a failed
+connection. A desynchronized byte stream can never be re-parsed as if it
 were valid.
 
 ### Outbound injection (response splitting)
@@ -134,9 +134,12 @@ them wrong can reintroduce a smuggling or DoS class that the core sidesteps.
 2. **Connection concurrency / request caps.** The host must cap concurrent
    connections and may cap requests-per-connection.
 3. **Bodyless responses (client role).** Responses to `HEAD` and all
-   `1xx` / `204` / `304` have no body regardless of headers. The application
-   **must** call `conn.expect_bodyless()` before parsing such a response, or a
-   keep-alive response stream will desynchronize. (This is h11's contract.)
+   `1xx` / `204` / `304` have no body regardless of headers. The connection
+   handles this automatically: it remembers the method from `send_request` and
+   auto-frames the matching response as bodyless. The integrator's only
+   responsibility is to send the request through the **same** `Connection` so the
+   method is known; parsing a response on a connection that never saw the request
+   will desynchronize a keep-alive stream.
 4. **`Upgrade` / `CONNECT` / `101`.** zttp has no tunnel awareness. After a
    protocol switch the integrator must stop feeding bytes to zttp as HTTP/1.1,
    must not call `start_next_cycle()` on a tunneled connection, and must strip
@@ -148,17 +151,18 @@ them wrong can reintroduce a smuggling or DoS class that the core sidesteps.
 6. **Discard poisoned connections.** When `next_event()` raises
    `RemoteProtocolError`, the connection is terminally failed; the host should
    send an error response (if appropriate) and close it.
-7. **Tune `Limits` for the deployment.** The defaults are conservative; adjust
-   them to the workload and threat profile.
+7. **Know the `Limits`.** The defaults (above) are conservative and are not
+   configurable from the Python API today; the host's own caps (timeouts,
+   concurrency) are the tunable defense.
 
 ## Residual risks
 
 These are not defects in the current parser; they are the places where the
 *system* can still go wrong:
 
-- **Misuse of the integration contract** (items 3-5 above) - a forgotten
-  `expect_bodyless()` or mishandled `CONNECT` can desynchronize a stream that the
-  core itself parses correctly.
+- **Misuse of the integration contract** (items 3-5 above) - parsing a response
+  on a connection that never sent the request, or a mishandled `CONNECT`, can
+  desynchronize a stream that the core itself parses correctly.
 - **Lenient mode.** The Zig core has `strict_crlf` / chunk-strictness toggles that
   default to strict and are **not** exposed through the Python API. If a future
   binding ever exposes them, the bare-LF/CR smuggling classes re-open. Keep

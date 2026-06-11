@@ -423,8 +423,8 @@ test "oversized entry empties the table but still emits the header" {
 }
 
 test "an indexed dynamic header survives a later insert that evicts it" {
-    // Codex caught this: a header that resolves through the dynamic table must not
-    // dangle when a subsequent insert in the SAME block evicts/compacts the store.
+    // A header that resolves through the dynamic table must not dangle when a
+    // subsequent insert in the SAME block evicts/compacts the store.
     // With the offset-into-out_store design, the emitted bytes are copied before
     // any table mutation, so they stay valid.
     var d = Decoder.init(testing.allocator, 70, 1 << 20); // room for ~2 small entries

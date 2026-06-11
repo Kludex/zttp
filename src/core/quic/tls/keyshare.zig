@@ -8,8 +8,8 @@ const std = @import("std");
 
 const X25519 = std.crypto.dh.X25519;
 
-pub const PUBLIC_LEN = X25519.public_length; // 32
-pub const SHARED_LEN = X25519.shared_length; // 32
+pub const PUBLIC_LEN = X25519.public_length;
+pub const SHARED_LEN = X25519.shared_length;
 
 pub const KeyShare = struct {
     public_key: [PUBLIC_LEN]u8,
