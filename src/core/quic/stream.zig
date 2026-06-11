@@ -180,61 +180,216 @@ pub const RecvStream = struct {
     }
 };
 
-/// The send side of one stream: a queue of outbound bytes the connection drains
-/// into STREAM frames. It tracks the offset of the next unsent byte and whether a
-/// FIN is owed, mirroring RecvStream but for the write direction.
+/// The send side of one stream: a retain buffer of all unacked bytes the
+/// connection drains into STREAM frames, plus the bookkeeping to retransmit a
+/// range whose packet was lost. One contiguous `buf` holds [base_offset, end);
+/// the `sent` cursor splits already-framed bytes (left) from never-framed bytes
+/// (right). Lost ranges are re-framed before new bytes (RFC 9002 13.3); acked
+/// bytes are freed off the front. Mirrors RecvStream, but for the write direction.
 pub const SendStream = struct {
     gpa: std.mem.Allocator,
-    /// Bytes queued but not yet framed (drained from the front as they are sent).
-    unsent: std.ArrayListUnmanaged(u8) = .empty,
-    /// The offset of the first byte still in `unsent` - what a STREAM frame for the
-    /// next chunk carries.
-    send_offset: u64 = 0,
-    /// The application has finished writing; a FIN is owed on the last frame.
-    fin: bool = false,
-    /// The FIN has been emitted on a frame, so the stream is fully sent.
-    fin_sent: bool = false,
+    /// Every written, not-yet-acked byte: [base_offset, base_offset + buf.len).
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// Offset of buf.items[0]; everything below is acked and freed.
+    base_offset: u64 = 0,
+    /// Bytes in [base_offset, sent) have ridden a frame; [sent, end) are new. The
+    /// cursor only moves forward (commit); a loss records a `lost` range instead.
+    sent: u64 = 0,
+    fin: bool = false, // the application finished writing; a FIN is owed at end()
+    fin_sent: bool = false, // the FIN has ridden a frame
+    fin_acked: bool = false, // the FIN has been acknowledged
+    fin_lost: bool = false, // the FIN's packet was lost; it must ride again
+    /// Byte spans below `sent` whose carrying packet was lost: re-framed first.
+    /// Sorted by offset, non-overlapping.
+    lost: std.ArrayListUnmanaged(Range) = .empty,
+    /// Acked spans above `base_offset` not yet contiguous with it (out-of-order
+    /// acks): held until the filling ack lets `base_offset` slide through them.
+    /// Sorted, non-overlapping - the send-side mirror of RecvStream.pending.
+    acked_gaps: std.ArrayListUnmanaged(Range) = .empty,
+
+    const Range = struct { offset: u64, len: u64 };
 
     pub fn init(gpa: std.mem.Allocator) SendStream {
         return .{ .gpa = gpa };
     }
 
     pub fn deinit(self: *SendStream) void {
-        self.unsent.deinit(self.gpa);
+        self.buf.deinit(self.gpa);
+        self.lost.deinit(self.gpa);
+        self.acked_gaps.deinit(self.gpa);
     }
 
-    /// Queue `data` to be sent and/or mark the stream finished. Writing after the
-    /// stream has been finished (FIN owed or sent) would push bytes past the
-    /// declared final size (RFC 9000 4.5), so it is rejected.
+    pub fn end(self: *const SendStream) u64 {
+        return self.base_offset + self.buf.items.len;
+    }
+
+    /// Queue `data` and/or mark the stream finished. Writing after the stream is
+    /// finished would exceed the final size (RFC 9000 4.5), so it is rejected.
     pub fn write(self: *SendStream, data: []const u8, fin: bool) Error!void {
         if (self.fin and (data.len != 0 or !fin)) return error.FinalSizeError;
-        self.unsent.appendSlice(self.gpa, data) catch return error.OutOfMemory;
+        self.buf.appendSlice(self.gpa, data) catch return error.OutOfMemory;
         if (fin) self.fin = true;
     }
 
-    /// Whether anything still needs to leave: buffered bytes, or an owed FIN.
+    /// Whether anything still needs to leave: a lost range, an owed FIN, or new
+    /// bytes past the cursor.
     pub fn pending(self: *const SendStream) bool {
-        return self.unsent.items.len > 0 or (self.fin and !self.fin_sent);
+        if (self.lost.items.len > 0 or self.fin_lost) return true;
+        if (self.sent < self.end()) return true;
+        return self.finOwedAtEnd();
     }
 
-    /// The next chunk to frame, capped at `max` bytes. Returns the offset, the
-    /// chunk (a slice into `unsent`, valid until the next `commit`), and whether
-    /// this chunk carries the FIN. Call `commit` once the chunk is framed.
+    /// The next chunk to frame, capped at `max` bytes: a lost range first, then a
+    /// lost FIN with no lost bytes, then new bytes. The data slice borrows from
+    /// `buf` - valid until the next mutation, same as today's contract.
     pub const Chunk = struct { offset: u64, data: []const u8, fin: bool };
     pub fn peek(self: *const SendStream, max: usize) ?Chunk {
-        const n = @min(max, self.unsent.items.len);
-        const carries_fin = self.fin and !self.fin_sent and n == self.unsent.items.len;
+        if (max == 0) {
+            if (self.finOwedAtEnd() and self.sent == self.end()) {
+                return .{ .offset = self.end(), .data = &.{}, .fin = true };
+            }
+            return null;
+        }
+        // 1. Lost ranges first (resend lost data before new, RFC 9002 13.3).
+        if (self.lost.items.len > 0) {
+            const r = self.lost.items[0];
+            const n: usize = @intCast(@min(@as(u64, max), r.len));
+            const lo: usize = @intCast(r.offset - self.base_offset);
+            const carries_fin = self.fin_lost and n == r.len and r.offset + r.len == self.end();
+            return .{ .offset = r.offset, .data = self.buf.items[lo .. lo + n], .fin = carries_fin };
+        }
+        // 2. A lost FIN with no lost bytes left (a FIN-only retransmit).
+        if (self.fin_lost and self.sent == self.end()) {
+            return .{ .offset = self.end(), .data = &.{}, .fin = true };
+        }
+        // 3. New bytes after the cursor.
+        const avail = self.end() - self.sent;
+        const n: usize = @intCast(@min(@as(u64, max), avail));
+        const carries_fin = self.finOwedAtEnd() and @as(u64, n) == avail;
         if (n == 0 and !carries_fin) return null;
-        return .{ .offset = self.send_offset, .data = self.unsent.items[0..n], .fin = carries_fin };
+        const lo: usize = @intCast(self.sent - self.base_offset);
+        return .{ .offset = self.sent, .data = self.buf.items[lo .. lo + n], .fin = carries_fin };
     }
 
-    /// Drop the `n` bytes a framed chunk consumed and, if it carried the FIN, mark
-    /// the FIN sent. `n` must be the length of the chunk returned by `peek`.
-    pub fn commit(self: *SendStream, n: usize, sent_fin: bool) void {
-        std.mem.copyForwards(u8, self.unsent.items[0 .. self.unsent.items.len - n], self.unsent.items[n..]);
-        self.unsent.shrinkRetainingCapacity(self.unsent.items.len - n);
-        self.send_offset += n;
-        if (sent_fin) self.fin_sent = true;
+    fn finOwedAtEnd(self: *const SendStream) bool {
+        return self.fin and !self.fin_acked and (!self.fin_sent or self.fin_lost);
+    }
+
+    /// Record that the chunk `peek` returned at `offset` (length `n`) has been
+    /// framed. A lost-range chunk shrinks the front of `lost`; a new chunk advances
+    /// the cursor. The offset disambiguates which path `peek` took.
+    pub fn commit(self: *SendStream, offset: u64, n: usize, sent_fin: bool) void {
+        if (self.lost.items.len > 0 and offset == self.lost.items[0].offset) {
+            var r = &self.lost.items[0];
+            r.offset += n;
+            r.len -= n;
+            if (r.len == 0) _ = self.lost.orderedRemove(0);
+            if (sent_fin) self.fin_lost = false;
+            return;
+        }
+        // A pure-FIN retransmit (no bytes, FIN owed) or new bytes after the cursor.
+        self.sent += n;
+        if (sent_fin) {
+            self.fin_sent = true;
+            self.fin_lost = false;
+        }
+    }
+
+    /// A packet carrying [offset, offset+len) and possibly the FIN was lost. Record
+    /// the still-unacked sub-range for retransmission. Idempotent and clipped to the
+    /// unacked window, so an already-acked prefix is never re-queued.
+    pub fn onLost(self: *SendStream, offset: u64, len: u64, fin: bool) Error!void {
+        const lo = @max(offset, self.base_offset);
+        const hi = offset + len;
+        if (hi > lo) try self.insertLost(lo, hi - lo);
+        if (fin and !self.fin_acked) self.fin_lost = true;
+    }
+
+    /// A packet carrying [offset, offset+len) and possibly the FIN was acked. Drop
+    /// the span from any pending retransmit and free the now-contiguous prefix.
+    pub fn onAck(self: *SendStream, offset: u64, len: u64, fin: bool) Error!void {
+        const hi = offset + len;
+        if (fin) {
+            self.fin_acked = true;
+            self.fin_lost = false;
+        }
+        try self.dropLost(offset, hi);
+        if (hi <= self.base_offset) return; // wholly below the frontier; already freed
+        if (offset <= self.base_offset) {
+            self.slideBase(hi);
+        } else {
+            try self.insertAckedGap(offset, hi); // out of order: hold until the gap fills
+        }
+    }
+
+    /// Slide `base_offset` up to `new_base`, freeing the prefix, then absorb any
+    /// held acked gaps now made contiguous. `sent` never falls below `base_offset`.
+    fn slideBase(self: *SendStream, new_base_in: u64) void {
+        var new_base = new_base_in;
+        var i: usize = 0;
+        while (i < self.acked_gaps.items.len) {
+            const g = self.acked_gaps.items[i];
+            if (g.offset <= new_base) {
+                new_base = @max(new_base, g.offset + g.len);
+                _ = self.acked_gaps.orderedRemove(i);
+                i = 0; // a merge can unlock an earlier-skipped gap; rescan
+            } else i += 1;
+        }
+        const drop: usize = @intCast(new_base - self.base_offset);
+        const keep = self.buf.items.len - drop;
+        std.mem.copyForwards(u8, self.buf.items[0..keep], self.buf.items[drop..]);
+        self.buf.shrinkRetainingCapacity(keep);
+        self.base_offset = new_base;
+        if (self.sent < self.base_offset) self.sent = self.base_offset;
+    }
+
+    fn insertLost(self: *SendStream, offset: u64, len: u64) Error!void {
+        try self.insertRange(&self.lost, offset, len);
+    }
+
+    fn insertAckedGap(self: *SendStream, offset: u64, hi: u64) Error!void {
+        try self.insertRange(&self.acked_gaps, offset, hi - offset);
+    }
+
+    /// Insert [offset, offset+len) into a sorted, non-overlapping range list,
+    /// coalescing with any touching neighbour. An allocation failure propagates: a
+    /// dropped retransmit or acked-gap record would silently strand bytes, so it is
+    /// surfaced to the caller rather than swallowed.
+    fn insertRange(self: *SendStream, list: *std.ArrayListUnmanaged(Range), offset: u64, len: u64) Error!void {
+        var lo = offset;
+        var hi = offset + len;
+        var i: usize = 0;
+        while (i < list.items.len) {
+            const r = list.items[i];
+            if (r.offset + r.len < lo) {
+                i += 1; // entirely before; keep
+            } else if (r.offset > hi) {
+                break; // entirely after; insert here
+            } else {
+                lo = @min(lo, r.offset);
+                hi = @max(hi, r.offset + r.len);
+                _ = list.orderedRemove(i); // merged in; re-examine this index
+            }
+        }
+        list.insert(self.gpa, i, .{ .offset = lo, .len = hi - lo }) catch return error.OutOfMemory;
+    }
+
+    /// Remove [lo, hi) from the pending retransmit list (it has been acked), keeping
+    /// the remaining fragments. Intersection-based, so a span already absent is a
+    /// no-op.
+    fn dropLost(self: *SendStream, lo: u64, hi: u64) Error!void {
+        var i: usize = 0;
+        while (i < self.lost.items.len) {
+            const r = self.lost.items[i];
+            const rhi = r.offset + r.len;
+            if (rhi <= lo or r.offset >= hi) {
+                i += 1; // disjoint
+                continue;
+            }
+            _ = self.lost.orderedRemove(i);
+            if (r.offset < lo) try self.insertLost(r.offset, lo - r.offset); // left remainder
+            if (rhi > hi) try self.insertLost(hi, rhi - hi); // right remainder
+        }
     }
 };
 
@@ -317,12 +472,12 @@ test "SendStream drains queued bytes in offset-ordered chunks" {
     try std.testing.expectEqual(@as(u64, 0), c1.offset);
     try std.testing.expectEqualStrings("hello", c1.data);
     try std.testing.expect(!c1.fin);
-    s.commit(c1.data.len, false);
+    s.commit(c1.offset, c1.data.len, false);
 
     const c2 = s.peek(100).?;
     try std.testing.expectEqual(@as(u64, 5), c2.offset);
     try std.testing.expectEqualStrings(" world", c2.data);
-    s.commit(c2.data.len, false);
+    s.commit(c2.offset, c2.data.len, false);
     try std.testing.expect(!s.pending());
 }
 
@@ -333,7 +488,7 @@ test "SendStream carries the FIN on the final chunk and forbids later writes" {
     try s.write("data", true); // bytes + FIN
     const c = s.peek(100).?;
     try std.testing.expect(c.fin);
-    s.commit(c.data.len, true);
+    s.commit(c.offset, c.data.len, true);
     try std.testing.expect(!s.pending()); // FIN sent, nothing left
 
     // Writing after FIN would exceed the final size.
@@ -351,6 +506,77 @@ test "SendStream owes a FIN even with no bytes" {
     const c = s.peek(100).?;
     try std.testing.expectEqual(@as(usize, 0), c.data.len);
     try std.testing.expect(c.fin);
-    s.commit(0, true);
+    s.commit(c.offset, 0, true);
     try std.testing.expect(!s.pending());
+}
+
+test "SendStream retains sent bytes until acked, then frees the prefix" {
+    const gpa = std.testing.allocator;
+    var s = SendStream.init(gpa);
+    defer s.deinit();
+    try s.write("abcdefghij", false);
+    const c = s.peek(100).?;
+    s.commit(c.offset, c.data.len, false);
+    try std.testing.expect(!s.pending()); // all sent
+    try std.testing.expectEqual(@as(usize, 10), s.buf.items.len); // but retained
+
+    try s.onAck(0, 4, false); // first 4 bytes acked
+    try std.testing.expectEqual(@as(u64, 4), s.base_offset);
+    try std.testing.expectEqual(@as(usize, 6), s.buf.items.len); // prefix freed
+    try s.onAck(4, 6, false);
+    try std.testing.expectEqual(@as(usize, 0), s.buf.items.len); // fully freed
+}
+
+test "SendStream re-frames a lost range before new bytes" {
+    const gpa = std.testing.allocator;
+    var s = SendStream.init(gpa);
+    defer s.deinit();
+    try s.write("AAAA", false);
+    const a = s.peek(100).?; // [0,4)
+    s.commit(a.offset, a.data.len, false);
+    try s.write("BBBB", false);
+    const b = s.peek(100).?; // [4,8)
+    s.commit(b.offset, b.data.len, false);
+
+    try s.onLost(0, 4, false); // the first packet was lost
+    try std.testing.expect(s.pending());
+    const r = s.peek(100).?; // retransmit comes first
+    try std.testing.expectEqual(@as(u64, 0), r.offset);
+    try std.testing.expectEqualStrings("AAAA", r.data);
+    s.commit(r.offset, r.data.len, false);
+    try std.testing.expect(!s.pending()); // [4,8) was already sent; nothing new
+}
+
+test "SendStream frees out-of-order acks once the gap fills" {
+    const gpa = std.testing.allocator;
+    var s = SendStream.init(gpa);
+    defer s.deinit();
+    try s.write("0123456789", false);
+    const c = s.peek(100).?;
+    s.commit(c.offset, c.data.len, false);
+
+    try s.onAck(5, 5, false); // ack the LATER half first (out of order)
+    try std.testing.expectEqual(@as(u64, 0), s.base_offset); // cannot free yet
+    try std.testing.expectEqual(@as(usize, 10), s.buf.items.len);
+    try s.onAck(0, 5, false); // the filling ack lets base slide through the held gap
+    try std.testing.expectEqual(@as(u64, 10), s.base_offset);
+    try std.testing.expectEqual(@as(usize, 0), s.buf.items.len);
+}
+
+test "SendStream re-sends a lost FIN exactly once" {
+    const gpa = std.testing.allocator;
+    var s = SendStream.init(gpa);
+    defer s.deinit();
+    try s.write("hi", true);
+    const c = s.peek(100).?; // "hi" + FIN
+    try std.testing.expect(c.fin);
+    s.commit(c.offset, c.data.len, true);
+
+    try s.onLost(0, 2, true); // the FIN-carrying packet was lost
+    try std.testing.expect(s.pending());
+    const r = s.peek(100).?;
+    try std.testing.expect(r.fin); // the FIN rides the resend
+    try std.testing.expectEqualStrings("hi", r.data);
+    s.commit(r.offset, r.data.len, true);
+    try std.testing.expect(!s.pending()); // FIN owed exactly once
 }
