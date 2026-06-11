@@ -134,11 +134,13 @@ pub const Connection = struct {
                 const body = try self.dupe(f.payload);
                 try self.push(.{ .data = .{ .data = body, .stream_id = id } });
             },
-            else => {
-                if (h3_frame.isReserved(@intFromEnum(f.ftype))) return; // grease: ignore
-                // SETTINGS/GOAWAY/etc. on a request stream are an error (RFC 9114 7.1).
-                return error.H3Error;
-            },
+            // Control-stream frames are not allowed on a request stream (RFC 9114
+            // 7.1): H3_FRAME_UNEXPECTED.
+            .cancel_push, .settings, .push_promise, .goaway, .max_push_id => return error.H3Error,
+            // Any other (unknown) frame type, grease or not, MUST be ignored on
+            // receipt (RFC 9114 9). The frame is already fully buffered, so the pump
+            // loop skips it by Decoded.len.
+            else => {},
         }
     }
 
@@ -427,6 +429,40 @@ test "TE trailers is accepted" {
     try pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 2, 't', 'e', 0x08, 't', 'r', 'a', 'i', 'l', 'e', 'r', 's' });
 }
 
+test "a control byte in a field value is malformed" {
+    // literal name "x" (0x20|1), value "a\rb": CR is not a field-vchar (RFC 9110).
+    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 1, 'x', 0x03, 'a', '\r', 'b' }));
+}
+
+test "a non-numeric Content-Length is malformed" {
+    // content-length: "x".
+    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1, 0x20 | 7, 0x03, 'c', 'o', 'n', 't', 'e', 'n', 't', '-', 'l', 'e', 'n', 'g', 't', 'h', 0x01, 'x' }));
+}
+
+test "two disagreeing Content-Length values are malformed" {
+    // content-length: 1 then content-length: 2.
+    const cl = [_]u8{ 0x20 | 7, 0x03, 'c', 'o', 'n', 't', 'e', 'n', 't', '-', 'l', 'e', 'n', 'g', 't', 'h' };
+    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &(.{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1 } ++ cl ++ .{ 0x01, '1' } ++ cl ++ .{ 0x01, '2' })));
+}
+
+test "more body than Content-Length is malformed at the DATA frame" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xd1, 0xd2, 0xd3, 0xd4 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+    var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer h3_bytes.deinit(gpa);
+    try postWithContentLength(&h3_bytes, gpa, "2"); // declares 2, sends 5
+    try h3_frame.append(&h3_bytes, gpa, .data, "body!");
+    const dgram = try buildRequest(gpa, &dcid, 0, h3_bytes.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try testing.expectError(error.H3Error, h3.pump(0));
+}
+
 test "a request with a body yields request then data" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0xab, 0xcd, 0xef, 0x01 };
@@ -512,6 +548,51 @@ test "the body matching Content-Length is accepted, a mismatch is malformed" {
         try qc.receiveDatagram(dgram, 1000);
         try testing.expectError(error.H3Error, h3.pump(0));
     }
+}
+
+test "an unknown non-grease frame on a request stream is ignored" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x2a, 0x2b, 0x2c, 0x2d };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer h3_bytes.deinit(gpa);
+    // An unknown frame type 0x2f (not a grease value, not a known control frame)
+    // before the HEADERS: RFC 9114 9 says ignore it, so the request still parses.
+    try h3_frame.append(&h3_bytes, gpa, @enumFromInt(0x2f), "junk");
+    try h3_frame.append(&h3_bytes, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 });
+    const dgram = try buildRequest(gpa, &dcid, 0, h3_bytes.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .request);
+}
+
+test "a SETTINGS frame on a request stream is unexpected" {
+    const gpa = testing.allocator;
+    // SETTINGS (0x04) belongs on the control stream, never a request stream.
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    defer block.deinit(gpa);
+    h3_frame.append(&block, gpa, .settings, "") catch unreachable;
+    try testing.expectError(error.H3Error, pumpFrames(gpa, block.items));
+}
+
+// Feed an arbitrary H3 frame stream (already encoded) and pump stream 0.
+fn pumpFrames(gpa: std.mem.Allocator, h3_bytes: []const u8) Error!void {
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var qc = quic_conn.Connection.init(gpa, .server, &dcid) catch return error.H3Error;
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+    const dgram = buildRequest(gpa, &dcid, 0, h3_bytes) catch return error.H3Error;
+    defer gpa.free(dgram);
+    qc.receiveDatagram(dgram, 1000) catch return error.H3Error;
+    try h3.pump(0);
 }
 
 test "DATA before HEADERS is rejected" {
