@@ -182,12 +182,12 @@ const H2Engine = struct {
         return id;
     }
 
-    /// Seed an h2c-upgraded request as stream 1 (RFC 7540 3.2). The method/target
+    /// Initialise an h2c-upgraded connection: seed the request as stream 1 (RFC 7540 3.2). The method/target
     /// and headers come from the HTTP/1.1 request the server already parsed; scheme
     /// is "http" (h2c is cleartext) and :authority is derived from the host header.
     /// `settings_header` is the base64url HTTP2-Settings value (RFC 7540 3.2.1) the
     /// client sent, or null. Returns true on success, false with a Python error set.
-    fn seedUpgrade(self: *H2Engine, method: []const u8, target: []const u8, hdrs: *BorrowedHeaders, settings_header: ?[]const u8) bool {
+    fn initiateUpgrade(self: *H2Engine, method: []const u8, target: []const u8, hdrs: *BorrowedHeaders, settings_header: ?[]const u8) bool {
         var settings_buf: [256]u8 = undefined;
         var settings: ?[]const u8 = null;
         if (settings_header) |b64| {
@@ -208,7 +208,7 @@ const H2Engine = struct {
         }
         var regular: []events.Header = hdrs.headers;
         const authority = h2SplitAuthority(hdrs.headers, &regular);
-        self.conn.seedUpgradeRequest(method, target, "http", if (authority.len == 0) null else authority, regular, settings) catch |e| switch (e) {
+        self.conn.initiateUpgradeConnection(method, target, "http", if (authority.len == 0) null else authority, regular, settings) catch |e| switch (e) {
             error.Malformed => {
                 _ = py.raise(exceptions.LocalProtocolError, "the upgrade request is not a valid HTTP/2 request (forbidden header or bad pseudo-header)");
                 return false;
@@ -218,7 +218,7 @@ const H2Engine = struct {
                 return false;
             },
             error.AlreadyStarted => {
-                _ = py.raiseRuntime("the connection has already started; seed the upgrade request before feeding any bytes");
+                _ = py.raiseRuntime("the connection has already started; initiate the upgrade before feeding any bytes");
                 return false;
             },
             error.OutOfMemory => {
@@ -1251,7 +1251,7 @@ fn initiate_upgrade_connection(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwds:
     }
     var hdrs = borrowHeaders(hdrs_seq) orelse return null;
     defer hdrs.deinit();
-    if (!e.seedUpgrade(mb, tb, &hdrs, settings_header)) return null;
+    if (!e.initiateUpgrade(mb, tb, &hdrs, settings_header)) return null;
     return makeStream(self_obj, 1);
 }
 
