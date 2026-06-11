@@ -13,11 +13,11 @@ belong to.
 ```python
 import zttp
 
-conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)  # (1)!
+conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
 ```
 
-1.  The only new thing: `protocol=zttp.HTTP2`. Leave it off and you get HTTP/1.1,
-    exactly as before.
+The only new thing is `protocol=zttp.HTTP2`. Leave it off and you get HTTP/1.1,
+exactly as before.
 
 !!! note "Prior knowledge"
     zttp speaks HTTP/2 over a plain connection (the *prior-knowledge* mode, and
@@ -32,23 +32,21 @@ right type for the protocol you asked for:
 ```python
 import zttp
 
-h1 = zttp.Connection(zttp.SERVER)                       # (1)!
-h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)  # (2)!
+h1 = zttp.Connection(zttp.SERVER)
+h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
 
 type(h1).__name__  #> 'H1Connection'
 type(h2).__name__  #> 'H2Connection'
 
-isinstance(h2, zttp.Connection)  #> True  (3)!
+isinstance(h2, zttp.Connection)  #> True
 ```
 
-1.  An `H1Connection`: the message-scoped send API you saw in
-    [Sending](sending.md): `send_response`, `send_data`, `end_message`.
-
-2.  An `H2Connection`: everything is **stream-scoped**, so it has no connection-level
-    `send_data`. You send on a [`Stream`](#streams) instead.
-
-3.  Both are real `Connection` subclasses, so code that only reads (`receive_data`
-    / `next_event` / `data_to_send`) can take either one.
+An `H1Connection` carries the message-scoped send API you saw in
+[HTTP/1.1](http1.md): `send_response`, `send_data`, `end_message` on the base
+connection. An `H2Connection` makes everything **stream-scoped**, so it has no
+connection-level `send_data`; you send on a [`Stream`](#streams) instead. Both
+are real `Connection` subclasses, so code that only reads (`receive_data` /
+`next_event` / `data_to_send`) can take either one.
 
 !!! tip "Your editor knows"
     Because they're distinct types, calling `h2.send_data(...)` is a **type
@@ -61,26 +59,23 @@ isinstance(h2, zttp.Connection)  #> True  (3)!
 Reading is what you already do. The only addition is `stream_id` on every event,
 because one HTTP/2 connection multiplexes many requests at once:
 
-```python title="server_read.py" hl_lines="10"
+```python title="server_read.py"
 import zttp
 
 server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
-server.receive_data(incoming_bytes)  # (1)!
+server.receive_data(incoming_bytes)
 
 while True:
     event = server.next_event()
     if event is zttp.NEED_DATA:
         break
     if isinstance(event, zttp.Request):
-        print(event.method, event.target, event.stream_id)  # (2)!
+        print(event.method, event.target, event.stream_id)
 ```
 
-1.  The bytes off the wire: HTTP/2 frames, not text. Feed whole or in fragments,
-    same as always.
-
-2.  `event.stream_id` tells you which stream this `Request` arrived on. On
-    HTTP/1.1 it's `0`; on HTTP/2 it's the real id, and every `Data` /
-    `EndOfMessage` for that request carries the same id.
+`event.stream_id` tells you which stream this `Request` arrived on. On HTTP/1.1
+it's `0`; on HTTP/2 it's the real id, and every `Data` / `EndOfMessage` for that
+request carries the same id.
 
 A **client** reads the mirror image (`Response` events instead of `Request`),
 again tagged with the `stream_id` of the request they answer.
@@ -102,38 +97,36 @@ it. You get one in two ways, depending on who opens the stream.
 The client **originates** a stream by sending a request, so `send_request`
 hands you the `Stream` back:
 
-```python title="client.py" hl_lines="4"
+```python title="client.py"
 import zttp
 
 client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
-stream = client.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")])  # (1)!
+stream = client.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")])
 
 stream  #> Stream(stream_id=1)
 
-stream.end_message()  # (2)!
+stream.end_message()
 print(client.data_to_send())  # the HTTP/2 frames to put on the wire
 ```
 
-1.  `send_request` opens the stream and returns its `Stream`. The version arg is
-    ignored (it's always `2`), and `:authority` is derived from your `host`
-    header, so a request you'd build for HTTP/1.1 works unchanged.
-
-2.  From here you talk to the **stream**, not the connection: `stream.send_data`,
-    `stream.end_message`.
+The version arg is ignored (it's always `2`), and `:authority` is derived from
+your `host` header, so a request you'd build for HTTP/1.1 works unchanged. From
+here you talk to the **stream**, not the connection: `stream.send_data`,
+`stream.end_message`.
 
 ### Server: answering a stream
 
 The server learns a stream's id by **reading** the request off it. Use
 `conn.stream(id)` to get the handle for the stream you want to answer:
 
-```python title="server.py" hl_lines="7 9"
+```python title="server.py"
 import zttp
 
 server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
 server.receive_data(request_bytes)
-request = next(e for e in drain(server) if isinstance(e, zttp.Request))  # (1)!
+request = next(e for e in drain(server) if isinstance(e, zttp.Request))
 
-stream = server.stream(request.stream_id)  # (2)!
+stream = server.stream(request.stream_id)
 stream.send_response(200, [(b"content-type", b"text/plain")])
 stream.send_data(b"Hello, HTTP/2!")
 stream.end_message()
@@ -141,11 +134,8 @@ stream.end_message()
 print(server.data_to_send())
 ```
 
-1.  `drain` is just a loop over `next_event` until `NEED_DATA`: the events carry
-    the `stream_id` you need.
-
-2.  `conn.stream(id)` returns the handle for that stream. The connection already
-    owns the stream state; this is your typed view onto it.
+`drain` is just a loop over `next_event` until `NEED_DATA`: the events carry the
+`stream_id` you need.
 
 !!! tip "Many streams at once"
     Because each `Stream` names its own id, you can answer requests in **any
@@ -164,34 +154,33 @@ and **parks the rest**. As the peer grants more window (it sends you
 `WINDOW_UPDATE` frames, which arrive as bytes you `receive_data`), zttp drains the
 parked bytes automatically on the next `next_event`:
 
-```python title="flow.py" hl_lines="6 11"
+```python title="flow.py"
 import zttp
 
 stream = server.stream(1)
 stream.send_response(200, [(b"content-type", b"text/plain")])
-stream.send_data(b"a very large body ...")  # (1)!
+stream.send_data(b"a very large body ...")
 out = server.data_to_send()                 # only what the window allowed
 
 # ... later, the peer grants more window ...
-server.receive_data(window_update_bytes)    # (2)!
+server.receive_data(window_update_bytes)
 for event in drain(server):
     ...                                      # a WindowUpdate flows past
-more = server.data_to_send()                 # (3)!  the parked bytes, now freed
+more = server.data_to_send()                 # the parked bytes, now freed
 ```
 
-1.  You hand zttp the whole body. It never blocks and never drops anything: it
-    sends what fits and remembers the rest.
-
-2.  The credit arrives as ordinary inbound bytes. No special call.
-
-3.  The bytes the window now permits are waiting for you, framed and ready.
+You hand zttp the whole body in one `send_data` call: it never blocks and never
+drops anything, sending what fits and remembering the rest. The extra window
+credit arrives as ordinary inbound bytes you `receive_data` - there's no special
+call - and once you drain the events the parked bytes are waiting for you on the
+next `data_to_send`, framed and ready.
 
 !!! note "Buffering is not I/O"
     Parking bytes until the window opens is bookkeeping, not I/O: zttp still
     never touches a socket, never blocks, and never waits. *When* to ask for more
     window and what your event loop does meanwhile stays yours; zttp only decides
     *how many bytes may leave now*. That's the sans-IO line. See
-    [Why sans-IO](../architecture/sans-io.md).
+    [Architecture](../architecture.md).
 
 ## Control events
 
@@ -215,7 +204,7 @@ parked data) on its own, but they're there when you need visibility.
 
 <div class="grid cards" markdown>
 
--   :material-upload-network: **[Sending](sending.md)**
+-   :material-upload-network: **[HTTP/1.1](http1.md)**
 
     ---
 

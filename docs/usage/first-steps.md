@@ -41,7 +41,7 @@ conn.receive_data(b"TP/1.1\r\n") # the rest of it
 
 Then call `next_event()` to get the next thing that happened:
 
-```python title="echo.py" hl_lines="12"
+```python title="echo.py"
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)
@@ -53,18 +53,16 @@ conn.receive_data(
 )
 
 while True:
-    event = conn.next_event()  # (1)!
-    if event is zttp.NEED_DATA:  # (2)!
+    event = conn.next_event()
+    if event is zttp.NEED_DATA:
         break
     print(type(event).__name__, getattr(event, "data", ""))
     if isinstance(event, zttp.EndOfMessage):
         break
 ```
 
-1.  Each call returns the **next complete event**, in order.
-
-2.  When there isn't a complete event yet, you get the `NEED_DATA` sentinel:
-    your cue to `receive_data` more bytes (or stop).
+When there isn't a complete event yet, `next_event()` returns the `NEED_DATA`
+sentinel - your cue to `receive_data` more bytes (or stop the loop).
 
 Run it:
 
@@ -142,6 +140,5 @@ the `Request` event.
 
 You've seen the read side. Next:
 
-* [Parsing in depth](parsing.md): bodies, chunked encoding, trailers, partial data.
-* [Sending](sending.md): the write side, building messages and getting bytes to send.
+* [HTTP/1.1](http1.md): the read and write sides in depth - bodies, chunked encoding, trailers, building messages.
 * [Errors](errors.md): what zttp rejects, and how.
