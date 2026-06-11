@@ -181,6 +181,30 @@ const H2Engine = struct {
         return id;
     }
 
+    /// Seed an h2c-upgraded request as stream 1 (RFC 7540 3.2). The method/target
+    /// and headers come from the HTTP/1.1 request the server already parsed; scheme
+    /// is "http" (h2c is cleartext) and :authority is derived from the host header.
+    /// Returns true on success, false with a Python error set.
+    fn seedUpgrade(self: *H2Engine, method: []const u8, target: []const u8, hdrs: *BorrowedHeaders) bool {
+        var regular: []events.Header = hdrs.headers;
+        const authority = h2SplitAuthority(hdrs.headers, &regular);
+        self.conn.seedUpgradeRequest(method, target, "http", if (authority.len == 0) null else authority, regular) catch |e| switch (e) {
+            error.Malformed => {
+                _ = py.raise(exceptions.LocalProtocolError, "the upgrade request is not a valid HTTP/2 request (forbidden header or bad pseudo-header)");
+                return false;
+            },
+            error.AlreadyStarted => {
+                _ = py.raiseRuntime("the connection has already started; seed the upgrade request before feeding any bytes");
+                return false;
+            },
+            error.OutOfMemory => {
+                _ = c.PyErr_NoMemory();
+                return false;
+            },
+        };
+        return true;
+    }
+
     fn sendResponse(self: *H2Engine, stream_id: u32, status: u16, hdrs: *BorrowedHeaders, end_stream: bool) py.Object {
         if (!self.ensureHandshake()) return null;
         self.writer.sendResponse(stream_id, status, hdrs.headers, end_stream) catch |e| return h2RaiseWrite(e);
@@ -910,6 +934,25 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
     }
 }
 
+fn seed_upgrade_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    const e = switch (engine.*) {
+        .h2 => |*x| x,
+        else => return py.raiseRuntime("seed_upgrade_request() exists only on an HTTP/2 connection"),
+    };
+    var method: ?*c.PyObject = null;
+    var target: ?*c.PyObject = null;
+    var hdrs_seq: ?*c.PyObject = null;
+    if (c.PyArg_ParseTuple(args, "OOO", &method, &target, &hdrs_seq) == 0) return null;
+    const mb = py.asBytes(method) orelse return null;
+    const tb = py.asBytes(target) orelse return null;
+    var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+    defer hdrs.deinit();
+    if (!e.seedUpgrade(mb, tb, &hdrs)) return null;
+    return makeStream(self_obj, 1);
+}
+
 fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const e = h1(self) orelse return null; // HTTP/2 answers via a Stream (conn.stream(id))
@@ -1143,6 +1186,7 @@ var h1_methods = [_]py.MethodDef{
 var h2_methods = [_]py.MethodDef{
     .{ .ml_name = "initiate_connection", .ml_meth = h2_initiate, .ml_flags = c.METH_NOARGS, .ml_doc = "Emit the connection preface (client preface + SETTINGS, or the server's SETTINGS) now, rather than lazily on the first send. Idempotent." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
+    .{ .ml_name = "seed_upgrade_request", .ml_meth = seed_upgrade_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Seed an h2c-upgraded HTTP/1.1 request as stream 1 and return its Stream: seed_upgrade_request(method, target, headers). Call on a fresh server connection before feeding the client's HTTP/2 preface; next_event() then yields the request." },
     .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id. The connection owns the stream state; the handle is a stream-scoped command surface (send_response / send_data / end_message)." },
     .{ .ml_name = "close", .ml_meth = h2_close, .ml_flags = c.METH_VARARGS, .ml_doc = "Send GOAWAY to shut the connection down: close(error_code=NO_ERROR, last_stream_id=None). last_stream_id defaults to the highest peer stream processed." },
     .{ .ml_name = "has_pending_send", .ml_meth = h2_has_pending_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether any stream still has body bytes (or a FIN) parked waiting for the send window." },

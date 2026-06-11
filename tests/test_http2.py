@@ -697,3 +697,49 @@ def test_connection_send_window_and_has_pending_send() -> None:
     stream.send_data(b"hello world")
     conn.data_to_send()
     assert conn.has_pending_send() is True
+
+
+def test_h2c_seed_surfaces_the_upgraded_request() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    stream = conn.seed_upgrade_request(b"GET", b"/upgrade", [(b"host", b"example.com"), (b"x-k", b"v")])
+    assert stream.stream_id == 1
+    events = list(drain_h2(conn))
+    req = next(e for e in events if isinstance(e, zttp.Request))
+    assert req.method == b"GET"
+    assert req.target == b"/upgrade"
+    assert req.stream_id == 1
+    assert (b"host", b"example.com") in req.headers
+    assert (b"x-k", b"v") in req.headers
+    assert any(isinstance(e, zttp.EndOfMessage) for e in events)
+
+
+def test_h2c_seed_then_respond_and_continue_with_the_preface() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    stream = conn.seed_upgrade_request(b"GET", b"/", [(b"host", b"x")])
+    list(drain_h2(conn))
+    stream.send_response(200, end_stream=True)  # answer the upgraded request on stream 1
+    assert conn.data_to_send()  # a HEADERS frame went out
+
+    # The client still sends the HTTP/2 preface after the 101, then uses stream 3.
+    conn.receive_data(PREFACE + frame(0x04, 0, 0, b"") + frame(0x01, END_HEADERS | END_STREAM, 3, GET_BLOCK))
+    req3 = next(e for e in drain_h2(conn) if isinstance(e, zttp.Request))
+    assert req3.stream_id == 3
+
+
+def test_h2c_seed_rejects_a_forbidden_header() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.seed_upgrade_request(b"GET", b"/", [(b"connection", b"keep-alive")])
+
+
+def test_h2c_seed_twice_is_an_error() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    conn.seed_upgrade_request(b"GET", b"/", [(b"host", b"x")])
+    with pytest.raises(RuntimeError):
+        conn.seed_upgrade_request(b"GET", b"/", [(b"host", b"x")])
+
+
+def test_seed_upgrade_request_on_http1_is_an_error() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP1)
+    with pytest.raises(AttributeError):
+        conn.seed_upgrade_request(b"GET", b"/", [(b"host", b"x")])
