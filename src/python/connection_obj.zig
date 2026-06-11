@@ -436,6 +436,14 @@ const H3Engine = struct {
         return self.flush();
     }
 
+    /// Open the control stream + SETTINGS now (RFC 9114 6.2.1), rather than lazily on
+    /// the first response, and packetise it. Mirrors H2's initiate_connection.
+    fn initiate(self: *H3Engine) py.Object {
+        const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        h.initiateControl() catch |e| return exceptions.raiseH3(e);
+        return self.flush();
+    }
+
     fn flush(self: *H3Engine) py.Object {
         // AmplificationLimited is not an error: it means the unvalidated peer's 3x
         // budget is spent, so the bytes stay queued and surface on a later flush once
@@ -1486,6 +1494,11 @@ fn h3_close_info(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object
     return e.closeInfo();
 }
 
+fn h3_initiate(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    return e.initiate();
+}
+
 // HTTP/2 connection-level send helpers --------------------------------------
 
 fn h2_initiate(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
@@ -1573,6 +1586,7 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id (the request's stream_id). The handle is the stream-scoped send surface: send_response / send_data / end_message." },
     .{ .ml_name = "next_timeout", .ml_meth = h3_next_timeout, .ml_flags = c.METH_NOARGS, .ml_doc = "The next loss/PTO deadline (same clock as now), or None if no timer is armed." },
     .{ .ml_name = "handle_timeout", .ml_meth = h3_handle_timeout, .ml_flags = c.METH_O, .ml_doc = "Fire the timer at time now: handle_timeout(now). Re-queues probes; drain them with data_to_send." },
+    .{ .ml_name = "initiate_connection", .ml_meth = h3_initiate, .ml_flags = c.METH_NOARGS, .ml_doc = "Open the control stream and send SETTINGS now (RFC 9114 6.2.1), rather than lazily on the first response. Idempotent. Drain it with data_to_send." },
     .{ .ml_name = "is_closed", .ml_meth = h3_is_closed, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection has been closed (a peer CONNECTION_CLOSE was received)." },
     .{ .ml_name = "close_info", .ml_meth = h3_close_info, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's CONNECTION_CLOSE as (error_code, reason, is_application), or None if the peer has not closed." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },

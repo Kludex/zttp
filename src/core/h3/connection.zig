@@ -16,8 +16,10 @@ const events = @import("../events.zig");
 const fields = @import("../fields.zig");
 const quic_conn = @import("../quic/connection.zig");
 const quic_stream = @import("../quic/stream.zig");
+const varint = @import("../quic/varint.zig");
 const h3_frame = @import("frame.zig");
 const h3_stream = @import("stream.zig");
+const h3_error = @import("error.zig");
 const qpack = @import("qpack/decoder.zig");
 const qpack_enc = @import("qpack/encoder.zig");
 
@@ -45,6 +47,14 @@ const RequestStream = struct {
 /// HTTP/3: DATA before HEADERS, a second HEADERS, or a write after the FIN.
 const SendState = enum { idle, headers_sent, fin_sent };
 
+/// The largest field section (header block) we will decode, advertised to the peer
+/// as SETTINGS_MAX_FIELD_SECTION_SIZE so it does not send a larger one.
+const MAX_FIELD_SECTION_SIZE: u64 = 1 << 16;
+
+/// The first server-initiated unidirectional stream id (RFC 9000 2.1): server uni
+/// ids are 4*N+3, so the control stream is 3.
+const CONTROL_STREAM_ID: u64 = 3;
+
 pub const Connection = struct {
     gpa: std.mem.Allocator,
     qc: *quic_conn.Connection,
@@ -56,12 +66,15 @@ pub const Connection = struct {
     /// Owned copies of the strings each queued event borrows; freed when the queue
     /// is reset. QPACK's decode store is reused per call, so we materialise here.
     arena: std.heap.ArenaAllocator,
+    /// Whether our control stream (type + SETTINGS) has been opened (RFC 9114
+    /// 6.2.1). The control stream is opened once, before any response.
+    control_sent: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, qc: *quic_conn.Connection) Connection {
         return .{
             .gpa = gpa,
             .qc = qc,
-            .qpack_dec = qpack.Decoder.init(gpa, 1 << 16),
+            .qpack_dec = qpack.Decoder.init(gpa, MAX_FIELD_SECTION_SIZE),
             .arena = std.heap.ArenaAllocator.init(gpa),
         };
     }
@@ -72,6 +85,28 @@ pub const Connection = struct {
         self.qpack_dec.deinit();
         self.queue.deinit(self.gpa);
         self.arena.deinit();
+    }
+
+    /// Open our unidirectional control stream and send SETTINGS as its first frame
+    /// (RFC 9114 6.2.1, 7.2.4). A conformant peer treats the absence of our SETTINGS
+    /// as H3_MISSING_SETTINGS and may refuse to send requests, so this must precede
+    /// any response. Idempotent: the control stream is opened at most once. The
+    /// stream-type byte (0x00) prefixes the SETTINGS frame on the same stream.
+    pub fn initiateControl(self: *Connection) Error!void {
+        if (self.control_sent) return;
+        var settings: std.ArrayListUnmanaged(u8) = .empty;
+        defer settings.deinit(self.gpa);
+        // SETTINGS_MAX_FIELD_SECTION_SIZE = our decode cap. QPACK capacity and
+        // blocked-streams default to 0 (RFC 9204 5), so they need not be sent.
+        varint.append(&settings, self.gpa, @intFromEnum(h3_stream.SettingId.max_field_section_size)) catch return error.OutOfMemory;
+        varint.append(&settings, self.gpa, MAX_FIELD_SECTION_SIZE) catch return error.OutOfMemory;
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.gpa);
+        out.append(self.gpa, @intFromEnum(h3_stream.UniStreamType.control)) catch return error.OutOfMemory;
+        h3_frame.append(&out, self.gpa, .settings, settings.items) catch return error.OutOfMemory;
+        try self.streamSend(CONTROL_STREAM_ID, out.items, false);
+        self.control_sent = true;
     }
 
     /// Advance the parse of request stream `id` from whatever ordered bytes the
@@ -280,6 +315,8 @@ pub const Connection = struct {
         if (status < 100 or status > 599) return error.H3Error; // RFC 9110 status range
         if (try self.sendStateOf(id) != .idle) return error.H3Error; // HEADERS once, before DATA/FIN
         for (headers) |h| try validateResponseHeader(h);
+        // Our control stream + SETTINGS must precede any response (RFC 9114 6.2.1).
+        try self.initiateControl();
 
         // The QPACK field section: prefix (RIC 0, Base 0), then :status, then headers.
         var section: std.ArrayList(u8) = .empty;
@@ -344,7 +381,6 @@ const testing = std.testing;
 // data is application data, so it rides the Application space (STREAM is illegal in
 // Initial); the matching server installs the test app keys via testInstallAppKeys.
 fn buildRequest(gpa: std.mem.Allocator, dcid: []const u8, stream_id: u64, h3_bytes: []const u8) ![]u8 {
-    const varint = @import("../quic/varint.zig");
     var sframe: std.ArrayListUnmanaged(u8) = .empty;
     defer sframe.deinit(gpa);
     try sframe.append(gpa, 0x0a); // STREAM, LEN set, no OFF, no FIN
@@ -523,7 +559,6 @@ test "a request with a body yields request then data" {
 // Build a request datagram whose STREAM frame sets the FIN bit, so the H3 layer
 // sees the stream end (needed to exercise the Content-Length reconciliation).
 fn buildRequestFin(gpa: std.mem.Allocator, dcid: []const u8, h3_bytes: []const u8) ![]u8 {
-    const varint = @import("../quic/varint.zig");
     var sframe: std.ArrayListUnmanaged(u8) = .empty;
     defer sframe.deinit(gpa);
     try sframe.append(gpa, 0x0b); // STREAM, LEN|FIN set, no OFF
@@ -699,7 +734,6 @@ test "a peer reset reclaims the request stream" {
     defer h3.deinit();
 
     // A RESET_STREAM (type 0x04) on stream 0 with final size 0, in a 1-RTT packet.
-    const varint = @import("../quic/varint.zig");
     var rframe: std.ArrayListUnmanaged(u8) = .empty;
     defer rframe.deinit(gpa);
     try rframe.append(gpa, 0x04); // RESET_STREAM
@@ -718,7 +752,6 @@ test "a peer reset reclaims the request stream" {
 
 // Build a request datagram on `stream_id` with the FIN bit set, at packet number `pn`.
 fn buildRequestOnFin(gpa: std.mem.Allocator, dcid: []const u8, stream_id: u64, pn: u64, h3_bytes: []const u8) ![]u8 {
-    const varint = @import("../quic/varint.zig");
     var sframe: std.ArrayListUnmanaged(u8) = .empty;
     defer sframe.deinit(gpa);
     try sframe.append(gpa, 0x0b); // STREAM, LEN|FIN set, no OFF
@@ -749,7 +782,6 @@ test "DATA before HEADERS is rejected" {
 // Build a 1-RTT packet whose STREAM frame carries `h3_bytes` at `offset` on stream
 // 0 (the OFF flag is set), with packet number `pn` so a second datagram decrypts.
 fn buildRequestAt(gpa: std.mem.Allocator, dcid: []const u8, offset: u64, pn: u64, h3_bytes: []const u8) ![]u8 {
-    const varint = @import("../quic/varint.zig");
     var sframe: std.ArrayListUnmanaged(u8) = .empty;
     defer sframe.deinit(gpa);
     try sframe.append(gpa, 0x0e); // STREAM, OFF|LEN set
@@ -865,6 +897,42 @@ test "a server sends a response: HEADERS then DATA then FIN" {
     const d2 = try h3_frame.decode(got[d1.len..]);
     try testing.expectEqual(h3_frame.FrameType.data, d2.frame.ftype);
     try testing.expectEqualStrings("hello", d2.frame.payload);
+}
+
+test "the server opens its control stream with a SETTINGS frame" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x31, 0x33, 0x37, 0x39 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A response auto-opens the control stream first (RFC 9114 6.2.1); idempotent.
+    try h3.sendResponse(0, 200, &.{});
+    try h3.initiateControl(); // a second call is a no-op
+    try qc.flushSend(1000);
+
+    var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    quic_conn.testInstallAppKeys(&peer);
+    const buf = qc.datagramsToSend();
+    var off: usize = 0;
+    for (qc.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+
+    // Stream 3 (the first server uni) carries the control stream: a type prefix
+    // 0x00, then a SETTINGS frame advertising max_field_section_size.
+    const ctrl = peer.streamData(3);
+    try testing.expect(ctrl.len > 1);
+    const t = h3_stream.decodeUniType(ctrl).?;
+    try testing.expectEqual(h3_stream.UniStreamType.control, t.utype);
+    const f = try h3_frame.decode(ctrl[t.len..]);
+    try testing.expectEqual(h3_frame.FrameType.settings, f.frame.ftype);
+    const s = try h3_stream.parseSettings(f.frame.payload);
+    try testing.expectEqual(@as(u64, 1 << 16), s.max_field_section_size);
 }
 
 test "the response send API rejects invalid sequences and inputs" {
