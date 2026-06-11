@@ -215,7 +215,17 @@ pub const Connection = struct {
         var consumed: usize = 0;
 
         if (u.utype == null) {
-            const d = h3_stream.decodeUniType(ready) orelse return; // type varint not all here yet
+            const d = h3_stream.decodeUniType(ready) orelse {
+                // The type varint is not all here yet. If the stream is already
+                // finished/reset without ever sending a type, it is an abandoned
+                // empty uni stream - reclaim it so a flood of them cannot grow the
+                // maps (the type stays unknown, so it is never the control stream).
+                if (self.qc.streamFinished(id) or self.qc.streamReset(id)) {
+                    self.qc.consumeStream(id, 0);
+                    if (self.qc.dropStream(id)) _ = self.uni_streams.remove(id);
+                }
+                return;
+            };
             u.utype = d.utype;
             consumed += d.len;
             if (d.utype == .control) {
@@ -241,14 +251,16 @@ pub const Connection = struct {
             // drain it rather than letting its bytes accrete.
             _ => consumed = ready.len,
         }
-        // Reclaim a finished/reset ignored uni stream so a peer cannot grow the maps
-        // by opening-and-finishing many of them. The control stream is critical (RFC
-        // 9114 6.2.1) and kept for the connection's life; the rest are disposable.
-        const ignored_done = u.utype.? != .control and (self.qc.streamFinished(id) or self.qc.streamReset(id));
-        // Consume even zero bytes when the stream just finished: a bare FIN at the
-        // final offset (arriving in its own frame after the content was already
-        // drained) leaves nothing new to consume, but the consume is what flips the
-        // recv state to terminal so dropStream can reclaim it.
+        const finished = self.qc.streamFinished(id) or self.qc.streamReset(id);
+        // The control stream is critical: closing it (FIN or reset) is a connection
+        // error (RFC 9114 6.2.1, H3_CLOSED_CRITICAL_STREAM), and closing it before its
+        // mandatory SETTINGS frame would otherwise leave peer_settings null forever.
+        if (u.utype.? == .control and finished) return self.fail(.closed_critical_stream, "the control stream was closed");
+        // Reclaim any other finished/reset ignored uni stream so a peer cannot grow
+        // the maps by opening-and-finishing many of them. Consume even zero bytes: a
+        // bare FIN in its own frame leaves nothing new to consume, but the consume is
+        // what flips the recv state to terminal so dropStream can reclaim it.
+        const ignored_done = u.utype.? != .control and finished;
         if (consumed > 0 or ignored_done) self.qc.consumeStream(id, consumed);
         if (ignored_done) {
             if (self.qc.dropStream(id)) _ = self.uni_streams.remove(id);
@@ -1130,6 +1142,53 @@ test "the control stream's first frame must be SETTINGS" {
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
     try testing.expectError(error.H3Error, h3.pump(2));
+}
+
+// Build a uni-stream datagram with the FIN bit set, so a "stream closed" test can
+// finish a unidirectional stream.
+fn buildUniFin(gpa: std.mem.Allocator, dcid: []const u8, uni_id: u64, bytes: []const u8) ![]u8 {
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x0b); // STREAM, LEN|FIN
+    try varint.append(&sframe, gpa, uni_id);
+    try varint.append(&sframe, gpa, bytes.len);
+    try sframe.appendSlice(gpa, bytes);
+    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, 0, sframe.items);
+}
+
+test "closing the control stream is a connection error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x4a, 0x4b, 0x4c, 0x4d };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    // The control stream type, then a FIN, before any SETTINGS: critical stream
+    // closed (RFC 9114 6.2.1, H3_CLOSED_CRITICAL_STREAM).
+    const dgram = try buildUniFin(gpa, &dcid, 2, &.{0x00});
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try testing.expectError(error.H3Error, h3.pump(2));
+}
+
+test "an empty uni stream finished before its type is reclaimed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x4e, 0x4f, 0x50, 0x51 };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    // A uni stream that is FIN'd with NO bytes at all: the type varint never arrives,
+    // so it is an abandoned empty stream. It must be reclaimed, not retained.
+    const dgram = try buildUniFin(gpa, &dcid, 2, &.{});
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pump(2);
+    var ids: [4]u64 = undefined;
+    try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
+    try testing.expectEqual(@as(u32, 0), h3.uni_streams.count());
 }
 
 test "a second SETTINGS on the control stream is unexpected" {
