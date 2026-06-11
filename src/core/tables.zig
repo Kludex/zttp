@@ -2,6 +2,10 @@
 //! (RFC 9110 Appendix B). A byte's class is a single array lookup - no branches
 //! in the hot scan loops.
 
+const HTAB = 0x09;
+const SP = 0x20;
+const DEL = 0x7F;
+
 /// tchar (RFC 9110 5.6.2): the set of characters allowed in a `token`, which is
 /// what field-names, methods and transfer-coding names are built from.
 ///   token = 1*tchar
@@ -25,10 +29,10 @@ pub const is_tchar: [256]bool = blk: {
 pub const is_field_vchar: [256]bool = blk: {
     var t = [_]bool{false} ** 256;
     var ch: usize = 0x21;
-    while (ch <= 0xFF) : (ch += 1) t[ch] = true; // VCHAR + obs-text (0x80-0xFF)
-    t[0x09] = true; // HTAB
-    t[0x20] = true; // SP
-    t[0x7F] = false; // DEL is not field-vchar
+    while (ch <= 0xFF) : (ch += 1) t[ch] = true; // obs-text runs to 0xFF
+    t[HTAB] = true;
+    t[SP] = true;
+    t[DEL] = false;
     break :blk t;
 };
 
@@ -49,7 +53,7 @@ pub const is_target_char: [256]bool = blk: {
     var t = [_]bool{false} ** 256;
     var ch: usize = 0x21;
     while (ch <= 0xFF) : (ch += 1) t[ch] = true;
-    t[0x7F] = false; // DEL
+    t[DEL] = false;
     t['"'] = false;
     break :blk t;
 };

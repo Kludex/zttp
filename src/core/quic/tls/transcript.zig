@@ -8,7 +8,7 @@
 const std = @import("std");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
-pub const LEN = Sha256.digest_length; // 32
+pub const LEN = Sha256.digest_length;
 
 pub const Transcript = struct {
     hasher: Sha256 = Sha256.init(.{}),

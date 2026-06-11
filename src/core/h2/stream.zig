@@ -55,7 +55,7 @@ pub const Stream = struct {
     /// (it answers a HEAD, or its status is 204/304), so the content-length vs
     /// data-seen check is skipped (RFC 9110 8.6).
     expects_bodyless: bool = false,
-    headers_done: bool = false, // the request/response HEADERS block completed
+    headers_done: bool = false,
     end_stream_seen: bool = false,
     /// Outbound DATA the send window could not yet admit, parked here and drained
     /// as WINDOW_UPDATE credits arrive. `send_end_pending` records that END_STREAM

@@ -100,7 +100,7 @@ pub fn determine(headers: []const Header, opts: FramingOptions) ParseError!Frami
     for (headers) |h| {
         if (eqIgnoreCase(h.name, "transfer-encoding")) {
             has_te = true;
-            te.add(h.value); // fold every TE field-line into one ordered list
+            te.add(h.value);
         } else if (eqIgnoreCase(h.name, "content-length")) {
             const n = try parseContentLength(h.value);
             if (content_length) |prev| {

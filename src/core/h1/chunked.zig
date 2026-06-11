@@ -110,7 +110,6 @@ fn parseChunkSize(line: []const u8) ParseError!u64 {
     var digits: usize = 0;
     for (line) |ch| {
         if (ch == ';') {
-            // Chunk extensions follow; ignore the remainder of the line.
             if (digits == 0) return error.InvalidChunk;
             return n;
         }
@@ -130,7 +129,7 @@ fn consumeCrlf(sc: *Scanner, strict: bool) ParseError!bool {
     const r = sc.remaining();
     if (r.len == 0) return false;
     if (r[0] == '\n') {
-        if (strict) return error.InvalidChunk; // bare LF rejected
+        if (strict) return error.InvalidChunk;
         _ = sc.take(1);
         return true;
     }
