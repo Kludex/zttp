@@ -151,6 +151,11 @@ pub const Connection = struct {
     /// higher one is rejected), so a shutdown can narrow but never widen what we
     /// promise to handle.
     pub fn shutdown(self: *Connection, stream_id: u64) Error!void {
+        // A server's GOAWAY id names a client request stream (RFC 9114 5.2), so it is
+        // a client-bidi id and within the 62-bit varint range. Validate BEFORE any
+        // side effect (opening the control stream), so a bad id is a clean rejection.
+        if (stream_id > varint.MAX) return error.H3Error;
+        if (quic_stream.StreamType.of(stream_id) != .client_bidi) return error.H3Error;
         if (self.goaway_sent) |prev| if (stream_id > prev) return error.H3Error;
         try self.initiateControl();
         var payload: std.ArrayListUnmanaged(u8) = .empty;
@@ -294,8 +299,18 @@ pub const Connection = struct {
         }
         if (f.ftype == .data or f.ftype == .headers) return self.fail(.frame_unexpected, "DATA/HEADERS on the control stream");
         // Any other frame (GOAWAY, MAX_PUSH_ID, grease) before SETTINGS means the
-        // first frame was not SETTINGS - missing_settings; after, it is ignored.
+        // first frame was not SETTINGS - missing_settings (RFC 9114 6.2.1).
         if (!u.settings_seen) return self.fail(.missing_settings, "control stream did not begin with SETTINGS");
+        if (f.ftype == .goaway) {
+            const d = varint.decode(f.payload) catch return self.fail(.frame_error, "malformed GOAWAY");
+            if (d.len != f.payload.len) return self.fail(.frame_error, "GOAWAY has trailing bytes");
+            // A peer's GOAWAY id may only decrease (RFC 9114 5.2); a higher one is an
+            // H3_ID_ERROR. The id names the largest push id / response stream the peer
+            // will accept - it never grows.
+            if (self.goaway_recv) |prev| if (d.value > prev) return self.fail(.id_error, "GOAWAY id increased");
+            self.goaway_recv = d.value;
+        }
+        // MAX_PUSH_ID / CANCEL_PUSH / grease after SETTINGS: ignored (no push support).
     }
 
     fn onFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame) Error!void {
@@ -1113,6 +1128,22 @@ test "a later GOAWAY may only lower the id" {
     try testing.expectError(error.H3Error, h3.shutdown(12)); // widening is not
 }
 
+test "shutdown rejects a non-request-stream id" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x68, 0x69, 0x6a, 0x6b };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // id 3 is a server uni stream, not a client request stream (RFC 9114 5.2).
+    try testing.expectError(error.H3Error, h3.shutdown(3));
+    // An id past the 62-bit varint range is rejected before any control stream opens.
+    try testing.expectError(error.H3Error, h3.shutdown((1 << 62)));
+    try testing.expectEqual(@as(usize, 0), qc.datagramsToSend().len); // nothing was sent
+}
+
 test "the response send API rejects invalid sequences and inputs" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x1a, 0x2b, 0x3c, 0x4d };
@@ -1183,6 +1214,47 @@ test "the peer's control stream + SETTINGS is read without error" {
     try h3.pump(2);
     try testing.expectEqual(@as(?u64, 2), h3.control_recv_id);
     try testing.expectEqual(@as(u64, 0x400), h3.peer_settings.?.max_field_section_size);
+}
+
+test "a GOAWAY received after SETTINGS is recorded" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xab, 0xac, 0xad, 0xae };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    var ctrl: std.ArrayListUnmanaged(u8) = .empty;
+    defer ctrl.deinit(gpa);
+    try ctrl.append(gpa, 0x00);
+    try h3_frame.append(&ctrl, gpa, .settings, &.{});
+    try h3_frame.append(&ctrl, gpa, .goaway, &.{0x08}); // GOAWAY id 8
+    const dgram = try buildUni(gpa, &dcid, 2, 0, ctrl.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pump(2);
+    try testing.expectEqual(@as(?u64, 8), h3.goaway_recv);
+}
+
+test "a received GOAWAY id may only decrease" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xaf, 0xb0, 0xb1, 0xb2 };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    // SETTINGS, GOAWAY 8, then GOAWAY 12 (a higher id): H3_ID_ERROR.
+    var ctrl: std.ArrayListUnmanaged(u8) = .empty;
+    defer ctrl.deinit(gpa);
+    try ctrl.append(gpa, 0x00);
+    try h3_frame.append(&ctrl, gpa, .settings, &.{});
+    try h3_frame.append(&ctrl, gpa, .goaway, &.{0x08});
+    try h3_frame.append(&ctrl, gpa, .goaway, &.{0x0c});
+    const dgram = try buildUni(gpa, &dcid, 2, 0, ctrl.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try testing.expectError(error.H3Error, h3.pump(2));
 }
 
 test "the control stream's first frame must be SETTINGS" {

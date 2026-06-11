@@ -498,6 +498,14 @@ const H3Engine = struct {
         return q.closed;
     }
 
+    /// The id of a GOAWAY received from the peer (RFC 9114 5.2), or None - so an
+    /// integrator learns the peer is shutting down and stops opening new streams.
+    fn goawayReceived(self: *const H3Engine) py.Object {
+        const h = self.h3 orelse return py.none();
+        const id = h.goaway_recv orelse return py.none();
+        return c.PyLong_FromUnsignedLongLong(id);
+    }
+
     /// The peer's CONNECTION_CLOSE as (error_code, reason, is_application), or None if
     /// the peer has not sent one - so an integrator learns WHY the peer closed, not
     /// just that it did.
@@ -1563,6 +1571,11 @@ fn h3_shutdown(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object
     return e.shutdown(@intCast(id));
 }
 
+fn h3_goaway_received(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    return e.goawayReceived();
+}
+
 // HTTP/2 connection-level send helpers --------------------------------------
 
 fn h2_initiate(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
@@ -1655,6 +1668,7 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "close_info", .ml_meth = h3_close_info, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's CONNECTION_CLOSE as (error_code, reason, is_application), or None if the peer has not closed." },
     .{ .ml_name = "peer_settings", .ml_meth = h3_peer_settings, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's HTTP/3 SETTINGS as a dict (max_field_section_size, qpack_max_table_capacity, qpack_blocked_streams), or None until its SETTINGS frame has been received." },
     .{ .ml_name = "shutdown", .ml_meth = h3_shutdown, .ml_flags = c.METH_O, .ml_doc = "Begin a graceful shutdown: send a GOAWAY announcing stream_id as the first request stream not processed (RFC 9114 5.2). A later GOAWAY may only lower the id. Drain it with data_to_send." },
+    .{ .ml_name = "goaway_received", .ml_meth = h3_goaway_received, .ml_flags = c.METH_NOARGS, .ml_doc = "The id of a GOAWAY received from the peer (RFC 9114 5.2), or None - the peer is shutting down and will not process streams at or above this id." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

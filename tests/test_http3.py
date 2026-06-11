@@ -203,6 +203,13 @@ def test_peer_settings_is_none_until_the_control_stream_arrives() -> None:
     assert conn.peer_settings() is None
 
 
+def test_goaway_received_is_none_until_the_peer_sends_one() -> None:
+    conn = make_server()
+    assert conn.goaway_received() is None
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    assert conn.goaway_received() is None
+
+
 def test_next_timeout_arms_after_the_handshake_flight() -> None:
     conn = make_server()
     conn.receive_datagram(CLIENT_HELLO, 1000)
