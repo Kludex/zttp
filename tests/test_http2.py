@@ -51,6 +51,39 @@ def _settings_flags(buf: bytes) -> list[int]:
     return [flags for ftype, flags, _, _ in _frames(buf) if ftype == 0x04]
 
 
+def _own_settings(buf: bytes) -> dict[int, int]:
+    # The first non-ACK SETTINGS frame is the server's own preface; decode it.
+    for ftype, flags, _, payload in _frames(buf):
+        if ftype == 0x04 and not flags & 0x01:
+            return {
+                int.from_bytes(payload[j : j + 2], "big"): int.from_bytes(payload[j + 2 : j + 6], "big")
+                for j in range(0, len(payload), 6)
+            }
+    return {}
+
+
+def test_handshake_advertises_real_settings() -> None:
+    # The server must advertise its enforced limits, not an empty SETTINGS, or a
+    # peer uses RFC defaults and gets spurious REFUSED_STREAM resets (RFC 9113 6.5).
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    settings = _own_settings(conn.data_to_send())
+    assert settings[0x03] == 128  # MAX_CONCURRENT_STREAMS (the default cap)
+    assert settings[0x06] == 64 * 1024  # MAX_HEADER_LIST_SIZE
+    assert settings[0x01] == 4096  # HEADER_TABLE_SIZE
+    assert settings[0x05] == 16384  # MAX_FRAME_SIZE
+
+
+def test_advertised_settings_round_trip_to_a_peer() -> None:
+    # A client parses the server's advertised SETTINGS as a Settings event.
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    server.initiate_connection()
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    client.receive_data(server.data_to_send())
+    settings = next(e for e in drain_h2(client) if isinstance(e, zttp.Settings))
+    assert (0x03, 128) in settings.params  # MAX_CONCURRENT_STREAMS
+
+
 def test_server_settings_precede_the_settings_ack() -> None:
     # The server's own SETTINGS must be the first frame it sends (RFC 9113 3.4),
     # even when the client's SETTINGS is ACKed first while draining events.
