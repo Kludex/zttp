@@ -16,17 +16,12 @@ nav = [
     "usage/first-steps.md",
   ] },
   { "Using zttp" = [
-    "usage/parsing.md",
-    "usage/sending.md",
+    "usage/http1.md",
     "usage/http2.md",
     "usage/http3.md",
     "usage/errors.md",
   ] },
-  { "Architecture" = [
-    "architecture/overview.md",
-    "architecture/sans-io.md",
-    "architecture/http3.md",
-  ] },
+  { "Architecture" = "architecture.md" },
   { "Reference" = [
     "reference/performance.md",
     "reference/api.md",

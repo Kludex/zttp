@@ -64,20 +64,21 @@ uv add zttp
 ## Example
 
 Let's parse an HTTP request. You play the **server**: bytes come in, events come
-out.
+out. A `Connection` takes your role - `SERVER` to receive requests or `CLIENT`
+to receive responses.
 
-```python title="parse.py" hl_lines="3 5 13"
+```python title="parse.py"
 import zttp
 
-conn = zttp.Connection(zttp.SERVER)  # (1)!
+conn = zttp.Connection(zttp.SERVER)
 
-conn.receive_data(  # (2)!
+conn.receive_data(
     b"GET /hello?name=you HTTP/1.1\r\n"
     b"Host: example.com\r\n"
     b"\r\n"
 )
 
-event = conn.next_event()  # (3)!
+event = conn.next_event()
 print(event.method, event.target)
 #> b'GET' b'/hello?name=you'
 
@@ -85,14 +86,9 @@ print(conn.next_event())
 #> EndOfMessage(trailers=[])
 ```
 
-1.  A `Connection` is the one object you need. Tell it your role: `SERVER` (you
-    receive requests) or `CLIENT` (you receive responses).
-
-2.  Feed it whatever bytes you have. A whole request, half a request, a single
-    byte: it doesn't matter. zttp buffers and resumes.
-
-3.  Pull events out one at a time. Each call returns the next complete event, or
-    the `NEED_DATA` sentinel when it needs more bytes.
+Feed `receive_data` whatever bytes you have - a whole request, half a request, or
+a single byte - and zttp buffers and resumes. Each `next_event` call returns the
+next complete event, or the `NEED_DATA` sentinel when it needs more bytes.
 
 Run it:
 
@@ -109,7 +105,7 @@ That's it. The buffering, the header parsing, the body framing: all Zig. 🎉
     Notice there were **no callbacks**. You don't register `on_header` /
     `on_body` functions and lose control of the flow. You *pull* events when
     *you* are ready. That's what sans-IO means. Read
-    [Why sans-IO](architecture/sans-io.md) for the why.
+    [Architecture](architecture.md) for the why.
 
 ## Where to go next
 
@@ -121,7 +117,7 @@ That's it. The buffering, the header parsing, the body framing: all Zig. 🎉
 
     The 30-second tour of the read side: feed bytes, pull events.
 
--   :material-upload-network: **[Sending](usage/sending.md)**
+-   :material-upload-network: **[HTTP/1.1](usage/http1.md)**
 
     ---
 
@@ -139,7 +135,7 @@ That's it. The buffering, the header parsing, the body framing: all Zig. 🎉
 
     The same events again, fed by UDP datagrams through a QUIC transport.
 
--   :material-sitemap: **[Why sans-IO](architecture/sans-io.md)**
+-   :material-sitemap: **[Architecture](architecture.md)**
 
     ---
 
