@@ -15,6 +15,11 @@ const Role = core.h1.reader.Role;
 const H2Connection = core.h2.connection.Connection;
 const h2_constants = core.h2.constants;
 const H2Role = core.h2.connection.Role;
+const Header = core.events.Header;
+const hpack_encoder = core.h2.hpack_encoder;
+const HpackDecoder = core.h2.hpack_decoder.Decoder;
+const qpack_encoder = core.h3.qpack_encoder;
+const QpackDecoder = core.h3.qpack_decoder.Decoder;
 
 fn drive(input: []const u8) void {
     inline for (.{ Role.server, Role.client }) |role| {
@@ -66,14 +71,91 @@ fn driveH2(input: []const u8) void {
     }
 }
 
+const MAX_HEADERS = 32;
+
+// Carve the mutated input into a header list: a count byte, then per header a
+// name-length byte and a value-length byte slicing the remaining bytes. Slices
+// point into `input`, valid for the encode->decode->compare below. Fills `buf`
+// and returns the populated prefix.
+fn drawHeaders(input: []const u8, buf: *[MAX_HEADERS]Header) []const Header {
+    if (input.len == 0) return buf[0..0];
+    var p: usize = 0;
+    const count = @min(input[p] % MAX_HEADERS, MAX_HEADERS);
+    p += 1;
+    var n: usize = 0;
+    while (n < count and p < input.len) {
+        const nlen = @min(@as(usize, input[p]) % 24, input.len - p -| 1);
+        p += 1;
+        if (p + nlen > input.len) break;
+        const name = input[p .. p + nlen];
+        p += nlen;
+        if (p >= input.len) break;
+        const vlen = @min(@as(usize, input[p]) % 48, input.len - p -| 1);
+        p += 1;
+        if (p + vlen > input.len) break;
+        const value = input[p .. p + vlen];
+        p += vlen;
+        buf[n] = .{ .name = name, .value = value };
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+fn headersEqual(a: []const Header, b: []const Header) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!std.mem.eql(u8, x.name, y.name) or !std.mem.eql(u8, x.value, y.value)) return false;
+    }
+    return true;
+}
+
+// HPACK is its own inverse: whatever the encoder emits, the decoder must read
+// back into the identical header list. A divergence is a write/read mismatch -
+// the same bug class a smuggling vector exploits.
+fn driveHpackRoundtrip(input: []const u8) void {
+    var buf: [MAX_HEADERS]Header = undefined;
+    const headers = drawHeaders(input, &buf);
+
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(std.heap.c_allocator);
+    hpack_encoder.encode(&block, std.heap.c_allocator, headers) catch return;
+
+    var d = HpackDecoder.init(std.heap.c_allocator, 4096, 1 << 20);
+    defer d.deinit();
+    const out = d.decodeBlock(block.items) catch return;
+    std.debug.assert(headersEqual(headers, out));
+}
+
+// The QPACK encode->decode differential, mirroring the HPACK one.
+fn driveQpackRoundtrip(input: []const u8) void {
+    var buf: [MAX_HEADERS]Header = undefined;
+    const headers = drawHeaders(input, &buf);
+
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(std.heap.c_allocator);
+    qpack_encoder.encode(&block, std.heap.c_allocator, headers) catch return;
+
+    var d = QpackDecoder.init(std.heap.c_allocator, 1 << 20);
+    defer d.deinit();
+    const out = d.decode(block.items) catch return;
+    std.debug.assert(headersEqual(headers, out));
+}
+
 export fn zttp_fuzz_drive(data: [*]const u8, size: usize) callconv(.c) void {
     const input = data[0..size];
-    // First byte selects the parser so one corpus exercises both H1 and H2; the
-    // rest is the mutated body. No build wiring changes: `.fuzz` already
-    // instruments the whole `core` import, H2 included.
-    if (input.len != 0 and input[0] & 1 == 1) {
-        driveH2(input[1..]);
-    } else {
-        drive(if (input.len == 0) input else input[1..]);
+    // The low 2 bits of the first byte select the target so one corpus exercises
+    // every surface (H1 read, H2 read, HPACK and QPACK encode->decode); the rest
+    // is the mutated body. No build wiring changes: the `.fuzz` instrumentation
+    // already covers the whole `core` import.
+    if (input.len == 0) {
+        drive(input);
+        return;
+    }
+    const body = input[1..];
+    switch (@as(u2, @truncate(input[0]))) {
+        0 => drive(body),
+        1 => driveH2(body),
+        2 => driveHpackRoundtrip(body),
+        3 => driveQpackRoundtrip(body),
     }
 }

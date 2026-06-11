@@ -19,9 +19,12 @@ a segfault - is a parser bug.
 - `harness.consume` - read path. Splits input across read boundaries (so the
   parser is exercised mid-buffer, not just on whole feeds) and pulls every
   event out for both `SERVER` and `CLIENT` roles.
-- `roundtrip.roundtrip` - encode then decode. A `CLIENT` serializes a request a
-  `SERVER` parses; method, target, and headers must survive unchanged. Catches
-  encoder/parser disagreements that smuggling exploits.
+- `roundtrip.roundtrip` - encode then decode (HTTP/1.1). A `CLIENT` serializes a
+  request a `SERVER` parses; method, target, and headers must survive unchanged.
+  Catches encoder/parser disagreements that smuggling exploits.
+- `roundtrip_h2.roundtrip_h2` - the same differential over HTTP/2: a `CLIENT`
+  HEADERS block (HPACK-encoded) must parse back to the identical request on the
+  `SERVER`, including the `host` <-> `:authority` bridge.
 
 `structured.draw_request` maps fuzzer bytes into HTTP-shaped requests so inputs
 reach header, framing, and chunked-body code instead of bailing on byte one.
@@ -48,8 +51,11 @@ scripts/fuzz-docker -max_total_time=60
 ## libFuzzer target and OSS-Fuzz
 
 `fuzz/target.zig` exports `zttp_fuzz_drive`, a coverage-instrumented (`.fuzz`)
-drive of the reader that mirrors the `driveReader` property test in
-`src/core/reader.zig`. `fuzz/target.c` is the libFuzzer/AFL++ entry point: it
+drive of the core. The low 2 bits of the first input byte select the surface:
+the HTTP/1.1 reader, the HTTP/2 connection, or an HPACK / QPACK encode->decode
+roundtrip (a header list drawn from the input is encoded and must decode back
+identical - the write/read differential at the codec layer). `fuzz/target.c` is
+the libFuzzer/AFL++ entry point: it
 forwards to `zttp_fuzz_drive` and registers the Zig object's SanitizerCoverage
 counters with the engine - Zig 0.16 emits the counter section but not the
 registration hook clang would, so the shim wires it up. `zig build fuzz-obj`
