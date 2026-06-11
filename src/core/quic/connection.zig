@@ -188,6 +188,13 @@ pub const Connection = struct {
     /// legitimate new lower id as retired. One u64 per retired stream is far smaller
     /// than the RecvStream it replaces, so this still bounds the per-stream memory.
     retired_recv: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// The cap on client-initiated bidirectional streams (RFC 9000 4.6): exactly the
+    /// initial_max_streams_bidi we advertise, enforced on each newly opened request
+    /// stream so a peer cannot exhaust memory by opening unboundedly many. The wire and
+    /// the enforced value are always identical (a server advertising 0 rejects every
+    /// bidi stream). `null` on the non-server `init` path, which advertises nothing, so
+    /// the recv-pipeline tests open streams unchecked; initServer always sets it.
+    bidi_limit: ?flow.StreamLimit = null,
 
     /// `client_dcid` is the destination connection id on the client's first
     /// Initial: both endpoints derive the Initial keys from it. The server picks
@@ -230,8 +237,13 @@ pub const Connection = struct {
     /// flight. `tls_config` supplies the ServerHello randomness, ephemeral seed,
     /// signing key, certificate, and transport parameters.
     pub fn initServer(gpa: std.mem.Allocator, client_dcid: []const u8, tls_config: tls.flight.Config) Error!Connection {
+        // Enforce exactly the bidi cap we advertise (RFC 9000 4.6): parse it from our
+        // own transport parameters so the wire and the enforced value never diverge. A
+        // malformed own blob is a configuration bug, surfaced before anything is built.
+        const own = transport_params.parse(tls_config.transport_params) catch return error.ProtocolViolation;
         var conn = try init(gpa, .server, client_dcid);
         conn.tls = tls.server.Server.init(tls_config);
+        conn.bidi_limit = flow.StreamLimit.init(own.initial_max_streams_bidi);
         return conn;
     }
 
@@ -1041,6 +1053,7 @@ pub const Connection = struct {
 
     fn onStreamFrame(self: *Connection, id: u64, offset: u64, data: []const u8, fin: bool) Error!void {
         if (self.isRetired(id)) return; // a late frame for a completed-and-dropped stream
+        try self.noteClientStream(id);
         const s = try self.recvStream(id);
         const delta = s.push(offset, data, fin) catch |e| switch (e) {
             error.FinalSizeError => return error.FinalSizeError,
@@ -1054,8 +1067,20 @@ pub const Connection = struct {
 
     fn onReset(self: *Connection, id: u64, error_code: u64, final_size: u64) Error!void {
         if (self.isRetired(id)) return; // a reset for an already-completed-and-dropped stream
+        try self.noteClientStream(id);
         const s = try self.recvStream(id);
         s.onReset(error_code, final_size) catch return error.FinalSizeError;
+    }
+
+    /// Charge a peer-initiated bidirectional stream against the advertised cap (RFC
+    /// 9000 4.6): a STREAM_LIMIT_ERROR if `id` is beyond it. Idempotent - the limit
+    /// records the high-water count, so re-noting an already-open stream is a no-op.
+    /// Only client-bidi request streams are gated here; enforcement is off (null) on
+    /// the non-server path, and uni control streams are bounded by their own logic.
+    fn noteClientStream(self: *Connection, id: u64) Error!void {
+        const limit = if (self.bidi_limit) |*l| l else return; // unenforced (non-server) path
+        if (stream.StreamType.of(id) != .client_bidi) return;
+        limit.onOpened(id / 4) catch return error.StreamLimitError;
     }
 
     /// A peer STOP_SENDING (RFC 9000 19.5) asks us to stop sending on `id`. Reset that
@@ -1067,6 +1092,10 @@ pub const Connection = struct {
     /// layer above, so it never resets the critical control stream.
     fn onStopSending(self: *Connection, id: u64, error_code: u64) Error!void {
         if (stream.StreamType.of(id) != .client_bidi) return;
+        // Charge the stream against the bidi cap before stashing any state for it (RFC
+        // 9000 4.6): a STOP_SENDING for a never-seen high id is otherwise an unchecked
+        // way to grow peer_stop_sending unbounded.
+        try self.noteClientStream(id);
         if (self.send_streams.get(id)) |s| {
             s.reset(error_code);
         } else {
@@ -1322,6 +1351,55 @@ test "consume re-grants connection flow-control credit" {
     try testing.expectEqualStrings("", conn.streamData(0));
 }
 
+test "a bidi stream past the advertised cap is a stream-limit error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x51, 0x52, 0x53, 0x54 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.bidi_limit = flow.StreamLimit.init(2); // allow client-bidi 0 and 4, reject 8
+
+    // Two request streams open within the cap (ids 0 and 4); a STREAM frame each.
+    const s0 = [_]u8{ 0x0b, 0x00, 0x01, 'a' }; // STREAM|LEN|FIN id 0
+    const d0 = try testBuildApp(gpa, &dcid, 0, &s0);
+    defer gpa.free(d0);
+    try conn.receiveDatagram(d0, 1000);
+    const s4 = [_]u8{ 0x0b, 0x04, 0x01, 'b' }; // id 4
+    const d4 = try testBuildApp(gpa, &dcid, 1, &s4);
+    defer gpa.free(d4);
+    try conn.receiveDatagram(d4, 1000);
+
+    // The third (id 8) is one beyond the cap of 2: STREAM_LIMIT_ERROR.
+    const s8 = [_]u8{ 0x0b, 0x08, 0x01, 'c' }; // id 8
+    const d8 = try testBuildApp(gpa, &dcid, 2, &s8);
+    defer gpa.free(d8);
+    try testing.expectError(error.StreamLimitError, conn.receiveDatagram(d8, 1000));
+}
+
+test "initServer enforces exactly the bidi cap it advertises" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x60, 0x61, 0x62, 0x63 };
+
+    // The cap enforced is the initial_max_streams_bidi the config advertises (8 here).
+    var conn = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer conn.deinit();
+    try testing.expectEqual(@as(u64, 8), conn.bidi_limit.?.max);
+
+    // A config advertising no initial_max_streams_bidi enforces 0: a conformant client
+    // opens no request stream, and the server rejects any it does open.
+    var noneCfg = testServerConfig();
+    noneCfg.transport_params = &.{};
+    var none = try Connection.initServer(gpa, &dcid, noneCfg);
+    defer none.deinit();
+    try testing.expectEqual(@as(u64, 0), none.bidi_limit.?.max);
+
+    // A malformed own transport-parameter blob is a configuration bug, not silently
+    // defaulted: initServer surfaces it.
+    var badCfg = testServerConfig();
+    badCfg.transport_params = &[_]u8{ 0x08, 0x08, 0x00 }; // len 8, only 1 byte follows
+    try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, badCfg));
+}
+
 test "connection flow control sums across streams" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x0a, 0x0b, 0x0c, 0x0d };
@@ -1498,7 +1576,7 @@ fn testServerConfig() tls.flight.Config {
         .ephemeral_seed = [_]u8{0x33} ** 32,
         .signer = tls.sign.Signer.fromSeed([_]u8{0x42} ** 32) catch unreachable,
         .cert_chain = &[_]u8{0xCC} ** 48,
-        .transport_params = &[_]u8{ 0x00, 0x01 },
+        .transport_params = &[_]u8{ 0x08, 0x01, 0x08 }, // initial_max_streams_bidi = 8
     };
 }
 
