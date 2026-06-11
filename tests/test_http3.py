@@ -134,6 +134,21 @@ def test_http3_sends_a_response() -> None:
     assert all(isinstance(d, bytes) for d in datagrams)
 
 
+def test_http3_initiate_connection_sends_the_control_stream() -> None:
+    conn = make_server()
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    conn.data_to_send()
+    conn.receive_datagram(CLIENT_FINISHED, 2000)
+    conn.data_to_send()
+
+    # The control stream + SETTINGS leaves as a 1-RTT datagram; idempotent.
+    conn.initiate_connection()
+    datagrams = conn.data_to_send()
+    assert len(datagrams) >= 1
+    conn.initiate_connection()  # no second control stream
+    assert conn.data_to_send() == []
+
+
 def test_next_event_before_any_datagram_is_need_data() -> None:
     conn = make_server()
     assert conn.next_event() is zttp.NEED_DATA
@@ -165,6 +180,13 @@ def test_close_info_is_none_until_the_peer_closes() -> None:
     assert conn.close_info() is None
     conn.receive_datagram(CLIENT_HELLO, 1000)
     assert conn.close_info() is None
+
+
+def test_peer_settings_is_none_until_the_control_stream_arrives() -> None:
+    conn = make_server()
+    assert conn.peer_settings() is None
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    assert conn.peer_settings() is None
 
 
 def test_next_timeout_arms_after_the_handshake_flight() -> None:

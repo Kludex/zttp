@@ -48,7 +48,10 @@ pub const Error = error{
 };
 
 /// Parse a SETTINGS frame payload (a sequence of id/value varint pairs) into a
-/// `Settings`. A repeated identifier is rejected.
+/// `Settings`. A repeated known identifier is a connection error (RFC 9114 7.2.4);
+/// unknown settings are ignored, and an unbounded number of distinct unknown ids is
+/// legal, so the distinct count is not capped (only duplicates of the settings we
+/// act on are detected - the duplicate-error is a MAY for the rest).
 pub fn parseSettings(payload: []const u8) Error!Settings {
     var s = Settings{};
     var seen_cap = false;
@@ -60,6 +63,9 @@ pub fn parseSettings(payload: []const u8) Error!Settings {
         pos += id.len;
         const val = varint.decode(payload[pos..]) catch return error.SettingsError;
         pos += val.len;
+        // The HTTP/2 setting ids 0x02-0x05 are reserved in HTTP/3 and their receipt
+        // MUST be a connection error (RFC 9114 7.2.4.1), not ignored as unknown.
+        if (id.value >= 0x02 and id.value <= 0x05) return error.SettingsError;
         switch (@as(SettingId, @enumFromInt(id.value))) {
             .qpack_max_table_capacity => {
                 if (seen_cap) return error.SettingsError;
@@ -102,4 +108,18 @@ test "an unknown setting is ignored" {
 
 test "a repeated setting is an error" {
     try std.testing.expectError(error.SettingsError, parseSettings(&.{ 0x01, 0x10, 0x01, 0x20 }));
+}
+
+test "many distinct unknown settings are accepted" {
+    // Unknown ids are ignored and not capped (RFC 9114 7.2.4); only a known-id
+    // duplicate is an error.
+    const s = try parseSettings(&.{ 0x21, 0x00, 0x22, 0x00, 0x23, 0x00, 0x24, 0x00, 0x25, 0x00 });
+    try std.testing.expectEqual(@as(u64, 0), s.qpack_max_table_capacity);
+}
+
+test "a reserved HTTP/2 setting id is a connection error" {
+    // 0x02-0x05 are reserved in HTTP/3 and MUST be rejected (RFC 9114 7.2.4.1).
+    for ([_]u8{ 0x02, 0x03, 0x04, 0x05 }) |id| {
+        try std.testing.expectError(error.SettingsError, parseSettings(&.{ id, 0x00 }));
+    }
 }
