@@ -1591,6 +1591,39 @@ test "completing request streams advertises a raised MAX_STREAMS" {
     try testing.expect(conn.datagramsToSend().len > 0); // the cap rode again
 }
 
+test "a cap of one request still slides after the request completes" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x59, 0x5a, 0x5b, 0x5c };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.bidi_limit = flow.StreamLimit.init(1); // one request at a time
+
+    // The one allowed request (stream 0): a single byte with FIN, drained to terminal.
+    var s0: std.ArrayListUnmanaged(u8) = .empty;
+    defer s0.deinit(gpa);
+    try frame.encodeStream(&s0, gpa, 0, 0, &[_]u8{0x7a}, true);
+    const d0 = try testBuildApp(gpa, &dcid, 0, s0.items);
+    defer gpa.free(d0);
+    try conn.receiveDatagram(d0, 1000);
+    conn.consumeStream(0, 1);
+    try testing.expect(conn.dropStream(0));
+
+    // Completing it slides the cap to 2 and queues a MAX_STREAMS (the window-of-1 edge).
+    try testing.expect(conn.max_streams_pending);
+    try testing.expectEqual(@as(u64, 2), conn.bidi_limit.?.max);
+    try conn.flushSend(2000);
+
+    // The next request (stream 4) is now within the raised cap.
+    var s4: std.ArrayListUnmanaged(u8) = .empty;
+    defer s4.deinit(gpa);
+    try frame.encodeStream(&s4, gpa, 4, 0, &[_]u8{0x7a}, true);
+    const d4 = try testBuildApp(gpa, &dcid, 1, s4.items);
+    defer gpa.free(d4);
+    try conn.receiveDatagram(d4, 2100); // no StreamLimitError
+    try testing.expectEqualStrings("z", conn.streamData(4));
+}
+
 // ---- TLS handshake seam tests ----------------------------------------------
 
 // The RFC 8448 section 3 client x25519 public key, the same value tls/keyshare.zig

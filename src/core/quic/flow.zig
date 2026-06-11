@@ -123,9 +123,12 @@ pub const StreamLimit = struct {
     }
 
     /// Should a higher cap be advertised? True once the headroom ahead of the highest
-    /// opened stream falls below half the window (RFC 9000 4.6 auto-tuning).
+    /// opened stream falls below half the window (RFC 9000 4.6 auto-tuning). The half is
+    /// rounded up so a window of 1 still trips after its single slot is used - an
+    /// integer `window / 2` would be 0, a threshold unsigned headroom can never fall
+    /// below, stranding a one-request-at-a-time server.
     pub fn shouldUpdate(self: *const StreamLimit) bool {
-        return self.max - self.opened < self.window / 2;
+        return self.max - self.opened < (self.window + 1) / 2;
     }
 
     /// Slide the cap to `opened + window` and record it; the new value to advertise.
@@ -182,4 +185,13 @@ test "stream limit re-advertises once headroom runs low" {
     try std.testing.expectEqual(@as(u64, 7), l.grant()); // opened 3 + window 4
     try std.testing.expect(!l.shouldUpdate());
     try l.onOpened(6); // the newly granted ids are now usable
+}
+
+test "a window of 1 still slides after its single slot is used" {
+    var l = StreamLimit.init(1);
+    try std.testing.expect(!l.shouldUpdate()); // nothing opened yet
+    try l.onOpened(0); // the one allowed stream
+    try std.testing.expect(l.shouldUpdate()); // would be never-true with `window / 2`
+    try std.testing.expectEqual(@as(u64, 2), l.grant()); // opened 1 + window 1
+    try l.onOpened(1); // the next stream is now permitted
 }
