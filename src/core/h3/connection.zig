@@ -238,6 +238,22 @@ pub const Connection = struct {
 
     // ---- response send path (RFC 9114 4.1) -------------------------------------
 
+    /// A response field is well-formed before it goes on the wire (RFC 9114 4.2):
+    /// a lowercase token name (no pseudo-header - the server supplies :status), no
+    /// connection-specific field, and a value with no control bytes (the write side
+    /// is stricter than the read side and rejects CR/LF/NUL/HTAB and edge
+    /// whitespace), so a re-serialised response cannot split or inject.
+    fn validateResponseHeader(h: Header) Error!void {
+        if (!fields.isValidFieldName(h.name)) return error.H3Error; // pseudo / uppercase / non-token
+        if (fields.isConnectionSpecific(h.name)) return error.H3Error;
+        for (h.value) |ch| if (ch < 0x20 or ch == 0x7F) return error.H3Error;
+        if (h.value.len > 0) {
+            const first = h.value[0];
+            const last = h.value[h.value.len - 1];
+            if (first == ' ' or first == '\t' or last == ' ' or last == '\t') return error.H3Error;
+        }
+    }
+
     /// Send a response head on request stream `id`: a HEADERS frame whose field
     /// section is `:status` plus `headers`, QPACK-encoded. Follow with `sendData`
     /// for the body and `endStream` to finish. Responses ride the client-initiated
@@ -248,7 +264,7 @@ pub const Connection = struct {
         if (quic_stream.StreamType.of(id) != .client_bidi) return error.H3Error; // responses ride the request stream
         if (status < 100 or status > 599) return error.H3Error; // RFC 9110 status range
         if (try self.sendStateOf(id) != .idle) return error.H3Error; // HEADERS once, before DATA/FIN
-        for (headers) |h| if (h.name.len > 0 and h.name[0] == ':') return error.H3Error; // no pseudo-headers
+        for (headers) |h| try validateResponseHeader(h);
 
         // The QPACK field section: prefix (RIC 0, Base 0), then :status, then headers.
         var section: std.ArrayList(u8) = .empty;
@@ -435,13 +451,13 @@ test "a control byte in a field value is malformed" {
 }
 
 test "a non-numeric Content-Length is malformed" {
-    // content-length: "x".
-    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1, 0x20 | 7, 0x03, 'c', 'o', 'n', 't', 'e', 'n', 't', '-', 'l', 'e', 'n', 'g', 't', 'h', 0x01, 'x' }));
+    // content-length: "x" (name length 14 = 3-bit prefix 7 + continuation 7).
+    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1, 0x20 | 7, 0x07, 'c', 'o', 'n', 't', 'e', 'n', 't', '-', 'l', 'e', 'n', 'g', 't', 'h', 0x01, 'x' }));
 }
 
 test "two disagreeing Content-Length values are malformed" {
-    // content-length: 1 then content-length: 2.
-    const cl = [_]u8{ 0x20 | 7, 0x03, 'c', 'o', 'n', 't', 'e', 'n', 't', '-', 'l', 'e', 'n', 'g', 't', 'h' };
+    // content-length: 1 then content-length: 2 (name length 14 = 7 + continuation 7).
+    const cl = [_]u8{ 0x20 | 7, 0x07, 'c', 'o', 'n', 't', 'e', 'n', 't', '-', 'l', 'e', 'n', 'g', 't', 'h' };
     try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &(.{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1 } ++ cl ++ .{ 0x01, '1' } ++ cl ++ .{ 0x01, '2' })));
 }
 
@@ -749,6 +765,12 @@ test "the response send API rejects invalid sequences and inputs" {
     try testing.expectError(error.H3Error, h3.sendResponse(0, 99, &.{}));
     // A pseudo-header in the response headers is rejected (the server sets :status).
     try testing.expectError(error.H3Error, h3.sendResponse(0, 200, &[_]Header{.{ .name = ":status", .value = "200" }}));
+    // An uppercase / non-token field name is rejected (RFC 9114 4.2).
+    try testing.expectError(error.H3Error, h3.sendResponse(0, 200, &[_]Header{.{ .name = "X-Bad", .value = "x" }}));
+    // A connection-specific field is rejected.
+    try testing.expectError(error.H3Error, h3.sendResponse(0, 200, &[_]Header{.{ .name = "connection", .value = "close" }}));
+    // A CR/LF/control byte in a value is rejected (no header splitting).
+    try testing.expectError(error.H3Error, h3.sendResponse(0, 200, &[_]Header{.{ .name = "x", .value = "a\r\nb" }}));
     // A response on a non-client-bidi stream is rejected.
     try testing.expectError(error.H3Error, h3.sendResponse(1, 200, &.{}));
 
