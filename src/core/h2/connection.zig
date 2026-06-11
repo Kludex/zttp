@@ -138,9 +138,17 @@ pub const Connection = struct {
     eof_seen: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, role: Role) Connection {
+        return initWithLimits(gpa, role, .{});
+    }
+
+    /// Construct with explicit DoS limits. The HPACK decoder is sized from
+    /// `limits` here (before it is built), so an overridden header_table_size /
+    /// max_header_list_size takes effect; a post-init field set could not.
+    pub fn initWithLimits(gpa: std.mem.Allocator, role: Role, limits: Limits) Connection {
         var c = Connection{
             .gpa = gpa,
             .role = role,
+            .limits = limits,
             .hpack = undefined,
         };
         c.hpack = decoder_mod.Decoder.init(gpa, c.limits.header_table_size, c.limits.max_header_list_size);

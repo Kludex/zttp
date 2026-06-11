@@ -10,6 +10,7 @@ const core = @import("core");
 const Reader = core.h1.reader.Reader;
 const Role = core.h1.reader.Role;
 const Writer = core.h1.writer.Writer;
+const H1Limits = core.h1.reader.Limits;
 const events = core.events;
 const events_obj = @import("events_obj.zig");
 const exceptions = @import("exceptions.zig");
@@ -17,6 +18,7 @@ const exceptions = @import("exceptions.zig");
 const H2Connection = core.h2.connection.Connection;
 const H2Role = core.h2.connection.Role;
 const H2Writer = core.h2.writer.Writer;
+const H2Limits = core.h2.connection.Limits;
 
 const QuicConnection = core.quic.connection.Connection;
 const QuicRole = core.quic.connection.Role;
@@ -471,13 +473,117 @@ var stream_spec = py.Spec{
     .slots = &stream_slots,
 };
 
-// Parse (role, protocol) from the constructor args. `default_protocol` is what a
-// missing `protocol` arg means - HTTP1 for the base Connection, but a subtype
-// fixes it (and the arg is rejected if it disagrees, so H2Connection(role, HTTP1)
-// can't lie). Returns false with a Python error set on bad input.
-fn parseArgs(args: ?*c.PyObject, kwds: ?*c.PyObject, role: *Role, protocol_out: *c_long, fixed: ?c_long) bool {
+// The DoS limits parsed from the constructor's `limits=` dict. One dict spans
+// both protocols' Limits structs: each takes the keys it knows, the other ignores
+// them, so a caller can pass one dict regardless of the protocol it builds.
+// `present` is false when no limits dict was given (the no-override fast path).
+const ParsedLimits = struct {
+    h1: H1Limits = .{},
+    h2: H2Limits = .{},
+    present: bool = false,
+};
+
+// The union of every key either Limits struct understands. A key outside this set
+// is a typo and raises ValueError. `max_buffer` appears in both structs and is set
+// in both; the rest are protocol-specific and ignored by the other protocol.
+const known_limit_keys = [_][]const u8{
+    // H1
+    "max_line",        "max_headers",     "max_header_bytes",    "max_trailers",
+    "max_trailer_bytes", "strict_crlf",
+    // shared
+    "max_buffer",
+    // H2
+    "max_concurrent_streams", "max_header_list_size", "header_table_size", "max_frame_size",
+    "max_field_block_bytes",  "max_continuation_frames", "max_streams", "max_stream_resets",
+};
+
+fn isKnownLimitKey(key: []const u8) bool {
+    for (known_limit_keys) |k| {
+        if (std.mem.eql(u8, k, key)) return true;
+    }
+    return false;
+}
+
+// Read an unsigned integer limit from `dict[name]` into `out` (only if present).
+// Returns false with a Python error set on a negative/overflowing/non-integer
+// value; a missing key keeps `out` untouched (the struct default).
+fn readU(comptime T: type, dict: ?*c.PyObject, name: [*c]const u8, out: *T) bool {
+    const val = c.PyDict_GetItemString(dict, name); // borrowed, null if absent
+    if (val == null) return true;
+    const n = c.PyLong_AsUnsignedLongLong(val);
+    if (n == @as(c_ulonglong, @bitCast(@as(c_longlong, -1))) and py.errOccurred()) return false;
+    if (n > std.math.maxInt(T)) {
+        _ = py.raiseValue("limits value out of range");
+        return false;
+    }
+    out.* = @intCast(n);
+    return true;
+}
+
+// Parse the `limits` dict into both Limits structs. Returns null (with a Python
+// error already set) on any bad key or value so the caller aborts construction.
+fn parseLimits(dict: ?*c.PyObject) ?ParsedLimits {
+    if (c.PyDict_Check(dict) == 0) {
+        _ = py.raiseType("limits must be a dict");
+        return null;
+    }
+    var parsed = ParsedLimits{ .present = true };
+
+    var pos: c.Py_ssize_t = 0;
+    var key: ?*c.PyObject = null;
+    var value: ?*c.PyObject = null;
+    while (c.PyDict_Next(dict, &pos, &key, &value) != 0) {
+        const ks = py.asUtf8(key) orelse {
+            _ = py.raiseType("limits keys must be strings");
+            return null;
+        };
+        if (!isKnownLimitKey(ks)) {
+            _ = py.raise(c.PyExc_ValueError, "unknown limits key");
+            return null;
+        }
+    }
+
+    // H1
+    if (!readU(usize, dict, "max_line", &parsed.h1.max_line)) return null;
+    if (!readU(usize, dict, "max_headers", &parsed.h1.max_headers)) return null;
+    if (!readU(usize, dict, "max_header_bytes", &parsed.h1.max_header_bytes)) return null;
+    if (!readU(usize, dict, "max_trailers", &parsed.h1.max_trailers)) return null;
+    if (!readU(usize, dict, "max_trailer_bytes", &parsed.h1.max_trailer_bytes)) return null;
+    {
+        const val = c.PyDict_GetItemString(dict, "strict_crlf");
+        if (val != null) {
+            const b = c.PyObject_IsTrue(val);
+            if (b < 0) return null;
+            parsed.h1.strict_crlf = b == 1;
+        }
+    }
+
+    // shared: set in both structs
+    if (!readU(usize, dict, "max_buffer", &parsed.h1.max_buffer)) return null;
+    parsed.h2.max_buffer = parsed.h1.max_buffer;
+
+    // H2
+    if (!readU(u32, dict, "max_concurrent_streams", &parsed.h2.max_concurrent_streams)) return null;
+    if (!readU(u32, dict, "max_header_list_size", &parsed.h2.max_header_list_size)) return null;
+    if (!readU(u32, dict, "header_table_size", &parsed.h2.header_table_size)) return null;
+    if (!readU(u32, dict, "max_frame_size", &parsed.h2.max_frame_size)) return null;
+    if (!readU(usize, dict, "max_field_block_bytes", &parsed.h2.max_field_block_bytes)) return null;
+    if (!readU(u32, dict, "max_continuation_frames", &parsed.h2.max_continuation_frames)) return null;
+    if (!readU(u64, dict, "max_streams", &parsed.h2.max_streams)) return null;
+    if (!readU(u64, dict, "max_stream_resets", &parsed.h2.max_stream_resets)) return null;
+
+    return parsed;
+}
+
+// Parse (role, protocol, limits) from the constructor args. `default_protocol` is
+// what a missing `protocol` arg means - HTTP1 for the base Connection, but a
+// subtype fixes it (and the arg is rejected if it disagrees, so
+// H2Connection(role, HTTP1) can't lie). `limits` is keyword-only. Returns false
+// with a Python error set on bad input.
+fn parseArgs(args: ?*c.PyObject, kwds: ?*c.PyObject, role: *Role, protocol_out: *c_long, limits_out: *ParsedLimits, fixed: ?c_long) bool {
     var role_val: c_long = 0;
     var protocol_val: c_long = fixed orelse HTTP1;
+    var limits_obj: ?*c.PyObject = null;
     const positional = if (kwds == null) c.PyTuple_Size(args) else -1;
     if (positional == 1 or positional == 2) {
         // The common positional forms skip PyArg_ParseTupleAndKeywords, which
@@ -491,9 +597,13 @@ fn parseArgs(args: ?*c.PyObject, kwds: ?*c.PyObject, role: *Role, protocol_out: 
     } else {
         // The kwlist parameter type differs across CPython versions (char** in 3.12,
         // const char* const* in 3.13+), so build a plain C-pointer array and ptrCast
-        // it to whatever the translated signature expects.
-        var kwlist = [_][*c]u8{ @constCast("role"), @constCast("protocol"), null };
-        if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l", @ptrCast(&kwlist), &role_val, &protocol_val) == 0) return false;
+        // it to whatever the translated signature expects. `$` makes `limits`
+        // keyword-only so it never disturbs the (role, protocol) positional forms.
+        var kwlist = [_][*c]u8{ @constCast("role"), @constCast("protocol"), @constCast("limits"), null };
+        if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$O", @ptrCast(&kwlist), &role_val, &protocol_val, &limits_obj) == 0) return false;
+    }
+    if (limits_obj != null and !py.isNone(limits_obj)) {
+        limits_out.* = parseLimits(limits_obj) orelse return false;
     }
     role.* = switch (role_val) {
         SERVER => .server,
@@ -523,14 +633,14 @@ fn parseArgs(args: ?*c.PyObject, kwds: ?*c.PyObject, role: *Role, protocol_out: 
 
 // Allocate an instance of `tp` and build the engine for `protocol_val`. Shared by
 // the concrete subtypes' tp_new.
-fn allocAndBuild(tp: ?*c.PyTypeObject, role: Role, protocol_val: c_long) py.Object {
+fn allocAndBuild(tp: ?*c.PyTypeObject, role: Role, protocol_val: c_long, limits: ParsedLimits) py.Object {
     const alloc = tp.?.tp_alloc.?;
     const obj = alloc(tp, 0);
     if (obj == null) return null;
     const self: *ConnectionObject = @ptrCast(obj);
     self.engine = null;
     const engine: *Engine = @ptrCast(@alignCast(&self.engine_storage));
-    if (!buildEngine(engine, role, protocol_val)) {
+    if (!buildEngine(engine, role, protocol_val, limits)) {
         py.decref(obj);
         return null;
     }
@@ -546,42 +656,51 @@ fn allocAndBuild(tp: ?*c.PyTypeObject, role: Role, protocol_val: c_long) py.Obje
 fn new_base(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
     var role: Role = .server;
     var protocol_val: c_long = HTTP1;
-    if (!parseArgs(args, kwds, &role, &protocol_val, null)) return null;
+    var limits = ParsedLimits{};
+    if (!parseArgs(args, kwds, &role, &protocol_val, &limits, null)) return null;
     if (@intFromPtr(tp) == @intFromPtr(connection_type)) {
         const sub: ?*c.PyTypeObject = @ptrCast(switch (protocol_val) {
             HTTP2 => h2_connection_type,
             HTTP3 => h3_connection_type,
             else => h1_connection_type,
         });
-        return allocAndBuild(sub, role, protocol_val);
+        return allocAndBuild(sub, role, protocol_val, limits);
     }
-    return allocAndBuild(tp, role, protocol_val);
+    return allocAndBuild(tp, role, protocol_val, limits);
 }
 
 fn new_h1(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
     var role: Role = .server;
     var protocol_val: c_long = HTTP1;
-    if (!parseArgs(args, kwds, &role, &protocol_val, HTTP1)) return null;
-    return allocAndBuild(tp, role, HTTP1);
+    var limits = ParsedLimits{};
+    if (!parseArgs(args, kwds, &role, &protocol_val, &limits, HTTP1)) return null;
+    return allocAndBuild(tp, role, HTTP1, limits);
 }
 
 fn new_h2(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
     var role: Role = .server;
     var protocol_val: c_long = HTTP2;
-    if (!parseArgs(args, kwds, &role, &protocol_val, HTTP2)) return null;
-    return allocAndBuild(tp, role, HTTP2);
+    var limits = ParsedLimits{};
+    if (!parseArgs(args, kwds, &role, &protocol_val, &limits, HTTP2)) return null;
+    return allocAndBuild(tp, role, HTTP2, limits);
 }
 
 fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
     var role: Role = .server;
     var protocol_val: c_long = HTTP3;
-    if (!parseArgs(args, kwds, &role, &protocol_val, HTTP3)) return null;
-    return allocAndBuild(tp, role, HTTP3);
+    var limits = ParsedLimits{};
+    if (!parseArgs(args, kwds, &role, &protocol_val, &limits, HTTP3)) return null;
+    return allocAndBuild(tp, role, HTTP3, limits);
 }
 
-fn buildEngine(engine: *Engine, role: Role, protocol_val: c_long) bool {
+fn buildEngine(engine: *Engine, role: Role, protocol_val: c_long, limits: ParsedLimits) bool {
     if (protocol_val == HTTP3) {
-        // The QUIC + HTTP/3 engine is built lazily on the first datagram.
+        // The QUIC + HTTP/3 engine is built lazily and owns its own limits path,
+        // so an override here has nowhere to land - refuse it rather than lie.
+        if (limits.present) {
+            _ = py.raiseValue("limits are not configurable for HTTP/3 yet");
+            return false;
+        }
         engine.* = .{ .h3 = .{} };
         return true;
     }
@@ -591,7 +710,11 @@ fn buildEngine(engine: *Engine, role: Role, protocol_val: c_long) bool {
             _ = c.PyErr_NoMemory();
             return false;
         };
-        conn.* = H2Connection.init(gpa, if (role == .server) H2Role.server else H2Role.client);
+        const h2_role = if (role == .server) H2Role.server else H2Role.client;
+        conn.* = if (limits.present)
+            H2Connection.initWithLimits(gpa, h2_role, limits.h2)
+        else
+            H2Connection.init(gpa, h2_role);
         const writer = gpa.create(H2Writer) catch {
             conn.deinit();
             gpa.destroy(conn);
@@ -603,7 +726,9 @@ fn buildEngine(engine: *Engine, role: Role, protocol_val: c_long) bool {
         return true;
     }
 
-    engine.* = .{ .h1 = .{ .reader = Reader.init(gpa, role) } };
+    var reader = Reader.init(gpa, role);
+    if (limits.present) reader.limits = limits.h1;
+    engine.* = .{ .h1 = .{ .reader = reader } };
     return true;
 }
 

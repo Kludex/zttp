@@ -116,6 +116,16 @@ pub fn fromBytes(s: []const u8) Object {
     return c.PyBytes_FromStringAndSize(s.ptr, @intCast(s.len));
 }
 
+/// Borrow the UTF-8 bytes behind a Python `str`. Returns null (with a Python
+/// error set) if `o` is not a str. The buffer is owned by the str and valid for
+/// its lifetime.
+pub fn asUtf8(o: Object) ?[]const u8 {
+    var len: ssize = undefined;
+    const ptr = c.PyUnicode_AsUTF8AndSize(o, &len);
+    if (ptr == null) return null;
+    return ptr[0..@intCast(len)];
+}
+
 /// Borrow the buffer behind a Python `bytes`/`bytearray`/buffer-protocol object.
 /// Returns null and sets a TypeError if `o` is not bytes-like.
 pub fn asBytes(o: Object) ?[]const u8 {
