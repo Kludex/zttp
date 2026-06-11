@@ -164,6 +164,10 @@ pub const Connection = struct {
     /// The server TLS handshake driver, attached by `initServer`; null on a client
     /// or a connection that does not run the handshake (the recv-pipeline tests).
     tls: ?tls.server.Server = null,
+    /// The full transport-parameter blob this server advertises: the integrator's
+    /// base parameters plus the mandatory per-connection ids initServer appends.
+    /// Connection-owned (the TLS driver borrows it); null outside the server path.
+    own_tp: ?[]u8 = null,
     /// The client's transport parameters (RFC 9000 18.2), parsed from the
     /// ClientHello; until then the RFC defaults apply. Drives the send window and
     /// the PTO ack-delay.
@@ -248,15 +252,33 @@ pub const Connection = struct {
     /// A server connection with the TLS handshake driver attached: incoming CRYPTO
     /// drives the handshake, which installs per-space keys and emits the server
     /// flight. `tls_config` supplies the ServerHello randomness, ephemeral seed,
-    /// signing key, certificate, and transport parameters.
+    /// signing key, certificate, and transport parameters. The integrator's
+    /// transport-parameter blob carries only the limits it chooses; the mandatory
+    /// per-connection ids (RFC 9000 7.3) are appended here, since only the
+    /// connection knows them.
     pub fn initServer(gpa: std.mem.Allocator, client_dcid: []const u8, tls_config: tls.flight.Config) Error!Connection {
         // Enforce exactly the bidi cap we advertise (RFC 9000 4.6): parse it from our
         // own transport parameters so the wire and the enforced value never diverge. A
         // malformed own blob is a configuration bug, surfaced before anything is built.
+        // The connection-id parameters are appended below, so a base blob already
+        // carrying one would duplicate it on the wire - also a configuration bug.
         const own = transport_params.parse(tls_config.transport_params) catch return error.ProtocolViolation;
+        if (own.has_server_only_param or own.initial_scid != null) return error.ProtocolViolation;
         var conn = try init(gpa, .server, client_dcid);
+        errdefer conn.deinit();
         conn.tls = tls.server.Server.init(tls_config);
         conn.bidi_limit = flow.StreamLimit.init(own.initial_max_streams_bidi);
+        // Advertise the mandatory connection ids (RFC 9000 18.2): the client MUST see
+        // its first Initial's destination id echoed as original_destination_connection_id
+        // and our source id as initial_source_connection_id, or it fails the handshake
+        // with TRANSPORT_PARAMETER_ERROR. The augmented blob is connection-owned.
+        var full: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer full.deinit(gpa);
+        try full.appendSlice(gpa, tls_config.transport_params);
+        try transport_params.appendBytesParam(&full, gpa, 0x00, client_dcid); // original_destination_connection_id
+        try transport_params.appendBytesParam(&full, gpa, 0x0f, conn.scid); // initial_source_connection_id
+        conn.own_tp = try full.toOwnedSlice(gpa);
+        conn.tls.?.config.transport_params = conn.own_tp.?;
         return conn;
     }
 
@@ -264,6 +286,7 @@ pub const Connection = struct {
         self.gpa.free(self.dcid);
         self.gpa.free(self.scid);
         self.gpa.free(self.peer_scid);
+        if (self.own_tp) |tp| self.gpa.free(tp);
         var it = self.streams.valueIterator();
         while (it.next()) |s| {
             s.*.deinit();
@@ -1481,6 +1504,31 @@ test "initServer enforces exactly the bidi cap it advertises" {
     var badCfg = testServerConfig();
     badCfg.transport_params = &[_]u8{ 0x08, 0x08, 0x00 }; // len 8, only 1 byte follows
     try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, badCfg));
+}
+
+test "initServer advertises the mandatory connection ids" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x70, 0x71, 0x72, 0x73 };
+    var conn = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer conn.deinit();
+
+    // The advertised blob is the integrator base plus original_destination_connection_id
+    // (the client's first dcid) and initial_source_connection_id (our scid) - the two
+    // a conformant client validates before completing the handshake (RFC 9000 7.3).
+    var expected: std.ArrayListUnmanaged(u8) = .empty;
+    defer expected.deinit(gpa);
+    try expected.appendSlice(gpa, testServerConfig().transport_params);
+    try transport_params.appendBytesParam(&expected, gpa, 0x00, &dcid);
+    try transport_params.appendBytesParam(&expected, gpa, 0x0f, conn.scid);
+    try testing.expectEqualSlices(u8, expected.items, conn.own_tp.?);
+    // The TLS driver ships exactly this blob in EncryptedExtensions.
+    try testing.expectEqualSlices(u8, conn.own_tp.?, conn.tls.?.config.transport_params);
+
+    // A base blob already carrying a connection-id parameter would duplicate it on
+    // the wire: a configuration bug, rejected up front.
+    var dupCfg = testServerConfig();
+    dupCfg.transport_params = &[_]u8{ 0x0f, 0x00 }; // initial_source_connection_id
+    try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, dupCfg));
 }
 
 test "connection flow control sums across streams" {
