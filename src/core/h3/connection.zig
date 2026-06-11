@@ -17,6 +17,7 @@ const quic_stream = @import("../quic/stream.zig");
 const h3_frame = @import("frame.zig");
 const h3_stream = @import("stream.zig");
 const qpack = @import("qpack/decoder.zig");
+const qpack_enc = @import("qpack/encoder.zig");
 
 const Header = events.Header;
 const H3Event = events.H3Event;
@@ -34,10 +35,15 @@ const RequestStream = struct {
     state: ReqState = .idle,
 };
 
+/// Outbound (response) state per stream, so the send API cannot serialize invalid
+/// HTTP/3: DATA before HEADERS, a second HEADERS, or a write after the FIN.
+const SendState = enum { idle, headers_sent, fin_sent };
+
 pub const Connection = struct {
     gpa: std.mem.Allocator,
     qc: *quic_conn.Connection,
     streams: std.AutoHashMapUnmanaged(u64, RequestStream) = .empty,
+    send_state: std.AutoHashMapUnmanaged(u64, SendState) = .empty,
     qpack_dec: qpack.Decoder,
     queue: std.ArrayListUnmanaged(H3Event) = .empty,
     qpos: usize = 0,
@@ -56,6 +62,7 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection) void {
         self.streams.deinit(self.gpa);
+        self.send_state.deinit(self.gpa);
         self.qpack_dec.deinit();
         self.queue.deinit(self.gpa);
         self.arena.deinit();
@@ -193,6 +200,71 @@ pub const Connection = struct {
         const ev = self.queue.items[self.qpos];
         self.qpos += 1;
         return ev;
+    }
+
+    // ---- response send path (RFC 9114 4.1) -------------------------------------
+
+    /// Send a response head on request stream `id`: a HEADERS frame whose field
+    /// section is `:status` plus `headers`, QPACK-encoded. Follow with `sendData`
+    /// for the body and `endStream` to finish. Responses ride the client-initiated
+    /// request stream; HEADERS must precede DATA and nothing follows the FIN, both
+    /// enforced here. `headers` must not contain pseudo-headers (names beginning
+    /// ":") - the server supplies :status.
+    pub fn sendResponse(self: *Connection, id: u64, status: u16, headers: []const Header) Error!void {
+        if (quic_stream.StreamType.of(id) != .client_bidi) return error.H3Error; // responses ride the request stream
+        if (status < 100 or status > 599) return error.H3Error; // RFC 9110 status range
+        if (try self.sendStateOf(id) != .idle) return error.H3Error; // HEADERS once, before DATA/FIN
+        for (headers) |h| if (h.name.len > 0 and h.name[0] == ':') return error.H3Error; // no pseudo-headers
+
+        // The QPACK field section: prefix (RIC 0, Base 0), then :status, then headers.
+        var section: std.ArrayList(u8) = .empty;
+        defer section.deinit(self.gpa);
+        section.appendSlice(self.gpa, &.{ 0x00, 0x00 }) catch return error.OutOfMemory;
+        var status_buf: [3]u8 = undefined;
+        const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch return error.H3Error;
+        qpack_enc.encodeHeader(&section, self.gpa, .{ .name = ":status", .value = status_str }) catch return error.OutOfMemory;
+        for (headers) |h| qpack_enc.encodeHeader(&section, self.gpa, h) catch return error.OutOfMemory;
+
+        var frame: std.ArrayListUnmanaged(u8) = .empty;
+        defer frame.deinit(self.gpa);
+        h3_frame.append(&frame, self.gpa, .headers, section.items) catch return error.OutOfMemory;
+        try self.streamSend(id, frame.items, false);
+        try self.setSendState(id, .headers_sent);
+    }
+
+    /// Send a chunk of response body on stream `id` as an HTTP/3 DATA frame. The
+    /// response head must have been sent first (RFC 9114 4.1).
+    pub fn sendData(self: *Connection, id: u64, data: []const u8) Error!void {
+        if (try self.sendStateOf(id) != .headers_sent) return error.H3Error; // DATA only after HEADERS, before FIN
+        var frame: std.ArrayListUnmanaged(u8) = .empty;
+        defer frame.deinit(self.gpa);
+        h3_frame.append(&frame, self.gpa, .data, data) catch return error.OutOfMemory;
+        try self.streamSend(id, frame.items, false);
+    }
+
+    /// Finish the response on stream `id` (send the stream FIN). The head must have
+    /// been sent; a second endStream is rejected.
+    pub fn endStream(self: *Connection, id: u64) Error!void {
+        if (try self.sendStateOf(id) != .headers_sent) return error.H3Error;
+        try self.streamSend(id, &.{}, true);
+        try self.setSendState(id, .fin_sent);
+    }
+
+    fn sendStateOf(self: *Connection, id: u64) Error!SendState {
+        const gop = self.send_state.getOrPut(self.gpa, id) catch return error.OutOfMemory;
+        if (!gop.found_existing) gop.value_ptr.* = .idle;
+        return gop.value_ptr.*;
+    }
+
+    fn setSendState(self: *Connection, id: u64, s: SendState) Error!void {
+        self.send_state.put(self.gpa, id, s) catch return error.OutOfMemory;
+    }
+
+    fn streamSend(self: *Connection, id: u64, bytes: []const u8, fin: bool) Error!void {
+        self.qc.sendStreamData(id, bytes, fin) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.H3Error, // FinalSizeError etc.
+        };
     }
 };
 
@@ -378,4 +450,67 @@ test "the event arena is reclaimed when the queue drains" {
     const req2 = h3.nextEvent();
     try testing.expect(req2 == .request);
     try testing.expectEqualStrings("GET", req2.request.method);
+}
+
+test "a server sends a response: HEADERS then DATA then FIN" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x99, 0xaa, 0xbb, 0xcc };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // Respond 200 on server-initiated bidi stream id 1 with a body.
+    const headers = [_]Header{.{ .name = "content-type", .value = "text/plain" }};
+    try h3.sendResponse(0, 200, &headers);
+    try h3.sendData(0, "hello");
+    try h3.endStream(0);
+
+    // The QUIC send stream now holds the HEADERS frame, the DATA frame, and a FIN.
+    // Flush into a datagram and read it back through a peer to confirm reassembly.
+    try qc.flushSend(1000);
+    var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    quic_conn.testInstallAppKeys(&peer);
+    const buf = qc.datagramsToSend();
+    var off: usize = 0;
+    for (qc.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+    const got = peer.streamData(0);
+    try testing.expect(peer.streamFinished(0));
+
+    // The first H3 frame is HEADERS; the next is DATA carrying "hello".
+    const d1 = try h3_frame.decode(got);
+    try testing.expectEqual(h3_frame.FrameType.headers, d1.frame.ftype);
+    const d2 = try h3_frame.decode(got[d1.len..]);
+    try testing.expectEqual(h3_frame.FrameType.data, d2.frame.ftype);
+    try testing.expectEqualStrings("hello", d2.frame.payload);
+}
+
+test "the response send API rejects invalid sequences and inputs" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x1a, 0x2b, 0x3c, 0x4d };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // DATA before HEADERS is rejected.
+    try testing.expectError(error.H3Error, h3.sendData(0, "x"));
+    // An out-of-range status is rejected.
+    try testing.expectError(error.H3Error, h3.sendResponse(0, 99, &.{}));
+    // A pseudo-header in the response headers is rejected (the server sets :status).
+    try testing.expectError(error.H3Error, h3.sendResponse(0, 200, &[_]Header{.{ .name = ":status", .value = "200" }}));
+    // A response on a non-client-bidi stream is rejected.
+    try testing.expectError(error.H3Error, h3.sendResponse(1, 200, &.{}));
+
+    // A valid response, then a second HEADERS is rejected, and writes after FIN too.
+    try h3.sendResponse(0, 200, &.{});
+    try testing.expectError(error.H3Error, h3.sendResponse(0, 200, &.{}));
+    try h3.endStream(0);
+    try testing.expectError(error.H3Error, h3.sendData(0, "late"));
 }
