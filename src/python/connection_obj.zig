@@ -151,9 +151,17 @@ const H2Engine = struct {
     writer: *H2Writer,
     handshake_sent: bool = false,
 
+    /// Serialize our connection preface, advertising the SETTINGS we enforce so a
+    /// peer respects our limits (e.g. max_concurrent_streams) rather than the RFC
+    /// defaults. Shared by every site that may emit the preface first.
+    fn sendOurPreface(self: *H2Engine) core.h2.writer.WriteError!void {
+        var buf: [4][2]u32 = undefined;
+        try self.writer.sendPreface(self.conn.localSettingsParams(&buf));
+    }
+
     fn ensureHandshake(self: *H2Engine) bool {
         if (self.handshake_sent) return true;
-        self.writer.sendPreface(&.{}) catch {
+        self.sendOurPreface() catch {
             _ = c.PyErr_NoMemory();
             return false;
         };
@@ -286,7 +294,7 @@ const H2Engine = struct {
         // Our own preface must be the first frame WE send (RFC 9113 3.4), so emit
         // it before any ACK/WINDOW_UPDATE this event would otherwise queue first.
         if (!self.handshake_sent) {
-            try self.writer.sendPreface(&.{});
+            try self.sendOurPreface();
             self.handshake_sent = true;
         }
         switch (ev) {
@@ -309,7 +317,7 @@ const H2Engine = struct {
     fn emitGoawayIfOwed(self: *H2Engine) void {
         if (self.conn.takeGoawayOwed()) |code| {
             if (!self.handshake_sent) {
-                self.writer.sendPreface(&.{}) catch return;
+                self.sendOurPreface() catch return;
                 self.handshake_sent = true;
             }
             self.writer.sendGoaway(self.conn.lastPeerStreamId(), code, &.{}) catch {};

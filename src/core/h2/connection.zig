@@ -228,6 +228,20 @@ pub const Connection = struct {
         return owed;
     }
 
+    /// The (id, value) SETTINGS to advertise in our connection preface (RFC 9113
+    /// 6.5), built from `limits` so what we announce is exactly what we enforce.
+    /// MAX_CONCURRENT_STREAMS is the load-bearing one: the RFC default is unlimited,
+    /// so without it a peer opens more streams than we accept and gets spurious
+    /// REFUSED_STREAM resets. Fills `buf` and returns the populated prefix.
+    pub fn localSettingsParams(self: *const Connection, buf: *[4][2]u32) []const [2]u32 {
+        const ids = constants.SettingId;
+        buf[0] = .{ @intFromEnum(ids.max_concurrent_streams), self.limits.max_concurrent_streams };
+        buf[1] = .{ @intFromEnum(ids.max_header_list_size), self.limits.max_header_list_size };
+        buf[2] = .{ @intFromEnum(ids.header_table_size), self.limits.header_table_size };
+        buf[3] = .{ @intFromEnum(ids.max_frame_size), self.limits.max_frame_size };
+        return buf[0..4];
+    }
+
     fn dispatch(self: *Connection) H2Error!Event {
         if (self.pending_len > 0) return self.popPending();
 
@@ -1390,6 +1404,21 @@ test "a fatal feed (max_buffer breach) poisons the connection and owes a GOAWAY"
     // A later feed re-raises the latched error without re-arming a GOAWAY.
     try testing.expectError(error.MessageTooLong, c.feed("more"));
     try testing.expectEqual(@as(?ErrorCode, null), c.takeGoawayOwed());
+}
+
+test "localSettingsParams advertises the enforced limits" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    c.limits.max_concurrent_streams = 64;
+    var buf: [4][2]u32 = undefined;
+    const params = c.localSettingsParams(&buf);
+    var by_id = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer by_id.deinit();
+    for (params) |p| try by_id.put(p[0], p[1]);
+    try testing.expectEqual(@as(?u32, 64), by_id.get(@intFromEnum(constants.SettingId.max_concurrent_streams)));
+    try testing.expectEqual(@as(?u32, c.limits.max_header_list_size), by_id.get(@intFromEnum(constants.SettingId.max_header_list_size)));
+    try testing.expectEqual(@as(?u32, c.limits.header_table_size), by_id.get(@intFromEnum(constants.SettingId.header_table_size)));
+    try testing.expectEqual(@as(?u32, c.limits.max_frame_size), by_id.get(@intFromEnum(constants.SettingId.max_frame_size)));
 }
 
 test "errorCode maps each H2Error to its RFC 9113 code" {
