@@ -173,10 +173,12 @@ pub const Connection = struct {
     /// the PTO ack-delay.
     peer_tp: transport_params.TransportParameters = .{},
     peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
-    /// The source connection id of the peer's FIRST Initial, kept verbatim (a
-    /// zero-length id stays distinguishable from "none seen") so the peer's
-    /// initial_source_connection_id transport parameter can be validated against it
-    /// (RFC 9000 7.3). peer_scid cannot serve here: it defaults to the client dcid
+    /// The source connection id of the peer's first AUTHENTICATED Initial, kept
+    /// verbatim (a zero-length id stays distinguishable from "none seen") so the
+    /// peer's initial_source_connection_id transport parameter can be validated
+    /// against it (RFC 9000 7.3). Committed only after the packet's AEAD opens - a
+    /// spoofed Initial racing the client's must not poison the anchor and kill the
+    /// real handshake. peer_scid cannot serve here: it defaults to the client dcid
     /// and never adopts an empty id.
     peer_initial_scid: [20]u8 = undefined,
     peer_initial_scid_len: u8 = 0,
@@ -998,30 +1000,15 @@ pub const Connection = struct {
         };
         const total = hdr.pn_offset + @as(usize, @intCast(hdr.length));
         if (total > buf.len) return error.Dropped;
-        // Adopt the peer's source connection id (from its first long header) as the
-        // destination of everything we send (RFC 9000 7.2). Until this, peer_scid
-        // defaults to the client dcid - fine for tests that use one shared id.
-        if (!self.peer_scid_set and hdr.scid.len > 0) {
-            const sc = self.gpa.dupe(u8, hdr.scid) catch return error.OutOfMemory;
-            self.gpa.free(self.peer_scid);
-            self.peer_scid = sc;
-            self.peer_scid_set = true;
-        }
-        // Retain the first Initial's source id verbatim - including a zero-length
-        // one, which the adoption above skips - so the client's
-        // initial_source_connection_id transport parameter can be checked against
-        // what was actually in the packet header (RFC 9000 7.3).
-        if (space == .initial and !self.peer_initial_scid_set) {
-            if (hdr.scid.len > 20) return error.Dropped; // RFC 9000 17.2: at most 20 in v1
-            @memcpy(self.peer_initial_scid[0..hdr.scid.len], hdr.scid);
-            self.peer_initial_scid_len = @intCast(hdr.scid.len);
-            self.peer_initial_scid_set = true;
-        }
         // A long header's length is known, so a packet we cannot decrypt (no keys
         // for the space yet, or a bad tag) is SKIPPED, not fatal: we return its
         // length so the caller keeps walking any coalesced packets behind it
-        // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2.
-        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, now) catch |e| switch (e) {
+        // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2. The
+        // header's scid rides along so it is adopted only AFTER the packet
+        // authenticates: a spoofed Initial racing the client's must not steer
+        // where replies go or poison the id its transport parameters are checked
+        // against (that would let an off-path attacker kill the handshake).
+        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, now, hdr.scid) catch |e| switch (e) {
             error.Dropped => return total,
             else => return e,
         };
@@ -1031,11 +1018,11 @@ pub const Connection = struct {
     fn receiveShort(self: *Connection, buf: []const u8, now: u64) Error!usize {
         const hdr = packet.parseShort(buf, self.dcid.len) catch return error.Dropped;
         // A short-header packet is the rest of the datagram (no length field).
-        try self.decryptAndDispatch(buf, hdr.pn_offset, .application, false, now);
+        try self.decryptAndDispatch(buf, hdr.pn_offset, .application, false, now, null);
         return buf.len;
     }
 
-    fn decryptAndDispatch(self: *Connection, pkt: []const u8, pn_offset: usize, space: Space, long: bool, now: u64) Error!void {
+    fn decryptAndDispatch(self: *Connection, pkt: []const u8, pn_offset: usize, space: Space, long: bool, now: u64, peer_scid_hdr: ?[]const u8) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
         const keys = st.recv_keys orelse return error.Dropped; // no keys for this space yet
         // Work on a mutable copy: header protection removal and decryption mutate.
@@ -1052,6 +1039,26 @@ pub const Connection = struct {
         const plaintext = self.gpa.alloc(u8, ciphertext.len) catch return error.OutOfMemory;
         defer self.gpa.free(plaintext);
         const payload = crypto.open(keys, pn, header, ciphertext, plaintext) catch return error.Dropped;
+
+        // The packet authenticated: NOW the peer's source connection id can be
+        // trusted. Adopt it as the destination of everything we send (RFC 9000 7.2),
+        // and retain the first Initial's verbatim - including a zero-length one,
+        // which the adoption skips - as the anchor the client's
+        // initial_source_connection_id transport parameter is checked against
+        // (RFC 9000 7.3). This runs before frame dispatch, where that check lives.
+        if (peer_scid_hdr) |scid| {
+            if (!self.peer_scid_set and scid.len > 0) {
+                const sc = self.gpa.dupe(u8, scid) catch return error.OutOfMemory;
+                self.gpa.free(self.peer_scid);
+                self.peer_scid = sc;
+                self.peer_scid_set = true;
+            }
+            if (space == .initial and !self.peer_initial_scid_set) {
+                @memcpy(self.peer_initial_scid[0..scid.len], scid); // parseLong caps cids at 20
+                self.peer_initial_scid_len = @intCast(scid.len);
+                self.peer_initial_scid_set = true;
+            }
+        }
 
         // A decryptable Handshake packet proves the peer received our Initial/
         // handshake keys, so its address is validated and the 3x send limit lifts
@@ -1962,6 +1969,32 @@ test "a client sending a server-only transport parameter is rejected" {
     const ch = try buildClientHelloInitialTp(gpa, &dcid, pubkey, &[_]u8{ 0x0f, 0x00, 0x00, 0x01, 0xcc });
     defer gpa.free(ch);
     try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
+}
+
+test "an unauthenticated Initial does not anchor the peer's connection id" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    // An off-path attacker who saw the dcid races the client with a spoofed Initial.
+    // Its tag fails authentication, so it must not commit the connection-id anchor -
+    // otherwise the real client's initial_source_connection_id check would fail and
+    // the spoof would have killed the handshake.
+    const spoof = try buildClientHelloInitial(gpa, &dcid, pubkey);
+    defer gpa.free(spoof);
+    spoof[spoof.len - 1] ^= 0xff; // corrupt the AEAD tag
+    try server.receiveDatagram(spoof, 900); // dropped, not fatal
+    try testing.expect(!server.peer_initial_scid_set);
+
+    // The authentic ClientHello still anchors and completes the flight.
+    const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
+    defer gpa.free(ch);
+    try server.receiveDatagram(ch, 1000);
+    try testing.expect(server.peer_initial_scid_set);
+    try testing.expect(server.datagramLengths().len >= 1); // the server flight went out
 }
 
 test "a lost handshake CRYPTO packet is retransmitted on loss" {
