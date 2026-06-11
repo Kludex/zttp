@@ -23,6 +23,7 @@ from pathlib import Path
 
 from fuzz.harness import consume, consume_h2
 from fuzz.roundtrip import roundtrip
+from fuzz.roundtrip_h2 import roundtrip_h2
 
 CORPUS = Path(__file__).parent / "corpus"
 
@@ -49,7 +50,7 @@ H2_SEEDS = (
     b"\x00\x00\x04\x08\x00\x00\x00\x00\x01\x00\x00\x00\x10",
 )
 
-ORACLES: tuple[Callable[[bytes], None], ...] = (consume, consume_h2, roundtrip)
+ORACLES: tuple[Callable[[bytes], None], ...] = (consume, consume_h2, roundtrip, roundtrip_h2)
 
 
 def _mutate(rng: random.Random, sample: bytes) -> bytes:
