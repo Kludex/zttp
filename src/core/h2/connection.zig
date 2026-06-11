@@ -785,6 +785,23 @@ pub const Connection = struct {
         return self.highest_peer_id;
     }
 
+    /// The connection-level send window: how many body bytes may leave across all
+    /// streams before a WINDOW_UPDATE. Can be negative after a SETTINGS shrink.
+    pub fn connSendWindow(self: *const Connection) i32 {
+        return self.conn_send_window;
+    }
+
+    /// The send window of `id`, or null if no such stream is live.
+    pub fn streamSendWindow(self: *Connection, id: u32) ?i32 {
+        return if (self.streams.getPtr(id)) |s| s.send_window else null;
+    }
+
+    /// Body bytes queued on `id` that the send window could not yet admit, or null
+    /// if no such stream is live.
+    pub fn streamPendingBytes(self: *Connection, id: u32) ?usize {
+        return if (self.streams.getPtr(id)) |s| s.send_pending.items.len else null;
+    }
+
     /// Queue outbound body bytes on `id`, emitting as much as the connection and
     /// stream send windows (and the peer's max frame) allow, parking the rest.
     pub fn sendStreamData(self: *Connection, writer: *writer_mod.Writer, id: u32, data: []const u8, end_stream: bool) writer_mod.WriteError!void {

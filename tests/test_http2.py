@@ -565,3 +565,95 @@ def test_h2_head_response_with_content_length_is_not_a_stream_error() -> None:
     client.receive_data(server.data_to_send())
     events = [type(e).__name__ for e in drain_h2(client)]
     assert events == snapshot(["Settings", "Settings", "Response", "EndOfMessage"])
+
+
+def test_initiate_connection_emits_the_preface_before_any_send() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    conn.initiate_connection()
+    types = [f[0] for f in _frames(conn.data_to_send())]
+    assert types == [0x04]  # the server SETTINGS frame, emitted at connection time
+
+
+def test_initiate_connection_is_idempotent() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    conn.initiate_connection()
+    conn.initiate_connection()
+    assert len([f for f in _frames(conn.data_to_send()) if f[0] == 0x04]) == 1
+
+
+def test_initiate_connection_on_http1_is_an_error() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP1)
+    with pytest.raises(AttributeError):
+        conn.initiate_connection()
+
+
+def test_send_response_end_stream_rides_the_headers_frame() -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    conn.stream(1).send_response(204, end_stream=True)
+    frames = [f for f in _frames(conn.data_to_send()) if f[0] in (0x01, 0x00)]
+    assert len(frames) == 1  # a single HEADERS frame, no trailing DATA
+    ftype, flags, sid, _ = frames[0]
+    assert ftype == 0x01 and flags & END_STREAM and sid == 1
+
+
+def test_send_response_without_end_stream_still_needs_a_data_frame() -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    conn.stream(1).send_response(200, [(b"content-length", b"0")])
+    headers = [f for f in _frames(conn.data_to_send()) if f[0] == 0x01]
+    assert not (headers[0][1] & END_STREAM)  # END_STREAM rides DATA, set by end_message
+
+
+def test_stream_send_informational_then_final_response() -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    conn.stream(1).send_informational(100)
+    conn.stream(1).send_response(200, [(b"content-length", b"0")])
+    headers = [f for f in _frames(conn.data_to_send()) if f[0] == 0x01]
+    assert len(headers) == 2  # interim HEADERS, then final HEADERS
+    assert not (headers[0][1] & END_STREAM)  # an interim never ends the stream
+
+
+def test_stream_send_informational_rejects_non_1xx() -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    with pytest.raises(ValueError):
+        conn.stream(1).send_informational(200)
+
+
+def test_stream_send_informational_rejects_101() -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    with pytest.raises(ValueError):
+        conn.stream(1).send_informational(101)
+
+
+def test_stream_send_window_and_pending_bytes_track_backpressure() -> None:
+    conn = server_with_small_window(5)
+    stream = conn.stream(1)
+    assert stream.send_window == 5
+    stream.send_response(200, [(b"content-type", b"text/plain")])
+    stream.send_data(b"hello world")  # 11 bytes, window is 5
+    conn.data_to_send()
+    assert stream.send_window == 0
+    assert stream.pending_bytes == 6  # the 6 bytes the window could not admit
+
+
+def test_send_window_and_pending_bytes_are_none_for_an_unknown_stream() -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    handle = conn.stream(99)
+    assert handle.send_window is None
+    assert handle.pending_bytes is None
+
+
+def test_connection_send_window_and_has_pending_send() -> None:
+    conn = server_with_small_window(5)
+    assert conn.send_window == 65535  # the connection window is still the default
+    assert conn.has_pending_send() is False
+    stream = conn.stream(1)
+    stream.send_response(200, [(b"content-type", b"text/plain")])
+    stream.send_data(b"hello world")
+    conn.data_to_send()
+    assert conn.has_pending_send() is True
