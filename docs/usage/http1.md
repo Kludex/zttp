@@ -126,33 +126,10 @@ print(end.trailers)
 #> [(b'X-Checksum', b'900150983cd24fb0')]
 ```
 
-### Bodyless responses (client)
-
-Some responses have **no body no matter what their headers say**: the response to
-a `HEAD` request, and any `1xx` / `204` / `304`. A `HEAD` response, for instance,
-carries the `Content-Length` the `GET` *would* have had, but sends no bytes.
-
-You don't track this. Because you sent the request through the same connection, it
-remembers the method and frames the response correctly on its own. The connection
-saw the `HEAD`, so it yields `EndOfMessage` straight after the head instead of
-waiting for 1234 body bytes that never come:
-
-```python
-import zttp
-
-conn = zttp.Connection(zttp.CLIENT)
-conn.send_request(b"HEAD", b"/", b"1.1", [(b"Host", b"example.com")])
-conn.data_to_send()
-conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n")
-
-print([type(e).__name__ for e in events(conn)])
-#> ['Response', 'EndOfMessage']
-```
-
 ### A reusable drain helper
 
 In practice you'll want a small helper that pulls events until it needs more
-data. Here's one:
+data. Here's one, used by the examples that follow:
 
 ```python
 import zttp
@@ -180,6 +157,29 @@ for event in events(conn):
             ...
         case zttp.EndOfMessage():
             ...
+```
+
+### Bodyless responses (client)
+
+Some responses have **no body no matter what their headers say**: the response to
+a `HEAD` request, and any `1xx` / `204` / `304`. A `HEAD` response, for instance,
+carries the `Content-Length` the `GET` *would* have had, but sends no bytes.
+
+You don't track this. Because you sent the request through the same connection, it
+remembers the method and frames the response correctly on its own. The connection
+saw the `HEAD`, so it yields `EndOfMessage` straight after the head instead of
+waiting for 1234 body bytes that never come (using the `events` helper above):
+
+```python
+import zttp
+
+conn = zttp.Connection(zttp.CLIENT)
+conn.send_request(b"HEAD", b"/", b"1.1", [(b"Host", b"example.com")])
+conn.data_to_send()
+conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n")
+
+print([type(e).__name__ for e in events(conn)])
+#> ['Response', 'EndOfMessage']
 ```
 
 ## Sending
