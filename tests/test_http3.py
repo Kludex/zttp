@@ -148,7 +148,7 @@ def test_http3_stream_reset() -> None:
     stream = conn.stream(0)
     stream.reset()
     assert len(conn.data_to_send()) >= 1
-    stream.reset(0x010c)  # an explicit code is accepted (a second reset is a no-op)
+    stream.reset(0x010C)  # an explicit code is accepted (a second reset is a no-op)
     # An error code past the 62-bit QUIC range is rejected.
     with pytest.raises(ValueError):
         conn.stream(4).reset(1 << 62)
