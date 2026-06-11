@@ -11,24 +11,24 @@ import zttp
 SERVER_CONFIG = {
     "certificate": b"\xcc" * 48,
     "private_key": b"\x42" * 32,
-    "transport_params": b"\x00\x01",
+    "transport_params": b"\x08\x01\x08",
     "random": b"\xab" * 32,
     "ephemeral_seed": b"\x33" * 32,
 }
 
 # Real handshake datagrams a client produces against SERVER_CONFIG, captured from the
-# Zig transport's test builders (RFC 8448 client key share; client transport params
-# grant initial_max_data 65536 so the server can send a response). The ClientHello
-# rides an Initial, the Finished a Handshake packet, the GET request a 1-RTT packet -
-# each sealed with the keys the real handshake derives, so nothing is forged with test
-# keys. dcid is 11 22 33 44.
+# Zig transport's test builders (RFC 8448 client key share; the client transport params
+# grant initial_max_data 65536 so the server can send a response, the server advertises
+# initial_max_streams_bidi 8). The ClientHello rides an Initial, the Finished a Handshake
+# packet, the GET request a 1-RTT packet - each sealed with the keys the real handshake
+# derives, so nothing is forged with test keys. dcid is 11 22 33 44.
 CLIENT_HELLO = bytes.fromhex(
     "c50000000104112233440000408f483e116484af5563d1a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0cbccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe883b8cddc289b6944cd68dfb2ecf25008c78255eef81817c25a8"
 )
 CLIENT_FINISHED = bytes.fromhex(
-    "ec00000001041122334400382752efb16776726f129f2798e7cee3ab080e10925a8331338a626e045753f05e8faf92e68fa71b216c74ad62328c98266e9a02dfc1e04b73"
+    "ef00000001041122334400389752efb16776726f311fc8f83518999b83e43201874da34629db68e1a148f7270cb0277e2cd047788f1e7c69e7aa96f6f64dc4f02a3aff97"
 )
-GET_REQUEST = bytes.fromhex("43112233444d9d682e5bf0ebaf0a11b98027c97bf97fd885a8313873436ad9bbdfce745335")
+GET_REQUEST = bytes.fromhex("53112233447b8268f6a6591dc327e27a69cbfb7b3fa33d1bfce2894c49f816ecbace313565")
 
 
 def make_server() -> zttp.H3Connection:

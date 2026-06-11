@@ -388,9 +388,9 @@ const H3Engine = struct {
             const hdr = core.quic.packet.parseLong(dgram) catch
                 return py.raise(exceptions.RemoteProtocolError, "malformed QUIC Initial packet");
             const q = gpa.create(QuicConnection) catch return c.PyErr_NoMemory();
-            q.* = QuicConnection.initServer(gpa, hdr.dcid, self.config.flightConfig()) catch {
+            q.* = QuicConnection.initServer(gpa, hdr.dcid, self.config.flightConfig()) catch |e| {
                 gpa.destroy(q);
-                return c.PyErr_NoMemory();
+                return exceptions.raiseQuic(e);
             };
             const h = gpa.create(H3Connection) catch {
                 q.deinit();
