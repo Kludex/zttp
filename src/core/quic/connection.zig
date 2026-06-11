@@ -28,6 +28,22 @@ const Space = constants.Space;
 
 pub const Role = enum { server, client };
 
+/// The Application-space PTO ack-delay budget (RFC 9002 6.2.1). The default peer
+/// max_ack_delay (RFC 9000 18.2) until transport parameters are negotiated; the
+/// long-header spaces use 0, handled when handshake PTO lands.
+const MAX_ACK_DELAY_US: u64 = 25_000;
+
+/// The earlier of an optional `a` and a `b`.
+fn minOpt(a: ?u64, b: u64) ?u64 {
+    return if (a) |x| @min(x, b) else b;
+}
+
+/// The PTO ack-delay term per space (RFC 9002 6.2.1): max_ack_delay applies only to
+/// Application; the long-header spaces add 0.
+fn ackDelayFor(space: Space) u64 {
+    return if (space == .application) MAX_ACK_DELAY_US else 0;
+}
+
 pub const Error = error{
     /// A received packet failed authentication and was dropped; surfaced so a
     /// caller can count it, never fatal on its own (RFC 9001 9.5).
@@ -58,6 +74,11 @@ const SpaceState = struct {
     /// so a lost packet's data can be re-queued and an acked packet's data freed.
     /// Only the Application space carries STREAM frames, but the field is uniform.
     stream_sent: std.AutoHashMapUnmanaged(u64, StreamSent) = .empty,
+    /// The ack-eliciting send-time anchor a PTO last fired against. A PTO will not
+    /// re-fire for the same anchor (which would inflate the backoff without a probe
+    /// reaching the wire); it re-arms only once a fresh ack-eliciting send advances
+    /// last_ack_eliciting_sent_time past this.
+    pto_fired_anchor: ?u64 = null,
 
     fn deinit(self: *SpaceState, gpa: std.mem.Allocator) void {
         self.rec.deinit(gpa);
@@ -342,6 +363,19 @@ pub const Connection = struct {
                 if (self.send_streams.get(e.value.id)) |s| try s.onAck(e.value.offset, e.value.len, e.value.fin);
             }
         }
+        // ACK progress resets the PTO backoff (in recovery), so release the fire-once
+        // latch: a fresh PTO epoch may arm even if another packet sharing the fired
+        // anchor is still in flight.
+        if (acked_pns.items.len > 0) st.pto_fired_anchor = null;
+        try self.detectLostAndRequeue(space, now);
+    }
+
+    /// Run loss detection for one space and re-queue every newly-lost packet's
+    /// STREAM range so the next flushSend retransmits it. Shared by the ACK arm and
+    /// the time-threshold path of onTimeout; `fetchRemove` keeps rec.sent and
+    /// stream_sent in lockstep, so each pn is routed exactly once.
+    fn detectLostAndRequeue(self: *Connection, space: Space, now: u64) Error!void {
+        const st = &self.spaces[@intFromEnum(space)];
         var lost_pns: std.ArrayListUnmanaged(u64) = .empty;
         defer lost_pns.deinit(self.gpa);
         _ = st.rec.detectLost(&self.rtt, &self.cc, now, &lost_pns, self.gpa) catch return error.OutOfMemory;
@@ -350,6 +384,73 @@ pub const Connection = struct {
                 if (self.send_streams.get(e.value.id)) |s| try s.onLost(e.value.offset, e.value.len, e.value.fin);
             }
         }
+    }
+
+    // ---- loss-recovery timer (sans-IO: the integrator owns the OS timer) --------
+
+    /// The absolute time (us) of the earliest armed deadline across all spaces - the
+    /// earlier of any time-threshold loss deadline and any PTO deadline - or null if
+    /// nothing is armed. The integrator sets an OS timer for this and calls
+    /// `onTimeout` at or after it. Null also when the PTO backoff has saturated (a
+    /// black-holed peer): the integrator's own idle timeout then closes the connection.
+    pub fn nextTimeout(self: *Connection) ?u64 {
+        var earliest: ?u64 = null;
+        for (&self.spaces, 0..) |*st, i| {
+            if (st.rec.loss_time) |t| earliest = minOpt(earliest, t);
+            if (st.rec.ptoDeadline(&self.rtt, ackDelayFor(@enumFromInt(i)))) |t| earliest = minOpt(earliest, t);
+        }
+        return earliest;
+    }
+
+    /// Drive the loss-recovery timers at time `now`. First handle any space whose
+    /// time-threshold loss deadline passed (declare lost + re-queue, exactly the ACK
+    /// path). Then, per space whose PTO deadline passed, send a probe: re-queue the
+    /// oldest unacked STREAM range so the next flushSend resends it (or a PING). No
+    /// I/O happens here - the next flushSend emits whatever was queued.
+    pub fn onTimeout(self: *Connection, now: u64) Error!void {
+        if (self.closed) return error.ProtocolViolation;
+
+        // (1) Time-threshold losses first (RFC 9002 6.2.1: loss_time takes precedence).
+        for (&self.spaces, 0..) |*st, i| {
+            if (st.rec.loss_time) |lt| {
+                if (now >= lt) try self.detectLostAndRequeue(@enumFromInt(i), now);
+            }
+        }
+
+        // (2) PTO fires. The latch (pto_fired_anchor) stops a re-fire for the same
+        // ack-eliciting anchor: a PTO must wait for an actual probe to advance the
+        // anchor before backing off again, so repeated onTimeout calls without an
+        // intervening send cannot inflate the backoff.
+        for (&self.spaces, 0..) |*st, i| {
+            if (st.send_keys == null) continue;
+            const deadline = st.rec.ptoDeadline(&self.rtt, ackDelayFor(@enumFromInt(i))) orelse continue;
+            if (now < deadline) continue;
+            if (st.pto_fired_anchor == st.rec.last_ack_eliciting_sent_time) continue; // already fired for this anchor
+            st.pto_fired_anchor = st.rec.last_ack_eliciting_sent_time;
+            if (st.rec.onPtoExpired()) |pn| try self.sendProbe(@enumFromInt(i), pn, now);
+        }
+    }
+
+    /// Send a PTO probe for `space`: re-queue the oldest unacked STREAM range so the
+    /// next flushSend resends it to elicit an ACK, or a PING if that packet carried
+    /// no STREAM data. Crucially `stream_sent.get` (not fetchRemove): the probed
+    /// packet stays in flight - a probe re-sends data, it does not declare loss - so
+    /// its genuine later ACK or loss still routes exactly once.
+    fn sendProbe(self: *Connection, space: Space, pn: u64, now: u64) Error!void {
+        const st = &self.spaces[@intFromEnum(space)];
+        if (st.stream_sent.get(pn)) |sent| {
+            if (self.send_streams.get(sent.id)) |s| try s.onLost(sent.offset, sent.len, sent.fin);
+            return;
+        }
+        // No STREAM data to resend (a CRYPTO or PING packet): a PING is a valid probe
+        // that elicits an ACK. Retransmitting lost CRYPTO data on PTO - so the
+        // handshake itself recovers from tail loss - is a separate follow-up; here the
+        // PING at least keeps the timer and recovery loop alive.
+        try self.sendPing(space, now);
+    }
+
+    fn sendPing(self: *Connection, space: Space, now: u64) Error!void {
+        _ = try self.buildPacket(space, &[_]u8{0x01}, true, now); // PING (RFC 9000 19.2)
     }
 
     // ---- TLS handshake drive ---------------------------------------------------
@@ -1202,4 +1303,143 @@ test "a late ACK of an already-lost packet is a harmless no-op" {
     defer gpa.free(late);
     try sender.receiveDatagram(late, 4000); // must not crash, double-free, or resurrect
     try testing.expect(!sender.closed);
+}
+
+// ---- PTO / tail-loss tests --------------------------------------------------
+
+test "a lost tail STREAM packet is retransmitted via the PTO timer" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    testInstallAppKeys(&peer);
+
+    // ONE tail packet, never acked: ACK-driven loss detection is blind here (no
+    // later packet, no ACK, loss_time never set). Only the PTO recovers it.
+    try sender.sendStreamData(1, "tail", true);
+    try sender.flushSend(1000);
+    try testing.expectEqual(@as(usize, 1), sender.datagramLengths().len);
+    sender.clearSend();
+    try testing.expect(!sender.hasPendingSend());
+
+    const deadline = sender.nextTimeout().?; // armed off the one ack-eliciting send
+    try testing.expect(deadline > 1000);
+    try sender.onTimeout(deadline + 1); // PTO fires -> probe re-queues the tail range
+    try testing.expect(sender.hasPendingSend());
+    try sender.flushSend(deadline + 2);
+    try testing.expect(sender.datagramLengths().len >= 1); // retransmitted
+
+    // The peer receives the retransmission and reassembles the whole stream.
+    try deliverAllExcept(&sender, &peer, null, deadline + 3);
+    try testing.expectEqualStrings("tail", peer.streamData(1));
+    try testing.expect(peer.streamFinished(1));
+}
+
+test "nextTimeout is null when idle and after everything is acked" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xE1, 0xE2, 0xE3, 0xE4 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    try testing.expect(sender.nextTimeout() == null); // nothing in flight: no timer
+
+    try sender.sendStreamData(1, "x", true);
+    try sender.flushSend(1000);
+    try testing.expect(sender.nextTimeout() != null); // armed off the send
+
+    const ack = try buildAppAck(gpa, &dcid, 0, 0, 0); // ack pn 0
+    defer gpa.free(ack);
+    try sender.receiveDatagram(ack, 2000);
+    try testing.expect(sender.nextTimeout() == null); // all acked: no spurious arm
+}
+
+test "the PTO backs off exponentially across consecutive fires" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xF1, 0xF2, 0xF3, 0xF4 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    try sender.sendStreamData(1, "x", false);
+    try sender.flushSend(1000);
+    const d1 = sender.nextTimeout().?; // anchor 1000, pto_count 0 -> base
+    const base = d1 - 1000;
+
+    try sender.onTimeout(d1 + 1); // PTO 1: pto_count -> 1, re-queue
+    try sender.flushSend(d1 + 2); // the probe leaves; anchor advances to d1+2
+    const d2 = sender.nextTimeout().?;
+    // Second deadline is the doubled base measured from the probe's send time.
+    try testing.expectEqual((d1 + 2) + base * 2, d2);
+}
+
+test "a PTO probe that gets acked resets the backoff" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x1A, 0x2B, 0x3C, 0x4D };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    try sender.sendStreamData(1, "data", true);
+    try sender.flushSend(1000);
+    const d1 = sender.nextTimeout().?;
+    try sender.onTimeout(d1 + 1); // pto_count -> 1
+    try sender.flushSend(d1 + 2); // probe sent as pn 1
+
+    // Ack both the original tail (pn 0) and the probe (pn 1): everything in flight
+    // is acknowledged, so the backoff resets and no timer remains armed.
+    const ack = try buildAppAck(gpa, &dcid, 0, 1, 1);
+    defer gpa.free(ack);
+    try sender.receiveDatagram(ack, d1 + 3);
+    try testing.expect(sender.nextTimeout() == null); // pto_count reset, nothing in flight
+}
+
+test "onTimeout without an intervening flush does not inflate the backoff" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x5E, 0x6F, 0x70, 0x81 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    try sender.sendStreamData(1, "x", false);
+    try sender.flushSend(1000);
+    const d1 = sender.nextTimeout().?;
+    try sender.onTimeout(d1 + 1); // fires once for this anchor
+    const after_first = sender.nextTimeout().?;
+    // A second onTimeout past the deadline WITHOUT a flush (no new probe on the wire)
+    // must not re-fire and double the backoff again: the anchor has not advanced.
+    try sender.onTimeout(after_first + 1);
+    try testing.expectEqual(after_first, sender.nextTimeout().?);
+}
+
+test "ACK progress releases the PTO latch so a later loss can re-fire" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x9A, 0x8B, 0x7C, 0x6D };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    // Two packets sent at the SAME time -> they share one ack-eliciting anchor.
+    try sender.sendStreamData(1, "aaaa", false);
+    try sender.sendStreamData(2, "bbbb", false);
+    try sender.flushSend(1000); // pn 0 (stream 1), pn 1 (stream 2), anchor 1000
+
+    const d1 = sender.nextTimeout().?;
+    try sender.onTimeout(d1 + 1); // PTO fires for anchor 1000, latch = 1000
+    try sender.flushSend(d1 + 2);
+
+    // Ack only the probe/first packet; pto_count resets and the latch is released.
+    const ack = try buildAppAck(gpa, &dcid, 0, 0, 0); // ack pn 0
+    defer gpa.free(ack);
+    try sender.receiveDatagram(ack, d1 + 3);
+
+    // A still-unacked packet remains in flight, so the PTO must be able to arm and
+    // fire a fresh epoch - the latch must not suppress it forever.
+    try testing.expect(sender.nextTimeout() != null);
+    const d2 = sender.nextTimeout().?;
+    try sender.onTimeout(d2 + 1);
+    try testing.expect(sender.hasPendingSend()); // a new probe was queued
 }
