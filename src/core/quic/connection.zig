@@ -170,8 +170,14 @@ pub const Connection = struct {
     /// (RFC 9000 4.1); flushSend emits it so the peer is not stalled at its grant.
     max_data_pending: bool = false,
     /// Enough request streams completed to advertise a higher bidi cap (RFC 9000 4.6);
-    /// flushSend emits a MAX_STREAMS so the peer is not stuck at the old limit.
+    /// flushSend emits a MAX_STREAMS (carrying `bidi_limit.max`, already granted) so the
+    /// peer is not stuck at the old limit.
     max_streams_pending: bool = false,
+    /// The packet number an emitted MAX_STREAMS is riding, so a lost one is re-sent (RFC
+    /// 9000 13.3): without this a lost MAX_STREAMS would deadlock the peer, which - being
+    /// out of stream credit - cannot open the streams whose completion would re-trigger
+    /// the advertisement. Cleared when that packet is acked.
+    max_streams_sent: ?u64 = null,
     /// Anti-amplification (RFC 9000 8.1): until the client's address is validated, the
     /// server may send at most AMPLIFICATION_FACTOR x the bytes it has received. A
     /// received Handshake packet (only a real client can produce one) validates the
@@ -473,14 +479,16 @@ pub const Connection = struct {
         }
 
         // Advertise a raised bidi-stream cap if one is pending, so a peer serving a long
-        // run of requests is not stuck at the old MAX_STREAMS limit (RFC 9000 4.6).
+        // run of requests is not stuck at the old MAX_STREAMS limit (RFC 9000 4.6). The
+        // value was granted in dropStream; emit it and record the pn so a lost frame is
+        // re-sent (the cap only grows, so a duplicate is harmless).
         if (self.max_streams_pending) {
             if (self.bidi_limit) |*limit| {
                 var msf: std.ArrayListUnmanaged(u8) = .empty;
                 defer msf.deinit(self.gpa);
-                frame.encodeMaxStreams(&msf, self.gpa, true, limit.grant()) catch return error.OutOfMemory;
+                frame.encodeMaxStreams(&msf, self.gpa, true, limit.max) catch return error.OutOfMemory;
                 while (msf.items.len < 20) msf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
-                _ = try self.buildPacket(space, msf.items, true, now);
+                self.max_streams_sent = try self.buildPacket(space, msf.items, true, now);
             }
             self.max_streams_pending = false;
         }
@@ -597,6 +605,7 @@ pub const Connection = struct {
                 }
             }
             if (self.stop_sending_inflight.fetchRemove(pn)) |e| _ = self.stop_sending.remove(e.value); // acked: done
+            if (self.max_streams_sent == pn) self.max_streams_sent = null; // the advertised cap is confirmed
         }
         // ACK progress resets the PTO backoff (in recovery), so release the fire-once
         // latch: a fresh PTO epoch may arm even if another packet sharing the fired
@@ -631,6 +640,11 @@ pub const Connection = struct {
             // A lost STOP_SENDING: clear in_flight so the next flushSend re-emits it.
             if (self.stop_sending_inflight.fetchRemove(pn)) |e| {
                 if (self.stop_sending.getPtr(e.value)) |ss| ss.in_flight = false;
+            }
+            // A lost MAX_STREAMS: re-arm so the next flushSend re-advertises the cap.
+            if (self.max_streams_sent == pn) {
+                self.max_streams_sent = null;
+                self.max_streams_pending = true;
             }
         }
         if (crypto_lost) try self.flushCrypto(space, now); // resend the lost handshake bytes now
@@ -729,6 +743,12 @@ pub const Connection = struct {
                 ss.in_flight = false;
                 return; // the next flushSend re-sends it
             }
+        }
+        // ... or the MAX_STREAMS the probed packet carried: re-arm it to re-advertise.
+        if (self.max_streams_sent == pn) {
+            self.max_streams_sent = null;
+            self.max_streams_pending = true;
+            return; // the next flushSend re-sends it
         }
         // No data to resend (the range was already acked, or a PING-only packet): a
         // PING is a valid probe that elicits an ACK and keeps the recovery loop alive.
@@ -1161,9 +1181,14 @@ pub const Connection = struct {
         self.gpa.destroy(s);
         // A finished request frees a bidi slot: re-advertise a higher cap once the
         // headroom ahead of the highest opened stream runs low (RFC 9000 4.6), so a
-        // long-lived connection serving many requests is not stranded at the limit.
+        // long-lived connection serving many requests is not stranded at the limit. The
+        // grant happens here (once per slide); flushSend just emits the new max, so a
+        // retransmit re-sends the same value rather than ratcheting it up each time.
         if (self.bidi_limit) |*limit| {
-            if (stream.StreamType.of(id) == .client_bidi and limit.shouldUpdate()) self.max_streams_pending = true;
+            if (stream.StreamType.of(id) == .client_bidi and limit.shouldUpdate()) {
+                _ = limit.grant();
+                self.max_streams_pending = true;
+            }
         }
         return true;
     }
@@ -1548,13 +1573,22 @@ test "completing request streams advertises a raised MAX_STREAMS" {
     }
     conn.clearSend();
 
-    // Three of four opened crossed the auto-tune threshold: a MAX_STREAMS is queued
-    // and flushSend emits it, sliding the cap to opened (3) + window (4).
+    // Three of four opened crossed the auto-tune threshold: the cap slid to opened (3)
+    // + window (4) and a MAX_STREAMS is queued, which flushSend emits.
     try testing.expect(conn.max_streams_pending);
+    try testing.expectEqual(@as(u64, 7), conn.bidi_limit.?.max);
     try conn.flushSend(2000);
     try testing.expect(!conn.max_streams_pending); // emitted
     try testing.expect(conn.datagramLengths().len >= 1);
-    try testing.expectEqual(@as(u64, 7), conn.bidi_limit.?.max);
+    try testing.expect(conn.max_streams_sent != null); // recorded for loss recovery
+    conn.clearSend();
+
+    // A lost MAX_STREAMS must be re-sent, or the peer - out of stream credit - can never
+    // open the streams whose completion would re-trigger the advertisement (RFC 9000 13.3).
+    const d = conn.nextTimeout().?;
+    try conn.onTimeout(d + 1);
+    try conn.flushSend(d + 2);
+    try testing.expect(conn.datagramsToSend().len > 0); // the cap rode again
 }
 
 // ---- TLS handshake seam tests ----------------------------------------------
