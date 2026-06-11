@@ -1197,6 +1197,20 @@ pub const Connection = struct {
         }
         return n;
     }
+
+    /// Snapshot the ids with an unconsumed peer STOP_SENDING (RFC 9000 19.5), so the
+    /// HTTP/3 layer can surface a response cancellation even for a request whose recv
+    /// stream has already completed and is gone from `streamIds`.
+    pub fn stopSendingIds(self: *Connection, out: []u64) usize {
+        var n: usize = 0;
+        var it = self.stop_sending_recv.keyIterator();
+        while (it.next()) |k| {
+            if (n >= out.len) break;
+            out[n] = k.*;
+            n += 1;
+        }
+        return n;
+    }
 };
 
 const testing = std.testing;
