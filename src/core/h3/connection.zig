@@ -384,6 +384,10 @@ pub const Connection = struct {
         for (decoded) |h| {
             if (h.name.len > 0 and h.name[0] == ':') {
                 if (seen_regular) return error.H3Error; // pseudo after regular (RFC 9114 4.3)
+                // A pseudo-header value is validated like any other (no CR/LF/NUL/
+                // control), so a :authority carrying CR/LF cannot be synthesized into
+                // a `host` header and split a downgraded HTTP/1.1 request line.
+                if (!fields.validValue(h.value)) return error.H3Error;
                 // A request pseudo-header appears at most once (RFC 9114 4.3.1 ->
                 // RFC 9113 8.3); a duplicate is malformed.
                 const slot = if (eql(h.name, ":method")) &method else if (eql(h.name, ":path")) &path else if (eql(h.name, ":authority")) &authority else if (eql(h.name, ":scheme")) &scheme else return error.H3Error;
@@ -600,6 +604,33 @@ test "decode a GET request over HTTP/3" {
     try testing.expectEqualStrings("3", ev.request.http_version);
     try testing.expectEqualStrings("host", ev.request.headers[0].name);
     try testing.expectEqualStrings("exy", ev.request.headers[0].value);
+}
+
+test "a CR/LF in a pseudo-header value is malformed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // :authority = "ex\r\ny" - a CR/LF smuggled into the pseudo-header value must
+    // be rejected, or an h3->h1 downgrade could split it into a host header plus a
+    // second request line.
+    const qpack_block = [_]u8{
+        0x00,     0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1,
+        0x50 | 0, 0x05, 'e',       'x',       '\r',
+        '\n',     'y',
+    };
+    var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer h3_bytes.deinit(gpa);
+    try h3_frame.append(&h3_bytes, gpa, .headers, &qpack_block);
+
+    const dgram = try buildRequest(gpa, &dcid, 0, h3_bytes.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try testing.expectError(error.H3Error, h3.pump(0));
 }
 
 test "a request stream id above 2^32 is not truncated" {
