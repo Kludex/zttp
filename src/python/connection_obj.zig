@@ -449,6 +449,14 @@ const H3Engine = struct {
         return self.flush();
     }
 
+    /// Begin a graceful shutdown: send a GOAWAY announcing `stream_id` as the first
+    /// request stream we will not process (RFC 9114 5.2), then packetise it.
+    fn shutdown(self: *H3Engine, stream_id: u64) py.Object {
+        const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        h.shutdown(stream_id) catch |e| return exceptions.raiseH3(e);
+        return self.flush();
+    }
+
     /// Open the control stream + SETTINGS now (RFC 9114 6.2.1), rather than lazily on
     /// the first response, and packetise it. Mirrors H2's initiate_connection.
     fn initiate(self: *H3Engine) py.Object {
@@ -1548,6 +1556,13 @@ fn h3_peer_settings(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Obj
     return e.peerSettings();
 }
 
+fn h3_shutdown(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    const id = c.PyLong_AsUnsignedLongLong(arg);
+    if (id == @as(c_ulonglong, @bitCast(@as(c_longlong, -1))) and c.PyErr_Occurred() != null) return null;
+    return e.shutdown(@intCast(id));
+}
+
 // HTTP/2 connection-level send helpers --------------------------------------
 
 fn h2_initiate(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
@@ -1639,6 +1654,7 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "is_closed", .ml_meth = h3_is_closed, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection has been closed (a peer CONNECTION_CLOSE was received)." },
     .{ .ml_name = "close_info", .ml_meth = h3_close_info, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's CONNECTION_CLOSE as (error_code, reason, is_application), or None if the peer has not closed." },
     .{ .ml_name = "peer_settings", .ml_meth = h3_peer_settings, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's HTTP/3 SETTINGS as a dict (max_field_section_size, qpack_max_table_capacity, qpack_blocked_streams), or None until its SETTINGS frame has been received." },
+    .{ .ml_name = "shutdown", .ml_meth = h3_shutdown, .ml_flags = c.METH_O, .ml_doc = "Begin a graceful shutdown: send a GOAWAY announcing stream_id as the first request stream not processed (RFC 9114 5.2). A later GOAWAY may only lower the id. Drain it with data_to_send." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

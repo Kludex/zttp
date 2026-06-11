@@ -87,6 +87,12 @@ pub const Connection = struct {
     /// has been parsed (RFC 9114 7.2.4). Null until then; a request that arrives
     /// first is H3_MISSING_SETTINGS.
     peer_settings: ?h3_stream.Settings = null,
+    /// The id of the last GOAWAY we sent (RFC 9114 5.2), or null if none. A later
+    /// GOAWAY may only lower it, so this gates monotonicity.
+    goaway_sent: ?u64 = null,
+    /// The id of a GOAWAY received from the peer, or null. A second GOAWAY may only
+    /// lower it (a higher id is H3_ID_ERROR).
+    goaway_recv: ?u64 = null,
 
     pub fn init(gpa: std.mem.Allocator, qc: *quic_conn.Connection) Connection {
         return .{
@@ -136,6 +142,25 @@ pub const Connection = struct {
         h3_frame.append(&out, self.gpa, .settings, settings.items) catch return error.OutOfMemory;
         try self.streamSend(CONTROL_STREAM_ID, out.items, false);
         self.control_sent = true;
+    }
+
+    /// Begin a graceful shutdown: send a GOAWAY on the control stream (RFC 9114 5.2)
+    /// announcing `stream_id` as the first client request stream we will NOT process
+    /// - the peer finishes everything below it and opens nothing higher. The control
+    /// stream is opened first if needed. A later GOAWAY may only lower the id (a
+    /// higher one is rejected), so a shutdown can narrow but never widen what we
+    /// promise to handle.
+    pub fn shutdown(self: *Connection, stream_id: u64) Error!void {
+        if (self.goaway_sent) |prev| if (stream_id > prev) return error.H3Error;
+        try self.initiateControl();
+        var payload: std.ArrayListUnmanaged(u8) = .empty;
+        defer payload.deinit(self.gpa);
+        varint.append(&payload, self.gpa, stream_id) catch return error.OutOfMemory;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.gpa);
+        h3_frame.append(&out, self.gpa, .goaway, payload.items) catch return error.OutOfMemory;
+        try self.streamSend(CONTROL_STREAM_ID, out.items, false);
+        self.goaway_sent = stream_id;
     }
 
     /// Advance the parse of request stream `id` from whatever ordered bytes the
@@ -1039,6 +1064,53 @@ test "the server opens its control stream with a SETTINGS frame" {
     try testing.expectEqual(h3_frame.FrameType.settings, f.frame.ftype);
     const s = try h3_stream.parseSettings(f.frame.payload);
     try testing.expectEqual(@as(u64, 1 << 16), s.max_field_section_size);
+}
+
+test "shutdown sends a GOAWAY on the control stream after SETTINGS" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x60, 0x61, 0x62, 0x63 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    try h3.shutdown(8); // graceful shutdown: do not process request stream 8 or higher
+    try qc.flushSend(1000);
+
+    var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    quic_conn.testInstallAppKeys(&peer);
+    const buf = qc.datagramsToSend();
+    var off: usize = 0;
+    for (qc.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+
+    // The control stream is SETTINGS then GOAWAY(8).
+    const ctrl = peer.streamData(3);
+    const t = h3_stream.decodeUniType(ctrl).?;
+    const f1 = try h3_frame.decode(ctrl[t.len..]);
+    try testing.expectEqual(h3_frame.FrameType.settings, f1.frame.ftype);
+    const f2 = try h3_frame.decode(ctrl[t.len + f1.len ..]);
+    try testing.expectEqual(h3_frame.FrameType.goaway, f2.frame.ftype);
+    const id = try varint.decode(f2.frame.payload);
+    try testing.expectEqual(@as(u64, 8), id.value);
+}
+
+test "a later GOAWAY may only lower the id" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x64, 0x65, 0x66, 0x67 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    try h3.shutdown(8);
+    try h3.shutdown(4); // narrowing is allowed
+    try testing.expectError(error.H3Error, h3.shutdown(12)); // widening is not
 }
 
 test "the response send API rejects invalid sequences and inputs" {
