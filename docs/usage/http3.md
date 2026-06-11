@@ -11,11 +11,11 @@ of feeding a byte stream you feed whole datagrams:
 ```python
 import zttp
 
-conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)  # (1)!
+conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
 ```
 
-1.  Construction returns an `H3Connection`. Like HTTP/2, the protocol picks the
-    subtype, so the surface you get matches the wire you chose.
+As with HTTP/2, the `protocol` argument picks the subtype, so construction
+returns an `H3Connection` and the surface you get matches the wire you chose.
 
 !!! warning "Scope"
     The HTTP/3 **server read path** is implemented end to end: a client Initial
@@ -28,27 +28,25 @@ conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)  # (1)!
 
 TCP hands you an ordered byte stream, so HTTP/1.1 and HTTP/2 take
 `receive_data(bytes)`. QUIC is packet-oriented and the transport must see
-datagram boundaries, so HTTP/3 takes `receive_datagram` instead. The event side
-is unchanged:
+datagram boundaries, so HTTP/3 takes `receive_datagram` instead. Pass one UDP
+payload per call, exactly as it came off the socket; the QUIC layer underneath
+decrypts the packets, tracks acks, and reassembles the stream bytes for you. The
+event side is unchanged:
 
-```python title="server_read.py" hl_lines="4"
+```python title="server_read.py"
 import zttp
 
 conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
-conn.receive_datagram(udp_payload)  # (1)!
+conn.receive_datagram(udp_payload)
 
 while (event := conn.next_event()) is not zttp.NEED_DATA:
     if isinstance(event, zttp.Request):
-        print(event.method, event.path, event.stream_id)  # (2)!
+        print(event.method, event.path, event.stream_id)
 ```
 
-1.  One UDP payload per call, exactly as it came off the socket. The QUIC layer
-    underneath decrypts the packets, tracks acks, and reassembles the stream
-    bytes for you.
-
-2.  The same `Request` / `Data` / `EndOfMessage` events, tagged with the QUIC
-    `stream_id`. An HTTP/3 request collapses its pseudo-headers into the same
-    shape the other protocols use, and `http_version` is `b"3"`.
+You get the same `Request` / `Data` / `EndOfMessage` events, now tagged with the
+QUIC `stream_id`. An HTTP/3 request collapses its pseudo-headers into the same
+shape the other protocols use, and `http_version` is `b"3"`.
 
 ## The transport is inside
 
@@ -59,7 +57,7 @@ and stream reassembly all live in the Zig core, written from scratch on
 `std.crypto`. The sans-IO line holds: the core never touches a socket; your I/O
 layer moves the datagrams.
 
-Read [HTTP/3 and QUIC](../architecture/http3.md) for the full layer-by-layer
+Read [Architecture](../architecture.md) for the layering and the QUIC-as-transport
 tour, including the security posture (amplification limits, AEAD packet
 protection, and the QPACK bomb defenses).
 
@@ -73,7 +71,7 @@ protection, and the QPACK bomb defenses).
 
     The same multiplexed event model over TCP, with the full write side.
 
--   :material-sitemap: **[HTTP/3 and QUIC](../architecture/http3.md)**
+-   :material-sitemap: **[Architecture](../architecture.md)**
 
     ---
 
