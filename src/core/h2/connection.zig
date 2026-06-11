@@ -779,7 +779,7 @@ pub const Connection = struct {
         if (self.streams.getPtr(id)) |s| s.expects_bodyless = true;
     }
 
-    pub const SeedError = error{ Malformed, OutOfMemory, AlreadyStarted };
+    pub const SeedError = error{ Malformed, OutOfMemory, AlreadyStarted, BadSettings };
 
     /// Seed an h2c-upgraded request as stream 1, half-closed-remote (RFC 7540 3.2):
     /// the HTTP/1.1 request the server already parsed becomes the first HTTP/2
@@ -791,6 +791,11 @@ pub const Connection = struct {
     /// the caller; their bytes are copied into seed_store so the pushed Request
     /// outlives this call. The synthesized headers run through collapseRequest, so
     /// the same validation (and host synthesis) a wire request gets applies here.
+    ///
+    /// `settings` is the DECODED HTTP2-Settings payload from the upgrade request
+    /// (RFC 7540 3.2.1) - the client's settings, applied before stream 1 opens so
+    /// its initial window honors the negotiated value. The client repeats these in
+    /// the SETTINGS frame of its connection preface, which surfaces normally.
     /// May only be called once, before any frame has been processed.
     pub fn seedUpgradeRequest(
         self: *Connection,
@@ -799,8 +804,15 @@ pub const Connection = struct {
         scheme: []const u8,
         authority: ?[]const u8,
         headers: []const events.Header,
+        settings: ?[]const u8,
     ) SeedError!void {
         if (self.streams_opened != 0 or self.highest_peer_id != 0) return error.AlreadyStarted;
+
+        // Apply the client's upgrade SETTINGS before any stream is created so the
+        // seeded stream's send window starts from the negotiated initial size.
+        if (settings) |payload| {
+            _ = self.peer_settings.apply(payload) catch return error.BadSettings;
+        }
 
         self.seed_store.clearRetainingCapacity();
         self.seed_headers.clearRetainingCapacity();
@@ -1393,7 +1405,7 @@ test "h2c seed surfaces the upgraded request as a complete stream 1" {
     var c = Connection.init(testing.allocator, .server);
     defer c.deinit();
     const hdrs = [_]events.Header{.{ .name = "user-agent", .value = "curl/8" }};
-    try c.seedUpgradeRequest("GET", "/upgrade?x=1", "http", "example.com", &hdrs);
+    try c.seedUpgradeRequest("GET", "/upgrade?x=1", "http", "example.com", &hdrs, null);
 
     const req = try c.nextEvent();
     try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
@@ -1420,7 +1432,7 @@ test "h2c seed surfaces the upgraded request as a complete stream 1" {
 test "after an h2c seed the client preface and a later stream still parse" {
     var c = Connection.init(testing.allocator, .server);
     defer c.deinit();
-    try c.seedUpgradeRequest("GET", "/", "http", "example.com", &.{});
+    try c.seedUpgradeRequest("GET", "/", "http", "example.com", &.{}, null);
     try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
     try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
 
@@ -1439,7 +1451,7 @@ test "a seeded request's bytes survive a later stream's decode (drain discipline
     var c = Connection.init(testing.allocator, .server);
     defer c.deinit();
     const hdrs = [_]events.Header{.{ .name = "x-marker", .value = "KEEP" }};
-    try c.seedUpgradeRequest("GET", "/seeded", "http", "example.com", &hdrs);
+    try c.seedUpgradeRequest("GET", "/seeded", "http", "example.com", &hdrs, null);
     // Feed the preface + a stream-3 HEADERS BEFORE draining the seed: the seeded
     // request must still be intact when it surfaces (nextEvent drains the pending
     // ring fully before decoding the next block, so its slices are materialized
@@ -1473,7 +1485,7 @@ test "an h2c seed with many large headers does not dangle its slices" {
     const big = "v" ** 256;
     var hdrs: [40]events.Header = undefined;
     for (&hdrs) |*h| h.* = .{ .name = "x-pad", .value = big };
-    try c.seedUpgradeRequest("GET", "/target", "http", "example.com", &hdrs);
+    try c.seedUpgradeRequest("GET", "/target", "http", "example.com", &hdrs, null);
     const req = try c.nextEvent();
     try testing.expectEqualStrings("GET", req.request.method);
     try testing.expectEqualStrings("/target", req.request.target);
@@ -1492,14 +1504,32 @@ test "a malformed h2c seed is rejected" {
     defer c.deinit();
     // A connection-specific header is forbidden in HTTP/2 (RFC 9113 8.2.2).
     const bad = [_]events.Header{.{ .name = "connection", .value = "keep-alive" }};
-    try testing.expectError(error.Malformed, c.seedUpgradeRequest("GET", "/", "http", "example.com", &bad));
+    try testing.expectError(error.Malformed, c.seedUpgradeRequest("GET", "/", "http", "example.com", &bad, null));
 }
 
 test "seeding twice is rejected" {
     var c = Connection.init(testing.allocator, .server);
     defer c.deinit();
-    try c.seedUpgradeRequest("GET", "/", "http", "example.com", &.{});
-    try testing.expectError(error.AlreadyStarted, c.seedUpgradeRequest("GET", "/", "http", "example.com", &.{}));
+    try c.seedUpgradeRequest("GET", "/", "http", "example.com", &.{}, null);
+    try testing.expectError(error.AlreadyStarted, c.seedUpgradeRequest("GET", "/", "http", "example.com", &.{}, null));
+}
+
+test "the h2c upgrade SETTINGS seed the peer settings and stream-1 window" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // SETTINGS_INITIAL_WINDOW_SIZE (id 4) = 1000 - the client's upgrade setting.
+    const settings = [_]u8{ 0x00, 0x04, 0x00, 0x00, 0x03, 0xE8 };
+    try c.seedUpgradeRequest("GET", "/", "http", "example.com", &.{}, &settings);
+    try testing.expectEqual(@as(i32, 1000), c.peer_settings.initial_window_size);
+    // Stream 1's send window (what the peer will accept) starts from that value.
+    try testing.expectEqual(@as(?i32, 1000), c.streamSendWindow(1));
+}
+
+test "a malformed upgrade SETTINGS payload is rejected" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    const bad = [_]u8{ 0x00, 0x04, 0x00 }; // not a multiple of 6
+    try testing.expectError(error.BadSettings, c.seedUpgradeRequest("GET", "/", "http", "example.com", &.{}, &bad));
 }
 
 // A client's inbound handshake is just the server's SETTINGS - no preface to

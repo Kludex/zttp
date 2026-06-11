@@ -701,7 +701,7 @@ def test_connection_send_window_and_has_pending_send() -> None:
 
 def test_h2c_seed_surfaces_the_upgraded_request() -> None:
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
-    stream = conn.seed_upgrade_request(b"GET", b"/upgrade", [(b"host", b"example.com"), (b"x-k", b"v")])
+    stream = conn.initiate_upgrade_connection(b"GET", b"/upgrade", [(b"host", b"example.com"), (b"x-k", b"v")])
     assert stream.stream_id == 1
     events = list(drain_h2(conn))
     req = next(e for e in events if isinstance(e, zttp.Request))
@@ -715,7 +715,7 @@ def test_h2c_seed_surfaces_the_upgraded_request() -> None:
 
 def test_h2c_seed_then_respond_and_continue_with_the_preface() -> None:
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
-    stream = conn.seed_upgrade_request(b"GET", b"/", [(b"host", b"x")])
+    stream = conn.initiate_upgrade_connection(b"GET", b"/", [(b"host", b"x")])
     list(drain_h2(conn))
     stream.send_response(200, end_stream=True)  # answer the upgraded request on stream 1
     assert conn.data_to_send()  # a HEADERS frame went out
@@ -726,13 +726,39 @@ def test_h2c_seed_then_respond_and_continue_with_the_preface() -> None:
     assert req3.stream_id == 3
 
 
+def test_h2c_settings_header_is_applied() -> None:
+    import base64
+
+    # The client's HTTP2-Settings header: INITIAL_WINDOW_SIZE (id 4) = 1000.
+    settings = base64.urlsafe_b64encode((4).to_bytes(2, "big") + (1000).to_bytes(4, "big")).rstrip(b"=")
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    stream = conn.initiate_upgrade_connection(b"GET", b"/", [(b"host", b"x")], settings_header=settings)
+    # The peer's settings governed stream 1's send window (what it will accept).
+    assert stream.send_window == 1000
+
+
+def test_h2c_settings_header_invalid_base64_raises() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    with pytest.raises(ValueError):
+        conn.initiate_upgrade_connection(b"GET", b"/", [(b"host", b"x")], settings_header=b"not!base64!")
+
+
+def test_h2c_settings_header_bad_payload_raises() -> None:
+    import base64
+
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    bad = base64.urlsafe_b64encode(b"\x00\x04\x00").rstrip(b"=")  # not a multiple of 6
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.initiate_upgrade_connection(b"GET", b"/", [(b"host", b"x")], settings_header=bad)
+
+
 def test_h2c_seed_with_many_large_headers_is_intact() -> None:
     # Enough header bytes to force the seed byte-store to grow mid-build; the
     # method/target and every header must survive (regression: a reallocation
     # used to dangle the slices taken before it).
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
     headers = [(b"host", b"example.com")] + [(b"x-pad", b"v" * 256) for _ in range(40)]
-    conn.seed_upgrade_request(b"GET", b"/target", headers)
+    conn.initiate_upgrade_connection(b"GET", b"/target", headers)
     req = next(e for e in drain_h2(conn) if isinstance(e, zttp.Request))
     assert req.method == b"GET"
     assert req.target == b"/target"
@@ -742,17 +768,17 @@ def test_h2c_seed_with_many_large_headers_is_intact() -> None:
 def test_h2c_seed_rejects_a_forbidden_header() -> None:
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
     with pytest.raises(zttp.LocalProtocolError):
-        conn.seed_upgrade_request(b"GET", b"/", [(b"connection", b"keep-alive")])
+        conn.initiate_upgrade_connection(b"GET", b"/", [(b"connection", b"keep-alive")])
 
 
 def test_h2c_seed_twice_is_an_error() -> None:
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
-    conn.seed_upgrade_request(b"GET", b"/", [(b"host", b"x")])
+    conn.initiate_upgrade_connection(b"GET", b"/", [(b"host", b"x")])
     with pytest.raises(RuntimeError):
-        conn.seed_upgrade_request(b"GET", b"/", [(b"host", b"x")])
+        conn.initiate_upgrade_connection(b"GET", b"/", [(b"host", b"x")])
 
 
-def test_seed_upgrade_request_on_http1_is_an_error() -> None:
+def test_initiate_upgrade_connection_on_http1_is_an_error() -> None:
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP1)
     with pytest.raises(AttributeError):
-        conn.seed_upgrade_request(b"GET", b"/", [(b"host", b"x")])
+        conn.initiate_upgrade_connection(b"GET", b"/", [(b"host", b"x")])
