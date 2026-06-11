@@ -778,7 +778,24 @@ pub fn fromH3Event(ev: events.H3Event) py.Object {
         .need_data => py.newRef(need_data),
         .settings => |s| makeSettings(s),
         .goaway => |g| makeGoaway(g),
+        .rst_stream => |r| makeH3RstStream(r),
     };
+}
+
+/// Build a RstStream event from an HTTP/3 peer reset. The same Python type as the H2
+/// reset event (its fields are boxed ints), but the values are u64 (62-bit QUIC
+/// stream id and error code), so they are not truncated.
+fn makeH3RstStream(r: events.StreamReset) py.Object {
+    const o = py.allocInstance(rst_stream_type);
+    if (o == null) return null;
+    const s: *RstStreamObject = @ptrCast(o);
+    s.stream_id = c.PyLong_FromUnsignedLongLong(r.stream_id);
+    s.error_code = c.PyLong_FromUnsignedLongLong(r.error_code);
+    if (s.stream_id == null or s.error_code == null) {
+        py.decref(o);
+        return null;
+    }
+    return o;
 }
 
 fn u32Obj(v: u32) py.Object {

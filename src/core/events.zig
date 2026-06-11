@@ -73,6 +73,14 @@ pub const RstStream = struct {
     error_code: u32,
 };
 
+/// A peer reset (RESET_STREAM) or asked us to stop sending (STOP_SENDING) on an
+/// HTTP/3 request stream (RFC 9114 4.4): the request/response is cancelled. The id
+/// and code are 62-bit/u64, so this is the H3 analogue of the (u32) H2 RstStream.
+pub const StreamReset = struct {
+    stream_id: u64,
+    error_code: u64,
+};
+
 /// The peer is shutting the connection down (RFC 9113 6.8). HTTP/2 only.
 pub const Goaway = struct {
     last_stream_id: u32,
@@ -146,6 +154,7 @@ pub const H3Event = union(enum) {
     need_data,
     settings: SettingsEvent,
     goaway: Goaway,
+    rst_stream: StreamReset,
 };
 
 test "H1 event union round-trips a request" {

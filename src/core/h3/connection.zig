@@ -27,13 +27,16 @@ const Header = events.Header;
 const H3Event = events.H3Event;
 
 pub const Error = error{
-    /// A malformed HTTP/3 frame, a bad QPACK block, or a missing pseudo-header:
-    /// an HTTP/3 connection or stream error (RFC 9114 4.1.2 / 7).
+    /// A connection-fatal HTTP/3 error (RFC 9114 7): the connection is closed.
     H3Error,
+    /// A stream-level HTTP/3 error (RFC 9114 4.1.2): a malformed request that resets
+    /// just that stream, leaving the connection up. Caught in the pump, never escapes
+    /// to the integrator.
+    StreamError,
     OutOfMemory,
 };
 
-const ReqState = enum { idle, headers_done, done };
+const ReqState = enum { idle, headers_done, done, rejected };
 
 const RequestStream = struct {
     state: ReqState = .idle,
@@ -41,6 +44,9 @@ const RequestStream = struct {
     /// Content-Length was sent. Reconciled against the DATA bytes at the FIN.
     content_length: ?u64 = null,
     body_received: u64 = 0,
+    /// Whether a peer-reset event has already been emitted for this stream, so a
+    /// re-pump (if the stream could not yet be dropped) does not re-fire it.
+    rst_emitted: bool = false,
 };
 
 /// Outbound (response) state per stream, so the send API cannot serialize invalid
@@ -93,6 +99,10 @@ pub const Connection = struct {
     /// The id of a GOAWAY received from the peer, or null. A second GOAWAY may only
     /// lower it (a higher id is H3_ID_ERROR).
     goaway_recv: ?u64 = null,
+    /// The H3 error code a stream-level rejection (failStream) wants the pump to reset
+    /// the current stream with; consumed by pumpRequest. Carries the code across the
+    /// error.StreamError return (Zig errors hold no payload).
+    pending_reject: ?h3_error.ErrorCode = null,
 
     pub fn init(gpa: std.mem.Allocator, qc: *quic_conn.Connection) Connection {
         return .{
@@ -120,6 +130,32 @@ pub const Connection = struct {
     fn fail(self: *Connection, code: h3_error.ErrorCode, reason: []const u8) Error {
         self.qc.close(true, @intFromEnum(code), reason) catch {};
         return error.H3Error;
+    }
+
+    /// Reject one request stream without closing the connection (RFC 9114 4.1.2): the
+    /// pump catches error.StreamError, reads this code, and resets the stream. A
+    /// malformed request thus costs one stream, not the whole connection.
+    fn failStream(self: *Connection, code: h3_error.ErrorCode) Error {
+        self.pending_reject = code;
+        return error.StreamError;
+    }
+
+    /// Reset request stream `id` with `code` and drop its state: RESET_STREAM the
+    /// response, STOP_SENDING the request, drain and reclaim. Used both for a
+    /// malformed request (failStream) and a request covered by our GOAWAY.
+    fn rejectStream(self: *Connection, id: u64, code: h3_error.ErrorCode) Error!void {
+        self.qc.resetStream(id, @intFromEnum(code)) catch return error.H3Error;
+        self.qc.stopSending(id, @intFromEnum(code)) catch return error.H3Error;
+        const pending = self.qc.streamData(id).len;
+        if (pending > 0) self.qc.consumeStream(id, pending);
+        // Drop the stream if the transport can (recv terminal); otherwise mark it
+        // .rejected so a later pump quarantines it (drains, no more events) rather than
+        // re-parsing a stream we already reset, which could surface a spurious request.
+        if (self.qc.dropStream(id)) {
+            _ = self.streams.remove(id);
+        } else if (self.streams.getPtr(id)) |rs| {
+            rs.state = .rejected;
+        }
     }
 
     /// Open our unidirectional control stream and send SETTINGS as its first frame
@@ -200,12 +236,10 @@ pub const Connection = struct {
         // tracked).
         if (self.goaway_sent) |limit| {
             if (id >= limit and !self.streams.contains(id)) {
-                const pending = self.qc.streamData(id).len;
-                const finished = self.qc.streamFinished(id) or self.qc.streamReset(id);
-                // Drain its bytes (re-grant flow control); consume even zero on a bare
-                // FIN so the recv state reaches terminal and dropStream can reclaim it.
-                if (pending > 0 or finished) self.qc.consumeStream(id, pending);
-                if (finished) _ = self.qc.dropStream(id);
+                // We promised not to process this request (RFC 9114 5.2): reject it
+                // with H3_REQUEST_REJECTED so the client knows it may safely retry on a
+                // fresh connection, rather than silently dropping it.
+                try self.rejectStream(id, .request_rejected);
                 return;
             }
         }
@@ -217,6 +251,17 @@ pub const Connection = struct {
         if (!gop.found_existing) gop.value_ptr.* = .{};
         const rs = gop.value_ptr;
 
+        // A stream we already rejected (reset) but could not yet drop: drain any
+        // further bytes the peer sent and reclaim it once terminal, but never parse
+        // them - it must produce no more events.
+        if (rs.state == .rejected) {
+            const pending = self.qc.streamData(id).len;
+            const finished = self.qc.streamFinished(id) or self.qc.streamReset(id);
+            if (pending > 0 or finished) self.qc.consumeStream(id, pending);
+            if (finished and self.qc.dropStream(id)) _ = self.streams.remove(id);
+            return;
+        }
+
         // Parse from the start of the ordered bytes the transport currently holds:
         // every fully-decoded frame is consumed (removed from the QUIC stream)
         // before this returns, so the next pump always begins at offset 0 with the
@@ -227,7 +272,16 @@ pub const Connection = struct {
         while (consumed_total < ready.len) {
             const rest = ready[consumed_total..];
             const d = h3_frame.decode(rest) catch break; // NeedData: wait for more
-            try self.onFrame(id, rs, d.frame);
+            self.onFrame(id, rs, d.frame) catch |e| switch (e) {
+                // A stream-level error (a malformed request): reset just this stream
+                // and stop processing it, rather than poisoning the whole connection.
+                error.StreamError => {
+                    const code = self.pending_reject orelse h3_error.ErrorCode.message_error;
+                    self.pending_reject = null;
+                    return self.rejectStream(id, code); // rs dangles after the drop inside
+                },
+                else => return e,
+            };
             consumed_total += d.len;
         }
         if (self.qc.streamFinished(id) and rs.state == .headers_done) {
@@ -240,6 +294,14 @@ pub const Connection = struct {
         // Consume BEFORE dropping: consuming the last byte of a finished stream is
         // what moves its receive state to terminal, which dropStream then reclaims.
         if (consumed_total > 0) self.qc.consumeStream(id, consumed_total);
+        // A peer RESET_STREAM cancels the request: surface it as an event (with the
+        // peer's error code) once, before the stream is dropped, so the integrator is
+        // not left waiting on a request that silently vanished. The flag guards against
+        // a re-fire if the stream cannot be dropped yet (e.g. an allocator failure).
+        if (self.qc.streamReset(id) and !rs.rst_emitted) {
+            try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = self.qc.streamResetCode(id) orelse 0 } });
+            rs.rst_emitted = true;
+        }
         // Drop the per-stream state on both layers once the request is fully
         // delivered (EOM) OR the peer reset the stream, so an open-then-reset storm
         // cannot grow the maps (the memory half of the Rapid-Reset class). The QUIC
@@ -346,7 +408,7 @@ pub const Connection = struct {
     fn onFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame) Error!void {
         switch (f.ftype) {
             .headers => {
-                if (rs.state != .idle) return error.H3Error; // trailers after body are a follow-up
+                if (rs.state != .idle) return self.failStream(.message_error); // trailers after body are a follow-up
                 const req = try self.decodeRequest(id, f.payload, rs);
                 try self.push(.{ .request = req });
                 rs.state = .headers_done;
@@ -372,7 +434,11 @@ pub const Connection = struct {
     /// Collapse a QPACK-decoded field section into a Request, pulling the four
     /// pseudo-headers into the shared shape and keeping the rest as headers.
     fn decodeRequest(self: *Connection, id: u64, block: []const u8, rs: *RequestStream) Error!events.Request {
-        const decoded = self.qpack_dec.decode(block) catch return error.H3Error;
+        // A malformed request (a bad QPACK block or any field violation below) is a
+        // STREAM-level error (RFC 9114 4.1.2): it resets just this stream via
+        // failStream, leaving the connection up. With a cap-0 QPACK decoder there is
+        // no shared dynamic-table state, so a decode failure is safely stream-local.
+        const decoded = self.qpack_dec.decode(block) catch return self.failStream(.message_error);
         var method: ?[]const u8 = null;
         var path: ?[]const u8 = null;
         var authority: ?[]const u8 = null;
@@ -383,38 +449,38 @@ pub const Connection = struct {
 
         for (decoded) |h| {
             if (h.name.len > 0 and h.name[0] == ':') {
-                if (seen_regular) return error.H3Error; // pseudo after regular (RFC 9114 4.3)
+                if (seen_regular) return self.failStream(.message_error); // pseudo after regular (RFC 9114 4.3)
                 // A pseudo-header value is validated like any other (no CR/LF/NUL/
                 // control), so a :authority carrying CR/LF cannot be synthesized into
                 // a `host` header and split a downgraded HTTP/1.1 request line.
-                if (!fields.validValue(h.value)) return error.H3Error;
+                if (!fields.validValue(h.value)) return self.failStream(.message_error);
                 // A request pseudo-header appears at most once (RFC 9114 4.3.1 ->
                 // RFC 9113 8.3); a duplicate is malformed.
-                const slot = if (eql(h.name, ":method")) &method else if (eql(h.name, ":path")) &path else if (eql(h.name, ":authority")) &authority else if (eql(h.name, ":scheme")) &scheme else return error.H3Error;
-                if (slot.* != null) return error.H3Error;
+                const slot = if (eql(h.name, ":method")) &method else if (eql(h.name, ":path")) &path else if (eql(h.name, ":authority")) &authority else if (eql(h.name, ":scheme")) &scheme else return self.failStream(.message_error);
+                if (slot.* != null) return self.failStream(.message_error);
                 slot.* = h.value;
             } else {
                 seen_regular = true;
                 // RFC 9114 4.2 inherits the HTTP/2 field rules: lowercase token
                 // names, no connection-specific fields, and TE only "trailers".
-                if (!fields.isValidFieldName(h.name)) return error.H3Error;
-                if (!fields.validValue(h.value)) return error.H3Error;
-                if (fields.isConnectionSpecific(h.name)) return error.H3Error;
-                if (eql(h.name, "te") and !eql(h.value, "trailers")) return error.H3Error;
+                if (!fields.isValidFieldName(h.name)) return self.failStream(.message_error);
+                if (!fields.validValue(h.value)) return self.failStream(.message_error);
+                if (fields.isConnectionSpecific(h.name)) return self.failStream(.message_error);
+                if (eql(h.name, "te") and !eql(h.value, "trailers")) return self.failStream(.message_error);
                 if (eql(h.name, "content-length")) {
-                    const cl = ascii.parseDecimal(u64, h.value) orelse return error.H3Error;
+                    const cl = ascii.parseDecimal(u64, h.value) orelse return self.failStream(.message_error);
                     // A repeated Content-Length is malformed unless it agrees (RFC 9110).
                     if (rs.content_length) |prev| {
-                        if (prev != cl) return error.H3Error;
+                        if (prev != cl) return self.failStream(.message_error);
                     } else rs.content_length = cl;
                 }
                 regular.append(self.gpa, h) catch return error.OutOfMemory;
             }
         }
-        const method_v = method orelse return error.H3Error;
-        const path_v = path orelse return error.H3Error;
-        const scheme_v = scheme orelse return error.H3Error;
-        if (method_v.len == 0 or path_v.len == 0 or scheme_v.len == 0) return error.H3Error;
+        const method_v = method orelse return self.failStream(.message_error);
+        const path_v = path orelse return self.failStream(.message_error);
+        const scheme_v = scheme orelse return self.failStream(.message_error);
+        if (method_v.len == 0 or path_v.len == 0 or scheme_v.len == 0) return self.failStream(.message_error);
 
         // Materialise everything into the arena so the slices outlive the next
         // QPACK decode (which clears its store).
@@ -532,6 +598,21 @@ pub const Connection = struct {
         try self.setSendState(id, .fin_sent);
     }
 
+    /// Abruptly cancel a request stream with `error_code` (RFC 9114 4.4): RESET_STREAM
+    /// the response send half and STOP_SENDING the request recv half, so neither side
+    /// keeps producing. Used to reject a request or abandon a response without closing
+    /// the connection. The stream's send state is marked finished.
+    pub fn resetStream(self: *Connection, id: u64, error_code: u64) Error!void {
+        if (quic_stream.StreamType.of(id) != .client_bidi) return error.H3Error;
+        // A response that already finished (FIN sent) has nothing to reset; a second
+        // reset would recreate a reclaimed QUIC send stream and emit a RESET_STREAM
+        // with a stale final size. No-op once the send half is done.
+        if (try self.sendStateOf(id) == .fin_sent) return;
+        self.qc.resetStream(id, error_code) catch return error.H3Error;
+        self.qc.stopSending(id, error_code) catch return error.H3Error;
+        try self.setSendState(id, .fin_sent);
+    }
+
     fn sendStateOf(self: *Connection, id: u64) Error!SendState {
         const gop = self.send_state.getOrPut(self.gpa, id) catch return error.OutOfMemory;
         if (!gop.found_existing) gop.value_ptr.* = .idle;
@@ -630,7 +711,10 @@ test "a CR/LF in a pseudo-header value is malformed" {
     const dgram = try buildRequest(gpa, &dcid, 0, h3_bytes.items);
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
-    try testing.expectError(error.H3Error, h3.pump(0));
+    // The malformed request resets the stream (no Request event, connection stays up).
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .need_data);
+    try testing.expect(!qc.closed);
 }
 
 test "a request stream id above 2^32 is not truncated" {
@@ -662,7 +746,10 @@ test "a request stream id above 2^32 is not truncated" {
 
 // Feed a HEADERS frame whose QPACK block is `qpack_block` and return the result of
 // pumping stream 0 - so a malformed-request test asserts the H3Error directly.
-fn pumpHeaders(gpa: std.mem.Allocator, qpack_block: []const u8) Error!void {
+// Pump a HEADERS-only request and report whether it was ACCEPTED (a Request event was
+// produced). A malformed request is now rejected with a stream reset (not a connection
+// error), so it returns false rather than error.H3Error.
+fn pumpHeaders(gpa: std.mem.Allocator, qpack_block: []const u8) Error!bool {
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
     var qc = quic_conn.Connection.init(gpa, .server, &dcid) catch return error.H3Error;
     defer qc.deinit();
@@ -676,47 +763,115 @@ fn pumpHeaders(gpa: std.mem.Allocator, qpack_block: []const u8) Error!void {
     defer gpa.free(dgram);
     qc.receiveDatagram(dgram, 1000) catch return error.H3Error;
     try h3.pump(0);
+    return h3.nextEvent() == .request;
 }
 
 test "a duplicate request pseudo-header is malformed" {
     // :method GET twice (RFC 9113 8.3 via RFC 9114 4.3.1).
-    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0xC0 | 17 }));
+    try testing.expect(!try pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0xC0 | 17 }));
 }
 
 test "an uppercase field name is malformed" {
     // literal name "Te" (0x20|2), value "x": a non-lowercase token (RFC 9114 4.2).
-    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 2, 'T', 'e', 0x01, 'x' }));
+    try testing.expect(!try pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 2, 'T', 'e', 0x01, 'x' }));
 }
 
 test "a connection-specific field is malformed" {
     // literal name "connection" (len 10: 3-bit prefix 7 + continuation 3), value "x".
-    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 7, 0x03, 'c', 'o', 'n', 'n', 'e', 'c', 't', 'i', 'o', 'n', 0x01, 'x' }));
+    try testing.expect(!try pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 7, 0x03, 'c', 'o', 'n', 'n', 'e', 'c', 't', 'i', 'o', 'n', 0x01, 'x' }));
 }
 
 test "TE with a value other than trailers is malformed" {
     // literal name "te" (0x20|2), value "gzip".
-    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 2, 't', 'e', 0x04, 'g', 'z', 'i', 'p' }));
+    try testing.expect(!try pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 2, 't', 'e', 0x04, 'g', 'z', 'i', 'p' }));
 }
 
 test "TE trailers is accepted" {
     // The one legal TE value (RFC 9114 4.2): te: trailers must NOT be rejected.
-    try pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 2, 't', 'e', 0x08, 't', 'r', 'a', 'i', 'l', 'e', 'r', 's' });
+    try testing.expect(try pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 2, 't', 'e', 0x08, 't', 'r', 'a', 'i', 'l', 'e', 'r', 's' }));
+}
+
+test "a malformed request resets its stream but not the connection" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x88, 0x89, 0x8a, 0x8b };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    var req: std.ArrayListUnmanaged(u8) = .empty;
+    defer req.deinit(gpa);
+    // A duplicate :method - malformed (RFC 9114 4.3.1).
+    try h3_frame.append(&req, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0xC0 | 17 });
+    const bad = try buildRequestOnFin(gpa, &dcid, 0, 0, req.items);
+    defer gpa.free(bad);
+    try qc.receiveDatagram(bad, 1000);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .need_data); // rejected, no request
+    try testing.expect(!qc.closed); // the connection is NOT closed
+
+    // The server reset the stream: a RESET_STREAM is queued to send.
+    try qc.flushSend(2000);
+    try testing.expect(qc.datagramsToSend().len > 0);
+
+    // A subsequent VALID request on a new stream still works - the connection is alive.
+    var ok: std.ArrayListUnmanaged(u8) = .empty;
+    defer ok.deinit(gpa);
+    try h3_frame.append(&ok, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 });
+    const good = try buildRequestOnFin(gpa, &dcid, 4, 1, ok.items);
+    defer gpa.free(good);
+    try qc.receiveDatagram(good, 3000);
+    try h3.pump(4);
+    try testing.expect(h3.nextEvent() == .request);
+}
+
+test "a rejected open stream stays quarantined on a later frame" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x8c, 0x8d, 0x8e, 0x8f };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A malformed HEADERS (duplicate :method) on an OPEN stream (no FIN), so the
+    // recv stream is not terminal and the H3 entry cannot be dropped yet.
+    var bad: std.ArrayListUnmanaged(u8) = .empty;
+    defer bad.deinit(gpa);
+    try h3_frame.append(&bad, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0xC0 | 17 });
+    const d1 = try buildRequest(gpa, &dcid, 0, bad.items); // no FIN
+    defer gpa.free(d1);
+    try qc.receiveDatagram(d1, 1000);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .need_data); // rejected, stream still tracked
+
+    // The peer (ignoring our reset) sends a VALID HEADERS on the same stream. It must
+    // NOT surface a request - the stream is quarantined.
+    var more: std.ArrayListUnmanaged(u8) = .empty;
+    defer more.deinit(gpa);
+    try h3_frame.append(&more, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 });
+    const d2 = try buildRequestAt(gpa, &dcid, bad.items.len, 1, more.items);
+    defer gpa.free(d2);
+    try qc.receiveDatagram(d2, 1100);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .need_data); // still no request
 }
 
 test "a control byte in a field value is malformed" {
     // literal name "x" (0x20|1), value "a\rb": CR is not a field-vchar (RFC 9110).
-    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 1, 'x', 0x03, 'a', '\r', 'b' }));
+    try testing.expect(!try pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x20 | 1, 'x', 0x03, 'a', '\r', 'b' }));
 }
 
 test "a non-numeric Content-Length is malformed" {
     // content-length: "x" (name length 14 = 3-bit prefix 7 + continuation 7).
-    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1, 0x20 | 7, 0x07, 'c', 'o', 'n', 't', 'e', 'n', 't', '-', 'l', 'e', 'n', 'g', 't', 'h', 0x01, 'x' }));
+    try testing.expect(!try pumpHeaders(testing.allocator, &.{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1, 0x20 | 7, 0x07, 'c', 'o', 'n', 't', 'e', 'n', 't', '-', 'l', 'e', 'n', 'g', 't', 'h', 0x01, 'x' }));
 }
 
 test "two disagreeing Content-Length values are malformed" {
     // content-length: 1 then content-length: 2 (name length 14 = 7 + continuation 7).
     const cl = [_]u8{ 0x20 | 7, 0x07, 'c', 'o', 'n', 't', 'e', 'n', 't', '-', 'l', 'e', 'n', 'g', 't', 'h' };
-    try testing.expectError(error.H3Error, pumpHeaders(testing.allocator, &(.{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1 } ++ cl ++ .{ 0x01, '1' } ++ cl ++ .{ 0x01, '2' })));
+    try testing.expect(!try pumpHeaders(testing.allocator, &(.{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1 } ++ cl ++ .{ 0x01, '1' } ++ cl ++ .{ 0x01, '2' })));
 }
 
 test "more body than Content-Length is malformed at the DATA frame" {
@@ -952,9 +1107,51 @@ test "a peer reset reclaims the request stream" {
     try qc.receiveDatagram(dgram, 1000);
     try h3.pump(0);
 
+    // The peer reset surfaces as an rst_stream event carrying the peer's code.
+    const ev = h3.nextEvent();
+    try testing.expect(ev == .rst_stream);
+    try testing.expectEqual(@as(u64, 0), ev.rst_stream.stream_id);
+    try testing.expectEqual(@as(u64, 0x10), ev.rst_stream.error_code);
+
     // The reset stream is reclaimed (not left to accrete on a reset storm).
     var ids: [4]u64 = undefined;
     try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
+}
+
+test "a peer STOP_SENDING resets our send half" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // The server has a response in flight on stream 0.
+    try h3.sendResponse(0, 200, &.{});
+
+    // The peer sends STOP_SENDING (type 0x05) on stream 0 asking us to stop.
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x05); // STOP_SENDING
+    try varint.append(&sframe, gpa, 0); // stream id 0
+    try varint.append(&sframe, gpa, 0x10); // error code
+    const dgram = try quic_conn.testBuildApp(gpa, &dcid, 0, sframe.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+
+    // Our send stream is now reset; flushing emits a RESET_STREAM the peer sees.
+    try qc.flushSend(2000);
+    var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    quic_conn.testInstallAppKeys(&peer);
+    const buf = qc.datagramsToSend();
+    var off: usize = 0;
+    for (qc.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 3000);
+        off += len;
+    }
+    try testing.expect(peer.streamReset(0));
 }
 
 // Build a request datagram on `stream_id` with the FIN bit set, at packet number `pn`.
@@ -1104,6 +1301,56 @@ test "a server sends a response: HEADERS then DATA then FIN" {
     const d2 = try h3_frame.decode(got[d1.len..]);
     try testing.expectEqual(h3_frame.FrameType.data, d2.frame.ftype);
     try testing.expectEqualStrings("hello", d2.frame.payload);
+}
+
+test "the server resets a request stream" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x90, 0x91, 0x92, 0x93 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A partial response, then cancel the stream (RFC 9114 4.4): RESET_STREAM the
+    // response and STOP_SENDING the request.
+    try h3.sendResponse(0, 200, &.{});
+    try h3.resetStream(0, 0x010c); // H3_REQUEST_CANCELLED
+    try qc.flushSend(1000);
+
+    var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    quic_conn.testInstallAppKeys(&peer);
+    const buf = qc.datagramsToSend();
+    var off: usize = 0;
+    for (qc.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+    try testing.expect(peer.streamReset(0)); // the peer sees the response stream reset
+
+    // A reset on a non-request (server uni) stream id is rejected.
+    try testing.expectError(error.H3Error, h3.resetStream(3, 0x010c));
+}
+
+test "a reset after the response finished is a no-op" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x94, 0x95, 0x96, 0x97 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    try h3.sendResponse(0, 200, &.{});
+    try h3.endStream(0); // the response finished (FIN sent)
+    qc.clearSend();
+    try qc.flushSend(1000);
+    qc.clearSend();
+    // A reset now must not recreate a reclaimed send stream / emit a stale frame.
+    try h3.resetStream(0, 0x010c);
+    try qc.flushSend(1000);
+    try testing.expectEqual(@as(usize, 0), qc.datagramsToSend().len); // nothing sent
 }
 
 test "the server opens its control stream with a SETTINGS frame" {

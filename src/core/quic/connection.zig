@@ -76,6 +76,9 @@ const SpaceState = struct {
     /// The CRYPTO byte range each in-flight packet carried (pn -> {offset,len}), the
     /// CRYPTO counterpart of stream_sent for ack/loss routing.
     crypto_sent: std.AutoHashMapUnmanaged(u64, CryptoSent) = .empty,
+    /// The stream id whose RESET_STREAM each in-flight packet carried, so a lost
+    /// reset is re-sent and an acked one is cleared (RFC 9000 13.3).
+    reset_sent: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// The packet numbers received in this space, for accurate ACK frames (RFC 9000
     /// 19.3) - a peer needs every range to detect loss correctly.
     recv_ranges: ack_ranges.AckRanges = .{},
@@ -91,6 +94,7 @@ const SpaceState = struct {
         self.crypto_send.deinit();
         self.stream_sent.deinit(gpa);
         self.crypto_sent.deinit(gpa);
+        self.reset_sent.deinit(gpa);
         self.recv_ranges.deinit(gpa);
     }
 };
@@ -102,6 +106,10 @@ const StreamSent = struct { id: u64, offset: u64, len: u64, fin: bool };
 /// The CRYPTO byte range one sent packet carried, so loss recovery can map a lost or
 /// acked packet number back to the handshake bytes it was responsible for.
 const CryptoSent = struct { offset: u64, len: u64 };
+
+/// A STOP_SENDING owed to the peer: the error code, and whether a frame carrying it is
+/// currently in flight (so flushSend does not re-send while one is unacked).
+const StopSending = struct { code: u64, in_flight: bool = false };
 
 /// A CONNECTION_CLOSE the peer sent (RFC 9000 19.19), retained so the integrator can
 /// surface why the connection ended. `app` distinguishes the application-error
@@ -135,6 +143,16 @@ pub const Connection = struct {
     conn_consumed_total: u64 = 0,
     streams: std.AutoHashMapUnmanaged(u64, *stream.RecvStream) = .empty,
     send_streams: std.AutoHashMapUnmanaged(u64, *stream.SendStream) = .empty,
+    /// STOP_SENDING frames owed to the peer (stream id -> {error code, in_flight}),
+    /// queued by stopSending and drained by flushSend; an entry is removed once acked,
+    /// and `in_flight` is cleared on loss so it is re-emitted.
+    stop_sending: std.AutoHashMapUnmanaged(u64, StopSending) = .empty,
+    /// The stream id whose STOP_SENDING each in-flight app packet carried, so a lost
+    /// or acked one routes back to the `stop_sending` entry by id.
+    stop_sending_inflight: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// A peer STOP_SENDING received before we created the matching send stream (id ->
+    /// error code), applied when the stream is lazily created so it is born reset.
+    peer_stop_sending: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Built datagrams waiting to be drained by `datagramsToSend` (one contiguous
     /// buffer; `out_lengths` records each datagram's byte length in order).
     out: std.ArrayListUnmanaged(u8) = .empty,
@@ -233,6 +251,9 @@ pub const Connection = struct {
             self.gpa.destroy(s.*);
         }
         self.send_streams.deinit(self.gpa);
+        self.stop_sending.deinit(self.gpa);
+        self.stop_sending_inflight.deinit(self.gpa);
+        self.peer_stop_sending.deinit(self.gpa);
         self.retired_recv.deinit(self.gpa);
         self.out.deinit(self.gpa);
         self.out_lengths.deinit(self.gpa);
@@ -365,6 +386,10 @@ pub const Connection = struct {
             self.gpa.destroy(s);
             return error.OutOfMemory;
         };
+        // The peer already asked us to stop sending on this stream (STOP_SENDING
+        // arrived before we created it): the stream is born reset, so any data the
+        // caller writes is replaced by the RESET_STREAM.
+        if (self.peer_stop_sending.fetchRemove(id)) |e| s.reset(e.value);
         return s;
     }
 
@@ -384,10 +409,27 @@ pub const Connection = struct {
         };
     }
 
-    /// Whether any stream has bytes (or a FIN) still to send.
+    /// Abruptly terminate the sending part of `id` with `error_code` (RFC 9000 19.4).
+    /// A RESET_STREAM, carrying the final size, replaces any unsent data and is
+    /// re-sent until acked; flushSend emits it. The first reset wins.
+    pub fn resetStream(self: *Connection, id: u64, error_code: u64) Error!void {
+        const s = try self.sendStream(id);
+        s.reset(error_code);
+    }
+
+    /// Ask the peer to stop sending on `id` with `error_code` (RFC 9000 19.5). A
+    /// STOP_SENDING is queued and re-sent until acked; flushSend emits it.
+    pub fn stopSending(self: *Connection, id: u64, error_code: u64) Error!void {
+        const gop = self.stop_sending.getOrPut(self.gpa, id) catch return error.OutOfMemory;
+        if (!gop.found_existing) gop.value_ptr.* = .{ .code = error_code };
+    }
+
+    /// Whether any stream has bytes (or a FIN) still to send, or a RESET_STREAM /
+    /// STOP_SENDING is owed.
     pub fn hasPendingSend(self: *Connection) bool {
+        if (self.stop_sending.count() > 0) return true;
         var it = self.send_streams.valueIterator();
-        while (it.next()) |s| if (s.*.pending()) return true;
+        while (it.next()) |s| if (s.*.pending() or s.*.resetOwed()) return true;
         return false;
     }
 
@@ -421,6 +463,20 @@ pub const Connection = struct {
         while (it.next()) |entry| {
             const id = entry.key_ptr.*;
             const s = entry.value_ptr.*;
+            // A reset stream sends a RESET_STREAM instead of any further data (RFC
+            // 9000 19.4): the final size is the bytes already written. It rides until
+            // acked; loss re-arms resetOwed via onResetLost.
+            if (s.resetOwed()) {
+                var rf: std.ArrayListUnmanaged(u8) = .empty;
+                defer rf.deinit(self.gpa);
+                frame.encodeResetStream(&rf, self.gpa, id, s.reset_code.?, s.reset_final_size) catch return error.OutOfMemory;
+                while (rf.items.len < 20) rf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+                st.reset_sent.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+                const pn = try self.buildPacket(space, rf.items, true, now);
+                st.reset_sent.putAssumeCapacity(pn, id);
+                s.onResetSent();
+                continue; // no data follows a reset
+            }
             while (s.pending()) {
                 // Peek a full packet's worth; a retransmit (offset below the send
                 // cursor) re-sends already-presented bytes, a new chunk presents
@@ -454,6 +510,22 @@ pub const Connection = struct {
                 s.commit(chunk.offset, chunk.data.len, chunk.fin);
             }
         }
+
+        // STOP_SENDING frames owed to peers (RFC 9000 19.5): one per packet, recorded
+        // so a lost one is re-sent. Only those not already in flight are emitted.
+        var ss = self.stop_sending.iterator();
+        while (ss.next()) |entry| {
+            if (entry.value_ptr.in_flight) continue; // already on the wire, unacked
+            const id = entry.key_ptr.*;
+            var sf: std.ArrayListUnmanaged(u8) = .empty;
+            defer sf.deinit(self.gpa);
+            frame.encodeStopSending(&sf, self.gpa, id, entry.value_ptr.code) catch return error.OutOfMemory;
+            while (sf.items.len < 20) sf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+            self.stop_sending_inflight.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+            const pn = try self.buildPacket(space, sf.items, true, now);
+            self.stop_sending_inflight.putAssumeCapacity(pn, id);
+            entry.value_ptr.in_flight = true;
+        }
     }
 
     /// Process an incoming ACK for `space`: fold it into recovery, free the STREAM
@@ -486,6 +558,17 @@ pub const Connection = struct {
                 }
             }
             if (st.crypto_sent.fetchRemove(pn)) |e| try st.crypto_send.onAck(e.value.offset, e.value.len, false);
+            if (st.reset_sent.fetchRemove(pn)) |e| {
+                if (self.send_streams.get(e.value)) |s| {
+                    s.onResetAck();
+                    if (s.fullyAcked()) {
+                        _ = self.send_streams.remove(e.value);
+                        s.deinit();
+                        self.gpa.destroy(s);
+                    }
+                }
+            }
+            if (self.stop_sending_inflight.fetchRemove(pn)) |e| _ = self.stop_sending.remove(e.value); // acked: done
         }
         // ACK progress resets the PTO backoff (in recovery), so release the fire-once
         // latch: a fresh PTO epoch may arm even if another packet sharing the fired
@@ -511,6 +594,15 @@ pub const Connection = struct {
             if (st.crypto_sent.fetchRemove(pn)) |e| {
                 try st.crypto_send.onLost(e.value.offset, e.value.len, false);
                 crypto_lost = true;
+            }
+            // A lost RESET_STREAM / STOP_SENDING must be re-sent (RFC 9000 13.3): clear
+            // its in-flight record so the next flushSend re-emits it.
+            if (st.reset_sent.fetchRemove(pn)) |e| {
+                if (self.send_streams.get(e.value)) |s| s.onResetLost();
+            }
+            // A lost STOP_SENDING: clear in_flight so the next flushSend re-emits it.
+            if (self.stop_sending_inflight.fetchRemove(pn)) |e| {
+                if (self.stop_sending.getPtr(e.value)) |ss| ss.in_flight = false;
             }
         }
         if (crypto_lost) try self.flushCrypto(space, now); // resend the lost handshake bytes now
@@ -593,6 +685,21 @@ pub const Connection = struct {
                 // advanced its backoff/latch with nothing sent and the timer would
                 // spin on an unsatisfiable deadline.
                 if (s.pending()) return;
+            }
+        }
+        // ... or the RESET_STREAM the probed packet carried: re-arm it so flushSend
+        // re-sends the reset rather than wasting the probe on a PING (RFC 9000 13.3).
+        if (st.reset_sent.get(pn)) |id| {
+            if (self.send_streams.get(id)) |s| {
+                s.onResetLost();
+                if (s.resetOwed()) return; // the next flushSend re-sends the reset
+            }
+        }
+        // ... or the STOP_SENDING the probed packet carried: clear in_flight to re-emit.
+        if (self.stop_sending_inflight.get(pn)) |id| {
+            if (self.stop_sending.getPtr(id)) |ss| {
+                ss.in_flight = false;
+                return; // the next flushSend re-sends it
             }
         }
         // No data to resend (the range was already acked, or a PING-only packet): a
@@ -886,7 +993,8 @@ pub const Connection = struct {
             },
             .max_data => |m| self.conn_send_window.onMaxData(m),
             .max_stream_data => {}, // per-stream send windows arrive with the send path
-            .reset_stream => |r| try self.onReset(r.stream_id, r.final_size),
+            .reset_stream => |r| try self.onReset(r.stream_id, r.error_code, r.final_size),
+            .stop_sending => |s| try self.onStopSending(s.stream_id, s.error_code),
             .connection_close => |cc| {
                 // Retain the peer's close details (RFC 9000 19.19); the reason slice
                 // points into the datagram, so copy a length-capped prefix. The first
@@ -944,10 +1052,26 @@ pub const Connection = struct {
         self.conn_recv_window.onReceived(self.conn_received_total) catch return error.FlowControlError;
     }
 
-    fn onReset(self: *Connection, id: u64, final_size: u64) Error!void {
+    fn onReset(self: *Connection, id: u64, error_code: u64, final_size: u64) Error!void {
         if (self.isRetired(id)) return; // a reset for an already-completed-and-dropped stream
         const s = try self.recvStream(id);
-        s.onReset(final_size) catch return error.FinalSizeError;
+        s.onReset(error_code, final_size) catch return error.FinalSizeError;
+    }
+
+    /// A peer STOP_SENDING (RFC 9000 19.5) asks us to stop sending on `id`. Reset that
+    /// send stream so we stop producing; if the stream does not exist yet (the peer
+    /// cancelled before we started the response), remember the request so the stream
+    /// is born already reset rather than sending data the peer rejected. Only the
+    /// bidirectional request/response streams are auto-reset - a STOP_SENDING aimed at
+    /// the server's own unidirectional infrastructure (control/QPACK) is left to the
+    /// layer above, so it never resets the critical control stream.
+    fn onStopSending(self: *Connection, id: u64, error_code: u64) Error!void {
+        if (stream.StreamType.of(id) != .client_bidi) return;
+        if (self.send_streams.get(id)) |s| {
+            s.reset(error_code);
+        } else {
+            self.peer_stop_sending.put(self.gpa, id, error_code) catch return error.OutOfMemory;
+        }
     }
 
     /// Whether `id` names a recv stream that already completed and was dropped, so a
@@ -1023,6 +1147,13 @@ pub const Connection = struct {
     pub fn streamReset(self: *Connection, id: u64) bool {
         if (self.streams.get(id)) |s| return s.state == .reset_recvd;
         return false;
+    }
+
+    /// The application error code of a peer RESET_STREAM on `id`, or null if the
+    /// stream was not reset (so the H3 layer can report why the peer cancelled).
+    pub fn streamResetCode(self: *Connection, id: u64) ?u64 {
+        if (self.streams.get(id)) |s| return s.reset_code;
+        return null;
     }
 
     /// Whether a receive stream currently exists for `id`. A retired (dropped) or
@@ -1602,6 +1733,147 @@ test "queued stream data flushes into a 1-RTT datagram a peer reassembles" {
     try peer.receiveDatagram(sender.datagramsToSend(), 2000);
     try testing.expectEqualStrings("hello over quic", peer.streamData(1));
     try testing.expect(peer.streamFinished(1));
+}
+
+test "a RESET_STREAM flushes and a peer sees the stream reset" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x70, 0x71, 0x72, 0x73 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    try sender.sendStreamData(1, "partial", false); // some data written first
+    try sender.resetStream(1, 0x010c); // then abort with H3_REQUEST_CANCELLED
+    try testing.expect(sender.hasPendingSend());
+    try sender.flushSend(1000);
+
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    testInstallAppKeys(&peer);
+    const buf = sender.datagramsToSend();
+    var off: usize = 0;
+    for (sender.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+    try testing.expect(peer.streamReset(1)); // the peer's recv stream is reset
+}
+
+test "a lost RESET_STREAM is retransmitted" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x74, 0x75, 0x76, 0x77 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    try sender.resetStream(1, 0x010c);
+    try sender.flushSend(1000);
+    sender.clearSend();
+    try testing.expect(!sender.hasPendingSend()); // the reset is in flight, not owed
+
+    // The PTO fires and re-arms the reset for retransmission.
+    const d = sender.nextTimeout().?;
+    try sender.onTimeout(d + 1);
+    try sender.flushSend(d + 2);
+    try testing.expect(sender.datagramsToSend().len > 0); // the reset rode again
+}
+
+test "a reset freezes the final size and rejects later writes" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x7c, 0x7d, 0x7e, 0x7f };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    try sender.sendStreamData(1, "five!", false); // 5 bytes
+    try sender.resetStream(1, 0x010c); // final size frozen at 5
+    // A write after the reset is a final-size error (it would move the frozen size).
+    try testing.expectError(error.FinalSizeError, sender.sendStreamData(1, "more", false));
+
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    testInstallAppKeys(&peer);
+    try sender.flushSend(1000);
+    const buf = sender.datagramsToSend();
+    var off: usize = 0;
+    for (sender.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+    // The peer accepts the reset with final size 5; no FinalSizeError on its side.
+    try testing.expect(peer.streamReset(1));
+}
+
+test "a PTO retransmits a reset-only stream, not a bare PING" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x80, 0x81, 0x82, 0x83 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    try sender.resetStream(1, 0x010c); // a reset with no prior data
+    try sender.flushSend(1000);
+    sender.clearSend();
+
+    // The PTO fires; the probe must re-arm and re-send the RESET_STREAM.
+    const d = sender.nextTimeout().?;
+    try sender.onTimeout(d + 1);
+    try sender.flushSend(d + 2);
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    testInstallAppKeys(&peer);
+    try peer.receiveDatagram(sender.datagramsToSend(), 2000);
+    try testing.expect(peer.streamReset(1)); // the resent reset reached the peer
+}
+
+test "a STOP_SENDING before the send stream exists still resets it" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x84, 0x85, 0x86, 0x87 };
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    testInstallAppKeys(&server);
+
+    // The peer cancels the response (STOP_SENDING on client-bidi stream 0) BEFORE the
+    // server has created any send stream for it.
+    const varint = @import("varint.zig");
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x05);
+    try varint.append(&sframe, gpa, 0);
+    try varint.append(&sframe, gpa, 0x10);
+    const dgram = try testBuildApp(gpa, &dcid, 0, sframe.items);
+    defer gpa.free(dgram);
+    try server.receiveDatagram(dgram, 1000);
+
+    // The stream is born reset, so writing data to it is rejected (final-size error):
+    // the server cannot send a response the peer already cancelled.
+    try testing.expectError(error.FinalSizeError, server.sendStreamData(0, "ignored body", false));
+
+    // Flushing sends only the RESET_STREAM, which the peer sees.
+    try server.flushSend(2000);
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    testInstallAppKeys(&peer);
+    try peer.receiveDatagram(server.datagramsToSend(), 3000);
+    try testing.expect(peer.streamReset(0));
+    try testing.expectEqualStrings("", peer.streamData(0)); // no data, just the reset
+}
+
+test "STOP_SENDING flushes to the peer" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x78, 0x79, 0x7a, 0x7b };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+
+    try sender.stopSending(0, 0x010c);
+    try testing.expect(sender.hasPendingSend());
+    try sender.flushSend(1000);
+    try testing.expectEqual(@as(usize, 1), sender.datagramLengths().len);
+    // It is in flight now, so a second flush does not re-send it.
+    sender.clearSend();
+    try sender.flushSend(1000);
+    try testing.expectEqual(@as(usize, 0), sender.datagramsToSend().len);
 }
 
 test "flushSend is a no-op until the Application keys are installed" {
