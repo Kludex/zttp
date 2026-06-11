@@ -149,6 +149,20 @@ def test_http3_initiate_connection_sends_the_control_stream() -> None:
     assert conn.data_to_send() == []
 
 
+def test_http3_shutdown_sends_a_goaway() -> None:
+    conn = make_server()
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    conn.data_to_send()
+    conn.receive_datagram(CLIENT_FINISHED, 2000)
+    conn.data_to_send()
+
+    conn.shutdown(8)
+    assert len(conn.data_to_send()) >= 1
+    # A later GOAWAY may only lower the id.
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.shutdown(12)
+
+
 def test_next_event_before_any_datagram_is_need_data() -> None:
     conn = make_server()
     assert conn.next_event() is zttp.NEED_DATA
@@ -187,6 +201,13 @@ def test_peer_settings_is_none_until_the_control_stream_arrives() -> None:
     assert conn.peer_settings() is None
     conn.receive_datagram(CLIENT_HELLO, 1000)
     assert conn.peer_settings() is None
+
+
+def test_goaway_received_is_none_until_the_peer_sends_one() -> None:
+    conn = make_server()
+    assert conn.goaway_received() is None
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    assert conn.goaway_received() is None
 
 
 def test_next_timeout_arms_after_the_handshake_flight() -> None:
