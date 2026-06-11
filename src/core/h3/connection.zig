@@ -246,6 +246,7 @@ pub const Connection = struct {
     fn validateResponseHeader(h: Header) Error!void {
         if (!fields.isValidFieldName(h.name)) return error.H3Error; // pseudo / uppercase / non-token
         if (fields.isConnectionSpecific(h.name)) return error.H3Error;
+        if (eql(h.name, "te") and !eql(h.value, "trailers")) return error.H3Error; // RFC 9114 4.2
         for (h.value) |ch| if (ch < 0x20 or ch == 0x7F) return error.H3Error;
         if (h.value.len > 0) {
             const first = h.value[0];
@@ -771,6 +772,8 @@ test "the response send API rejects invalid sequences and inputs" {
     try testing.expectError(error.H3Error, h3.sendResponse(0, 200, &[_]Header{.{ .name = "connection", .value = "close" }}));
     // A CR/LF/control byte in a value is rejected (no header splitting).
     try testing.expectError(error.H3Error, h3.sendResponse(0, 200, &[_]Header{.{ .name = "x", .value = "a\r\nb" }}));
+    // TE other than "trailers" is rejected (RFC 9114 4.2), like the request path.
+    try testing.expectError(error.H3Error, h3.sendResponse(0, 200, &[_]Header{.{ .name = "te", .value = "gzip" }}));
     // A response on a non-client-bidi stream is rejected.
     try testing.expectError(error.H3Error, h3.sendResponse(1, 200, &.{}));
 
