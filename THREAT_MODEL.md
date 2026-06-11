@@ -18,7 +18,9 @@ In scope:
 - HTTP/2 (RFC 9113): frame codec, HPACK, stream multiplexing and state, flow
   control, and the connection lifecycle, plus h2c upgrade (RFC 7540 3.2).
 - HTTP/3 (RFC 9114) over a QUIC transport (RFC 9000/9001/9002): the server read
-  path, QPACK, and the control/SETTINGS exchange.
+  path - QPACK decode and request-stream framing. The peer control stream and its
+  SETTINGS are **not yet processed** (only bidirectional request streams are
+  pumped), so HTTP/3 settings are neither negotiated nor enforced today.
 - The read side (`receive_data` / `next_event`) and the write side
   (`send_*` / `data_to_send`).
 
@@ -202,12 +204,28 @@ boundary (RFC 9113 8):
 
 ## HTTP/3
 
-HTTP/3 (RFC 9114) over QUIC is read-path-first and shares the H2 validation
-discipline (QPACK field validation, the same pseudo-header and smuggling rules).
-The QUIC transport (RFC 9000/9001/9002) is in scope - including the handshake,
-packet protection, and flow control - and is held to the same strict-reject bar.
-Its threat surface is large and still maturing; treat the HTTP/3 path as the
-newest and least battle-tested of the three.
+HTTP/3 (RFC 9114) over QUIC is read-path-first and the **least mature** of the
+three protocols. It reuses the shared field validators on **regular** header
+fields - lowercase token names, no control bytes in values, connection-specific
+fields and a non-`trailers` `TE` rejected, duplicate Content-Length conflict
+rejected (`decodeRequest`, `src/core/h3/connection.zig`). It also enforces the
+pseudo-header structure rules (pseudo before regular, no duplicates, required
+request pseudo-headers).
+
+Two gaps a downgrading proxy must NOT rely on yet:
+
+- **Pseudo-header *values* are not validated.** Unlike the H2 path, `decodeRequest`
+  does not run the value check on `:method`/`:path`/`:authority`/`:scheme`, so a
+  `:authority` carrying CR/LF is currently accepted and synthesized into a `host`
+  header. An h3→h1 downgrade must validate the pseudo-header values itself until
+  this is closed.
+- **The control stream and SETTINGS are not processed** (only request streams are
+  pumped), so HTTP/3 settings are neither negotiated nor enforced.
+
+The QUIC transport (RFC 9000/9001/9002) - handshake, packet protection, flow
+control - is in scope and held to the strict-reject bar, but its threat surface
+is broad and has had far less adversarial exposure than the H1/H2 paths. Treat
+HTTP/3 as experimental from a security standpoint.
 
 ## Integrator responsibilities
 
