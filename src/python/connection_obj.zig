@@ -789,6 +789,7 @@ fn stream_reset(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
         .h3 => |h3e| {
             var code: c_ulonglong = H3_REQUEST_CANCELLED;
             if (c.PyArg_ParseTuple(args, "|K", &code) == 0) return null;
+            if (code > core.quic.varint.MAX) return py.raiseValue("error code exceeds the 62-bit QUIC range");
             return h3e.resetStream(self.stream_id, @intCast(code));
         },
     }

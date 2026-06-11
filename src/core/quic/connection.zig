@@ -150,6 +150,9 @@ pub const Connection = struct {
     /// The stream id whose STOP_SENDING each in-flight app packet carried, so a lost
     /// or acked one routes back to the `stop_sending` entry by id.
     stop_sending_inflight: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// A peer STOP_SENDING received before we created the matching send stream (id ->
+    /// error code), applied when the stream is lazily created so it is born reset.
+    peer_stop_sending: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Built datagrams waiting to be drained by `datagramsToSend` (one contiguous
     /// buffer; `out_lengths` records each datagram's byte length in order).
     out: std.ArrayListUnmanaged(u8) = .empty,
@@ -250,6 +253,7 @@ pub const Connection = struct {
         self.send_streams.deinit(self.gpa);
         self.stop_sending.deinit(self.gpa);
         self.stop_sending_inflight.deinit(self.gpa);
+        self.peer_stop_sending.deinit(self.gpa);
         self.retired_recv.deinit(self.gpa);
         self.out.deinit(self.gpa);
         self.out_lengths.deinit(self.gpa);
@@ -382,6 +386,10 @@ pub const Connection = struct {
             self.gpa.destroy(s);
             return error.OutOfMemory;
         };
+        // The peer already asked us to stop sending on this stream (STOP_SENDING
+        // arrived before we created it): the stream is born reset, so any data the
+        // caller writes is replaced by the RESET_STREAM.
+        if (self.peer_stop_sending.fetchRemove(id)) |e| s.reset(e.value);
         return s;
     }
 
@@ -985,7 +993,8 @@ pub const Connection = struct {
             },
             .max_data => |m| self.conn_send_window.onMaxData(m),
             .max_stream_data => {}, // per-stream send windows arrive with the send path
-            .reset_stream => |r| try self.onReset(r.stream_id, r.final_size),
+            .reset_stream => |r| try self.onReset(r.stream_id, r.error_code, r.final_size),
+            .stop_sending => |s| try self.onStopSending(s.stream_id, s.error_code),
             .connection_close => |cc| {
                 // Retain the peer's close details (RFC 9000 19.19); the reason slice
                 // points into the datagram, so copy a length-capped prefix. The first
@@ -1043,10 +1052,26 @@ pub const Connection = struct {
         self.conn_recv_window.onReceived(self.conn_received_total) catch return error.FlowControlError;
     }
 
-    fn onReset(self: *Connection, id: u64, final_size: u64) Error!void {
+    fn onReset(self: *Connection, id: u64, error_code: u64, final_size: u64) Error!void {
         if (self.isRetired(id)) return; // a reset for an already-completed-and-dropped stream
         const s = try self.recvStream(id);
-        s.onReset(final_size) catch return error.FinalSizeError;
+        s.onReset(error_code, final_size) catch return error.FinalSizeError;
+    }
+
+    /// A peer STOP_SENDING (RFC 9000 19.5) asks us to stop sending on `id`. Reset that
+    /// send stream so we stop producing; if the stream does not exist yet (the peer
+    /// cancelled before we started the response), remember the request so the stream
+    /// is born already reset rather than sending data the peer rejected. Only the
+    /// bidirectional request/response streams are auto-reset - a STOP_SENDING aimed at
+    /// the server's own unidirectional infrastructure (control/QPACK) is left to the
+    /// layer above, so it never resets the critical control stream.
+    fn onStopSending(self: *Connection, id: u64, error_code: u64) Error!void {
+        if (stream.StreamType.of(id) != .client_bidi) return;
+        if (self.send_streams.get(id)) |s| {
+            s.reset(error_code);
+        } else {
+            self.peer_stop_sending.put(self.gpa, id, error_code) catch return error.OutOfMemory;
+        }
     }
 
     /// Whether `id` names a recv stream that already completed and was dropped, so a
@@ -1122,6 +1147,13 @@ pub const Connection = struct {
     pub fn streamReset(self: *Connection, id: u64) bool {
         if (self.streams.get(id)) |s| return s.state == .reset_recvd;
         return false;
+    }
+
+    /// The application error code of a peer RESET_STREAM on `id`, or null if the
+    /// stream was not reset (so the H3 layer can report why the peer cancelled).
+    pub fn streamResetCode(self: *Connection, id: u64) ?u64 {
+        if (self.streams.get(id)) |s| return s.reset_code;
+        return null;
     }
 
     /// Whether a receive stream currently exists for `id`. A retired (dropped) or
@@ -1792,6 +1824,39 @@ test "a PTO retransmits a reset-only stream, not a bare PING" {
     testInstallAppKeys(&peer);
     try peer.receiveDatagram(sender.datagramsToSend(), 2000);
     try testing.expect(peer.streamReset(1)); // the resent reset reached the peer
+}
+
+test "a STOP_SENDING before the send stream exists still resets it" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x84, 0x85, 0x86, 0x87 };
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    testInstallAppKeys(&server);
+
+    // The peer cancels the response (STOP_SENDING on client-bidi stream 0) BEFORE the
+    // server has created any send stream for it.
+    const varint = @import("varint.zig");
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x05);
+    try varint.append(&sframe, gpa, 0);
+    try varint.append(&sframe, gpa, 0x10);
+    const dgram = try testBuildApp(gpa, &dcid, 0, sframe.items);
+    defer gpa.free(dgram);
+    try server.receiveDatagram(dgram, 1000);
+
+    // The stream is born reset, so writing data to it is rejected (final-size error):
+    // the server cannot send a response the peer already cancelled.
+    try testing.expectError(error.FinalSizeError, server.sendStreamData(0, "ignored body", false));
+
+    // Flushing sends only the RESET_STREAM, which the peer sees.
+    try server.flushSend(2000);
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    testInstallAppKeys(&peer);
+    try peer.receiveDatagram(server.datagramsToSend(), 3000);
+    try testing.expect(peer.streamReset(0));
+    try testing.expectEqualStrings("", peer.streamData(0)); // no data, just the reset
 }
 
 test "STOP_SENDING flushes to the peer" {

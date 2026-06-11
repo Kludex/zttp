@@ -64,6 +64,9 @@ pub const RecvStream = struct {
     /// control sums the growth of this across all streams.
     highest_received: u64 = 0,
     final_size: ?u64 = null,
+    /// The application error code of a RESET_STREAM the peer sent (RFC 9000 19.4),
+    /// retained so the layer above can report why the peer reset the stream.
+    reset_code: ?u64 = null,
     /// Out-of-order fragments above `contiguous`, kept sorted by offset.
     pending: std.ArrayListUnmanaged(Fragment) = .empty,
     /// The in-order, not-yet-read bytes [read_offset, contiguous).
@@ -172,10 +175,11 @@ pub const RecvStream = struct {
         return if (self.final_size) |fs| self.contiguous >= fs else false;
     }
 
-    pub fn onReset(self: *RecvStream, final_size: u64) Error!void {
+    pub fn onReset(self: *RecvStream, error_code: u64, final_size: u64) Error!void {
         if (self.final_size) |fs| {
             if (fs != final_size) return error.FinalSizeError;
         } else self.final_size = final_size;
+        self.reset_code = error_code;
         self.state = .reset_recvd;
     }
 

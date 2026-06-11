@@ -41,6 +41,9 @@ const RequestStream = struct {
     /// Content-Length was sent. Reconciled against the DATA bytes at the FIN.
     content_length: ?u64 = null,
     body_received: u64 = 0,
+    /// Whether a peer-reset event has already been emitted for this stream, so a
+    /// re-pump (if the stream could not yet be dropped) does not re-fire it.
+    rst_emitted: bool = false,
 };
 
 /// Outbound (response) state per stream, so the send API cannot serialize invalid
@@ -240,6 +243,14 @@ pub const Connection = struct {
         // Consume BEFORE dropping: consuming the last byte of a finished stream is
         // what moves its receive state to terminal, which dropStream then reclaims.
         if (consumed_total > 0) self.qc.consumeStream(id, consumed_total);
+        // A peer RESET_STREAM cancels the request: surface it as an event (with the
+        // peer's error code) once, before the stream is dropped, so the integrator is
+        // not left waiting on a request that silently vanished. The flag guards against
+        // a re-fire if the stream cannot be dropped yet (e.g. an allocator failure).
+        if (self.qc.streamReset(id) and !rs.rst_emitted) {
+            try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = self.qc.streamResetCode(id) orelse 0 } });
+            rs.rst_emitted = true;
+        }
         // Drop the per-stream state on both layers once the request is fully
         // delivered (EOM) OR the peer reset the stream, so an open-then-reset storm
         // cannot grow the maps (the memory half of the Rapid-Reset class). The QUIC
@@ -538,6 +549,10 @@ pub const Connection = struct {
     /// the connection. The stream's send state is marked finished.
     pub fn resetStream(self: *Connection, id: u64, error_code: u64) Error!void {
         if (quic_stream.StreamType.of(id) != .client_bidi) return error.H3Error;
+        // A response that already finished (FIN sent) has nothing to reset; a second
+        // reset would recreate a reclaimed QUIC send stream and emit a RESET_STREAM
+        // with a stale final size. No-op once the send half is done.
+        if (try self.sendStateOf(id) == .fin_sent) return;
         self.qc.resetStream(id, error_code) catch return error.H3Error;
         self.qc.stopSending(id, error_code) catch return error.H3Error;
         try self.setSendState(id, .fin_sent);
@@ -963,9 +978,51 @@ test "a peer reset reclaims the request stream" {
     try qc.receiveDatagram(dgram, 1000);
     try h3.pump(0);
 
+    // The peer reset surfaces as an rst_stream event carrying the peer's code.
+    const ev = h3.nextEvent();
+    try testing.expect(ev == .rst_stream);
+    try testing.expectEqual(@as(u64, 0), ev.rst_stream.stream_id);
+    try testing.expectEqual(@as(u64, 0x10), ev.rst_stream.error_code);
+
     // The reset stream is reclaimed (not left to accrete on a reset storm).
     var ids: [4]u64 = undefined;
     try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
+}
+
+test "a peer STOP_SENDING resets our send half" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // The server has a response in flight on stream 0.
+    try h3.sendResponse(0, 200, &.{});
+
+    // The peer sends STOP_SENDING (type 0x05) on stream 0 asking us to stop.
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x05); // STOP_SENDING
+    try varint.append(&sframe, gpa, 0); // stream id 0
+    try varint.append(&sframe, gpa, 0x10); // error code
+    const dgram = try quic_conn.testBuildApp(gpa, &dcid, 0, sframe.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+
+    // Our send stream is now reset; flushing emits a RESET_STREAM the peer sees.
+    try qc.flushSend(2000);
+    var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    quic_conn.testInstallAppKeys(&peer);
+    const buf = qc.datagramsToSend();
+    var off: usize = 0;
+    for (qc.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 3000);
+        off += len;
+    }
+    try testing.expect(peer.streamReset(0));
 }
 
 // Build a request datagram on `stream_id` with the FIN bit set, at packet number `pn`.
@@ -1145,6 +1202,26 @@ test "the server resets a request stream" {
 
     // A reset on a non-request (server uni) stream id is rejected.
     try testing.expectError(error.H3Error, h3.resetStream(3, 0x010c));
+}
+
+test "a reset after the response finished is a no-op" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x94, 0x95, 0x96, 0x97 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    try h3.sendResponse(0, 200, &.{});
+    try h3.endStream(0); // the response finished (FIN sent)
+    qc.clearSend();
+    try qc.flushSend(1000);
+    qc.clearSend();
+    // A reset now must not recreate a reclaimed send stream / emit a stale frame.
+    try h3.resetStream(0, 0x010c);
+    try qc.flushSend(1000);
+    try testing.expectEqual(@as(usize, 0), qc.datagramsToSend().len); // nothing sent
 }
 
 test "the server opens its control stream with a SETTINGS frame" {
