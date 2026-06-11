@@ -22,26 +22,17 @@ const congestion = @import("congestion.zig");
 const flow = @import("flow.zig");
 const stream = @import("stream.zig");
 const crypto_stream = @import("crypto_stream.zig");
+const transport_params = @import("transport_params.zig");
+const ack_ranges = @import("ack_ranges.zig");
 const tls = @import("tls/root.zig");
 
 const Space = constants.Space;
 
 pub const Role = enum { server, client };
 
-/// The Application-space PTO ack-delay budget (RFC 9002 6.2.1). The default peer
-/// max_ack_delay (RFC 9000 18.2) until transport parameters are negotiated; the
-/// long-header spaces use 0, handled when handshake PTO lands.
-const MAX_ACK_DELAY_US: u64 = 25_000;
-
 /// The earlier of an optional `a` and a `b`.
 fn minOpt(a: ?u64, b: u64) ?u64 {
     return if (a) |x| @min(x, b) else b;
-}
-
-/// The PTO ack-delay term per space (RFC 9002 6.2.1): max_ack_delay applies only to
-/// Application; the long-header spaces add 0.
-fn ackDelayFor(space: Space) u64 {
-    return if (space == .application) MAX_ACK_DELAY_US else 0;
 }
 
 pub const Error = error{
@@ -56,6 +47,10 @@ pub const Error = error{
     FlowControlError,
     StreamLimitError,
     FinalSizeError,
+    /// The send would exceed the 3x anti-amplification budget before the client's
+    /// address is validated (RFC 9000 8.1). Not fatal: the send path stops and
+    /// resumes once the client's later packets raise the budget.
+    AmplificationLimited,
     OutOfMemory,
 };
 
@@ -69,11 +64,21 @@ const SpaceState = struct {
     largest_recv_pn: ?u64 = null,
     rec: recovery.Space = .{},
     crypto: crypto_stream.CryptoStream,
+    /// Outbound CRYPTO for this space (the handshake flight), retained until acked so
+    /// a lost or amplification-stalled flight is re-sent. A SendStream gives the
+    /// retain/peek/commit/onAck/onLost machinery; CRYPTO never sets the FIN.
+    crypto_send: stream.SendStream,
     ack_pending: bool = false,
     /// The STREAM range each in-flight packet carried (pn -> {id,offset,len,fin}),
     /// so a lost packet's data can be re-queued and an acked packet's data freed.
     /// Only the Application space carries STREAM frames, but the field is uniform.
     stream_sent: std.AutoHashMapUnmanaged(u64, StreamSent) = .empty,
+    /// The CRYPTO byte range each in-flight packet carried (pn -> {offset,len}), the
+    /// CRYPTO counterpart of stream_sent for ack/loss routing.
+    crypto_sent: std.AutoHashMapUnmanaged(u64, CryptoSent) = .empty,
+    /// The packet numbers received in this space, for accurate ACK frames (RFC 9000
+    /// 19.3) - a peer needs every range to detect loss correctly.
+    recv_ranges: ack_ranges.AckRanges = .{},
     /// The ack-eliciting send-time anchor a PTO last fired against. A PTO will not
     /// re-fire for the same anchor (which would inflate the backoff without a probe
     /// reaching the wire); it re-arms only once a fresh ack-eliciting send advances
@@ -83,13 +88,20 @@ const SpaceState = struct {
     fn deinit(self: *SpaceState, gpa: std.mem.Allocator) void {
         self.rec.deinit(gpa);
         self.crypto.deinit();
+        self.crypto_send.deinit();
         self.stream_sent.deinit(gpa);
+        self.crypto_sent.deinit(gpa);
+        self.recv_ranges.deinit(gpa);
     }
 };
 
 /// The STREAM frame one sent packet carried, kept so loss recovery can map a lost
 /// or acked packet number back to the stream bytes it was responsible for.
 const StreamSent = struct { id: u64, offset: u64, len: u64, fin: bool };
+
+/// The CRYPTO byte range one sent packet carried, so loss recovery can map a lost or
+/// acked packet number back to the handshake bytes it was responsible for.
+const CryptoSent = struct { offset: u64, len: u64 };
 
 pub const Connection = struct {
     gpa: std.mem.Allocator,
@@ -117,7 +129,22 @@ pub const Connection = struct {
     /// The server TLS handshake driver, attached by `initServer`; null on a client
     /// or a connection that does not run the handshake (the recv-pipeline tests).
     tls: ?tls.server.Server = null,
+    /// The client's transport parameters (RFC 9000 18.2), parsed from the
+    /// ClientHello; until then the RFC defaults apply. Drives the send window and
+    /// the PTO ack-delay.
+    peer_tp: transport_params.TransportParameters = .{},
     peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
+    handshake_confirmed: bool = false, // the client Finished verified; HANDSHAKE_DONE sent
+    /// The connection-level recv window grew enough to advertise a new MAX_DATA
+    /// (RFC 9000 4.1); flushSend emits it so the peer is not stalled at its grant.
+    max_data_pending: bool = false,
+    /// Anti-amplification (RFC 9000 8.1): until the client's address is validated, the
+    /// server may send at most AMPLIFICATION_FACTOR x the bytes it has received. A
+    /// received Handshake packet (only a real client can produce one) validates the
+    /// address. These count whole datagrams.
+    recv_bytes: u64 = 0,
+    sent_bytes: u64 = 0,
+    address_validated: bool = false,
     closed: bool = false,
 
     /// `client_dcid` is the destination connection id on the client's first
@@ -134,9 +161,9 @@ pub const Connection = struct {
         errdefer gpa.free(peer_scid);
         const initial = crypto.InitialKeys.derive(client_dcid);
         var spaces: [3]SpaceState = .{
-            .{ .crypto = crypto_stream.CryptoStream.init(gpa) },
-            .{ .crypto = crypto_stream.CryptoStream.init(gpa) },
-            .{ .crypto = crypto_stream.CryptoStream.init(gpa) },
+            .{ .crypto = crypto_stream.CryptoStream.init(gpa), .crypto_send = stream.SendStream.init(gpa) },
+            .{ .crypto = crypto_stream.CryptoStream.init(gpa), .crypto_send = stream.SendStream.init(gpa) },
+            .{ .crypto = crypto_stream.CryptoStream.init(gpa), .crypto_send = stream.SendStream.init(gpa) },
         };
         // The receiver decrypts with the opposite role's keys.
         const recv = if (role == .server) initial.client else initial.server;
@@ -226,13 +253,23 @@ pub const Connection = struct {
         };
         packet.writePacketNumber(&hdr, self.gpa, pn, pn_len) catch return error.OutOfMemory;
 
+        // Anti-amplification (RFC 9000 8.1): before the client's address is
+        // validated, refuse to send more than AMPLIFICATION_FACTOR x bytes received.
+        // This applies only to the handshake (long-header) spaces - sending 1-RTT
+        // (Application) packets means the handshake completed, which validates the
+        // address. The flight stalls here and resumes as the client's later packets
+        // raise the budget; the caller treats AmplificationLimited as "stop", not fatal.
+        const datagram_len = hdr.items.len + frames.len + crypto.TAG_LEN;
+        if (long and !self.address_validated and self.sent_bytes + datagram_len > constants.AMPLIFICATION_FACTOR * self.recv_bytes) {
+            return error.AmplificationLimited;
+        }
+
         const start = self.out.items.len;
         self.out.appendSlice(self.gpa, hdr.items) catch return error.OutOfMemory;
         const ct = self.out.addManyAsSlice(self.gpa, frames.len + crypto.TAG_LEN) catch return error.OutOfMemory;
         _ = crypto.seal(keys, pn, hdr.items, frames, ct);
         crypto.protectHeader(keys.hp, self.out.items[start..], pn_offset, long) catch return error.ProtocolViolation;
-
-        const datagram_len = self.out.items.len - start;
+        self.sent_bytes += datagram_len;
         self.out_lengths.append(self.gpa, datagram_len) catch return error.OutOfMemory;
         // A pure-ACK packet is not ack-eliciting, so it is not in flight: not
         // congestion-controlled or retransmitted (RFC 9002 2, 7). Only in-flight
@@ -242,6 +279,37 @@ pub const Connection = struct {
         if (ack_eliciting) self.cc.onSent(datagram_len);
         st.next_pn += 1;
         return pn;
+    }
+
+    /// Close the connection (RFC 9000 10.2): queue a CONNECTION_CLOSE frame and enter
+    /// the closing state. `app` selects the application error variant; `error_code`
+    /// and `reason` are the close details. After this the connection sends nothing
+    /// further except (a real stack would) a single close on each received packet;
+    /// here it is queued once and `closed` is set. Idempotent.
+    pub fn close(self: *Connection, app: bool, error_code: u64, reason: []const u8) Error!void {
+        if (self.closed) return;
+        // Send in the highest space whose keys are installed, so the peer can decrypt
+        // it: Application once 1-RTT keys exist, else Handshake, else Initial.
+        const space: Space = if (self.spaces[@intFromEnum(Space.application)].send_keys != null)
+            .application
+        else if (self.spaces[@intFromEnum(Space.handshake)].send_keys != null)
+            .handshake
+        else
+            .initial;
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(self.gpa);
+        // The application-error variant (0x1d) is legal only in 1-RTT (RFC 9000 12.5);
+        // in Initial/Handshake the transport variant carries APPLICATION_ERROR (0x0c).
+        const use_app = app and space == .application;
+        const code = if (app and !use_app) @intFromEnum(constants.TransportError.application_error) else error_code;
+        frame.encodeConnectionClose(&frames, self.gpa, use_app, code, 0, reason) catch return error.OutOfMemory;
+        while (frames.items.len < 20) frames.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING
+        // Only mark closed once the CLOSE is actually queued. If the 3x budget blocks
+        // it (a rare pre-validation close), surface AmplificationLimited and stay open
+        // so the integrator can retry after the client's next packet, rather than
+        // silently rejecting all future receives with no CLOSE ever sent.
+        _ = try self.buildPacket(space, frames.items, false, 0);
+        self.closed = true;
     }
 
     /// The built datagrams as one contiguous buffer; pair with `datagramLengths`.
@@ -310,6 +378,17 @@ pub const Connection = struct {
         const space = Space.application;
         const st = &self.spaces[@intFromEnum(space)];
         if (st.send_keys == null) return; // no 1-RTT keys yet: nothing can be sent
+        // Advertise a raised connection flow-control limit if one is pending, so the
+        // peer is not stalled at its old MAX_DATA grant (RFC 9000 4.1).
+        if (self.max_data_pending) {
+            var mf: std.ArrayListUnmanaged(u8) = .empty;
+            defer mf.deinit(self.gpa);
+            frame.encodeMaxData(&mf, self.gpa, self.conn_recv_window.grant()) catch return error.OutOfMemory;
+            while (mf.items.len < 20) mf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+            _ = try self.buildPacket(space, mf.items, true, now);
+            self.max_data_pending = false;
+        }
+
         // A conservative single-packet budget: one STREAM frame per packet.
         const packet_room = constants.MIN_INITIAL_DATAGRAM - 64;
         var it = self.send_streams.iterator();
@@ -364,6 +443,7 @@ pub const Connection = struct {
             if (st.stream_sent.fetchRemove(pn)) |e| {
                 if (self.send_streams.get(e.value.id)) |s| try s.onAck(e.value.offset, e.value.len, e.value.fin);
             }
+            if (st.crypto_sent.fetchRemove(pn)) |e| try st.crypto_send.onAck(e.value.offset, e.value.len, false);
         }
         // ACK progress resets the PTO backoff (in recovery), so release the fire-once
         // latch: a fresh PTO epoch may arm even if another packet sharing the fired
@@ -381,11 +461,17 @@ pub const Connection = struct {
         var lost_pns: std.ArrayListUnmanaged(u64) = .empty;
         defer lost_pns.deinit(self.gpa);
         _ = st.rec.detectLost(&self.rtt, &self.cc, now, &lost_pns, self.gpa) catch return error.OutOfMemory;
+        var crypto_lost = false;
         for (lost_pns.items) |pn| {
             if (st.stream_sent.fetchRemove(pn)) |e| {
                 if (self.send_streams.get(e.value.id)) |s| try s.onLost(e.value.offset, e.value.len, e.value.fin);
             }
+            if (st.crypto_sent.fetchRemove(pn)) |e| {
+                try st.crypto_send.onLost(e.value.offset, e.value.len, false);
+                crypto_lost = true;
+            }
         }
+        if (crypto_lost) try self.flushCrypto(space, now); // resend the lost handshake bytes now
     }
 
     // ---- loss-recovery timer (sans-IO: the integrator owns the OS timer) --------
@@ -395,11 +481,18 @@ pub const Connection = struct {
     /// nothing is armed. The integrator sets an OS timer for this and calls
     /// `onTimeout` at or after it. Null also when the PTO backoff has saturated (a
     /// black-holed peer): the integrator's own idle timeout then closes the connection.
+    /// The PTO ack-delay term per space (RFC 9002 6.2.1): the peer's negotiated
+    /// max_ack_delay applies only to the Application space; the long-header spaces
+    /// use 0 (the handshake has no ack-delay budget).
+    fn ackDelayFor(self: *const Connection, space: Space) u64 {
+        return if (space == .application) self.peer_tp.max_ack_delay_ms * std.time.us_per_ms else 0;
+    }
+
     pub fn nextTimeout(self: *Connection) ?u64 {
         var earliest: ?u64 = null;
         for (&self.spaces, 0..) |*st, i| {
             if (st.rec.loss_time) |t| earliest = minOpt(earliest, t);
-            if (st.rec.ptoDeadline(&self.rtt, ackDelayFor(@enumFromInt(i)))) |t| earliest = minOpt(earliest, t);
+            if (st.rec.ptoDeadline(&self.rtt, self.ackDelayFor(@enumFromInt(i)))) |t| earliest = minOpt(earliest, t);
         }
         return earliest;
     }
@@ -425,7 +518,7 @@ pub const Connection = struct {
         // intervening send cannot inflate the backoff.
         for (&self.spaces, 0..) |*st, i| {
             if (st.send_keys == null) continue;
-            const deadline = st.rec.ptoDeadline(&self.rtt, ackDelayFor(@enumFromInt(i))) orelse continue;
+            const deadline = st.rec.ptoDeadline(&self.rtt, self.ackDelayFor(@enumFromInt(i))) orelse continue;
             if (now < deadline) continue;
             if (st.pto_fired_anchor == st.rec.last_ack_eliciting_sent_time) continue; // already fired for this anchor
             st.pto_fired_anchor = st.rec.last_ack_eliciting_sent_time;
@@ -440,6 +533,15 @@ pub const Connection = struct {
     /// its genuine later ACK or loss still routes exactly once.
     fn sendProbe(self: *Connection, space: Space, pn: u64, now: u64) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
+        // Probe by re-sending the oldest unacked CRYPTO (handshake recovery) ...
+        if (st.crypto_sent.get(pn)) |sent| {
+            try st.crypto_send.onLost(sent.offset, sent.len, false);
+            if (st.crypto_send.pending()) {
+                try self.flushCrypto(space, now);
+                return;
+            }
+        }
+        // ... or the oldest unacked STREAM range.
         if (st.stream_sent.get(pn)) |sent| {
             if (self.send_streams.get(sent.id)) |s| {
                 try s.onLost(sent.offset, sent.len, sent.fin);
@@ -451,18 +553,20 @@ pub const Connection = struct {
                 if (s.pending()) return;
             }
         }
-        // No STREAM data to resend (a CRYPTO or PING packet, or an already-acked
-        // range): a PING is a valid probe that elicits an ACK. Retransmitting lost
-        // CRYPTO data on PTO - so the handshake itself recovers from tail loss - is a
-        // separate follow-up; here the PING keeps the timer and recovery loop alive.
+        // No data to resend (the range was already acked, or a PING-only packet): a
+        // PING is a valid probe that elicits an ACK and keeps the recovery loop alive.
         try self.sendPing(space, now);
     }
 
     fn sendPing(self: *Connection, space: Space, now: u64) Error!void {
         // PING (0x01) plus PADDING (0x00): the padding makes the packet long enough
         // for the 16-byte header-protection sample (a bare 1-byte PING is too short),
-        // and PADDING is legal in every space. PING makes it ack-eliciting.
-        _ = try self.buildPacket(space, &([_]u8{0x01} ++ [_]u8{0x00} ** 19), true, now);
+        // and PADDING is legal in every space. PING makes it ack-eliciting. A PING
+        // that does not fit the anti-amplification budget is simply not sent.
+        _ = self.buildPacket(space, &([_]u8{0x01} ++ [_]u8{0x00} ** 19), true, now) catch |e| switch (e) {
+            error.AmplificationLimited => return,
+            else => return e,
+        };
     }
 
     // ---- TLS handshake drive ---------------------------------------------------
@@ -485,6 +589,14 @@ pub const Connection = struct {
             switch (msg.msg_type) {
                 .client_hello => {
                     const decoded = tls.client_hello.parse(buf[0..msg.len]) catch return error.ProtocolViolation;
+
+                    // Honour the client's transport parameters (RFC 9000 7.4): its
+                    // initial_max_data is the send-window ceiling, max_ack_delay feeds
+                    // the PTO. Applied before the flight is built/sent.
+                    self.peer_tp = transport_params.parse(decoded.value.quic_transport_parameters) catch
+                        return error.ProtocolViolation;
+                    self.conn_send_window.setInitial(self.peer_tp.initial_max_data);
+
                     var flight_buf: std.ArrayListUnmanaged(u8) = .empty;
                     defer flight_buf.deinit(self.gpa);
                     const outcome = server.onClientHello(&flight_buf, self.gpa, decoded.value) catch return error.ProtocolViolation;
@@ -500,34 +612,100 @@ pub const Connection = struct {
                     try self.sendCryptoFlight(flight_buf.items, outcome.server_hello_len, now);
                     continue;
                 },
-                .finished => st.crypto.advance(msg.len), // the server does not verify a client Finished
+                .finished => {
+                    const body = tls.handshake.finishedBody(msg.body) catch return error.ProtocolViolation;
+                    server.onClientFinished(body) catch return error.ProtocolViolation;
+                    st.crypto.advance(msg.len);
+                    try self.confirmHandshake(now);
+                },
                 else => return error.ProtocolViolation, // unexpected message at the server
             }
         }
     }
 
-    /// Emit the server flight: ServerHello as CRYPTO in the Initial space, the rest
-    /// (EncryptedExtensions/Certificate/CertificateVerify/Finished) as CRYPTO in the
-    /// Handshake space. Each space's CRYPTO byte-stream starts at offset 0.
+    /// Queue the server flight: ServerHello into the Initial space's CRYPTO send
+    /// buffer, the rest (EncryptedExtensions/Certificate/CertificateVerify/Finished)
+    /// into the Handshake space's. The bytes are retained until acked, so an
+    /// amplification-stalled or lost flight is re-sent; flushCrypto packetizes them.
     fn sendCryptoFlight(self: *Connection, flight: []const u8, server_hello_len: usize, now: u64) Error!void {
-        try self.sendCrypto(.initial, flight[0..server_hello_len], now);
-        try self.sendCrypto(.handshake, flight[server_hello_len..], now);
+        self.spaces[@intFromEnum(Space.initial)].crypto_send.write(flight[0..server_hello_len], false) catch return error.OutOfMemory;
+        self.spaces[@intFromEnum(Space.handshake)].crypto_send.write(flight[server_hello_len..], false) catch return error.OutOfMemory;
+        try self.flushCrypto(.initial, now);
+        try self.flushCrypto(.handshake, now);
     }
 
-    fn sendCrypto(self: *Connection, space: Space, data: []const u8, now: u64) Error!void {
-        var frames: std.ArrayListUnmanaged(u8) = .empty;
-        defer frames.deinit(self.gpa);
-        frame.encodeCrypto(&frames, self.gpa, 0, data) catch return error.OutOfMemory;
-        _ = try self.buildPacket(space, frames.items, true, now); // CRYPTO carries no STREAM record
+    /// Packetize a space's pending CRYPTO into packets, recording each sent range so
+    /// ack/loss can free or re-send it. Stops cleanly on the anti-amplification limit
+    /// (RFC 9000 8.1) - the unsent bytes stay retained and flush on a later call once
+    /// the budget rises (the client's next packet) or the space is re-flushed.
+    fn flushCrypto(self: *Connection, space: Space, now: u64) Error!void {
+        const st = &self.spaces[@intFromEnum(space)];
+        if (st.send_keys == null) return;
+        const room = constants.MIN_INITIAL_DATAGRAM - 64;
+        while (st.crypto_send.pending()) {
+            const chunk = st.crypto_send.peek(room) orelse break;
+            if (chunk.data.len == 0) break; // CRYPTO has no FIN; an empty chunk is nothing to send
+            var frames: std.ArrayListUnmanaged(u8) = .empty;
+            defer frames.deinit(self.gpa);
+            frame.encodeCrypto(&frames, self.gpa, chunk.offset, chunk.data) catch return error.OutOfMemory;
+            st.crypto_sent.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+            const pn = self.buildPacket(space, frames.items, true, now) catch |e| switch (e) {
+                error.AmplificationLimited => return, // budget exhausted: keep the rest retained
+                else => return e,
+            };
+            st.crypto_sent.putAssumeCapacity(pn, .{ .offset = chunk.offset, .len = chunk.data.len });
+            st.crypto_send.commit(chunk.offset, chunk.data.len, false);
+        }
+    }
+
+    /// The client Finished verified: the handshake is confirmed. Signal it to the
+    /// client with HANDSHAKE_DONE (RFC 9001 4.1.2) and discard the now-unneeded
+    /// Initial and Handshake keys (RFC 9001 4.9.1/4.9.2) so no further packet is
+    /// processed in or sent from those spaces.
+    fn confirmHandshake(self: *Connection, now: u64) Error!void {
+        if (self.handshake_confirmed) return;
+        // Queue HANDSHAKE_DONE before committing the confirmation state, so a failed
+        // send (OOM) leaves the connection unconfirmed and retryable rather than
+        // confirmed-but-silent. HANDSHAKE_DONE (0x1e) + PADDING (0x00): the padding
+        // makes the packet long enough for the header-protection sample (RFC 9000
+        // 19.20, 19.1).
+        _ = try self.buildPacket(.application, &([_]u8{0x1e} ++ [_]u8{0x00} ** 19), true, now);
+        self.handshake_confirmed = true;
+        self.discardSpace(.initial);
+        self.discardSpace(.handshake);
+    }
+
+    /// Drop a packet-number space's keys and in-flight state once it is no longer
+    /// needed (RFC 9001 4.9): no packet can be sent or decrypted there afterwards.
+    fn discardSpace(self: *Connection, space: Space) void {
+        const st = &self.spaces[@intFromEnum(space)];
+        st.recv_keys = null;
+        st.send_keys = null;
+        st.rec.discard(&self.cc);
+        st.crypto_sent.clearRetainingCapacity(); // the space's CRYPTO is done; no more ack/loss routing
+        st.crypto_send.deinit(); // free the retained handshake bytes; the space is dead
+        st.crypto_send = stream.SendStream.init(self.gpa);
+        st.recv_ranges.ranges.clearRetainingCapacity(); // no more ACKs for a dead space
     }
 
     fn sendAck(self: *Connection, space: Space, now: u64) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
-        const largest = st.largest_recv_pn orelse return;
+        if (st.send_keys == null) {
+            st.ack_pending = false; // space discarded (e.g. handshake confirmed): nothing to ack with
+            return;
+        }
+        if (st.recv_ranges.isEmpty()) return;
         var frames: std.ArrayListUnmanaged(u8) = .empty;
         defer frames.deinit(self.gpa);
-        frame.encodeAck(&frames, self.gpa, largest, 0, 0) catch return error.OutOfMemory; // one contiguous range
-        _ = try self.buildPacket(space, frames.items, false, now); // ACK is not ack-eliciting
+        // The full received-pn range set (RFC 9000 19.3), so a peer with gaps detects
+        // loss accurately. Ack-delay is 0 for now (immediate ack, no coalescing).
+        frame.encodeAckRanges(&frames, self.gpa, &st.recv_ranges, 0) catch return error.OutOfMemory;
+        // An ACK that does not fit the anti-amplification budget is simply deferred
+        // (the ack_pending flag stays set so a later send re-attempts), never fatal.
+        _ = self.buildPacket(space, frames.items, false, now) catch |e| switch (e) {
+            error.AmplificationLimited => return,
+            else => return e,
+        };
         st.ack_pending = false;
     }
 
@@ -537,6 +715,9 @@ pub const Connection = struct {
     /// the connection.
     pub fn receiveDatagram(self: *Connection, datagram: []const u8, now: u64) Error!void {
         if (self.closed) return error.ProtocolViolation;
+        // Anti-amplification credit (RFC 9000 8.1): every received byte raises the
+        // budget for what the server may send before the address is validated.
+        self.recv_bytes += datagram.len;
         var rest = datagram;
         while (rest.len > 0) {
             const consumed = self.receivePacket(rest, now) catch |e| switch (e) {
@@ -550,6 +731,10 @@ pub const Connection = struct {
             if (consumed == 0 or consumed > rest.len) break;
             rest = rest[consumed..];
         }
+        // The received bytes raised the anti-amplification budget: flush any handshake
+        // CRYPTO that stalled on the limit (RFC 9000 8.1).
+        try self.flushCrypto(.initial, now);
+        try self.flushCrypto(.handshake, now);
     }
 
     fn receivePacket(self: *Connection, buf: []const u8, now: u64) Error!usize {
@@ -614,7 +799,13 @@ pub const Connection = struct {
         defer self.gpa.free(plaintext);
         const payload = crypto.open(keys, pn, header, ciphertext, plaintext) catch return error.Dropped;
 
+        // A decryptable Handshake packet proves the peer received our Initial/
+        // handshake keys, so its address is validated and the 3x send limit lifts
+        // (RFC 9000 8.1).
+        if (space == .handshake) self.address_validated = true;
+
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, pn) else pn;
+        st.recv_ranges.add(self.gpa, pn) catch return error.OutOfMemory; // for accurate ACKs
         try self.dispatchFrames(payload, space, now);
 
         // Acknowledge the space if it carried an ack-eliciting frame this packet.
@@ -733,6 +924,8 @@ pub const Connection = struct {
             s.consume(n);
             self.conn_consumed_total += s.read_offset - before;
             self.conn_recv_window.onConsumed(self.conn_consumed_total);
+            // Enough has been consumed to advertise a higher limit; flushSend emits it.
+            if (self.conn_recv_window.shouldUpdate()) self.max_data_pending = true;
         }
     }
 
@@ -783,6 +976,33 @@ pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, 
     try hdr_buf.appendSlice(gpa, try varint.encode(&lbuf, @intCast(length)));
     const pn_offset = hdr_buf.items.len;
     try hdr_buf.append(gpa, @intCast(pn & 0xff)); // 1-byte pn
+
+    const header = hdr_buf.items;
+    const out = try gpa.alloc(u8, header.len + frames.len + crypto.TAG_LEN);
+    errdefer gpa.free(out);
+    @memcpy(out[0..header.len], header);
+    _ = crypto.seal(keys, pn, header, frames, out[header.len..]);
+    try crypto.protectHeader(keys.hp, out, pn_offset, true);
+    return out;
+}
+
+// Build a Handshake-space (long-header type 0x02) packet carrying `frames`, sealed
+// with `keys` - used to deliver the client Finished into the server's Handshake
+// space the way a real client would.
+fn testBuildHandshake(gpa: std.mem.Allocator, dcid: []const u8, keys: crypto.Keys, pn: u64, frames: []const u8) ![]u8 {
+    var hdr_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer hdr_buf.deinit(gpa);
+    try hdr_buf.append(gpa, 0xE0); // long|fixed|handshake(type 2)|pn_len-1=0
+    try hdr_buf.appendSlice(gpa, &[_]u8{ 0, 0, 0, 1 }); // version 1
+    try hdr_buf.append(gpa, @intCast(dcid.len));
+    try hdr_buf.appendSlice(gpa, dcid);
+    try hdr_buf.append(gpa, 0); // scid len 0 (no token field on a Handshake header)
+    const length = 1 + frames.len + crypto.TAG_LEN;
+    var lbuf: [8]u8 = undefined;
+    const varint = @import("varint.zig");
+    try hdr_buf.appendSlice(gpa, try varint.encode(&lbuf, @intCast(length)));
+    const pn_offset = hdr_buf.items.len;
+    try hdr_buf.append(gpa, @intCast(pn & 0xff));
 
     const header = hdr_buf.items;
     const out = try gpa.alloc(u8, header.len + frames.len + crypto.TAG_LEN);
@@ -894,6 +1114,68 @@ test "connection flow control sums across streams" {
     try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
 }
 
+test "an ACK carries every received range, not just the largest" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x31, 0x32, 0x33, 0x34 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    // Receive pn 0 and pn 2 (a gap at pn 1), each carrying a PING so an ACK is owed.
+    const ping = [_]u8{0x01} ** 20;
+    const d0 = try testBuildApp(gpa, &dcid, 0, &ping);
+    defer gpa.free(d0);
+    const d2 = try testBuildApp(gpa, &dcid, 2, &ping);
+    defer gpa.free(d2);
+    try conn.receiveDatagram(d0, 1000);
+    try conn.receiveDatagram(d2, 1000);
+
+    // The space recorded two ranges ([2,2] and [0,0]); the emitted ACK reflects them.
+    const app = &conn.spaces[@intFromEnum(Space.application)];
+    try testing.expectEqual(@as(usize, 2), app.recv_ranges.ranges.items.len);
+    try testing.expectEqual(@as(u64, 2), app.recv_ranges.largest().?);
+}
+
+test "the server can send a CONNECTION_CLOSE and is then closed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x41, 0x42, 0x43, 0x44 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    try conn.close(false, 0x0a, "bye"); // transport error 0x0a (PROTOCOL_VIOLATION-ish)
+    try testing.expect(conn.closed);
+    try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len); // one close packet queued
+    // Idempotent: a second close does nothing.
+    try conn.close(false, 0x0a, "bye");
+    try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len);
+}
+
+test "consuming stream data advertises a raised MAX_DATA" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x51, 0x52, 0x53, 0x54 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.conn_recv_window.limit = 100; // a small window so consuming half trips the update
+
+    // Receive 60 bytes on stream 1, then consume them: that crosses the auto-tune
+    // threshold and queues a MAX_DATA, which flushSend emits.
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try frame.encodeStream(&sframe, gpa, 1, 0, &[_]u8{0x7a} ** 60, false);
+    const dgram = try testBuildApp(gpa, &dcid, 0, sframe.items);
+    defer gpa.free(dgram);
+    try conn.receiveDatagram(dgram, 1000);
+    conn.clearSend();
+
+    conn.consumeStream(1, 60);
+    try testing.expect(conn.max_data_pending);
+    try conn.flushSend(2000);
+    try testing.expect(!conn.max_data_pending); // emitted
+    try testing.expect(conn.datagramLengths().len >= 1);
+}
+
 // ---- TLS handshake seam tests ----------------------------------------------
 
 // The RFC 8448 section 3 client x25519 public key, the same value tls/keyshare.zig
@@ -1000,6 +1282,88 @@ test "a server drives the handshake from a ClientHello and installs 1-RTT keys" 
     const server_ks = try tls.keyshare.KeyShare.ephemeral([_]u8{0x33} ** 32);
     const ecdhe = try server_ks.shared(pubkey);
     try testing.expectEqual(@as(usize, 32), ecdhe.len); // both sides reach the same ECDHE input
+}
+
+test "the client Finished confirms the handshake and discards the early spaces" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+    const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
+    defer gpa.free(ch);
+    try server.receiveDatagram(ch, 1000);
+    server.clearSend();
+
+    // Forge the correct client Finished from the server's own retained transcript
+    // and client handshake secret (what a real client would independently derive),
+    // and deliver it in a Handshake packet sealed with the client's handshake send
+    // keys - which equal the server's handshake recv keys.
+    const drv = &server.tls.?;
+    const th = drv.transcript.hash();
+    const verify_data = tls.finished.build(drv.client_hs_secret, th);
+    var fin_msg: [4 + tls.finished.LEN]u8 = .{ 0x14, 0, 0, tls.finished.LEN } ++ [_]u8{0} ** tls.finished.LEN;
+    @memcpy(fin_msg[4..], &verify_data);
+    var crypto_frame: std.ArrayListUnmanaged(u8) = .empty;
+    defer crypto_frame.deinit(gpa);
+    try frame.encodeCrypto(&crypto_frame, gpa, 0, &fin_msg);
+
+    const hs_recv_keys = server.spaces[@intFromEnum(Space.handshake)].recv_keys.?;
+    const dgram = try testBuildHandshake(gpa, &dcid, hs_recv_keys, 0, crypto_frame.items);
+    defer gpa.free(dgram);
+    try server.receiveDatagram(dgram, 2000);
+
+    // The handshake is confirmed: HANDSHAKE_DONE was queued (an Application packet),
+    // and the Initial + Handshake spaces are discarded (keys cleared).
+    try testing.expect(server.handshake_confirmed);
+    try testing.expect(drv.state == .complete);
+    try testing.expect(server.spaces[@intFromEnum(Space.initial)].send_keys == null);
+    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].send_keys == null);
+    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].recv_keys == null);
+    try testing.expect(server.datagramLengths().len >= 1); // HANDSHAKE_DONE (+ a Handshake ACK)
+}
+
+test "the client's transport parameters set the connection send window" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+    // The test ClientHello carries quic_transport_parameters {0x01,0x02,0x40,0x01}:
+    // id 0x01 (max_idle_timeout), len 2, value varint 0x4001 = 1 -> initial_max_data
+    // is absent, so the send window becomes 0 (the client granted no data yet).
+    const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
+    defer gpa.free(ch);
+    try server.receiveDatagram(ch, 1000);
+    try testing.expectEqual(@as(u64, 0), server.peer_tp.initial_max_data);
+    try testing.expectEqual(@as(u64, 0), server.conn_send_window.limit); // set from the (absent) grant
+}
+
+test "a lost handshake CRYPTO packet is retransmitted on loss" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+    const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
+    defer gpa.free(ch);
+    try server.receiveDatagram(ch, 1000);
+
+    // The Handshake space carries the encrypted flight, recorded per-pn so loss
+    // recovery can re-send it; nothing is pending (all of it is in flight).
+    const hs = &server.spaces[@intFromEnum(Space.handshake)];
+    try testing.expect(hs.crypto_sent.count() >= 1);
+    try testing.expect(!hs.crypto_send.pending());
+
+    // A PTO re-queues the oldest unacked CRYPTO range for retransmission - the
+    // handshake recovers from a lost flight rather than deadlocking.
+    const deadline = server.nextTimeout().?;
+    try server.onTimeout(deadline + 1);
+    try testing.expect(hs.crypto_send.pending()); // the lost flight bytes are queued to resend
 }
 
 test "a fragmented ClientHello across CRYPTO frames still drives the handshake" {

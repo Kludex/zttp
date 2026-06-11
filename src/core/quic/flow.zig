@@ -82,6 +82,13 @@ pub const SendWindow = struct {
         self.limit = @max(self.limit, new_limit);
     }
 
+    /// Set the initial limit from the peer's transport parameter (RFC 9000 7.4),
+    /// before any MAX_DATA frame raises it. Unlike onMaxData this replaces, since
+    /// the initial grant is authoritative (it may be lower than a placeholder).
+    pub fn setInitial(self: *SendWindow, limit: u64) void {
+        self.limit = limit;
+    }
+
     pub fn blocked(self: *const SendWindow) bool {
         return self.available() == 0;
     }
