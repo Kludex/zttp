@@ -160,6 +160,13 @@ def test_is_closed_starts_false() -> None:
     assert conn.is_closed() is False
 
 
+def test_close_info_is_none_until_the_peer_closes() -> None:
+    conn = make_server()
+    assert conn.close_info() is None
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    assert conn.close_info() is None
+
+
 def test_next_timeout_arms_after_the_handshake_flight() -> None:
     conn = make_server()
     conn.receive_datagram(CLIENT_HELLO, 1000)

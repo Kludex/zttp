@@ -103,6 +103,19 @@ const StreamSent = struct { id: u64, offset: u64, len: u64, fin: bool };
 /// acked packet number back to the handshake bytes it was responsible for.
 const CryptoSent = struct { offset: u64, len: u64 };
 
+/// A CONNECTION_CLOSE the peer sent (RFC 9000 19.19), retained so the integrator can
+/// surface why the connection ended. `app` distinguishes the application-error
+/// variant; `reason` is an owned, length-capped copy of the human-readable phrase.
+pub const PeerClose = struct {
+    app: bool,
+    error_code: u64,
+    reason: []const u8,
+
+    /// Cap the retained reason so a peer cannot make the server allocate an
+    /// arbitrarily long phrase; the prefix is enough to diagnose.
+    pub const MAX_REASON: usize = 1024;
+};
+
 pub const Connection = struct {
     gpa: std.mem.Allocator,
     role: Role,
@@ -146,6 +159,11 @@ pub const Connection = struct {
     sent_bytes: u64 = 0,
     address_validated: bool = false,
     closed: bool = false,
+    /// The details of a CONNECTION_CLOSE received from the peer (RFC 9000 19.19),
+    /// captured so the integrator can report why the peer closed - not just that it
+    /// did. Null until a close arrives. `reason` is an owned copy (the decoded slice
+    /// points into the datagram), capped so a hostile reason cannot grow it.
+    peer_close: ?PeerClose = null,
 
     /// `client_dcid` is the destination connection id on the client's first
     /// Initial: both endpoints derive the Initial keys from it. The server picks
@@ -211,6 +229,7 @@ pub const Connection = struct {
         self.send_streams.deinit(self.gpa);
         self.out.deinit(self.gpa);
         self.out_lengths.deinit(self.gpa);
+        if (self.peer_close) |pc| self.gpa.free(pc.reason);
         for (&self.spaces) |*s| s.deinit(self.gpa);
     }
 
@@ -851,7 +870,16 @@ pub const Connection = struct {
             .max_data => |m| self.conn_send_window.onMaxData(m),
             .max_stream_data => {}, // per-stream send windows arrive with the send path
             .reset_stream => |r| try self.onReset(r.stream_id, r.final_size),
-            .connection_close => {
+            .connection_close => |cc| {
+                // Retain the peer's close details (RFC 9000 19.19); the reason slice
+                // points into the datagram, so copy a length-capped prefix. The first
+                // close wins - a later frame in the same (closing) packet cannot
+                // overwrite it. A copy failure still records the close, sans reason.
+                if (self.peer_close == null) {
+                    const n = @min(cc.reason.len, PeerClose.MAX_REASON);
+                    const reason = self.gpa.dupe(u8, cc.reason[0..n]) catch &.{};
+                    self.peer_close = .{ .app = cc.app, .error_code = cc.error_code, .reason = reason };
+                }
                 self.closed = true;
             },
             .handshake_done => {},
@@ -1155,6 +1183,26 @@ test "the server can send a CONNECTION_CLOSE and is then closed" {
     // Idempotent: a second close does nothing.
     try conn.close(false, 0x0a, "bye");
     try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len);
+}
+
+test "a received CONNECTION_CLOSE is captured with its code and reason" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x41, 0x42, 0x43, 0x44 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+    try sender.close(false, 0x0a, "bye");
+
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    testInstallAppKeys(&peer);
+    try peer.receiveDatagram(sender.datagramsToSend(), 1000);
+
+    try testing.expect(peer.closed);
+    const pc = peer.peer_close.?;
+    try testing.expect(!pc.app);
+    try testing.expectEqual(@as(u64, 0x0a), pc.error_code);
+    try testing.expectEqualStrings("bye", pc.reason);
 }
 
 test "consuming stream data advertises a raised MAX_DATA" {
