@@ -66,6 +66,11 @@ pub const AckOutcome = struct {
 };
 
 /// Loss detection over one packet-number space.
+/// PTO backs off as `base << pto_count`; the shift is capped here so it cannot
+/// invoke undefined behaviour, and `nextTimeout` treats a saturated count as "give
+/// up" so a black-holed connection stops arming and minting probe records.
+const PTO_SHIFT_CAP: u32 = 20;
+
 pub const Space = struct {
     sent: std.ArrayListUnmanaged(SentPacket) = .empty,
     largest_acked: ?u64 = null,
@@ -73,6 +78,9 @@ pub const Space = struct {
     /// The number of times the PTO has fired without progress (RFC 9002 6.2.1);
     /// the PTO backs off exponentially by this count.
     pto_count: u32 = 0,
+    /// Send time of the most recent ack-eliciting packet; the PTO is measured from
+    /// here (RFC 9002 6.2.1). Read only when something ack-eliciting is in flight.
+    last_ack_eliciting_sent_time: ?u64 = null,
 
     pub fn deinit(self: *Space, gpa: std.mem.Allocator) void {
         self.sent.deinit(gpa);
@@ -80,6 +88,36 @@ pub const Space = struct {
 
     pub fn onSent(self: *Space, gpa: std.mem.Allocator, pkt: SentPacket) !void {
         try self.sent.append(gpa, pkt);
+        if (pkt.ack_eliciting) self.last_ack_eliciting_sent_time = pkt.sent_time;
+    }
+
+    /// The armed PTO deadline (RFC 9002 6.2.1), or null when no ack-eliciting packet
+    /// is in flight (PTO is not armed) or the backoff has saturated (a black-holed
+    /// connection: stop arming and let the integrator's idle timeout close it).
+    pub fn ptoDeadline(self: *const Space, rtt: *const RttEstimator, max_ack_delay: u64) ?u64 {
+        if (self.pto_count >= PTO_SHIFT_CAP) return null;
+        if (!self.hasAckEliciting()) return null;
+        const anchor = self.last_ack_eliciting_sent_time orelse return null;
+        const base = rtt.pto() + max_ack_delay;
+        return anchor + (base << @intCast(self.pto_count));
+    }
+
+    /// A PTO fired for this space: name the oldest in-flight ack-eliciting packet to
+    /// probe (re-send its data to elicit an ACK) and back off the timer. Returns
+    /// null - WITHOUT backing off - if nothing is ack-eliciting (the caller should
+    /// not have fired). The packet is NOT removed: a probe re-sends, it does not
+    /// declare loss.
+    pub fn onPtoExpired(self: *Space) ?u64 {
+        // The oldest in-flight ack-eliciting packet is the smallest pn (pn is
+        // monotonic with send order). `sent` is not append-ordered - swapRemove in
+        // onAck/detectLost reorders it - so scan for the minimum rather than take
+        // the first entry.
+        var oldest: ?u64 = null;
+        for (self.sent.items) |p| {
+            if (p.ack_eliciting) oldest = if (oldest) |o| @min(o, p.pn) else p.pn;
+        }
+        if (oldest != null) self.pto_count += 1; // back off only when a probe target exists
+        return oldest;
     }
 
     /// Apply an ACK (its largest, first-range, and the raw range bytes from the
@@ -142,6 +180,12 @@ pub const Space = struct {
                 if (largest_acked_time) |t| rtt.update(now - t, ack_delay);
             }
             self.pto_count = 0;
+        }
+        // Once nothing is in flight, no deadline is armed: clear the timer anchors so
+        // nextTimeout does not report a stale loss_time / PTO for an idle space.
+        if (self.sent.items.len == 0) {
+            self.loss_time = null;
+            self.last_ack_eliciting_sent_time = null;
         }
         return outcome;
     }
