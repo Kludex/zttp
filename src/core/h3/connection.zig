@@ -47,6 +47,14 @@ const RequestStream = struct {
 /// HTTP/3: DATA before HEADERS, a second HEADERS, or a write after the FIN.
 const SendState = enum { idle, headers_sent, fin_sent };
 
+/// Per inbound unidirectional stream. `utype` is null until the leading type-prefix
+/// varint has fully arrived (it may straddle datagrams). `settings_seen` tracks the
+/// control stream's "SETTINGS first, exactly once" rule (RFC 9114 6.2.1).
+const UniStream = struct {
+    utype: ?h3_stream.UniStreamType = null,
+    settings_seen: bool = false,
+};
+
 /// The largest field section (header block) we will decode, advertised to the peer
 /// as SETTINGS_MAX_FIELD_SECTION_SIZE so it does not send a larger one.
 const MAX_FIELD_SECTION_SIZE: u64 = 1 << 16;
@@ -69,6 +77,12 @@ pub const Connection = struct {
     /// Whether our control stream (type + SETTINGS) has been opened (RFC 9114
     /// 6.2.1). The control stream is opened once, before any response.
     control_sent: bool = false,
+    /// Per inbound unidirectional stream: its decoded type, once enough bytes have
+    /// arrived to read the type-prefix varint (it may span datagrams).
+    uni_streams: std.AutoHashMapUnmanaged(u64, UniStream) = .empty,
+    /// The peer's control-stream id, set when its type prefix is read. A second
+    /// control stream is a connection error (RFC 9114 6.2.1).
+    control_recv_id: ?u64 = null,
 
     pub fn init(gpa: std.mem.Allocator, qc: *quic_conn.Connection) Connection {
         return .{
@@ -82,6 +96,7 @@ pub const Connection = struct {
     pub fn deinit(self: *Connection) void {
         self.streams.deinit(self.gpa);
         self.send_state.deinit(self.gpa);
+        self.uni_streams.deinit(self.gpa);
         self.qpack_dec.deinit();
         self.queue.deinit(self.gpa);
         self.arena.deinit();
@@ -124,8 +139,14 @@ pub const Connection = struct {
     }
 
     pub fn pump(self: *Connection, id: u64) Error!void {
-        // Only client-initiated bidirectional streams carry requests here.
-        if (quic_stream.StreamType.of(id) != .client_bidi) return;
+        switch (quic_stream.StreamType.of(id)) {
+            .client_bidi => try self.pumpRequest(id),
+            .client_uni => try self.pumpUni(id),
+            else => {}, // server-initiated streams are ours; nothing to read here
+        }
+    }
+
+    fn pumpRequest(self: *Connection, id: u64) Error!void {
         // Don't recreate H3 state for a stream the transport no longer has (retired
         // after completion/reset): a late frame for it is already ignored there, and
         // recreating an idle entry here would resurrect it on the H3 map.
@@ -164,6 +185,60 @@ pub const Connection = struct {
         // response is not freed from under recovery.
         if (rs.state == .done or self.qc.streamReset(id)) {
             if (self.qc.dropStream(id)) _ = self.streams.remove(id); // rs dangles after this
+        }
+    }
+
+    /// Advance an inbound unidirectional stream (RFC 9114 6.2). The first varint is
+    /// the stream type; the control stream then carries frames, the QPACK and push
+    /// streams carry content we do not use (cap-0 QPACK, no push), and an unknown
+    /// type is abandoned. The type-prefix read tolerates a varint that straddles
+    /// datagrams (it stays unconsumed until complete).
+    fn pumpUni(self: *Connection, id: u64) Error!void {
+        const us = self.uni_streams.getOrPut(self.gpa, id) catch return error.OutOfMemory;
+        if (!us.found_existing) us.value_ptr.* = .{};
+        const u = us.value_ptr;
+        const ready = self.qc.streamData(id);
+        var consumed: usize = 0;
+
+        if (u.utype == null) {
+            const d = h3_stream.decodeUniType(ready) orelse return; // type varint not all here yet
+            u.utype = d.utype;
+            consumed += d.len;
+            if (d.utype == .control) {
+                if (self.control_recv_id != null) return error.H3Error; // a 2nd control stream
+                self.control_recv_id = id;
+            }
+        }
+
+        switch (u.utype.?) {
+            .control => {
+                // Frames on the control stream (SETTINGS, and later GOAWAY); the
+                // ordering rules live in onControlFrame.
+                while (consumed < ready.len) {
+                    const d = h3_frame.decode(ready[consumed..]) catch break; // need more
+                    try self.onControlFrame(u, d.frame);
+                    consumed += d.len;
+                }
+            },
+            // QPACK encoder/decoder streams (cap-0: no instructions) and push streams
+            // (we never enable push): drain and ignore so flow control is re-granted.
+            .qpack_encoder, .qpack_decoder, .push => consumed = ready.len,
+            // An unknown unidirectional stream type MUST be abandoned (RFC 9114 6.2);
+            // drain it rather than letting its bytes accrete.
+            _ => consumed = ready.len,
+        }
+        if (consumed > 0) self.qc.consumeStream(id, consumed);
+    }
+
+    /// A frame on the control stream. DATA/HEADERS there are illegal (RFC 9114 7.1).
+    /// SETTINGS handling (first-and-once, applying the values) is wired in the next
+    /// step; for now an unknown/grease frame is ignored (RFC 9114 9).
+    fn onControlFrame(self: *Connection, u: *UniStream, f: h3_frame.Frame) Error!void {
+        _ = self;
+        switch (f.ftype) {
+            .data, .headers => return error.H3Error, // not allowed on the control stream
+            .settings => u.settings_seen = true,
+            else => {}, // GOAWAY/MAX_PUSH_ID/unknown: ignored for now
         }
     }
 
@@ -966,4 +1041,93 @@ test "the response send API rejects invalid sequences and inputs" {
     try testing.expectError(error.H3Error, h3.sendResponse(0, 200, &.{}));
     try h3.endStream(0);
     try testing.expectError(error.H3Error, h3.sendData(0, "late"));
+}
+
+// Build a 1-RTT datagram carrying `bytes` on unidirectional stream `uni_id` at the
+// given packet number, so a uni-stream test can feed the type prefix + content.
+fn buildUni(gpa: std.mem.Allocator, dcid: []const u8, uni_id: u64, pn: u64, bytes: []const u8) ![]u8 {
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x0a); // STREAM, LEN set, no OFF/FIN
+    try varint.append(&sframe, gpa, uni_id);
+    try varint.append(&sframe, gpa, bytes.len);
+    try sframe.appendSlice(gpa, bytes);
+    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, pn, sframe.items);
+}
+
+fn newH3Server(gpa: std.mem.Allocator, dcid: []const u8, qc: *quic_conn.Connection) Connection {
+    qc.* = quic_conn.Connection.init(gpa, .server, dcid) catch unreachable;
+    quic_conn.testInstallAppKeys(qc);
+    return Connection.init(gpa, qc);
+}
+
+test "the peer's control stream + SETTINGS is read without error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xc0, 0xc1, 0xc2, 0xc3 };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    // Client control stream (uni id 2): type 0x00, then a SETTINGS frame.
+    var ctrl: std.ArrayListUnmanaged(u8) = .empty;
+    defer ctrl.deinit(gpa);
+    try ctrl.append(gpa, 0x00); // control stream type
+    try h3_frame.append(&ctrl, gpa, .settings, &.{ 0x06, 0x44, 0x00 }); // max_field_section_size
+    const dgram = try buildUni(gpa, &dcid, 2, 0, ctrl.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pump(2);
+    try testing.expectEqual(@as(?u64, 2), h3.control_recv_id);
+}
+
+test "a second control stream is a connection error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xc4, 0xc5, 0xc6, 0xc7 };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    const d2 = try buildUni(gpa, &dcid, 2, 0, &.{0x00}); // control on uni 2
+    defer gpa.free(d2);
+    try qc.receiveDatagram(d2, 1000);
+    try h3.pump(2);
+    const d6 = try buildUni(gpa, &dcid, 6, 1, &.{0x00}); // a second control on uni 6
+    defer gpa.free(d6);
+    try qc.receiveDatagram(d6, 1100);
+    try testing.expectError(error.H3Error, h3.pump(6));
+}
+
+test "DATA on the control stream is unexpected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xc8, 0xc9, 0xca, 0xcb };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    var ctrl: std.ArrayListUnmanaged(u8) = .empty;
+    defer ctrl.deinit(gpa);
+    try ctrl.append(gpa, 0x00); // control type
+    try h3_frame.append(&ctrl, gpa, .data, "x"); // DATA is illegal here
+    const dgram = try buildUni(gpa, &dcid, 2, 0, ctrl.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try testing.expectError(error.H3Error, h3.pump(2));
+}
+
+test "a QPACK encoder stream is drained and ignored" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xcc, 0xcd, 0xce, 0xcf };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    const dgram = try buildUni(gpa, &dcid, 2, 0, &.{ 0x02, 0xde, 0xad }); // qpack encoder + junk
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pump(2); // no error; bytes drained
+    try testing.expectEqual(@as(usize, 0), qc.streamData(2).len);
 }
