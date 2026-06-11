@@ -23,6 +23,7 @@ const flow = @import("flow.zig");
 const stream = @import("stream.zig");
 const crypto_stream = @import("crypto_stream.zig");
 const transport_params = @import("transport_params.zig");
+const ack_ranges = @import("ack_ranges.zig");
 const tls = @import("tls/root.zig");
 
 const Space = constants.Space;
@@ -75,6 +76,9 @@ const SpaceState = struct {
     /// The CRYPTO byte range each in-flight packet carried (pn -> {offset,len}), the
     /// CRYPTO counterpart of stream_sent for ack/loss routing.
     crypto_sent: std.AutoHashMapUnmanaged(u64, CryptoSent) = .empty,
+    /// The packet numbers received in this space, for accurate ACK frames (RFC 9000
+    /// 19.3) - a peer needs every range to detect loss correctly.
+    recv_ranges: ack_ranges.AckRanges = .{},
     /// The ack-eliciting send-time anchor a PTO last fired against. A PTO will not
     /// re-fire for the same anchor (which would inflate the backoff without a probe
     /// reaching the wire); it re-arms only once a fresh ack-eliciting send advances
@@ -87,6 +91,7 @@ const SpaceState = struct {
         self.crypto_send.deinit();
         self.stream_sent.deinit(gpa);
         self.crypto_sent.deinit(gpa);
+        self.recv_ranges.deinit(gpa);
     }
 };
 
@@ -130,6 +135,9 @@ pub const Connection = struct {
     peer_tp: transport_params.TransportParameters = .{},
     peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
     handshake_confirmed: bool = false, // the client Finished verified; HANDSHAKE_DONE sent
+    /// The connection-level recv window grew enough to advertise a new MAX_DATA
+    /// (RFC 9000 4.1); flushSend emits it so the peer is not stalled at its grant.
+    max_data_pending: bool = false,
     /// Anti-amplification (RFC 9000 8.1): until the client's address is validated, the
     /// server may send at most AMPLIFICATION_FACTOR x the bytes it has received. A
     /// received Handshake packet (only a real client can produce one) validates the
@@ -273,6 +281,37 @@ pub const Connection = struct {
         return pn;
     }
 
+    /// Close the connection (RFC 9000 10.2): queue a CONNECTION_CLOSE frame and enter
+    /// the closing state. `app` selects the application error variant; `error_code`
+    /// and `reason` are the close details. After this the connection sends nothing
+    /// further except (a real stack would) a single close on each received packet;
+    /// here it is queued once and `closed` is set. Idempotent.
+    pub fn close(self: *Connection, app: bool, error_code: u64, reason: []const u8) Error!void {
+        if (self.closed) return;
+        // Send in the highest space whose keys are installed, so the peer can decrypt
+        // it: Application once 1-RTT keys exist, else Handshake, else Initial.
+        const space: Space = if (self.spaces[@intFromEnum(Space.application)].send_keys != null)
+            .application
+        else if (self.spaces[@intFromEnum(Space.handshake)].send_keys != null)
+            .handshake
+        else
+            .initial;
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(self.gpa);
+        // The application-error variant (0x1d) is legal only in 1-RTT (RFC 9000 12.5);
+        // in Initial/Handshake the transport variant carries APPLICATION_ERROR (0x0c).
+        const use_app = app and space == .application;
+        const code = if (app and !use_app) @intFromEnum(constants.TransportError.application_error) else error_code;
+        frame.encodeConnectionClose(&frames, self.gpa, use_app, code, 0, reason) catch return error.OutOfMemory;
+        while (frames.items.len < 20) frames.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING
+        // Only mark closed once the CLOSE is actually queued. If the 3x budget blocks
+        // it (a rare pre-validation close), surface AmplificationLimited and stay open
+        // so the integrator can retry after the client's next packet, rather than
+        // silently rejecting all future receives with no CLOSE ever sent.
+        _ = try self.buildPacket(space, frames.items, false, 0);
+        self.closed = true;
+    }
+
     /// The built datagrams as one contiguous buffer; pair with `datagramLengths`.
     pub fn datagramsToSend(self: *Connection) []const u8 {
         return self.out.items;
@@ -339,6 +378,18 @@ pub const Connection = struct {
         const space = Space.application;
         const st = &self.spaces[@intFromEnum(space)];
         if (st.send_keys == null) return; // no 1-RTT keys yet: nothing can be sent
+
+        // Advertise a raised connection flow-control limit if one is pending, so the
+        // peer is not stalled at its old MAX_DATA grant (RFC 9000 4.1).
+        if (self.max_data_pending) {
+            var mf: std.ArrayListUnmanaged(u8) = .empty;
+            defer mf.deinit(self.gpa);
+            frame.encodeMaxData(&mf, self.gpa, self.conn_recv_window.grant()) catch return error.OutOfMemory;
+            while (mf.items.len < 20) mf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+            _ = try self.buildPacket(space, mf.items, true, now);
+            self.max_data_pending = false;
+        }
+
         // A conservative single-packet budget; one STREAM frame per packet for now.
         const packet_room = constants.MIN_INITIAL_DATAGRAM - 64;
         var it = self.send_streams.iterator();
@@ -635,6 +686,7 @@ pub const Connection = struct {
         st.crypto_sent.clearRetainingCapacity(); // the space's CRYPTO is done; no more ack/loss routing
         st.crypto_send.deinit(); // free the retained handshake bytes; the space is dead
         st.crypto_send = stream.SendStream.init(self.gpa);
+        st.recv_ranges.ranges.clearRetainingCapacity(); // no more ACKs for a dead space
     }
 
     fn sendAck(self: *Connection, space: Space, now: u64) Error!void {
@@ -643,10 +695,12 @@ pub const Connection = struct {
             st.ack_pending = false; // space discarded (e.g. handshake confirmed): nothing to ack with
             return;
         }
-        const largest = st.largest_recv_pn orelse return;
+        if (st.recv_ranges.isEmpty()) return;
         var frames: std.ArrayListUnmanaged(u8) = .empty;
         defer frames.deinit(self.gpa);
-        frame.encodeAck(&frames, self.gpa, largest, 0, 0) catch return error.OutOfMemory; // one contiguous range
+        // The full received-pn range set (RFC 9000 19.3), so a peer with gaps detects
+        // loss accurately. Ack-delay is 0 for now (immediate ack, no coalescing).
+        frame.encodeAckRanges(&frames, self.gpa, &st.recv_ranges, 0) catch return error.OutOfMemory;
         // An ACK that does not fit the anti-amplification budget is simply deferred
         // (the ack_pending flag stays set so a later send re-attempts), never fatal.
         _ = self.buildPacket(space, frames.items, false, now) catch |e| switch (e) {
@@ -752,6 +806,7 @@ pub const Connection = struct {
         if (space == .handshake) self.address_validated = true;
 
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, pn) else pn;
+        st.recv_ranges.add(self.gpa, pn) catch return error.OutOfMemory; // for accurate ACKs
         try self.dispatchFrames(payload, space, now);
 
         // Acknowledge the space if it carried an ack-eliciting frame this packet.
@@ -871,6 +926,8 @@ pub const Connection = struct {
             s.consume(n);
             self.conn_consumed_total += s.read_offset - before;
             self.conn_recv_window.onConsumed(self.conn_consumed_total);
+            // Enough has been consumed to advertise a higher limit; flushSend emits it.
+            if (self.conn_recv_window.shouldUpdate()) self.max_data_pending = true;
         }
     }
 
@@ -1057,6 +1114,68 @@ test "connection flow control sums across streams" {
     const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
     defer gpa.free(dgram);
     try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
+}
+
+test "an ACK carries every received range, not just the largest" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x31, 0x32, 0x33, 0x34 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    // Receive pn 0 and pn 2 (a gap at pn 1), each carrying a PING so an ACK is owed.
+    const ping = [_]u8{0x01} ** 20;
+    const d0 = try testBuildApp(gpa, &dcid, 0, &ping);
+    defer gpa.free(d0);
+    const d2 = try testBuildApp(gpa, &dcid, 2, &ping);
+    defer gpa.free(d2);
+    try conn.receiveDatagram(d0, 1000);
+    try conn.receiveDatagram(d2, 1000);
+
+    // The space recorded two ranges ([2,2] and [0,0]); the emitted ACK reflects them.
+    const app = &conn.spaces[@intFromEnum(Space.application)];
+    try testing.expectEqual(@as(usize, 2), app.recv_ranges.ranges.items.len);
+    try testing.expectEqual(@as(u64, 2), app.recv_ranges.largest().?);
+}
+
+test "the server can send a CONNECTION_CLOSE and is then closed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x41, 0x42, 0x43, 0x44 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    try conn.close(false, 0x0a, "bye"); // transport error 0x0a (PROTOCOL_VIOLATION-ish)
+    try testing.expect(conn.closed);
+    try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len); // one close packet queued
+    // Idempotent: a second close does nothing.
+    try conn.close(false, 0x0a, "bye");
+    try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len);
+}
+
+test "consuming stream data advertises a raised MAX_DATA" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x51, 0x52, 0x53, 0x54 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.conn_recv_window.limit = 100; // a small window so consuming half trips the update
+
+    // Receive 60 bytes on stream 1, then consume them: that crosses the auto-tune
+    // threshold and queues a MAX_DATA, which flushSend emits.
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try frame.encodeStream(&sframe, gpa, 1, 0, &[_]u8{0x7a} ** 60, false);
+    const dgram = try testBuildApp(gpa, &dcid, 0, sframe.items);
+    defer gpa.free(dgram);
+    try conn.receiveDatagram(dgram, 1000);
+    conn.clearSend();
+
+    conn.consumeStream(1, 60);
+    try testing.expect(conn.max_data_pending);
+    try conn.flushSend(2000);
+    try testing.expect(!conn.max_data_pending); // emitted
+    try testing.expect(conn.datagramLengths().len >= 1);
 }
 
 // ---- TLS handshake seam tests ----------------------------------------------

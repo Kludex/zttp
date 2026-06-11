@@ -14,6 +14,7 @@ pub const flow = @import("flow.zig");
 pub const stream = @import("stream.zig");
 pub const crypto_stream = @import("crypto_stream.zig");
 pub const transport_params = @import("transport_params.zig");
+pub const ack_ranges = @import("ack_ranges.zig");
 pub const connection = @import("connection.zig");
 pub const tls = @import("tls/root.zig");
 
@@ -29,6 +30,7 @@ test {
     _ = stream;
     _ = crypto_stream;
     _ = transport_params;
+    _ = ack_ranges;
     _ = connection;
     _ = tls;
 }
