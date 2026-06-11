@@ -6,11 +6,14 @@
 
 const std = @import("std");
 const tables = @import("../tables.zig");
+const ascii = @import("../ascii.zig");
 const events = @import("../events.zig");
 const framing = @import("framing.zig");
 
 const Header = events.Header;
 const responseIsBodyless = framing.responseIsBodyless;
+const eqIgnoreCase = ascii.eqIgnoreCase;
+const trimOws = ascii.trimOws;
 
 pub const WriteError = error{
     /// A head was sent while a message was still in progress.
@@ -172,7 +175,7 @@ fn validateFraming(hdrs: []const Header) WriteError!void {
             has_te = true;
         } else if (eqIgnoreCase(h.name, "content-length")) {
             const v = trimOws(h.value);
-            for (v) |ch| if (ch < '0' or ch > '9') return error.InvalidField; // digits only
+            if (v.len > 0 and ascii.parseDecimal(u64, v) == null) return error.InvalidField; // digits, no overflow
             if (content_length) |prev| {
                 if (!eqIgnoreCase(prev, v)) return error.InvalidField; // conflicting duplicate
             }
@@ -180,14 +183,6 @@ fn validateFraming(hdrs: []const Header) WriteError!void {
         }
     }
     if (has_te and content_length != null) return error.InvalidField; // TE + CL
-}
-
-fn trimOws(s: []const u8) []const u8 {
-    var start: usize = 0;
-    var end = s.len;
-    while (start < end and (s[start] == ' ' or s[start] == '\t')) start += 1;
-    while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t')) end -= 1;
-    return s[start..end];
 }
 
 const State = enum {
@@ -363,12 +358,6 @@ pub const Writer = struct {
     }
 };
 
-fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| if (tables.to_lower[x] != tables.to_lower[y]) return false;
-    return true;
-}
-
 const BodyFraming = struct { state: State, length: u64 = 0 };
 
 /// Pick the body state from the headers the caller supplied: chunked if
@@ -389,12 +378,11 @@ fn bodyStateFor(hdrs: []const Header) BodyFraming {
     return .{ .state = .body_none };
 }
 
-/// Parse a digits-only Content-Length. validateFraming already rejected
-/// non-digit and conflicting values, so this only sees valid input.
+/// Parse a Content-Length. validateFraming already rejected non-digit,
+/// overflowing, and conflicting values, so this only sees an empty value (an
+/// empty Content-Length frames no body) or a parseable one.
 fn parseLength(v: []const u8) u64 {
-    var n: u64 = 0;
-    for (v) |ch| n = n * 10 + (ch - '0');
-    return n;
+    return ascii.parseDecimal(u64, v) orelse 0;
 }
 
 const t = std.testing;

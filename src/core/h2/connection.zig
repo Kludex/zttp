@@ -18,7 +18,8 @@ const stream_mod = @import("stream.zig");
 const decoder_mod = @import("hpack/decoder.zig");
 const writer_mod = @import("writer.zig");
 const events = @import("../events.zig");
-const tables = @import("../tables.zig");
+const ascii = @import("../ascii.zig");
+const fields = @import("fields.zig");
 
 const Event = events.H2Event;
 const FrameType = constants.FrameType;
@@ -622,7 +623,7 @@ pub const Connection = struct {
 
         for (headers) |h| {
             if (h.name.len == 0) return error.Malformed;
-            if (!validValue(h.value)) return error.Malformed; // CR/LF/NUL/control in value
+            if (!fields.validValue(h.value)) return error.Malformed; // CR/LF/NUL/control in value
             if (h.name[0] == ':') {
                 if (seen_regular) return error.Malformed; // pseudo after regular
                 if (eql(h.name, ":method")) {
@@ -643,11 +644,11 @@ pub const Connection = struct {
                 continue;
             }
             seen_regular = true;
-            if (!isValidFieldName(h.name)) return error.Malformed; // uppercase / non-token byte
-            if (isConnectionSpecific(h.name)) return error.Malformed;
+            if (!fields.isValidFieldName(h.name)) return error.Malformed; // uppercase / non-token byte
+            if (fields.isConnectionSpecific(h.name)) return error.Malformed;
             if (eql(h.name, "te") and !eql(h.value, "trailers")) return error.Malformed;
             if (eql(h.name, "content-length")) {
-                const cl = parseU64(h.value) orelse return error.Malformed;
+                const cl = ascii.parseDecimal(u64, h.value) orelse return error.Malformed;
                 // A repeated content-length is malformed unless it agrees (RFC 9110).
                 if (content_length) |prev| {
                     if (prev != cl) return error.Malformed;
@@ -720,11 +721,11 @@ pub const Connection = struct {
                 continue;
             }
             seen_regular = true;
-            if (!isValidFieldName(h.name)) return error.Malformed;
-            if (!validValue(h.value)) return error.Malformed; // CR/LF/NUL/control in value
-            if (isConnectionSpecific(h.name)) return error.Malformed;
+            if (!fields.isValidFieldName(h.name)) return error.Malformed;
+            if (!fields.validValue(h.value)) return error.Malformed; // CR/LF/NUL/control in value
+            if (fields.isConnectionSpecific(h.name)) return error.Malformed;
             if (eql(h.name, "content-length")) {
-                const cl = parseU64(h.value) orelse return error.Malformed;
+                const cl = ascii.parseDecimal(u64, h.value) orelse return error.Malformed;
                 if (content_length) |prev| {
                     if (prev != cl) return error.Malformed;
                 } else content_length = cl;
@@ -990,65 +991,16 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-/// A valid HTTP/2 field name: a non-empty RFC 9110 token (so no SP, NUL, ':',
-/// or other separators) with no uppercase ASCII (RFC 9113 8.2.1). `:` is
-/// excluded here, so this is only applied to regular (non-pseudo) names.
-fn isValidFieldName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    for (name) |ch| {
-        if (ch >= 'A' and ch <= 'Z') return false;
-        if (!tables.is_tchar[ch]) return false;
-    }
-    return true;
-}
-
-/// A legal field value (RFC 9113 8.2.1): no CR/LF/NUL or other control and no
-/// DEL (obs-text 0x80-0xFF and inner SP/HTAB are allowed), and no leading or
-/// trailing whitespace. The same rule the H2 write path enforces, so a value the
-/// read side accepts the write side can re-serialize without splitting or being
-/// silently re-trimmed by a peer.
-fn validValue(value: []const u8) bool {
-    for (value) |ch| {
-        if (!tables.is_field_vchar[ch]) return false;
-    }
-    if (value.len > 0) {
-        const first = value[0];
-        const last = value[value.len - 1];
-        if (first == ' ' or first == '\t' or last == ' ' or last == '\t') return false;
-    }
-    return true;
-}
-
 /// Trailers (RFC 9113 8.1): no pseudo-header may appear, and every name must be
 /// a valid lowercase field name. Connection-specific fields are likewise barred.
 fn validTrailers(headers: []const events.Header) bool {
     for (headers) |h| {
         if (h.name.len == 0 or h.name[0] == ':') return false;
-        if (!isValidFieldName(h.name)) return false;
-        if (!validValue(h.value)) return false;
-        if (isConnectionSpecific(h.name)) return false;
+        if (!fields.isValidFieldName(h.name)) return false;
+        if (!fields.validValue(h.value)) return false;
+        if (fields.isConnectionSpecific(h.name)) return false;
     }
     return true;
-}
-
-/// The connection-specific fields forbidden in HTTP/2 (RFC 9113 8.2.2).
-fn isConnectionSpecific(name: []const u8) bool {
-    const forbidden = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" };
-    for (forbidden) |f| {
-        if (eql(name, f)) return true;
-    }
-    return false;
-}
-
-fn parseU64(s: []const u8) ?u64 {
-    if (s.len == 0) return null;
-    var v: u64 = 0;
-    for (s) |ch| {
-        if (ch < '0' or ch > '9') return null;
-        v = std.math.mul(u64, v, 10) catch return null;
-        v = std.math.add(u64, v, ch - '0') catch return null;
-    }
-    return v;
 }
 
 const testing = std.testing;
