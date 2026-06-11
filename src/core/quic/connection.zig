@@ -404,8 +404,14 @@ pub const Connection = struct {
                 var chunk = s.peek(packet_room) orelse break;
                 const is_new = chunk.offset >= s.sent;
                 if (is_new and chunk.data.len > 0) {
-                    const credit = self.conn_send_window.available();
-                    if (credit == 0) break; // out of window: keep new bytes queued
+                    // New bytes are bounded by BOTH the peer's flow-control grant
+                    // (MAX_DATA, RFC 9000 4.1) and the congestion window (RFC 9002 7):
+                    // a retransmit or a pure FIN below is exempt, since neither
+                    // presents fresh offsets. cwnd limits bytes in flight, so a packet
+                    // already counts its header+tag; gate the new stream bytes against
+                    // the smaller of the two remaining budgets.
+                    const credit = @min(self.conn_send_window.available(), self.cc.available());
+                    if (credit == 0) break; // out of window or out of cwnd: keep new bytes queued
                     if (chunk.data.len > credit) chunk = s.peek(@intCast(credit)).?; // shrink to fit
                 }
                 if (chunk.data.len == 0 and !chunk.fin) break;
@@ -1525,6 +1531,33 @@ test "flushSend never sends past the connection send window, and resumes on MAX_
 
     // The peer raises MAX_DATA; the remaining bytes can now flow.
     conn.conn_send_window.onMaxData(10);
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(u64, 10), conn.conn_send_window.sent);
+    try testing.expect(!conn.hasPendingSend());
+}
+
+test "flushSend never sends past the congestion window, and resumes as it opens" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.conn_send_window.limit = 1000; // flow control is not the bound here
+    conn.cc.congestion_window = 4; // but the congestion window admits only 4 bytes
+
+    try conn.sendStreamData(1, "abcdefghij", false); // 10 bytes queued
+    try conn.flushSend(1000);
+    // cwnd capped the new bytes to 4; the rest stays queued (cwnd, not MAX_DATA).
+    try testing.expectEqual(@as(u64, 4), conn.conn_send_window.sent);
+    try testing.expect(conn.hasPendingSend());
+
+    // A flush with the window still full sends nothing more.
+    conn.clearSend();
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len);
+
+    // The congestion window opens (e.g. after an ACK); the remaining bytes flow.
+    conn.cc.congestion_window = 10_000;
     try conn.flushSend(1000);
     try testing.expectEqual(@as(u64, 10), conn.conn_send_window.sent);
     try testing.expect(!conn.hasPendingSend());
