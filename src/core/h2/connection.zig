@@ -186,17 +186,29 @@ pub const Connection = struct {
         self.upgrade_headers.deinit(self.gpa);
     }
 
-    /// Append received bytes (empty slice signals EOF). Bounded by max_buffer.
+    /// Append received bytes (empty slice signals EOF). Bounded by max_buffer; a
+    /// breach is connection-fatal and poisons the engine (arming a GOAWAY) just as
+    /// a parse error does, so the integrator sends one GOAWAY and stops.
     pub fn feed(self: *Connection, data: []const u8) H2Error!void {
+        if (self.phase == .failed) return self.failed_with;
         if (data.len == 0) {
             self.eof_seen = true;
             return;
         }
         if (self.limits.max_buffer != 0) {
             const unconsumed = self.buf.items.len - self.consumed;
-            if (unconsumed + data.len > self.limits.max_buffer) return error.MessageTooLong;
+            if (unconsumed + data.len > self.limits.max_buffer) return self.fail(error.MessageTooLong);
         }
-        self.buf.appendSlice(self.gpa, data) catch return error.MessageTooLong;
+        self.buf.appendSlice(self.gpa, data) catch return self.fail(error.MessageTooLong);
+    }
+
+    /// Poison the connection with `e` and arm the owed GOAWAY (RFC 9113 5.4.1).
+    /// The single transition into `.failed`, used by both feed and nextEvent.
+    fn fail(self: *Connection, e: H2Error) H2Error {
+        self.phase = .failed;
+        self.failed_with = e;
+        self.goaway_owed = errorCode(e);
+        return e;
     }
 
     /// Produce the next event, or `.need_data`. A connection error poisons the
@@ -205,12 +217,7 @@ pub const Connection = struct {
     /// integrator drains it via takeGoawayOwed and serializes one GOAWAY.
     pub fn nextEvent(self: *Connection) H2Error!Event {
         if (self.phase == .failed) return self.failed_with;
-        return self.dispatch() catch |e| {
-            self.phase = .failed;
-            self.failed_with = e;
-            self.goaway_owed = errorCode(e);
-            return e;
-        };
+        return self.dispatch() catch |e| self.fail(e);
     }
 
     /// The GOAWAY error code owed after a connection-fatal error, or null. Returns
@@ -1369,6 +1376,19 @@ test "a connection-fatal error owes one GOAWAY with the mapped code" {
     try testing.expectEqual(@as(?ErrorCode, null), c.takeGoawayOwed());
     // Re-raising the latched error does not re-arm a GOAWAY.
     try testing.expectError(error.ProtocolError, c.nextEvent());
+    try testing.expectEqual(@as(?ErrorCode, null), c.takeGoawayOwed());
+}
+
+test "a fatal feed (max_buffer breach) poisons the connection and owes a GOAWAY" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    c.limits.max_buffer = 8;
+    try testing.expectError(error.MessageTooLong, c.feed("123456789")); // 9 > 8
+    // The breach owes ENHANCE_YOUR_CALM and poisons the connection.
+    try testing.expectEqual(@as(?ErrorCode, .enhance_your_calm), c.takeGoawayOwed());
+    try testing.expectError(error.MessageTooLong, c.nextEvent()); // latched
+    // A later feed re-raises the latched error without re-arming a GOAWAY.
+    try testing.expectError(error.MessageTooLong, c.feed("more"));
     try testing.expectEqual(@as(?ErrorCode, null), c.takeGoawayOwed());
 }
 

@@ -1029,7 +1029,10 @@ fn receive_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Objec
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
     switch (engine.*) {
         .h2 => |*e| {
-            e.conn.feed(bytes) catch |err| return exceptions.raiseH2(err);
+            e.conn.feed(bytes) catch |err| {
+                e.emitGoawayIfOwed(); // a fatal feed (e.g. max_buffer flood) still owes a GOAWAY
+                return exceptions.raiseH2(err);
+            };
             return py.none();
         },
         .h1 => |*e| return e.receiveData(bytes, arg),
