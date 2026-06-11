@@ -134,6 +134,23 @@ def test_http3_sends_a_response() -> None:
     assert all(isinstance(d, bytes) for d in datagrams)
 
 
+def test_http3_stream_reset() -> None:
+    conn = make_server()
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    conn.data_to_send()
+    conn.receive_datagram(CLIENT_FINISHED, 2000)
+    conn.data_to_send()
+    conn.receive_datagram(GET_REQUEST, 3000)
+    conn.data_to_send()
+
+    # Cancel the request stream (RFC 9114 4.4): RESET_STREAM + STOP_SENDING leave as
+    # a 1-RTT datagram. The default code is H3_REQUEST_CANCELLED; a code is optional.
+    stream = conn.stream(0)
+    stream.reset()
+    assert len(conn.data_to_send()) >= 1
+    stream.reset(0x010c)  # an explicit code is accepted
+
+
 def test_http3_initiate_connection_sends_the_control_stream() -> None:
     conn = make_server()
     conn.receive_datagram(CLIENT_HELLO, 1000)

@@ -457,6 +457,14 @@ const H3Engine = struct {
         return self.flush();
     }
 
+    /// Cancel a request stream with `error_code` (RFC 9114 4.4): RESET_STREAM the
+    /// response and STOP_SENDING the request, then packetise.
+    fn resetStream(self: *H3Engine, id: u64, error_code: u64) py.Object {
+        const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        h.resetStream(id, error_code) catch |e| return exceptions.raiseH3(e);
+        return self.flush();
+    }
+
     /// Begin a graceful shutdown: send a GOAWAY announcing `stream_id` as the first
     /// request stream we will not process (RFC 9114 5.2), then packetise it.
     fn shutdown(self: *H3Engine, stream_id: u64) py.Object {
@@ -765,17 +773,25 @@ fn stream_end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     };
 }
 
+// The default HTTP/3 reset code: H3_REQUEST_CANCELLED (RFC 9114 8.1).
+const H3_REQUEST_CANCELLED: c_ulonglong = 0x010c;
+
 fn stream_reset(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *StreamObject = @ptrCast(self_obj.?);
     const e = self.engine() orelse return null;
-    const h2 = switch (e) {
-        .h2 => |x| x,
-        .h3 => return py.raise(exceptions.LocalProtocolError, "HTTP/3 RESET_STREAM is not supported yet"),
-    };
-    var code: c_ulong = @intFromEnum(core.h2.constants.ErrorCode.cancel);
-    if (c.PyArg_ParseTuple(args, "|k", &code) == 0) return null;
-    if (code > 0xFFFF_FFFF) return py.raiseValue("error code out of range");
-    return h2.resetStream(@intCast(self.stream_id), @intCast(code));
+    switch (e) {
+        .h2 => |h2| {
+            var code: c_ulong = @intFromEnum(core.h2.constants.ErrorCode.cancel);
+            if (c.PyArg_ParseTuple(args, "|k", &code) == 0) return null;
+            if (code > 0xFFFF_FFFF) return py.raiseValue("error code out of range");
+            return h2.resetStream(@intCast(self.stream_id), @intCast(code));
+        },
+        .h3 => |h3e| {
+            var code: c_ulonglong = H3_REQUEST_CANCELLED;
+            if (c.PyArg_ParseTuple(args, "|K", &code) == 0) return null;
+            return h3e.resetStream(self.stream_id, @intCast(code));
+        },
+    }
 }
 
 fn stream_id_get(self_obj: ?*c.PyObject, _: ?*anyopaque) callconv(.c) py.Object {

@@ -532,6 +532,17 @@ pub const Connection = struct {
         try self.setSendState(id, .fin_sent);
     }
 
+    /// Abruptly cancel a request stream with `error_code` (RFC 9114 4.4): RESET_STREAM
+    /// the response send half and STOP_SENDING the request recv half, so neither side
+    /// keeps producing. Used to reject a request or abandon a response without closing
+    /// the connection. The stream's send state is marked finished.
+    pub fn resetStream(self: *Connection, id: u64, error_code: u64) Error!void {
+        if (quic_stream.StreamType.of(id) != .client_bidi) return error.H3Error;
+        self.qc.resetStream(id, error_code) catch return error.H3Error;
+        self.qc.stopSending(id, error_code) catch return error.H3Error;
+        try self.setSendState(id, .fin_sent);
+    }
+
     fn sendStateOf(self: *Connection, id: u64) Error!SendState {
         const gop = self.send_state.getOrPut(self.gpa, id) catch return error.OutOfMemory;
         if (!gop.found_existing) gop.value_ptr.* = .idle;
@@ -1104,6 +1115,36 @@ test "a server sends a response: HEADERS then DATA then FIN" {
     const d2 = try h3_frame.decode(got[d1.len..]);
     try testing.expectEqual(h3_frame.FrameType.data, d2.frame.ftype);
     try testing.expectEqualStrings("hello", d2.frame.payload);
+}
+
+test "the server resets a request stream" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x90, 0x91, 0x92, 0x93 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A partial response, then cancel the stream (RFC 9114 4.4): RESET_STREAM the
+    // response and STOP_SENDING the request.
+    try h3.sendResponse(0, 200, &.{});
+    try h3.resetStream(0, 0x010c); // H3_REQUEST_CANCELLED
+    try qc.flushSend(1000);
+
+    var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    quic_conn.testInstallAppKeys(&peer);
+    const buf = qc.datagramsToSend();
+    var off: usize = 0;
+    for (qc.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+    try testing.expect(peer.streamReset(0)); // the peer sees the response stream reset
+
+    // A reset on a non-request (server uni) stream id is rejected.
+    try testing.expectError(error.H3Error, h3.resetStream(3, 0x010c));
 }
 
 test "the server opens its control stream with a SETTINGS frame" {
