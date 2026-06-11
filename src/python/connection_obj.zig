@@ -235,6 +235,12 @@ const H2Engine = struct {
     /// advertise consumed receive window via WINDOW_UPDATE. The serialized frames
     /// land in the writer buffer for the next data_to_send.
     fn autoRespond(self: *H2Engine, ev: events.H2Event) core.h2.writer.WriteError!void {
+        // Our own preface must be the first frame WE send (RFC 9113 3.4), so emit
+        // it before any ACK/WINDOW_UPDATE this event would otherwise queue first.
+        if (!self.handshake_sent) {
+            try self.writer.sendPreface(&.{});
+            self.handshake_sent = true;
+        }
         switch (ev) {
             .settings => try self.writer.sendSettingsAck(),
             .ping => |p| if (!p.ack) try self.writer.sendPingAck(p.opaque_data),

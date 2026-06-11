@@ -47,6 +47,27 @@ def test_handshake_emits_settings() -> None:
     assert events[0].params == []
 
 
+def _settings_flags(buf: bytes) -> list[int]:
+    return [flags for ftype, flags, _, _ in _frames(buf) if ftype == 0x04]
+
+
+def test_server_settings_precede_the_settings_ack() -> None:
+    # The server's own SETTINGS must be the first frame it sends (RFC 9113 3.4),
+    # even when the client's SETTINGS is ACKed first while draining events.
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    flags = _settings_flags(conn.data_to_send())
+    assert flags[0] & 0x01 == 0  # first SETTINGS is the server's own (non-ACK)
+    assert flags[1] & 0x01  # the ACK of the client's SETTINGS comes after
+
+
+def test_read_only_server_still_emits_its_preface() -> None:
+    conn = server_with()  # no request, server never responds
+    list(drain_h2(conn))
+    flags = _settings_flags(conn.data_to_send())
+    assert flags and flags[0] & 0x01 == 0  # own SETTINGS emitted, not just the ACK
+
+
 def test_simple_get_request() -> None:
     conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK))
     events = list(drain_h2(conn))
