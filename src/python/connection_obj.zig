@@ -792,15 +792,7 @@ fn borrowHeaders(seq: py.Object) ?BorrowedHeaders {
 
 // HTTP/2 send helpers -------------------------------------------------------
 
-fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        const lx = if (x >= 'A' and x <= 'Z') x + 32 else x;
-        const ly = if (y >= 'A' and y <= 'Z') y + 32 else y;
-        if (lx != ly) return false;
-    }
-    return true;
-}
+const asciiEqlIgnoreCase = core.ascii.eqIgnoreCase;
 
 // Build the HTTP/2 regular-header list and pull out :authority. For a request the
 // adapter derives :authority from a `host` (or `:authority`) field and drops it

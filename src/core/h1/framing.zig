@@ -4,11 +4,12 @@
 //! conflicting values, we reject rather than guess.
 
 const std = @import("std");
-const tables = @import("../tables.zig");
+const ascii = @import("../ascii.zig");
 const events = @import("../events.zig");
 const ParseError = @import("../errors.zig").ParseError;
 
 const Header = events.Header;
+const eqIgnoreCase = ascii.eqIgnoreCase;
 
 pub const Framing = union(enum) {
     /// No body. The message is complete once headers end.
@@ -20,14 +21,6 @@ pub const Framing = union(enum) {
     /// Body runs until the connection closes (responses only; RFC 9112 6.3).
     until_close,
 };
-
-fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (tables.to_lower[x] != tables.to_lower[y]) return false;
-    }
-    return true;
-}
 
 /// Accumulates Transfer-Encoding codings across (possibly multiple) field-lines,
 /// which RFC 9112 6.1 requires to be treated as a single ordered comma list. The
@@ -60,15 +53,8 @@ const TransferEncoding = struct {
 };
 
 fn parseContentLength(value: []const u8) ParseError!u64 {
-    const v = std.mem.trim(u8, value, " \t");
-    if (v.len == 0) return error.InvalidFraming;
-    var n: u64 = 0;
-    for (v) |ch| {
-        if (ch < '0' or ch > '9') return error.InvalidFraming;
-        n = std.math.mul(u64, n, 10) catch return error.InvalidFraming;
-        n = std.math.add(u64, n, ch - '0') catch return error.InvalidFraming;
-    }
-    return n;
+    const v = ascii.trimOws(value);
+    return ascii.parseDecimal(u64, v) orelse error.InvalidFraming;
 }
 
 /// A response carries no body regardless of its headers when it answers a HEAD,
