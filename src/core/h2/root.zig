@@ -11,6 +11,7 @@ pub const hpack_decoder = @import("hpack/decoder.zig");
 pub const hpack_encoder = @import("hpack/encoder.zig");
 pub const settings = @import("settings.zig");
 pub const stream = @import("stream.zig");
+pub const fields = @import("fields.zig");
 pub const connection = @import("connection.zig");
 pub const writer = @import("writer.zig");
 
@@ -23,6 +24,7 @@ test {
     _ = hpack_encoder;
     _ = settings;
     _ = stream;
+    _ = fields;
     _ = connection;
     _ = writer;
 }

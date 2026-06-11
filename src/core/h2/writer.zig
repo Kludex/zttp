@@ -9,6 +9,7 @@ const std = @import("std");
 const constants = @import("constants.zig");
 const frame_mod = @import("frame.zig");
 const encoder = @import("hpack/encoder.zig");
+const fields = @import("fields.zig");
 
 const Header = @import("../events.zig").Header;
 const FrameType = constants.FrameType;
@@ -234,23 +235,18 @@ pub const Writer = struct {
 /// non-token / uppercase name, control bytes in the value, or a connection-
 /// specific field.
 fn validateField(h: Header) WriteError!void {
-    if (h.name.len == 0) return error.InvalidField;
-    for (h.name) |ch| {
-        if (ch >= 'A' and ch <= 'Z') return error.InvalidField;
-        if (!is_tchar(ch)) return error.InvalidField;
-    }
+    if (!fields.isValidFieldName(h.name)) return error.InvalidField;
     try validateValue(h.value);
-    const forbidden = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" };
-    for (forbidden) |f| {
-        if (std.mem.eql(u8, h.name, f)) return error.LocalProtocol;
-    }
+    if (fields.isConnectionSpecific(h.name)) return error.LocalProtocol;
     // TE may only carry "trailers" in HTTP/2 (RFC 9113 8.2.2).
     if (std.mem.eql(u8, h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) return error.LocalProtocol;
 }
 
 /// A field value must contain no control bytes (CR/LF/NUL/DEL) and no leading or
 /// trailing whitespace (RFC 9113 8.2.1), so it can never inject a frame boundary,
-/// corrupt the decoded request line, or be silently re-trimmed by a peer.
+/// corrupt the decoded request line, or be silently re-trimmed by a peer. Stricter
+/// than the read side's `fields.validValue`: the write path rejects even an inner
+/// HTAB (`ch < 0x20`), so we never emit a value a stricter peer might re-trim.
 fn validateValue(value: []const u8) WriteError!void {
     for (value) |ch| {
         if (ch < 0x20 or ch == 0x7F) return error.InvalidField;
@@ -260,10 +256,6 @@ fn validateValue(value: []const u8) WriteError!void {
         const last = value[value.len - 1];
         if (first == ' ' or first == '\t' or last == ' ' or last == '\t') return error.InvalidField;
     }
-}
-
-fn is_tchar(ch: u8) bool {
-    return @import("../tables.zig").is_tchar[ch];
 }
 
 fn formatStatus(status: u16, buf: *[3]u8) ?[]const u8 {

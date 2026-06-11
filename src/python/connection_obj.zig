@@ -997,7 +997,7 @@ fn borrowHeaders(seq: py.Object) ?BorrowedHeaders {
         }
         const name = c.PySequence_GetItem(item, 0);
         const value = c.PySequence_GetItem(item, 1);
-        py.decref(item); // the pair tuple itself is not needed past this point
+        py.decref(item);
         refs[i * 2] = name; // held (may be null; xdecref-safe) so the buffer survives
         refs[i * 2 + 1] = value;
         if (name == null or value == null) {
@@ -1020,15 +1020,7 @@ fn borrowHeaders(seq: py.Object) ?BorrowedHeaders {
 
 // HTTP/2 send helpers -------------------------------------------------------
 
-fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        const lx = if (x >= 'A' and x <= 'Z') x + 32 else x;
-        const ly = if (y >= 'A' and y <= 'Z') y + 32 else y;
-        if (lx != ly) return false;
-    }
-    return true;
-}
+const asciiEqlIgnoreCase = core.ascii.eqIgnoreCase;
 
 // Build the HTTP/2 regular-header list and pull out :authority. For a request the
 // adapter derives :authority from a `host` (or `:authority`) field and drops it
@@ -1040,7 +1032,7 @@ fn h2SplitAuthority(headers: []events.Header, out: *[]events.Header) []const u8 
     for (headers) |h| {
         if (asciiEqlIgnoreCase(h.name, "host") or asciiEqlIgnoreCase(h.name, ":authority")) {
             if (authority.len == 0) authority = h.value;
-            continue; // dropped from the regular list
+            continue;
         }
         headers[n] = h;
         n += 1;

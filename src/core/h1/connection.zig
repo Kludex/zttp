@@ -6,24 +6,12 @@
 //! caller.
 
 const std = @import("std");
-const tables = @import("../tables.zig");
+const ascii = @import("../ascii.zig");
 const events = @import("../events.zig");
 
 const Header = events.Header;
-
-fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| if (tables.to_lower[x] != tables.to_lower[y]) return false;
-    return true;
-}
-
-fn trimOws(s: []const u8) []const u8 {
-    var start: usize = 0;
-    var end = s.len;
-    while (start < end and (s[start] == ' ' or s[start] == '\t')) start += 1;
-    while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t')) end -= 1;
-    return s[start..end];
-}
+const eqIgnoreCase = ascii.eqIgnoreCase;
+const trimOws = ascii.trimOws;
 
 /// True if any comma-separated token in `value` equals `token` (case-insensitive,
 /// surrounding whitespace ignored). Used for the `Connection` header's token list.

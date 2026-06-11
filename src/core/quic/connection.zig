@@ -348,8 +348,8 @@ pub const Connection = struct {
     /// This is application queueing: it buffers everything written. Only `flushSend`
     /// applies the connection send window, so the in-flight bytes on the wire are
     /// bounded by the peer's MAX_DATA grant, but the queued-but-unsent buffer is
-    /// bounded only by what the application writes. A write-side backpressure cap is
-    /// a follow-up.
+    /// bounded only by what the application writes; there is no write-side
+    /// backpressure cap.
     pub fn sendStreamData(self: *Connection, id: u64, data: []const u8, fin: bool) Error!void {
         const s = try self.sendStream(id);
         s.write(data, fin) catch |e| switch (e) {
@@ -372,13 +372,12 @@ pub const Connection = struct {
     ///
     /// Each sent range is recorded per packet (stream_sent) and retained in the
     /// SendStream until acked, so a lost packet is retransmitted (the ACK arm routes
-    /// lost pns back into SendStream.onLost). Loss is detected on ACK; a tail packet
-    /// with no later ACK to trigger detection needs the PTO timer, a follow-up.
+    /// lost pns back into SendStream.onLost). Loss is detected on ACK only; a tail
+    /// packet with no later ACK to trigger detection is not yet covered by a PTO timer.
     pub fn flushSend(self: *Connection, now: u64) Error!void {
         const space = Space.application;
         const st = &self.spaces[@intFromEnum(space)];
         if (st.send_keys == null) return; // no 1-RTT keys yet: nothing can be sent
-
         // Advertise a raised connection flow-control limit if one is pending, so the
         // peer is not stalled at its old MAX_DATA grant (RFC 9000 4.1).
         if (self.max_data_pending) {
@@ -390,7 +389,7 @@ pub const Connection = struct {
             self.max_data_pending = false;
         }
 
-        // A conservative single-packet budget; one STREAM frame per packet for now.
+        // A conservative single-packet budget: one STREAM frame per packet.
         const packet_room = constants.MIN_INITIAL_DATAGRAM - 64;
         var it = self.send_streams.iterator();
         while (it.next()) |entry| {
@@ -582,7 +581,7 @@ pub const Connection = struct {
     }
 
     fn driveTls(self: *Connection, space: Space, now: u64) Error!void {
-        const server = if (self.tls) |*s| s else return; // client handshake send is a later stage
+        const server = if (self.tls) |*s| s else return; // only the server drives the handshake here
         const st = &self.spaces[@intFromEnum(space)];
         while (true) {
             const buf = st.crypto.readable();
@@ -827,8 +826,7 @@ pub const Connection = struct {
         // RFC 9000 12.4: only PADDING, PING, ACK, CRYPTO, and CONNECTION_CLOSE are
         // permitted in the Initial and Handshake spaces. STREAM and the other
         // 1-RTT frames in those spaces are a PROTOCOL_VIOLATION - the recv mirror of
-        // keeping STREAM out of Initial on the send side. This gate matters now that
-        // Stage 4 installs Handshake/Application recv keys, widening what decrypts.
+        // keeping STREAM out of Initial on the send side.
         if (!frameAllowedIn(space, f)) return error.ProtocolViolation;
 
         const st = &self.spaces[@intFromEnum(space)];
@@ -868,7 +866,7 @@ pub const Connection = struct {
 
     /// The send-side mirror of the recv gate: assert every frame we are about to
     /// seal is legal in `space` (so STREAM can never reach an Initial/Handshake
-    /// packet, the #64 P1, even through the shared buildPacket primitive). A debug
+    /// packet, even through the shared buildPacket primitive). A debug
     /// check - it decodes the payload, so it compiles out in release builds, where
     /// the single STREAM caller is already pinned to the Application space.
     fn assertFramesAllowedIn(space: Space, frames: []const u8) void {
@@ -1494,7 +1492,7 @@ test "flushSend is a no-op until the Application keys are installed" {
     const dcid = [_]u8{ 0x51, 0x52, 0x53, 0x54 };
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
-    // No app keys yet (no handshake): queued data cannot leave - the #64 P1 fix.
+    // No app keys yet (no handshake): queued data cannot leave.
     try conn.sendStreamData(1, "held", false);
     try conn.flushSend(1000);
     try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len);

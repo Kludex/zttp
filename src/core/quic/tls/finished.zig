@@ -7,7 +7,7 @@
 const std = @import("std");
 const schedule = @import("schedule.zig");
 
-pub const LEN = schedule.SECRET_LEN; // 32
+pub const LEN = schedule.SECRET_LEN;
 
 /// The server's Finished verify_data over the transcript through CertificateVerify
 /// (RFC 8446 4.4.4), keyed by the server handshake traffic secret.
