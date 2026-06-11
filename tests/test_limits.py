@@ -71,10 +71,7 @@ def test_h2_only_key_ignored_on_h1_connection() -> None:
 def test_h2_max_concurrent_streams_override_refuses_extra_stream() -> None:
     conn = zttp.Connection(zttp.SERVER, zttp.HTTP2, limits={"max_concurrent_streams": 1})
     conn.receive_data(
-        PREFACE
-        + h2_frame(0x04, 0, 0, b"")
-        + h2_frame(0x01, 0x04, 1, GET_BLOCK)
-        + h2_frame(0x01, 0x04, 3, GET_BLOCK)
+        PREFACE + h2_frame(0x04, 0, 0, b"") + h2_frame(0x01, 0x04, 1, GET_BLOCK) + h2_frame(0x01, 0x04, 3, GET_BLOCK)
     )
     resets = []
     while True:
