@@ -103,7 +103,7 @@ pub const Connection = struct {
             consumed_total += d.len;
         }
         if (self.qc.streamFinished(id) and rs.state == .headers_done) {
-            try self.push(.{ .end_of_message = .{ .trailers = &.{}, .stream_id = @truncate(id) } });
+            try self.push(.{ .end_of_message = .{ .trailers = &.{}, .stream_id = id } });
             rs.state = .done;
         }
         if (consumed_total > 0) self.qc.consumeStream(id, consumed_total);
@@ -120,7 +120,7 @@ pub const Connection = struct {
             .data => {
                 if (rs.state != .headers_done) return error.H3Error; // DATA before HEADERS (RFC 9114 4.1)
                 const body = try self.dupe(f.payload);
-                try self.push(.{ .data = .{ .data = body, .stream_id = @truncate(id) } });
+                try self.push(.{ .data = .{ .data = body, .stream_id = id } });
             },
             else => {
                 if (h3_frame.isReserved(@intFromEnum(f.ftype))) return; // grease: ignore
@@ -172,7 +172,7 @@ pub const Connection = struct {
             .query = if (q) |i| target[i + 1 ..] else target[target.len..],
             .http_version = "3",
             .headers = headers.items,
-            .stream_id = @truncate(id),
+            .stream_id = id,
         };
     }
 
@@ -323,6 +323,33 @@ test "decode a GET request over HTTP/3" {
     try testing.expectEqualStrings("3", ev.request.http_version);
     try testing.expectEqualStrings("host", ev.request.headers[0].name);
     try testing.expectEqualStrings("exy", ev.request.headers[0].value);
+}
+
+test "a request stream id above 2^32 is not truncated" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    const qpack_block = [_]u8{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x50 | 0, 0x03, 'e', 'x', 'y' };
+    var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer h3_bytes.deinit(gpa);
+    try h3_frame.append(&h3_bytes, gpa, .headers, &qpack_block);
+
+    // A client-initiated bidi stream id (0 mod 4) above the 32-bit range. A u32
+    // truncation would surface it as 0, sending a later response on the wrong stream.
+    const big_id: u64 = 0x1_0000_0000;
+    const dgram = try buildRequest(gpa, &dcid, big_id, h3_bytes.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pump(big_id);
+
+    const ev = h3.nextEvent();
+    try testing.expect(ev == .request);
+    try testing.expectEqual(big_id, ev.request.stream_id);
 }
 
 test "a request with a body yields request then data" {

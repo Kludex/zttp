@@ -25,6 +25,7 @@ pub const ssize = c.Py_ssize_t;
 pub const T_OBJECT_EX: c_int = if (@hasDecl(c, "Py_T_OBJECT_EX")) c.Py_T_OBJECT_EX else c.T_OBJECT_EX;
 pub const T_BOOL: c_int = if (@hasDecl(c, "Py_T_BOOL")) c.Py_T_BOOL else c.T_BOOL;
 pub const T_UINT: c_int = if (@hasDecl(c, "Py_T_UINT")) c.Py_T_UINT else c.T_UINT;
+pub const T_ULONGLONG: c_int = if (@hasDecl(c, "Py_T_ULONGLONG")) c.Py_T_ULONGLONG else c.T_ULONGLONG;
 pub const READONLY: c_int = if (@hasDecl(c, "Py_READONLY")) c.Py_READONLY else c.READONLY;
 
 // -- reference counting -------------------------------------------------------

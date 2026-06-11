@@ -17,7 +17,8 @@ pub const Header = struct {
 /// The start of a request: method, target, HTTP version, and the full header
 /// block. Emitted once, after the blank line that terminates the headers.
 /// `stream_id` is 0 for HTTP/1.1 (the field is omitted at every H1 construction
-/// site and never surfaced); HTTP/2 sets the stream the request arrived on.
+/// site and never surfaced); HTTP/2 sets the 31-bit stream the request arrived on,
+/// HTTP/3 the 62-bit QUIC stream id (hence u64).
 pub const Request = struct {
     method: []const u8,
     target: []const u8,
@@ -29,7 +30,7 @@ pub const Request = struct {
     /// The version number only, e.g. "1.1" or "1.0" (the "HTTP/" is stripped).
     http_version: []const u8,
     headers: []const Header,
-    stream_id: u32 = 0,
+    stream_id: u64 = 0,
     /// Whether the request carried `Expect: 100-continue`. Per-request (a stream
     /// property under HTTP/2), so it rides the event rather than the connection.
     expect_continue: bool = false,
@@ -42,21 +43,21 @@ pub const Response = struct {
     reason: []const u8,
     http_version: []const u8,
     headers: []const Header,
-    stream_id: u32 = 0,
+    stream_id: u64 = 0,
 };
 
 /// A run of body bytes. For chunked bodies one Data event is emitted per chunk
 /// (or per buffered span); for Content-Length bodies, per fed span.
 pub const Data = struct {
     data: []const u8,
-    stream_id: u32 = 0,
+    stream_id: u64 = 0,
 };
 
 /// The message body has ended. Carries any trailer headers seen after the final
 /// chunk of a chunked body (empty otherwise).
 pub const EndOfMessage = struct {
     trailers: []const Header = &.{},
-    stream_id: u32 = 0,
+    stream_id: u64 = 0,
 };
 
 /// One peer setting (id, value), surfaced verbatim so the integrator can react
@@ -171,5 +172,5 @@ test "H2 event union carries a stream-tagged request" {
         .headers = &.{},
         .stream_id = 3,
     } };
-    try std.testing.expectEqual(@as(u32, 3), ev.request.stream_id);
+    try std.testing.expectEqual(@as(u64, 3), ev.request.stream_id);
 }

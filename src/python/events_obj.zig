@@ -22,7 +22,7 @@ const RequestObject = extern struct {
     query: py.Object,
     http_version: py.Object,
     headers: py.Object,
-    stream_id: c_uint,
+    stream_id: c_ulonglong,
     expect_continue: c_char,
 };
 
@@ -32,19 +32,19 @@ const ResponseObject = extern struct {
     reason: py.Object,
     http_version: py.Object,
     headers: py.Object,
-    stream_id: c_uint,
+    stream_id: c_ulonglong,
 };
 
 const DataObject = extern struct {
     ob_base: c.PyObject,
     data: py.Object,
-    stream_id: c_uint,
+    stream_id: c_ulonglong,
 };
 
 const EndOfMessageObject = extern struct {
     ob_base: c.PyObject,
     trailers: py.Object,
-    stream_id: c_uint,
+    stream_id: c_ulonglong,
 };
 
 // The five HTTP/2 control events. Each holds plain Python ints/bytes.
@@ -109,7 +109,7 @@ var request_members = [_]py.MemberDef{
     member("query", @offsetOf(RequestObject, "query")),
     member("http_version", @offsetOf(RequestObject, "http_version")),
     member("headers", @offsetOf(RequestObject, "headers")),
-    .{ .name = "stream_id", .type = py.T_UINT, .offset = @intCast(@offsetOf(RequestObject, "stream_id")), .flags = py.READONLY, .doc = null },
+    .{ .name = "stream_id", .type = py.T_ULONGLONG, .offset = @intCast(@offsetOf(RequestObject, "stream_id")), .flags = py.READONLY, .doc = null },
     .{ .name = "expect_continue", .type = py.T_BOOL, .offset = @intCast(@offsetOf(RequestObject, "expect_continue")), .flags = py.READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
@@ -118,17 +118,17 @@ var response_members = [_]py.MemberDef{
     member("reason", @offsetOf(ResponseObject, "reason")),
     member("http_version", @offsetOf(ResponseObject, "http_version")),
     member("headers", @offsetOf(ResponseObject, "headers")),
-    .{ .name = "stream_id", .type = py.T_UINT, .offset = @intCast(@offsetOf(ResponseObject, "stream_id")), .flags = py.READONLY, .doc = null },
+    .{ .name = "stream_id", .type = py.T_ULONGLONG, .offset = @intCast(@offsetOf(ResponseObject, "stream_id")), .flags = py.READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var data_members = [_]py.MemberDef{
     member("data", @offsetOf(DataObject, "data")),
-    .{ .name = "stream_id", .type = py.T_UINT, .offset = @intCast(@offsetOf(DataObject, "stream_id")), .flags = py.READONLY, .doc = null },
+    .{ .name = "stream_id", .type = py.T_ULONGLONG, .offset = @intCast(@offsetOf(DataObject, "stream_id")), .flags = py.READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var eom_members = [_]py.MemberDef{
     member("trailers", @offsetOf(EndOfMessageObject, "trailers")),
-    .{ .name = "stream_id", .type = py.T_UINT, .offset = @intCast(@offsetOf(EndOfMessageObject, "stream_id")), .flags = py.READONLY, .doc = null },
+    .{ .name = "stream_id", .type = py.T_ULONGLONG, .offset = @intCast(@offsetOf(EndOfMessageObject, "stream_id")), .flags = py.READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var rst_stream_members = [_]py.MemberDef{
