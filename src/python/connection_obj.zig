@@ -182,6 +182,53 @@ const H2Engine = struct {
         return id;
     }
 
+    /// Initialise an h2c-upgraded connection: seed the request as stream 1 (RFC 7540 3.2). The method/target
+    /// and headers come from the HTTP/1.1 request the server already parsed; scheme
+    /// is "http" (h2c is cleartext) and :authority is derived from the host header.
+    /// `settings_header` is the base64url HTTP2-Settings value (RFC 7540 3.2.1) the
+    /// client sent, or null. Returns true on success, false with a Python error set.
+    fn initiateUpgrade(self: *H2Engine, method: []const u8, target: []const u8, hdrs: *BorrowedHeaders, settings_header: ?[]const u8) bool {
+        var settings_buf: [256]u8 = undefined;
+        var settings: ?[]const u8 = null;
+        if (settings_header) |b64| {
+            const dec = std.base64.url_safe_no_pad.Decoder;
+            const len = dec.calcSizeForSlice(b64) catch {
+                _ = py.raiseValue("settings_header is not valid base64url");
+                return false;
+            };
+            if (len > settings_buf.len) {
+                _ = py.raiseValue("settings_header is too large");
+                return false;
+            }
+            dec.decode(settings_buf[0..len], b64) catch {
+                _ = py.raiseValue("settings_header is not valid base64url");
+                return false;
+            };
+            settings = settings_buf[0..len];
+        }
+        var regular: []events.Header = hdrs.headers;
+        const authority = h2SplitAuthority(hdrs.headers, &regular);
+        self.conn.initiateUpgradeConnection(method, target, "http", if (authority.len == 0) null else authority, regular, settings) catch |e| switch (e) {
+            error.Malformed => {
+                _ = py.raise(exceptions.LocalProtocolError, "the upgrade request is not a valid HTTP/2 request (forbidden header or bad pseudo-header)");
+                return false;
+            },
+            error.BadSettings => {
+                _ = py.raise(exceptions.LocalProtocolError, "the HTTP2-Settings header is not a valid SETTINGS payload");
+                return false;
+            },
+            error.AlreadyStarted => {
+                _ = py.raiseRuntime("the connection has already started; initiate the upgrade before feeding any bytes");
+                return false;
+            },
+            error.OutOfMemory => {
+                _ = c.PyErr_NoMemory();
+                return false;
+            },
+        };
+        return true;
+    }
+
     fn sendResponse(self: *H2Engine, stream_id: u32, status: u16, hdrs: *BorrowedHeaders, end_stream: bool) py.Object {
         if (!self.ensureHandshake()) return null;
         self.writer.sendResponse(stream_id, status, hdrs.headers, end_stream) catch |e| return h2RaiseWrite(e);
@@ -1207,6 +1254,31 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
     }
 }
 
+fn initiate_upgrade_connection(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    const e = switch (engine.*) {
+        .h2 => |*x| x,
+        else => return py.raiseRuntime("initiate_upgrade_connection() exists only on an HTTP/2 connection"),
+    };
+    var method: ?*c.PyObject = null;
+    var target: ?*c.PyObject = null;
+    var hdrs_seq: ?*c.PyObject = null;
+    var settings_obj: ?*c.PyObject = null;
+    var kwlist = [_][*c]u8{ @constCast("method"), @constCast("target"), @constCast("headers"), @constCast("settings_header"), null };
+    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "OOO|O", @ptrCast(&kwlist), &method, &target, &hdrs_seq, &settings_obj) == 0) return null;
+    const mb = py.asBytes(method) orelse return null;
+    const tb = py.asBytes(target) orelse return null;
+    var settings_header: ?[]const u8 = null;
+    if (settings_obj != null and !py.isNone(settings_obj)) {
+        settings_header = py.asBytes(settings_obj) orelse return null;
+    }
+    var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+    defer hdrs.deinit();
+    if (!e.initiateUpgrade(mb, tb, &hdrs, settings_header)) return null;
+    return makeStream(self_obj, 1);
+}
+
 fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const e = h1(self) orelse return null; // HTTP/2 answers via a Stream (conn.stream(id))
@@ -1477,6 +1549,7 @@ var h1_methods = [_]py.MethodDef{
 var h2_methods = [_]py.MethodDef{
     .{ .ml_name = "initiate_connection", .ml_meth = h2_initiate, .ml_flags = c.METH_NOARGS, .ml_doc = "Emit the connection preface (client preface + SETTINGS, or the server's SETTINGS) now, rather than lazily on the first send. Idempotent." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
+    .{ .ml_name = "initiate_upgrade_connection", .ml_meth = @ptrCast(&initiate_upgrade_connection), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Initialise an h2c-upgraded connection: initiate_upgrade_connection(method, target, headers, settings_header=None). Seeds the already-parsed HTTP/1.1 request as stream 1 and applies the client's base64url HTTP2-Settings, returning the stream's Stream. Call on a fresh server connection before feeding the client's HTTP/2 preface; next_event() then yields the request." },
     .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id. The connection owns the stream state; the handle is a stream-scoped command surface (send_response / send_data / end_message)." },
     .{ .ml_name = "close", .ml_meth = h2_close, .ml_flags = c.METH_VARARGS, .ml_doc = "Send GOAWAY to shut the connection down: close(error_code=NO_ERROR, last_stream_id=None). last_stream_id defaults to the highest peer stream processed." },
     .{ .ml_name = "has_pending_send", .ml_meth = h2_has_pending_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether any stream still has body bytes (or a FIN) parked waiting for the send window." },
