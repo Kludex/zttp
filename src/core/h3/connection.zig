@@ -83,6 +83,10 @@ pub const Connection = struct {
     /// The peer's control-stream id, set when its type prefix is read. A second
     /// control stream is a connection error (RFC 9114 6.2.1).
     control_recv_id: ?u64 = null,
+    /// The peer's SETTINGS, once its (mandatory, first-on-the-control-stream) frame
+    /// has been parsed (RFC 9114 7.2.4). Null until then; a request that arrives
+    /// first is H3_MISSING_SETTINGS.
+    peer_settings: ?h3_stream.Settings = null,
 
     pub fn init(gpa: std.mem.Allocator, qc: *quic_conn.Connection) Connection {
         return .{
@@ -228,18 +232,30 @@ pub const Connection = struct {
             _ => consumed = ready.len,
         }
         if (consumed > 0) self.qc.consumeStream(id, consumed);
+        // Reclaim a finished/reset ignored uni stream so a peer cannot grow the maps
+        // by opening-and-finishing many of them. The control stream is critical (RFC
+        // 9114 6.2.1) and kept for the connection's life; the rest are disposable.
+        if (u.utype.? != .control and (self.qc.streamFinished(id) or self.qc.streamReset(id))) {
+            if (self.qc.dropStream(id)) _ = self.uni_streams.remove(id);
+        }
     }
 
-    /// A frame on the control stream. DATA/HEADERS there are illegal (RFC 9114 7.1).
-    /// SETTINGS handling (first-and-once, applying the values) is wired in the next
-    /// step; for now an unknown/grease frame is ignored (RFC 9114 9).
+    /// A frame on the control stream (RFC 9114 7.2.4, 6.2.1). The first frame MUST be
+    /// SETTINGS, exactly once; DATA/HEADERS are never legal here. The parsed SETTINGS
+    /// are applied (the peer's max field-section size bounds what we send; an
+    /// unparsable or duplicate-id SETTINGS is a connection error).
     fn onControlFrame(self: *Connection, u: *UniStream, f: h3_frame.Frame) Error!void {
-        _ = self;
-        switch (f.ftype) {
-            .data, .headers => return error.H3Error, // not allowed on the control stream
-            .settings => u.settings_seen = true,
-            else => {}, // GOAWAY/MAX_PUSH_ID/unknown: ignored for now
+        if (f.ftype == .settings) {
+            if (u.settings_seen) return error.H3Error; // a second SETTINGS (frame_unexpected)
+            const s = h3_stream.parseSettings(f.payload) catch return error.H3Error; // settings_error
+            u.settings_seen = true;
+            self.peer_settings = s;
+            return;
         }
+        if (f.ftype == .data or f.ftype == .headers) return error.H3Error; // illegal on control
+        // Any other frame (GOAWAY, MAX_PUSH_ID, grease) before SETTINGS means the
+        // first frame was not SETTINGS - missing_settings; after, it is ignored.
+        if (!u.settings_seen) return error.H3Error; // missing_settings
     }
 
     fn onFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame) Error!void {
@@ -1073,12 +1089,69 @@ test "the peer's control stream + SETTINGS is read without error" {
     var ctrl: std.ArrayListUnmanaged(u8) = .empty;
     defer ctrl.deinit(gpa);
     try ctrl.append(gpa, 0x00); // control stream type
-    try h3_frame.append(&ctrl, gpa, .settings, &.{ 0x06, 0x44, 0x00 }); // max_field_section_size
+    try h3_frame.append(&ctrl, gpa, .settings, &.{ 0x06, 0x44, 0x00 }); // max_field_section_size 0x400
     const dgram = try buildUni(gpa, &dcid, 2, 0, ctrl.items);
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
     try h3.pump(2);
     try testing.expectEqual(@as(?u64, 2), h3.control_recv_id);
+    try testing.expectEqual(@as(u64, 0x400), h3.peer_settings.?.max_field_section_size);
+}
+
+test "the control stream's first frame must be SETTINGS" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xd0, 0xd1, 0xd2, 0xd3 };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    // Control stream whose first frame is GOAWAY (0x07), not SETTINGS: missing_settings.
+    var ctrl: std.ArrayListUnmanaged(u8) = .empty;
+    defer ctrl.deinit(gpa);
+    try ctrl.append(gpa, 0x00);
+    try h3_frame.append(&ctrl, gpa, .goaway, &.{0x00});
+    const dgram = try buildUni(gpa, &dcid, 2, 0, ctrl.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try testing.expectError(error.H3Error, h3.pump(2));
+}
+
+test "a second SETTINGS on the control stream is unexpected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xd4, 0xd5, 0xd6, 0xd7 };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    var ctrl: std.ArrayListUnmanaged(u8) = .empty;
+    defer ctrl.deinit(gpa);
+    try ctrl.append(gpa, 0x00);
+    try h3_frame.append(&ctrl, gpa, .settings, &.{}); // empty SETTINGS (valid)
+    try h3_frame.append(&ctrl, gpa, .settings, &.{}); // a second one (illegal)
+    const dgram = try buildUni(gpa, &dcid, 2, 0, ctrl.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try testing.expectError(error.H3Error, h3.pump(2));
+}
+
+test "a SETTINGS with a duplicate identifier is a connection error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xd8, 0xd9, 0xda, 0xdb };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    var ctrl: std.ArrayListUnmanaged(u8) = .empty;
+    defer ctrl.deinit(gpa);
+    try ctrl.append(gpa, 0x00);
+    try h3_frame.append(&ctrl, gpa, .settings, &.{ 0x06, 0x01, 0x06, 0x02 }); // 0x06 twice
+    const dgram = try buildUni(gpa, &dcid, 2, 0, ctrl.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try testing.expectError(error.H3Error, h3.pump(2));
 }
 
 test "a second control stream is a connection error" {
@@ -1130,4 +1203,30 @@ test "a QPACK encoder stream is drained and ignored" {
     try qc.receiveDatagram(dgram, 1000);
     try h3.pump(2); // no error; bytes drained
     try testing.expectEqual(@as(usize, 0), qc.streamData(2).len);
+}
+
+test "a finished ignored uni stream is reclaimed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe5, 0xe6, 0xe7, 0xe8 };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    // A push stream (uni id 2) that the peer opens and immediately finishes (FIN).
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x0b); // STREAM, LEN|FIN
+    try varint.append(&sframe, gpa, 2);
+    try varint.append(&sframe, gpa, 1);
+    try sframe.append(gpa, 0x01); // push stream type
+    const dgram = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 0, sframe.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pump(2);
+
+    // The finished ignored stream is dropped from both maps, not retained.
+    var ids: [4]u64 = undefined;
+    try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
+    try testing.expectEqual(@as(u32, 0), h3.uni_streams.count());
 }
