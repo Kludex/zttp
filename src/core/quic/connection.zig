@@ -118,6 +118,7 @@ pub const Connection = struct {
     /// or a connection that does not run the handshake (the recv-pipeline tests).
     tls: ?tls.server.Server = null,
     peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
+    handshake_confirmed: bool = false, // the client Finished verified; HANDSHAKE_DONE sent
     closed: bool = false,
 
     /// `client_dcid` is the destination connection id on the client's first
@@ -500,7 +501,12 @@ pub const Connection = struct {
                     try self.sendCryptoFlight(flight_buf.items, outcome.server_hello_len, now);
                     continue;
                 },
-                .finished => st.crypto.advance(msg.len), // client Finished verify is a later stage
+                .finished => {
+                    const body = tls.handshake.finishedBody(msg.body) catch return error.ProtocolViolation;
+                    server.onClientFinished(body) catch return error.ProtocolViolation;
+                    st.crypto.advance(msg.len);
+                    try self.confirmHandshake(now);
+                },
                 else => return error.ProtocolViolation, // unexpected message at the server
             }
         }
@@ -521,8 +527,38 @@ pub const Connection = struct {
         _ = try self.buildPacket(space, frames.items, true, now); // CRYPTO carries no STREAM record
     }
 
+    /// The client Finished verified: the handshake is confirmed. Signal it to the
+    /// client with HANDSHAKE_DONE (RFC 9001 4.1.2) and discard the now-unneeded
+    /// Initial and Handshake keys (RFC 9001 4.9.1/4.9.2) so no further packet is
+    /// processed in or sent from those spaces.
+    fn confirmHandshake(self: *Connection, now: u64) Error!void {
+        if (self.handshake_confirmed) return;
+        // Queue HANDSHAKE_DONE before committing the confirmation state, so a failed
+        // send (OOM) leaves the connection unconfirmed and retryable rather than
+        // confirmed-but-silent. HANDSHAKE_DONE (0x1e) + PADDING (0x00): the padding
+        // makes the packet long enough for the header-protection sample (RFC 9000
+        // 19.20, 19.1).
+        _ = try self.buildPacket(.application, &([_]u8{0x1e} ++ [_]u8{0x00} ** 19), true, now);
+        self.handshake_confirmed = true;
+        self.discardSpace(.initial);
+        self.discardSpace(.handshake);
+    }
+
+    /// Drop a packet-number space's keys and in-flight state once it is no longer
+    /// needed (RFC 9001 4.9): no packet can be sent or decrypted there afterwards.
+    fn discardSpace(self: *Connection, space: Space) void {
+        const st = &self.spaces[@intFromEnum(space)];
+        st.recv_keys = null;
+        st.send_keys = null;
+        st.rec.discard(&self.cc);
+    }
+
     fn sendAck(self: *Connection, space: Space, now: u64) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
+        if (st.send_keys == null) {
+            st.ack_pending = false; // space discarded (e.g. handshake confirmed): nothing to ack with
+            return;
+        }
         const largest = st.largest_recv_pn orelse return;
         var frames: std.ArrayListUnmanaged(u8) = .empty;
         defer frames.deinit(self.gpa);
@@ -794,6 +830,33 @@ pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, 
     return out;
 }
 
+// Build a Handshake-space (long-header type 0x02) packet carrying `frames`, sealed
+// with `keys` - used to deliver the client Finished into the server's Handshake
+// space the way a real client would.
+fn testBuildHandshake(gpa: std.mem.Allocator, dcid: []const u8, keys: crypto.Keys, pn: u64, frames: []const u8) ![]u8 {
+    var hdr_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer hdr_buf.deinit(gpa);
+    try hdr_buf.append(gpa, 0xE0); // long|fixed|handshake(type 2)|pn_len-1=0
+    try hdr_buf.appendSlice(gpa, &[_]u8{ 0, 0, 0, 1 }); // version 1
+    try hdr_buf.append(gpa, @intCast(dcid.len));
+    try hdr_buf.appendSlice(gpa, dcid);
+    try hdr_buf.append(gpa, 0); // scid len 0 (no token field on a Handshake header)
+    const length = 1 + frames.len + crypto.TAG_LEN;
+    var lbuf: [8]u8 = undefined;
+    const varint = @import("varint.zig");
+    try hdr_buf.appendSlice(gpa, try varint.encode(&lbuf, @intCast(length)));
+    const pn_offset = hdr_buf.items.len;
+    try hdr_buf.append(gpa, @intCast(pn & 0xff));
+
+    const header = hdr_buf.items;
+    const out = try gpa.alloc(u8, header.len + frames.len + crypto.TAG_LEN);
+    errdefer gpa.free(out);
+    @memcpy(out[0..header.len], header);
+    _ = crypto.seal(keys, pn, header, frames, out[header.len..]);
+    try crypto.protectHeader(keys.hp, out, pn_offset, true);
+    return out;
+}
+
 // Application-space test keys, deterministic so a test builder and the connection
 // agree. STREAM frames are illegal in Initial (RFC 9000 12.4); these helpers let
 // the recv-pipeline tests deliver stream data in the Application space, the way a
@@ -1001,6 +1064,47 @@ test "a server drives the handshake from a ClientHello and installs 1-RTT keys" 
     const server_ks = try tls.keyshare.KeyShare.ephemeral([_]u8{0x33} ** 32);
     const ecdhe = try server_ks.shared(pubkey);
     try testing.expectEqual(@as(usize, 32), ecdhe.len); // both sides reach the same ECDHE input
+}
+
+test "the client Finished confirms the handshake and discards the early spaces" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+    const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
+    defer gpa.free(ch);
+    try server.receiveDatagram(ch, 1000);
+    server.clearSend();
+
+    // Forge the correct client Finished from the server's own retained transcript
+    // and client handshake secret (what a real client would independently derive),
+    // and deliver it in a Handshake packet sealed with the client's handshake send
+    // keys - which equal the server's handshake recv keys.
+    const drv = &server.tls.?;
+    const th = drv.transcript.hash();
+    const verify_data = tls.finished.build(drv.client_hs_secret, th);
+    var fin_msg: [4 + tls.finished.LEN]u8 = .{ 0x14, 0, 0, tls.finished.LEN } ++ [_]u8{0} ** tls.finished.LEN;
+    @memcpy(fin_msg[4..], &verify_data);
+    var crypto_frame: std.ArrayListUnmanaged(u8) = .empty;
+    defer crypto_frame.deinit(gpa);
+    try frame.encodeCrypto(&crypto_frame, gpa, 0, &fin_msg);
+
+    const hs_recv_keys = server.spaces[@intFromEnum(Space.handshake)].recv_keys.?;
+    const dgram = try testBuildHandshake(gpa, &dcid, hs_recv_keys, 0, crypto_frame.items);
+    defer gpa.free(dgram);
+    try server.receiveDatagram(dgram, 2000);
+
+    // The handshake is confirmed: HANDSHAKE_DONE was queued (an Application packet),
+    // and the Initial + Handshake spaces are discarded (keys cleared).
+    try testing.expect(server.handshake_confirmed);
+    try testing.expect(drv.state == .complete);
+    try testing.expect(server.spaces[@intFromEnum(Space.initial)].send_keys == null);
+    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].send_keys == null);
+    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].recv_keys == null);
+    try testing.expect(server.datagramLengths().len >= 1); // HANDSHAKE_DONE (+ a Handshake ACK)
 }
 
 test "a fragmented ClientHello across CRYPTO frames still drives the handshake" {

@@ -47,6 +47,13 @@ pub const Controller = struct {
         self.bytes_in_flight += bytes;
     }
 
+    /// Remove bytes from the in-flight count WITHOUT treating them as acked (RFC
+    /// 9002 A.4): used when a packet-number space is discarded, so the window does
+    /// not grow for packets that were merely abandoned.
+    pub fn onDiscard(self: *Controller, bytes: u64) void {
+        self.bytes_in_flight -|= bytes;
+    }
+
     /// A packet of `bytes` (sent as packet number `pn`) was newly acked.
     pub fn onAck(self: *Controller, pn: u64, bytes: u64) void {
         self.bytes_in_flight -|= bytes;
