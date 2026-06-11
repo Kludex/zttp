@@ -19,7 +19,7 @@ const decoder_mod = @import("hpack/decoder.zig");
 const writer_mod = @import("writer.zig");
 const events = @import("../events.zig");
 const ascii = @import("../ascii.zig");
-const fields = @import("fields.zig");
+const fields = @import("../fields.zig");
 
 const Event = events.H2Event;
 const FrameType = constants.FrameType;

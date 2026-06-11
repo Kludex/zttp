@@ -469,6 +469,30 @@ const H3Engine = struct {
         return q.closed;
     }
 
+    /// The peer's CONNECTION_CLOSE as (error_code, reason, is_application), or None if
+    /// the peer has not sent one - so an integrator learns WHY the peer closed, not
+    /// just that it did.
+    fn closeInfo(self: *const H3Engine) py.Object {
+        const q = self.qc orelse return py.none();
+        const pc = q.peer_close orelse return py.none();
+        const tuple = py.tupleNew(3);
+        if (tuple == null) return null;
+        const code = c.PyLong_FromUnsignedLongLong(pc.error_code);
+        const reason = py.fromBytes(pc.reason);
+        const app = py.boolean(pc.app);
+        if (code == null or reason == null or app == null) {
+            py.xdecref(code);
+            py.xdecref(reason);
+            py.xdecref(app);
+            py.decref(tuple);
+            return null;
+        }
+        py.tupleSet(tuple, 0, code);
+        py.tupleSet(tuple, 1, reason);
+        py.tupleSet(tuple, 2, app);
+        return tuple;
+    }
+
     fn deinit(self: *H3Engine) void {
         if (self.h3) |h| {
             h.deinit();
@@ -1457,6 +1481,11 @@ fn h3_is_closed(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     return py.boolean(e.isClosed());
 }
 
+fn h3_close_info(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    return e.closeInfo();
+}
+
 // HTTP/2 connection-level send helpers --------------------------------------
 
 fn h2_initiate(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
@@ -1545,6 +1574,7 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "next_timeout", .ml_meth = h3_next_timeout, .ml_flags = c.METH_NOARGS, .ml_doc = "The next loss/PTO deadline (same clock as now), or None if no timer is armed." },
     .{ .ml_name = "handle_timeout", .ml_meth = h3_handle_timeout, .ml_flags = c.METH_O, .ml_doc = "Fire the timer at time now: handle_timeout(now). Re-queues probes; drain them with data_to_send." },
     .{ .ml_name = "is_closed", .ml_meth = h3_is_closed, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection has been closed (a peer CONNECTION_CLOSE was received)." },
+    .{ .ml_name = "close_info", .ml_meth = h3_close_info, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's CONNECTION_CLOSE as (error_code, reason, is_application), or None if the peer has not closed." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

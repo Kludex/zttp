@@ -103,6 +103,19 @@ const StreamSent = struct { id: u64, offset: u64, len: u64, fin: bool };
 /// acked packet number back to the handshake bytes it was responsible for.
 const CryptoSent = struct { offset: u64, len: u64 };
 
+/// A CONNECTION_CLOSE the peer sent (RFC 9000 19.19), retained so the integrator can
+/// surface why the connection ended. `app` distinguishes the application-error
+/// variant; `reason` is an owned, length-capped copy of the human-readable phrase.
+pub const PeerClose = struct {
+    app: bool,
+    error_code: u64,
+    reason: []const u8,
+
+    /// Cap the retained reason so a peer cannot make the server allocate an
+    /// arbitrarily long phrase; the prefix is enough to diagnose.
+    pub const MAX_REASON: usize = 1024;
+};
+
 pub const Connection = struct {
     gpa: std.mem.Allocator,
     role: Role,
@@ -146,6 +159,17 @@ pub const Connection = struct {
     sent_bytes: u64 = 0,
     address_validated: bool = false,
     closed: bool = false,
+    /// The details of a CONNECTION_CLOSE received from the peer (RFC 9000 19.19),
+    /// captured so the integrator can report why the peer closed - not just that it
+    /// did. Null until a close arrives. `reason` is an owned copy (the decoded slice
+    /// points into the datagram), capped so a hostile reason cannot grow it.
+    peer_close: ?PeerClose = null,
+    /// The receive-stream ids that completed and were dropped (see dropStream). A late
+    /// frame for one of these is ignored rather than resurrecting the stream. A set,
+    /// not a watermark: stream ids complete out of order, so a watermark would treat a
+    /// legitimate new lower id as retired. One u64 per retired stream is far smaller
+    /// than the RecvStream it replaces, so this still bounds the per-stream memory.
+    retired_recv: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     /// `client_dcid` is the destination connection id on the client's first
     /// Initial: both endpoints derive the Initial keys from it. The server picks
@@ -209,8 +233,10 @@ pub const Connection = struct {
             self.gpa.destroy(s.*);
         }
         self.send_streams.deinit(self.gpa);
+        self.retired_recv.deinit(self.gpa);
         self.out.deinit(self.gpa);
         self.out_lengths.deinit(self.gpa);
+        if (self.peer_close) |pc| self.gpa.free(pc.reason);
         for (&self.spaces) |*s| s.deinit(self.gpa);
     }
 
@@ -404,8 +430,14 @@ pub const Connection = struct {
                 var chunk = s.peek(packet_room) orelse break;
                 const is_new = chunk.offset >= s.sent;
                 if (is_new and chunk.data.len > 0) {
-                    const credit = self.conn_send_window.available();
-                    if (credit == 0) break; // out of window: keep new bytes queued
+                    // New bytes are bounded by BOTH the peer's flow-control grant
+                    // (MAX_DATA, RFC 9000 4.1) and the congestion window (RFC 9002 7):
+                    // a retransmit or a pure FIN below is exempt, since neither
+                    // presents fresh offsets. cwnd limits bytes in flight, so a packet
+                    // already counts its header+tag; gate the new stream bytes against
+                    // the smaller of the two remaining budgets.
+                    const credit = @min(self.conn_send_window.available(), self.cc.available());
+                    if (credit == 0) break; // out of window or out of cwnd: keep new bytes queued
                     if (chunk.data.len > credit) chunk = s.peek(@intCast(credit)).?; // shrink to fit
                 }
                 if (chunk.data.len == 0 and !chunk.fin) break;
@@ -441,7 +473,17 @@ pub const Connection = struct {
             return error.OutOfMemory;
         for (acked_pns.items) |pn| {
             if (st.stream_sent.fetchRemove(pn)) |e| {
-                if (self.send_streams.get(e.value.id)) |s| try s.onAck(e.value.offset, e.value.len, e.value.fin);
+                if (self.send_streams.get(e.value.id)) |s| {
+                    try s.onAck(e.value.offset, e.value.len, e.value.fin);
+                    // A response whose every byte and FIN is now acked has nothing
+                    // left to retransmit; reclaim it so a completed stream's send half
+                    // does not linger (dropStream could not free it while in flight).
+                    if (s.fullyAcked()) {
+                        _ = self.send_streams.remove(e.value.id);
+                        s.deinit();
+                        self.gpa.destroy(s);
+                    }
+                }
             }
             if (st.crypto_sent.fetchRemove(pn)) |e| try st.crypto_send.onAck(e.value.offset, e.value.len, false);
         }
@@ -845,7 +887,16 @@ pub const Connection = struct {
             .max_data => |m| self.conn_send_window.onMaxData(m),
             .max_stream_data => {}, // per-stream send windows arrive with the send path
             .reset_stream => |r| try self.onReset(r.stream_id, r.final_size),
-            .connection_close => {
+            .connection_close => |cc| {
+                // Retain the peer's close details (RFC 9000 19.19); the reason slice
+                // points into the datagram, so copy a length-capped prefix. The first
+                // close wins - a later frame in the same (closing) packet cannot
+                // overwrite it. A copy failure still records the close, sans reason.
+                if (self.peer_close == null) {
+                    const n = @min(cc.reason.len, PeerClose.MAX_REASON);
+                    const reason = self.gpa.dupe(u8, cc.reason[0..n]) catch &.{};
+                    self.peer_close = .{ .app = cc.app, .error_code = cc.error_code, .reason = reason };
+                }
                 self.closed = true;
             },
             .handshake_done => {},
@@ -881,6 +932,7 @@ pub const Connection = struct {
     }
 
     fn onStreamFrame(self: *Connection, id: u64, offset: u64, data: []const u8, fin: bool) Error!void {
+        if (self.isRetired(id)) return; // a late frame for a completed-and-dropped stream
         const s = try self.recvStream(id);
         const delta = s.push(offset, data, fin) catch |e| switch (e) {
             error.FinalSizeError => return error.FinalSizeError,
@@ -893,8 +945,16 @@ pub const Connection = struct {
     }
 
     fn onReset(self: *Connection, id: u64, final_size: u64) Error!void {
+        if (self.isRetired(id)) return; // a reset for an already-completed-and-dropped stream
         const s = try self.recvStream(id);
         s.onReset(final_size) catch return error.FinalSizeError;
+    }
+
+    /// Whether `id` names a recv stream that already completed and was dropped, so a
+    /// late frame for it must be ignored rather than resurrecting it (the dropped
+    /// stream's offset accounting is gone, so re-creating it would re-deliver data).
+    fn isRetired(self: *const Connection, id: u64) bool {
+        return self.retired_recv.contains(id);
     }
 
     fn recvStream(self: *Connection, id: u64) Error!*stream.RecvStream {
@@ -907,6 +967,30 @@ pub const Connection = struct {
             return error.OutOfMemory;
         };
         return s;
+    }
+
+    /// Drop a stream's receive state once it is terminal (fully read or reset), so a
+    /// peer that opens-then-resets streams forever cannot grow the streams map
+    /// unbounded (the memory half of the Rapid-Reset class). The send half is dropped
+    /// only when it has no unacked bytes left to retransmit; otherwise it is retained
+    /// until the ACK path frees it. Returns whether the recv stream was dropped.
+    pub fn dropStream(self: *Connection, id: u64) bool {
+        if (self.send_streams.get(id)) |ss| {
+            if (ss.fullyAcked()) {
+                _ = self.send_streams.remove(id);
+                ss.deinit();
+                self.gpa.destroy(ss);
+            }
+        }
+        const s = self.streams.get(id) orelse return false;
+        if (!s.isTerminal()) return false;
+        // Remember the id as retired BEFORE freeing, so a failure to record it leaves
+        // the stream in place rather than dropped-but-resurrectable.
+        self.retired_recv.put(self.gpa, id, {}) catch return false;
+        _ = self.streams.remove(id);
+        s.deinit();
+        self.gpa.destroy(s);
+        return true;
     }
 
     /// The ordered, not-yet-consumed bytes of a stream (empty if none/unknown).
@@ -932,6 +1016,19 @@ pub const Connection = struct {
     pub fn streamFinished(self: *Connection, id: u64) bool {
         if (self.streams.get(id)) |s| return s.isFinished();
         return false;
+    }
+
+    /// Whether the peer reset this receive stream (RFC 9000 19.4). The H3 layer
+    /// surfaces this as a cancelled request and drops the stream.
+    pub fn streamReset(self: *Connection, id: u64) bool {
+        if (self.streams.get(id)) |s| return s.state == .reset_recvd;
+        return false;
+    }
+
+    /// Whether a receive stream currently exists for `id`. A retired (dropped) or
+    /// never-seen id returns false, so the H3 layer does not recreate state for it.
+    pub fn hasStream(self: *Connection, id: u64) bool {
+        return self.streams.contains(id);
     }
 
     /// Snapshot the ids of every stream the transport currently knows about, into
@@ -1149,6 +1246,26 @@ test "the server can send a CONNECTION_CLOSE and is then closed" {
     // Idempotent: a second close does nothing.
     try conn.close(false, 0x0a, "bye");
     try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len);
+}
+
+test "a received CONNECTION_CLOSE is captured with its code and reason" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x41, 0x42, 0x43, 0x44 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+    try sender.close(false, 0x0a, "bye");
+
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    testInstallAppKeys(&peer);
+    try peer.receiveDatagram(sender.datagramsToSend(), 1000);
+
+    try testing.expect(peer.closed);
+    const pc = peer.peer_close.?;
+    try testing.expect(!pc.app);
+    try testing.expectEqual(@as(u64, 0x0a), pc.error_code);
+    try testing.expectEqualStrings("bye", pc.reason);
 }
 
 test "consuming stream data advertises a raised MAX_DATA" {
@@ -1525,6 +1642,33 @@ test "flushSend never sends past the connection send window, and resumes on MAX_
 
     // The peer raises MAX_DATA; the remaining bytes can now flow.
     conn.conn_send_window.onMaxData(10);
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(u64, 10), conn.conn_send_window.sent);
+    try testing.expect(!conn.hasPendingSend());
+}
+
+test "flushSend never sends past the congestion window, and resumes as it opens" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.conn_send_window.limit = 1000; // flow control is not the bound here
+    conn.cc.congestion_window = 4; // but the congestion window admits only 4 bytes
+
+    try conn.sendStreamData(1, "abcdefghij", false); // 10 bytes queued
+    try conn.flushSend(1000);
+    // cwnd capped the new bytes to 4; the rest stays queued (cwnd, not MAX_DATA).
+    try testing.expectEqual(@as(u64, 4), conn.conn_send_window.sent);
+    try testing.expect(conn.hasPendingSend());
+
+    // A flush with the window still full sends nothing more.
+    conn.clearSend();
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len);
+
+    // The congestion window opens (e.g. after an ACK); the remaining bytes flow.
+    conn.cc.congestion_window = 10_000;
     try conn.flushSend(1000);
     try testing.expectEqual(@as(u64, 10), conn.conn_send_window.sent);
     try testing.expect(!conn.hasPendingSend());

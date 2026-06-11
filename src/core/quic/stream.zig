@@ -178,6 +178,12 @@ pub const RecvStream = struct {
         } else self.final_size = final_size;
         self.state = .reset_recvd;
     }
+
+    /// The stream will deliver nothing more: the application has read every byte
+    /// through the FIN, or the peer reset it. Either way the connection can drop it.
+    pub fn isTerminal(self: *const RecvStream) bool {
+        return self.state == .data_read or self.state == .reset_recvd;
+    }
 };
 
 /// The send side of one stream: a retain buffer of all unacked bytes the
@@ -221,6 +227,13 @@ pub const SendStream = struct {
 
     pub fn end(self: *const SendStream) u64 {
         return self.base_offset + self.buf.items.len;
+    }
+
+    /// Every written byte (and the FIN, if one was written) has been acknowledged,
+    /// so nothing remains to retransmit and the stream can be dropped. Acked bytes
+    /// are freed off the front, so an empty buffer means all bytes are acked.
+    pub fn fullyAcked(self: *const SendStream) bool {
+        return self.buf.items.len == 0 and (!self.fin or self.fin_acked);
     }
 
     /// Queue `data` and/or mark the stream finished. Writing after the stream is

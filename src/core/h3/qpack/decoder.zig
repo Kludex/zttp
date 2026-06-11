@@ -164,15 +164,20 @@ const Parser = struct {
         var value: u64 = self.buf[self.pos] & max_prefix;
         self.pos += 1;
         if (value < max_prefix) return value;
-        var shift: u6 = 0;
+        var shift: u32 = 0; // wide enough that `shift += 7` never overflows
         while (true) {
             if (self.pos >= self.buf.len) return error.DecompressionFailed;
             const b = self.buf[self.pos];
             self.pos += 1;
-            value += @as(u64, b & 0x7f) << shift;
+            // A shift of 64+ bits, or any result exceeding u64, is malformed: reject
+            // before the shift/add can wrap (an unchecked u64 overflow traps in
+            // ReleaseSafe). Mirrors the HPACK decoder's continuation handling.
+            if (shift >= @bitSizeOf(u64)) return error.DecompressionFailed;
+            const add = @as(u64, b & 0x7f);
+            const shifted = std.math.shlExact(u64, add, @intCast(shift)) catch return error.DecompressionFailed;
+            value = std.math.add(u64, value, shifted) catch return error.DecompressionFailed;
             if (b & 0x80 == 0) break;
             shift += 7;
-            if (shift > 62) return error.DecompressionFailed;
         }
         return value;
     }
@@ -270,4 +275,16 @@ test "an out-of-range static index is rejected" {
     // index 99 (past the 0-98 table): 0xC0|63 then continuation for 99.
     const block = [_]u8{ 0x00, 0x00, 0xFF, 36 }; // 63 + 36 = 99
     try testing.expectError(error.BadIndex, dec.decode(&block));
+}
+
+test "an integer whose continuation overflows is rejected, not crashed" {
+    const gpa = testing.allocator;
+    var dec = Decoder.init(gpa, 1 << 20);
+    defer dec.deinit();
+    // RIC=0, Base=0, then an indexed static field (0xC0|63 = prefix all-ones, so a
+    // base-128 continuation follows) whose continuation never terminates the high
+    // bit and accumulates past 2^64. The unchecked accumulation would trap in
+    // ReleaseSafe; it must surface as a clean DecompressionFailed instead.
+    const block = [_]u8{ 0x00, 0x00, 0xFF } ++ [_]u8{0xFF} ** 10;
+    try testing.expectError(error.DecompressionFailed, dec.decode(&block));
 }

@@ -1,11 +1,11 @@
-//! RFC 9113 8.2 field validation shared by the H2 read and write paths, so both
-//! directions agree on which field names and connection-specific fields are
-//! legal. The value-body check intentionally lives in each path: the read side
-//! (`validValue`) follows RFC 9110 field-vchar and allows inner HTAB, while the
-//! write side is stricter and rejects it (see h2/writer.zig validateValue).
+//! RFC 9110 field validation shared by HTTP/2 and HTTP/3 (RFC 9114 4.2 inherits
+//! the HTTP/2 rules), so every path agrees on which field names and
+//! connection-specific fields are legal. The value-body check intentionally lives
+//! in each path: the read side (`validValue`) follows RFC 9110 field-vchar and
+//! allows inner HTAB, while the write side is stricter and rejects it.
 
 const std = @import("std");
-const tables = @import("../tables.zig");
+const tables = @import("tables.zig");
 
 /// A valid HTTP/2 field name: a non-empty RFC 9110 token (so no SP, NUL, ':',
 /// or other separators) with no uppercase ASCII (RFC 9113 8.2.1). `:` is

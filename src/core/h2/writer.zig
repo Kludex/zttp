@@ -9,7 +9,7 @@ const std = @import("std");
 const constants = @import("constants.zig");
 const frame_mod = @import("frame.zig");
 const encoder = @import("hpack/encoder.zig");
-const fields = @import("fields.zig");
+const fields = @import("../fields.zig");
 
 const Header = @import("../events.zig").Header;
 const FrameType = constants.FrameType;
