@@ -19,8 +19,9 @@ const H2Role = core.h2.connection.Role;
 const H2Writer = core.h2.writer.Writer;
 
 const QuicConnection = core.quic.connection.Connection;
-const QuicRole = core.quic.connection.Role;
 const H3Connection = core.h3.connection.Connection;
+const FlightConfig = core.quic.tls.flight.Config;
+const Signer = core.quic.tls.sign.Signer;
 
 const gpa = std.heap.c_allocator;
 
@@ -243,15 +244,48 @@ const H2Engine = struct {
     }
 };
 
-/// The HTTP/3 engine (server read path only). The QUIC transport and the HTTP/3
-/// engine on top of it are built lazily on the first datagram - the connection
-/// id is read from the client's first Initial packet, so it is not known at
-/// construction. `qc`/`h3` stay null until then.
+/// The server TLS material the QUIC handshake needs but the sans-IO core cannot
+/// invent: the certificate, signing key, transport parameters, selected ALPN, and
+/// the per-connection entropy (ServerHello random + ephemeral seed). The integrator
+/// supplies it at construction; the bytes are copied so they outlive the Python
+/// args. `signer` is derived from the 32-byte key seed once, up front, so a bad key
+/// is rejected at construction rather than on the first datagram.
+const ServerConfig = struct {
+    cert: []u8,
+    transport_params: []u8,
+    alpn: ?[]u8,
+    signer: Signer,
+    random: [32]u8,
+    ephemeral_seed: [32]u8,
+
+    fn deinit(self: *ServerConfig) void {
+        gpa.free(self.cert);
+        gpa.free(self.transport_params);
+        if (self.alpn) |a| gpa.free(a);
+    }
+
+    fn flightConfig(self: *const ServerConfig) FlightConfig {
+        return .{
+            .random = self.random,
+            .ephemeral_seed = self.ephemeral_seed,
+            .signer = self.signer,
+            .cert_chain = self.cert,
+            .alpn = self.alpn,
+            .transport_params = self.transport_params,
+        };
+    }
+};
+
+/// The HTTP/3 engine. The QUIC transport and the HTTP/3 engine on top of it are
+/// built lazily on the first datagram - the connection id is read from the client's
+/// first Initial packet, so it is not known at construction. `qc`/`h3` stay null
+/// until then; `config` carries the server credentials forward to that point.
 const H3Engine = struct {
+    config: ServerConfig,
     qc: ?*QuicConnection = null,
     h3: ?*H3Connection = null,
 
-    fn receiveDatagram(self: *H3Engine, dgram: []const u8) py.Object {
+    fn receiveDatagram(self: *H3Engine, dgram: []const u8, now: u64) py.Object {
         if (self.qc == null) {
             // Build the transport from the connection id in the client's first
             // Initial. A non-Initial first datagram has nowhere to take the id from.
@@ -261,7 +295,7 @@ const H3Engine = struct {
             const hdr = core.quic.packet.parseLong(dgram) catch
                 return py.raise(exceptions.RemoteProtocolError, "malformed QUIC Initial packet");
             const q = gpa.create(QuicConnection) catch return c.PyErr_NoMemory();
-            q.* = QuicConnection.init(gpa, QuicRole.server, hdr.dcid) catch {
+            q.* = QuicConnection.initServer(gpa, hdr.dcid, self.config.flightConfig()) catch {
                 gpa.destroy(q);
                 return c.PyErr_NoMemory();
             };
@@ -271,16 +305,11 @@ const H3Engine = struct {
                 return c.PyErr_NoMemory();
             };
             h.* = H3Connection.init(gpa, q);
-            // The HTTP/3 read demo delivers request data in the Application space
-            // (STREAM is illegal in Initial). Until the Python adapter drives the
-            // TLS handshake, install the deterministic test 1-RTT keys so a 1-RTT
-            // request packet (coalesced after the bootstrap Initial) decrypts.
-            core.quic.connection.testInstallAppKeys(q);
             self.qc = q;
             self.h3 = h;
         }
 
-        self.qc.?.receiveDatagram(dgram, 0) catch |e| return exceptions.raiseQuic(e);
+        self.qc.?.receiveDatagram(dgram, now) catch |e| return exceptions.raiseQuic(e);
         self.h3.?.pumpAll() catch |e| return exceptions.raiseH3(e);
         return py.none();
     }
@@ -288,6 +317,83 @@ const H3Engine = struct {
     fn nextEvent(self: *H3Engine) py.Object {
         const h = self.h3 orelse return py.newRef(events_obj.need_data); // no datagram fed yet
         return events_obj.fromH3Event(h.nextEvent());
+    }
+
+    /// The pending outbound datagrams (handshake flight, ACKs, response STREAM
+    /// frames) as a list of bytes, one per UDP datagram - QUIC datagram boundaries
+    /// are semantic, so each must reach the peer as its own packet, unlike the byte
+    /// stream the H1/H2 data_to_send returns. The queue is cleared on success.
+    fn dataToSend(self: *H3Engine) py.Object {
+        const q = self.qc orelse return py.newList(0); // nothing built yet
+        const flat = q.datagramsToSend();
+        const lengths = q.datagramLengths();
+        const list = py.newList(@intCast(lengths.len));
+        if (list == null) return null;
+        var off: usize = 0;
+        for (lengths, 0..) |len, i| {
+            const item = py.fromBytes(flat[off .. off + len]);
+            if (item == null) {
+                py.decref(list);
+                return null;
+            }
+            py.listSet(list, @intCast(i), item);
+            off += len;
+        }
+        q.clearSend();
+        return list;
+    }
+
+    /// Drive a response onto `stream_id`, then packetise so the bytes surface in the
+    /// next data_to_send. Send requires 1-RTT keys (the handshake must be complete),
+    /// which flushSend enforces by no-op'ing until they exist.
+    fn sendResponse(self: *H3Engine, id: u64, status: u16, headers: []const events.Header, now: u64) py.Object {
+        const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        h.sendResponse(id, status, headers) catch |e| return exceptions.raiseH3(e);
+        return self.flush(now);
+    }
+
+    fn sendData(self: *H3Engine, id: u64, data: []const u8, now: u64) py.Object {
+        const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        h.sendData(id, data) catch |e| return exceptions.raiseH3(e);
+        return self.flush(now);
+    }
+
+    fn endStream(self: *H3Engine, id: u64, now: u64) py.Object {
+        const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        h.endStream(id) catch |e| return exceptions.raiseH3(e);
+        return self.flush(now);
+    }
+
+    fn flush(self: *H3Engine, now: u64) py.Object {
+        // AmplificationLimited is not an error: it means the unvalidated peer's 3x
+        // budget is spent, so the bytes stay queued and surface on a later flush once
+        // a Handshake packet validates the address. Treat it as a deferred no-send.
+        self.qc.?.flushSend(now) catch |e| switch (e) {
+            error.AmplificationLimited => {},
+            else => return exceptions.raiseQuic(e),
+        };
+        return py.none();
+    }
+
+    fn nextTimeout(self: *H3Engine) py.Object {
+        const q = self.qc orelse return py.none();
+        return if (q.nextTimeout()) |t| c.PyLong_FromUnsignedLongLong(@intCast(t)) else py.none();
+    }
+
+    fn handleTimeout(self: *H3Engine, now: u64) py.Object {
+        const q = self.qc orelse return py.none();
+        q.onTimeout(now) catch |e| switch (e) {
+            error.AmplificationLimited => {},
+            else => return exceptions.raiseQuic(e),
+        };
+        // A PTO requeues STREAM data into the send stream; only flushSend packetises
+        // it, so the probe surfaces in the next data_to_send rather than stalling.
+        return self.flush(now);
+    }
+
+    fn isClosed(self: *const H3Engine) bool {
+        const q = self.qc orelse return false;
+        return q.closed;
     }
 
     fn deinit(self: *H3Engine) void {
@@ -299,6 +405,7 @@ const H3Engine = struct {
             q.deinit();
             gpa.destroy(q);
         }
+        self.config.deinit();
     }
 };
 
@@ -544,18 +651,45 @@ fn allocAndBuild(tp: ?*c.PyTypeObject, role: Role, protocol_val: c_long) py.Obje
 // on a user subclass of Connection, it builds in place with the requested protocol
 // (the subclass is honoured; no foreign-type substitution).
 fn new_base(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    // HTTP/3 carries server-credential kwargs that the (role, protocol) parser would
+    // reject, so detect it first by a cheap peek and route the whole call through
+    // new_h3, which owns the full parse. The H1/H2 fast path is unchanged.
+    if (peekProtocol(args, kwds) == HTTP3) {
+        const target = if (@intFromPtr(tp) == @intFromPtr(connection_type)) @as(?*c.PyTypeObject, @ptrCast(h3_connection_type)) else tp;
+        return new_h3(target, args, kwds);
+    }
     var role: Role = .server;
     var protocol_val: c_long = HTTP1;
     if (!parseArgs(args, kwds, &role, &protocol_val, null)) return null;
     if (@intFromPtr(tp) == @intFromPtr(connection_type)) {
         const sub: ?*c.PyTypeObject = @ptrCast(switch (protocol_val) {
             HTTP2 => h2_connection_type,
-            HTTP3 => h3_connection_type,
             else => h1_connection_type,
         });
         return allocAndBuild(sub, role, protocol_val);
     }
     return allocAndBuild(tp, role, protocol_val);
+}
+
+// Peek the `protocol` argument (2nd positional or the `protocol` kwarg) without the
+// strict kwlist parse, so the factory can branch to HTTP/3's bespoke parser before a
+// (role, protocol)-only parser would reject HTTP/3's extra credential kwargs. Returns
+// -1 (a non-protocol) if absent or unreadable; the real parse then reports the error.
+fn peekProtocol(args: ?*c.PyObject, kwds: ?*c.PyObject) c_long {
+    if (args != null and c.PyTuple_Size(args) >= 2) {
+        const v = c.PyLong_AsLong(c.PyTuple_GetItem(args, 1));
+        if (!(v == -1 and c.PyErr_Occurred() != null)) return v;
+        c.PyErr_Clear();
+    }
+    if (kwds != null) {
+        const item = c.PyDict_GetItemString(kwds, "protocol"); // borrowed
+        if (item != null) {
+            const v = c.PyLong_AsLong(item);
+            if (!(v == -1 and c.PyErr_Occurred() != null)) return v;
+            c.PyErr_Clear();
+        }
+    }
+    return -1;
 }
 
 fn new_h1(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
@@ -572,20 +706,111 @@ fn new_h2(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     return allocAndBuild(tp, role, HTTP2);
 }
 
+// H3Connection(role, protocol=HTTP3, *, certificate, private_key, transport_params,
+// random, ephemeral_seed, alpn=None). role and protocol stay positional-or-keyword so
+// the Connection(SERVER, HTTP3, certificate=...) factory form works; the credentials
+// are keyword-only (the `$` in the format) and mandatory - a sans-IO QUIC server
+// cannot invent its own certificate or entropy. The bytes are copied into a
+// ServerConfig the engine owns.
 fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
-    var role: Role = .server;
+    var role_val: c_long = 0;
     var protocol_val: c_long = HTTP3;
-    if (!parseArgs(args, kwds, &role, &protocol_val, HTTP3)) return null;
-    return allocAndBuild(tp, role, HTTP3);
+    var cert_obj: ?*c.PyObject = null;
+    var key_obj: ?*c.PyObject = null;
+    var tp_obj: ?*c.PyObject = null;
+    var random_obj: ?*c.PyObject = null;
+    var ephemeral_obj: ?*c.PyObject = null;
+    var alpn_obj: ?*c.PyObject = null;
+    var kwlist = [_][*c]u8{
+        @constCast("role"),   @constCast("protocol"),         @constCast("certificate"),
+        @constCast("private_key"), @constCast("transport_params"), @constCast("random"),
+        @constCast("ephemeral_seed"), @constCast("alpn"),      null,
+    };
+    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$OOOOOO", @ptrCast(&kwlist), &role_val, &protocol_val, &cert_obj, &key_obj, &tp_obj, &random_obj, &ephemeral_obj, &alpn_obj) == 0) return null;
+    if (cert_obj == null or key_obj == null or tp_obj == null or random_obj == null or ephemeral_obj == null) {
+        return py.raiseType("HTTP/3 requires the server credentials: certificate, private_key, transport_params, random, ephemeral_seed");
+    }
+    if (role_val != SERVER) return py.raiseValue("HTTP/3 currently supports the server read path only");
+    if (protocol_val != HTTP3) return py.raiseValue("protocol does not match this Connection subclass; construct zttp.Connection to choose by protocol");
+
+    const config = buildServerConfig(cert_obj, key_obj, tp_obj, random_obj, ephemeral_obj, alpn_obj) orelse return null;
+    const alloc = tp.?.tp_alloc.?;
+    const obj = alloc(tp, 0);
+    if (obj == null) {
+        var cfg = config;
+        cfg.deinit();
+        return null;
+    }
+    const self: *ConnectionObject = @ptrCast(obj);
+    self.engine = null;
+    const engine: *Engine = @ptrCast(@alignCast(&self.engine_storage));
+    engine.* = .{ .h3 = .{ .config = config } };
+    self.engine = engine;
+    return obj;
 }
 
-fn buildEngine(engine: *Engine, role: Role, protocol_val: c_long) bool {
-    if (protocol_val == HTTP3) {
-        // The QUIC + HTTP/3 engine is built lazily on the first datagram.
-        engine.* = .{ .h3 = .{} };
-        return true;
+// Copy the integrator's server credentials into an owned ServerConfig, validating
+// the fixed-size seeds and deriving the Signer up front. On any failure sets a Python
+// error, frees whatever was already copied, and returns null.
+fn buildServerConfig(cert_obj: ?*c.PyObject, key_obj: ?*c.PyObject, tp_obj: ?*c.PyObject, random_obj: ?*c.PyObject, ephemeral_obj: ?*c.PyObject, alpn_obj: ?*c.PyObject) ?ServerConfig {
+    const cert_src = py.asBytes(cert_obj) orelse return null;
+    const key_src = py.asBytes(key_obj) orelse return null;
+    const tp_src = py.asBytes(tp_obj) orelse return null;
+    const random_src = py.asBytes(random_obj) orelse return null;
+    const ephemeral_src = py.asBytes(ephemeral_obj) orelse return null;
+    if (key_src.len != 32) {
+        _ = py.raiseValue("private_key must be 32 bytes (the signing key seed)");
+        return null;
     }
+    if (random_src.len != 32) {
+        _ = py.raiseValue("random must be 32 bytes (the ServerHello random)");
+        return null;
+    }
+    if (ephemeral_src.len != 32) {
+        _ = py.raiseValue("ephemeral_seed must be 32 bytes");
+        return null;
+    }
+    const signer = Signer.fromSeed(key_src[0..32].*) catch {
+        _ = py.raiseValue("private_key is not a valid signing key seed");
+        return null;
+    };
 
+    const cert = gpa.dupe(u8, cert_src) catch {
+        _ = c.PyErr_NoMemory();
+        return null;
+    };
+    const tp_copy = gpa.dupe(u8, tp_src) catch {
+        gpa.free(cert);
+        _ = c.PyErr_NoMemory();
+        return null;
+    };
+    var alpn: ?[]u8 = null;
+    if (alpn_obj != null and !py.isNone(alpn_obj)) {
+        const alpn_src = py.asBytes(alpn_obj) orelse {
+            gpa.free(cert);
+            gpa.free(tp_copy);
+            return null;
+        };
+        alpn = gpa.dupe(u8, alpn_src) catch {
+            gpa.free(cert);
+            gpa.free(tp_copy);
+            _ = c.PyErr_NoMemory();
+            return null;
+        };
+    }
+    return .{
+        .cert = cert,
+        .transport_params = tp_copy,
+        .alpn = alpn,
+        .signer = signer,
+        .random = random_src[0..32].*,
+        .ephemeral_seed = ephemeral_src[0..32].*,
+    };
+}
+
+// HTTP/3 is never built here: new_h3 constructs its engine directly because it needs
+// the parsed server config. This builds the H1/H2 engines for the shared alloc path.
+fn buildEngine(engine: *Engine, role: Role, protocol_val: c_long) bool {
     if (protocol_val == HTTP2) {
         const conn = gpa.create(H2Connection) catch {
             _ = c.PyErr_NoMemory();
@@ -651,13 +876,16 @@ fn receive_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Objec
     }
 }
 
-fn receive_datagram(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+fn receive_datagram(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
     switch (engine.*) {
         .h3 => |*e| {
-            const dgram = py.asBytes(arg) orelse return null;
-            return e.receiveDatagram(dgram);
+            var dgram_obj: ?*c.PyObject = null;
+            var now: c_ulonglong = 0;
+            if (c.PyArg_ParseTuple(args, "O|K", &dgram_obj, &now) == 0) return null;
+            const dgram = py.asBytes(dgram_obj) orelse return null;
+            return e.receiveDatagram(dgram, @intCast(now));
         },
         else => return py.raiseRuntime("receive_datagram is only valid for an HTTP/3 connection"),
     }
@@ -933,7 +1161,7 @@ fn data_to_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     const pending = switch (engine.*) {
         .h2 => |*e| e.writer.pending(),
         .h1 => |*e| if (e.writer) |w| w.pending() else "",
-        .h3 => return py.raiseRuntime("the HTTP/3 write side is not implemented yet"),
+        .h3 => |*e| return e.dataToSend(),
     };
     const out = py.fromBytes(pending);
     if (out == null) return null;
@@ -1034,6 +1262,74 @@ fn h2_close(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     return h.goaway(@intCast(code), last);
 }
 
+// HTTP/3 send helpers ------------------------------------------------------
+
+fn h3(self: *ConnectionObject) ?*H3Engine {
+    const engine = self.engine orelse {
+        _ = py.raiseRuntime("connection is closed");
+        return null;
+    };
+    switch (engine.*) {
+        .h3 => |*e| return e,
+        else => {
+            _ = py.raiseRuntime("this method exists only on an HTTP/3 connection");
+            return null;
+        },
+    }
+}
+
+fn h3_send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    var stream_id: c_ulonglong = 0;
+    var status: c_long = 0;
+    var hdrs_seq: ?*c.PyObject = null;
+    var now: c_ulonglong = 0;
+    if (c.PyArg_ParseTuple(args, "Kl|OK", &stream_id, &status, &hdrs_seq, &now) == 0) return null;
+    if (status < 0 or status > 999) return py.raiseValue("status code out of range");
+    var hdrs: ?BorrowedHeaders = null;
+    defer if (hdrs) |*hh| hh.deinit();
+    if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
+        hdrs = borrowHeaders(hdrs_seq) orelse return null;
+    }
+    const h = hdrs orelse BorrowedHeaders{ .headers = &.{}, .refs = &.{} };
+    return e.sendResponse(@intCast(stream_id), @intCast(status), h.headers, @intCast(now));
+}
+
+fn h3_send_data(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    var stream_id: c_ulonglong = 0;
+    var data_obj: ?*c.PyObject = null;
+    var now: c_ulonglong = 0;
+    if (c.PyArg_ParseTuple(args, "KO|K", &stream_id, &data_obj, &now) == 0) return null;
+    const data = py.asBytes(data_obj) orelse return null;
+    return e.sendData(@intCast(stream_id), data, @intCast(now));
+}
+
+fn h3_end_stream(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    var stream_id: c_ulonglong = 0;
+    var now: c_ulonglong = 0;
+    if (c.PyArg_ParseTuple(args, "K|K", &stream_id, &now) == 0) return null;
+    return e.endStream(@intCast(stream_id), @intCast(now));
+}
+
+fn h3_next_timeout(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    return e.nextTimeout();
+}
+
+fn h3_handle_timeout(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    const now = c.PyLong_AsUnsignedLongLong(arg);
+    if (now == @as(c_ulonglong, @bitCast(@as(c_longlong, -1))) and c.PyErr_Occurred() != null) return null;
+    return e.handleTimeout(@intCast(now));
+}
+
+fn h3_is_closed(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    return py.boolean(e.isClosed());
+}
+
 // The read API, shared by both protocols and inherited by the subtypes. The base
 // Connection is the factory: constructing it picks H1Connection / H2Connection by
 // protocol (new_base), so the runtime type is truthful while isinstance(obj,
@@ -1068,10 +1364,19 @@ var h2_methods = [_]py.MethodDef{
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
-// HTTP/3 (server read path only): fed by UDP datagrams rather than a byte stream.
-// The QUIC transport and HTTP/3 engine are built lazily on the first datagram.
+// HTTP/3: fed by UDP datagrams rather than a byte stream. The QUIC transport and
+// HTTP/3 engine are built lazily on the first datagram; the handshake is driven from
+// the server config supplied at construction. Outgoing datagrams (handshake flight,
+// ACKs, responses) drain through the inherited data_to_send. `now` is the
+// integrator's monotonic clock, in the same unit it later feeds handle_timeout.
 var h3_methods = [_]py.MethodDef{
-    .{ .ml_name = "receive_datagram", .ml_meth = receive_datagram, .ml_flags = c.METH_O, .ml_doc = "Feed one received UDP datagram (HTTP/3 only)." },
+    .{ .ml_name = "receive_datagram", .ml_meth = receive_datagram, .ml_flags = c.METH_VARARGS, .ml_doc = "Feed one received UDP datagram: receive_datagram(datagram, now=0)." },
+    .{ .ml_name = "send_response", .ml_meth = h3_send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Send a response head on a stream: send_response(stream_id, status, headers=None, now=0)." },
+    .{ .ml_name = "send_data", .ml_meth = h3_send_data, .ml_flags = c.METH_VARARGS, .ml_doc = "Send response body bytes on a stream: send_data(stream_id, data, now=0)." },
+    .{ .ml_name = "end_stream", .ml_meth = h3_end_stream, .ml_flags = c.METH_VARARGS, .ml_doc = "Finish the response on a stream (send the FIN): end_stream(stream_id, now=0)." },
+    .{ .ml_name = "next_timeout", .ml_meth = h3_next_timeout, .ml_flags = c.METH_NOARGS, .ml_doc = "The next loss/PTO deadline (same clock as now), or None if no timer is armed." },
+    .{ .ml_name = "handle_timeout", .ml_meth = h3_handle_timeout, .ml_flags = c.METH_O, .ml_doc = "Fire the timer at time now: handle_timeout(now). Re-queues probes; drain them with data_to_send." },
+    .{ .ml_name = "is_closed", .ml_meth = h3_is_closed, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection has been closed (a peer CONNECTION_CLOSE was received)." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

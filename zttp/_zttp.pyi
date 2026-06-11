@@ -92,7 +92,18 @@ class Connection:
     # send surface differs, so each is its own type rather than methods that raise
     # at runtime.
     @overload
-    def __new__(cls, role: int, protocol: Literal[3]) -> H3Connection: ...
+    def __new__(
+        cls,
+        role: int,
+        protocol: Literal[3],
+        *,
+        certificate: bytes,
+        private_key: bytes,
+        transport_params: bytes,
+        random: bytes,
+        ephemeral_seed: bytes,
+        alpn: bytes | None = ...,
+    ) -> H3Connection: ...
     @overload
     def __new__(cls, role: int, protocol: Literal[2]) -> H2Connection: ...
     @overload
@@ -120,5 +131,17 @@ class H2Connection(Connection):
     def stream(self, stream_id: int, /) -> Stream: ...
 
 class H3Connection(Connection):
-    # Server read path only: fed by UDP datagrams rather than a byte stream.
-    def receive_datagram(self, datagram: bytes, /) -> None: ...
+    # Fed by UDP datagrams rather than a byte stream. The QUIC handshake is driven
+    # from the server credentials passed at construction. `now` is the integrator's
+    # monotonic clock. data_to_send returns one bytes per UDP datagram (QUIC datagram
+    # boundaries are semantic), not the byte stream the base returns.
+    def data_to_send(self) -> list[bytes]: ...  # type: ignore[override]
+    def receive_datagram(self, datagram: bytes, now: int = ..., /) -> None: ...
+    def send_response(
+        self, stream_id: int, status: int, headers: list[tuple[bytes, bytes]] | None = ..., now: int = ..., /
+    ) -> None: ...
+    def send_data(self, stream_id: int, data: bytes, now: int = ..., /) -> None: ...
+    def end_stream(self, stream_id: int, now: int = ..., /) -> None: ...
+    def next_timeout(self) -> int | None: ...
+    def handle_timeout(self, now: int, /) -> None: ...
+    def is_closed(self) -> bool: ...
