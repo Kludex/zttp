@@ -289,6 +289,27 @@ These are not defects in the current parser; they are the places where the
 - **Misuse of the integration contract** (items 3-5 above) - parsing a response
   on a connection that never sent the request, or a mishandled `CONNECT`, can
   desynchronize a stream that the core itself parses correctly.
+- **The h2→h1 downgrade boundary (integrator responsibility 10).** zttp's
+  inbound validation makes an H2 request *safe to read*, but the H1 request a
+  proxy *synthesizes* from it is the proxy's to keep unambiguous. The residual
+  hazards live entirely on that outbound path:
+  - **`:path` is a request target, not a header value.** zttp rejects CR/LF/NUL
+    inside header *values*, but a downgrading proxy that splices `:path` into an
+    H1 request line without its own request-target check can still emit a
+    smuggled line if it ever relaxes that. Re-validate the target you write.
+  - **Body framing is yours to re-declare.** The inbound `content-length`-vs-DATA
+    guard guarantees the H2 body length is *honest*; it does not write your H1
+    framing. When you build the H1 message, emit exactly one unambiguous framing
+    (a single `Content-Length`, or `Transfer-Encoding: chunked`) - never both,
+    and never a `content-length` you copied without re-counting the bytes you
+    actually forward.
+  - **Don't reintroduce hop-by-hop fields.** zttp strips `connection`,
+    `transfer-encoding`, `upgrade`, etc. on the way in; do not let your H1
+    builder re-add a `Connection`/`Keep-Alive` header derived from anything the
+    peer controlled.
+  A proxy that forwards the *parsed* `Request` fields verbatim and re-derives its
+  own framing is safe; one that string-concatenates peer-controlled bytes into an
+  H1 message owns the smuggling risk regardless of zttp's inbound checks.
 - **Lenient mode.** The Zig core has `strict_crlf` / chunk-strictness toggles that
   default to strict and are **not** exposed through the Python API. If a future
   binding ever exposes them, the bare-LF/CR smuggling classes re-open. Keep
