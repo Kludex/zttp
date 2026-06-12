@@ -334,9 +334,11 @@ pub const Connection = struct {
                     // If the integrator already saw the request (e.g. malformed
                     // trailers after the head and body), surface a terminal rst_stream
                     // so it stops waiting on an end_of_message that will never come.
+                    // Set the flag only after the push succeeds, so an OOM here leaves
+                    // a retry able to surface it rather than resetting silently.
                     if (rs.state != .idle and !rs.rst_emitted) {
-                        rs.rst_emitted = true;
                         try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(code) } });
+                        rs.rst_emitted = true;
                     }
                     return self.rejectStream(id, code); // rs dangles after the drop inside
                 },
@@ -605,6 +607,7 @@ pub const Connection = struct {
             const name = self.gpa.dupe(u8, h.name) catch return error.OutOfMemory;
             errdefer self.gpa.free(name);
             const value = self.gpa.dupe(u8, h.value) catch return error.OutOfMemory;
+            errdefer self.gpa.free(value);
             trailers.append(self.gpa, .{ .name = name, .value = value }) catch return error.OutOfMemory;
         }
         return trailers.toOwnedSlice(self.gpa) catch return error.OutOfMemory;
@@ -615,9 +618,16 @@ pub const Connection = struct {
     /// routing, or control fields that only make sense in the header section.
     fn isValidTrailerField(h: Header) bool {
         if (!fields.isValidFieldName(h.name)) return false; // pseudo-headers ':' and uppercase fail here
-        if (fields.isConnectionSpecific(h.name)) return false;
-        // Framing/routing/control fields the trailer section must not carry.
-        const forbidden = [_][]const u8{ "content-length", "host", "te", "trailer", "content-type", "cache-control", "expect", "max-forwards", "authorization", "set-cookie" };
+        if (fields.isConnectionSpecific(h.name)) return false; // connection, transfer-encoding, upgrade, ...
+        // The fields RFC 9110 6.5.1 disallows in trailers: message framing, routing,
+        // request modifiers, authentication, response control, and the
+        // payload-processing fields a recipient needs before the body.
+        const forbidden = [_][]const u8{
+            "content-length", "host",             "te",            "trailer",
+            "content-type",   "content-encoding", "content-range", "cache-control",
+            "expect",         "max-forwards",     "authorization", "set-cookie",
+            "vary",           "expires",
+        };
         for (forbidden) |name| if (eql(h.name, name)) return false;
         return true;
     }
@@ -1728,6 +1738,7 @@ test "a server sends response trailers as a trailing HEADERS frame" {
     try h3.sendData(0, "hi");
     try testing.expectError(error.H3Error, h3.endMessage(0, &[_]Header{.{ .name = "content-length", .value = "2" }}));
     try testing.expectError(error.H3Error, h3.endMessage(0, &[_]Header{.{ .name = "te", .value = "trailers" }}));
+    try testing.expectError(error.H3Error, h3.endMessage(0, &[_]Header{.{ .name = "content-encoding", .value = "gzip" }}));
     const trailers = [_]Header{.{ .name = "x-checksum", .value = "ok" }};
     try h3.endMessage(0, &trailers);
     // A pseudo-header in trailers is rejected; the send half is already finished.
