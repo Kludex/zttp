@@ -24,6 +24,7 @@ const stream = @import("stream.zig");
 const crypto_stream = @import("crypto_stream.zig");
 const transport_params = @import("transport_params.zig");
 const ack_ranges = @import("ack_ranges.zig");
+const varint = @import("varint.zig");
 const tls = @import("tls/root.zig");
 
 const Space = constants.Space;
@@ -111,6 +112,82 @@ const CryptoSent = struct { offset: u64, len: u64 };
 /// currently in flight (so flushSend does not re-send while one is unacked).
 const StopSending = struct { code: u64, in_flight: bool = false };
 
+/// One peer stream's receive window plus its MAX_STREAM_DATA bookkeeping. `pending`
+/// (the application consumed enough to re-advertise) is a flag, not a map entry, so
+/// marking it is allocation-free; `sent_pn` is the packet number an emitted
+/// MAX_STREAM_DATA rides, so a lost one is re-sent rather than stalling the stream.
+const StreamRecvWindow = struct {
+    window: flow.Window,
+    pending: bool = false,
+    sent_pn: ?u64 = null,
+};
+
+/// The per-stream-type receive limits a server advertises (RFC 9000 18.2). A
+/// client's request streams are peer-initiated bidirectional, so their limit is
+/// initial_max_stream_data_bidi_remote (the data WE accept on a stream the PEER
+/// opened); its control/QPACK streams are unidirectional. 0 is a real limit.
+const StreamRecvLimits = struct {
+    bidi: u64,
+    uni: u64,
+};
+
+/// Tracks which receive streams have completed-and-dropped, so a late frame for one
+/// is ignored rather than resurrecting it - in memory bounded by the number of live
+/// gaps, not the total stream count. Streams of one type carry indices 0, 1, 2, ...
+/// (id = type + index*4). Retired indices are kept as a sorted list of merged
+/// half-open `[lo, hi)` ranges per type: in-order completion grows the first range,
+/// and out-of-order completions above a still-open stream form additional ranges that
+/// merge as the gaps fill. The number of ranges is at most one more than the number
+/// of currently-open streams of that type - which the stream cap bounds - so a peer
+/// that pins a low stream open cannot grow this without bound.
+const RetiredStreams = struct {
+    /// Per StreamType: the sorted, non-overlapping, non-adjacent retired-index ranges.
+    types: [4]std.ArrayListUnmanaged(Range) = .{ .empty, .empty, .empty, .empty },
+
+    const Range = struct { lo: u64, hi: u64 }; // retired indices [lo, hi)
+
+    fn deinit(self: *RetiredStreams, gpa: std.mem.Allocator) void {
+        for (&self.types) |*list| list.deinit(gpa);
+    }
+
+    fn contains(self: *const RetiredStreams, id: u64) bool {
+        const index = id / 4;
+        for (self.types[@intFromEnum(stream.StreamType.of(id))].items) |r| {
+            if (index < r.lo) return false; // ranges are sorted; nothing lower matches
+            if (index < r.hi) return true;
+        }
+        return false;
+    }
+
+    /// Record `id` as retired, merging it into the range list. Returns false only on
+    /// allocator failure (the caller then leaves the stream in place rather than
+    /// dropping it unrecorded).
+    fn put(self: *RetiredStreams, gpa: std.mem.Allocator, id: u64) bool {
+        const list = &self.types[@intFromEnum(stream.StreamType.of(id))];
+        const index = id / 4;
+        // Find the first range starting at or after `index`; `index` belongs just before it.
+        var i: usize = 0;
+        while (i < list.items.len and list.items[i].lo <= index) : (i += 1) {
+            if (index < list.items[i].hi) return true; // already retired
+        }
+        // i is the insertion point. Try to extend the previous range's hi, the next
+        // range's lo, or both (which merges them); otherwise insert a singleton.
+        const touch_prev = i > 0 and list.items[i - 1].hi == index;
+        const touch_next = i < list.items.len and list.items[i].lo == index + 1;
+        if (touch_prev and touch_next) {
+            list.items[i - 1].hi = list.items[i].hi; // bridge the two ranges
+            _ = list.orderedRemove(i);
+        } else if (touch_prev) {
+            list.items[i - 1].hi = index + 1;
+        } else if (touch_next) {
+            list.items[i].lo = index;
+        } else {
+            list.insert(gpa, i, .{ .lo = index, .hi = index + 1 }) catch return false;
+        }
+        return true;
+    }
+};
+
 /// A CONNECTION_CLOSE the peer sent (RFC 9000 19.19), retained so the integrator can
 /// surface why the connection ended. `app` distinguishes the application-error
 /// variant; `reason` is an owned, length-capped copy of the human-readable phrase.
@@ -142,7 +219,36 @@ pub const Connection = struct {
     conn_received_total: u64 = 0,
     conn_consumed_total: u64 = 0,
     streams: std.AutoHashMapUnmanaged(u64, *stream.RecvStream) = .empty,
+    /// Per-stream receive flow control (RFC 9000 19.10): one window per peer stream,
+    /// bounding how much data that single stream may pin independently of the
+    /// connection-wide MAX_DATA - so one stream cannot consume the whole connection
+    /// window. Created lazily alongside the recv stream; dropped with it. Present only
+    /// when `stream_recv_limits` enforces (the server path); the per-entry pending flag
+    /// and in-flight pn make MAX_STREAM_DATA advertisement allocation-free and
+    /// retransmittable.
+    stream_recv_windows: std.AutoHashMapUnmanaged(u64, StreamRecvWindow) = .empty,
+    /// The per-stream receive limits this server advertises and enforces (RFC 9000
+    /// 18.2), or null on the non-server path (no enforcement). A limit of 0 is a real
+    /// value - it forbids all data on that stream type - distinct from "no limit".
+    stream_recv_limits: ?StreamRecvLimits = null,
     send_streams: std.AutoHashMapUnmanaged(u64, *stream.SendStream) = .empty,
+    /// Per-stream SEND flow control (RFC 9000 19.10): how much we may send on each of
+    /// our send streams, bounded by the peer's advertised per-stream limit (raised by
+    /// an inbound MAX_STREAM_DATA), so a response cannot overrun one stream's grant and
+    /// be reset. Created lazily with the send stream from `stream_send_initial`.
+    stream_send_windows: std.AutoHashMapUnmanaged(u64, flow.SendWindow) = .empty,
+    /// The peer's initial per-stream send limits, by the stream we send on (RFC 9000
+    /// 18.2): for a bidi stream the PEER opened (our responses), bidi_local; for one WE
+    /// opened, bidi_remote; for our unidirectional control/QPACK streams, uni. Learned
+    /// at the ClientHello; until then 0. Selected by stream type/initiator on creation.
+    stream_send_initial_peer_bidi: u64 = 0, // bidi the peer opened: bidi_local
+    stream_send_initial_own_bidi: u64 = 0, // bidi we opened: bidi_remote
+    stream_send_initial_uni: u64 = 0,
+    /// A peer MAX_STREAM_DATA for a send stream we have not created yet (it granted
+    /// credit before we opened our half): held by stream id so the higher limit is
+    /// applied when the send window is created, not lost - which would otherwise stall
+    /// the response at the stale initial limit.
+    pending_send_max: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// STOP_SENDING frames owed to the peer (stream id -> {error code, in_flight}),
     /// queued by stopSending and drained by flushSend; an entry is removed once acked,
     /// and `in_flight` is cleared on loss so it is re-emitted.
@@ -208,12 +314,13 @@ pub const Connection = struct {
     /// did. Null until a close arrives. `reason` is an owned copy (the decoded slice
     /// points into the datagram), capped so a hostile reason cannot grow it.
     peer_close: ?PeerClose = null,
-    /// The receive-stream ids that completed and were dropped (see dropStream). A late
-    /// frame for one of these is ignored rather than resurrecting the stream. A set,
-    /// not a watermark: stream ids complete out of order, so a watermark would treat a
-    /// legitimate new lower id as retired. One u64 per retired stream is far smaller
-    /// than the RecvStream it replaces, so this still bounds the per-stream memory.
-    retired_recv: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// The receive streams that completed and were dropped (see dropStream): a late
+    /// frame for one is ignored rather than resurrecting it. A contiguous per-type
+    /// watermark covers the common in-order completions in O(1) memory; a small sparse
+    /// set holds only the out-of-order gaps and is drained as the watermark catches up,
+    /// so this stays bounded by the reorder window even when MAX_STREAMS replenishment
+    /// lets a connection serve unboundedly many streams.
+    retired_recv: RetiredStreams = .{},
     /// The cap on client-initiated bidirectional streams (RFC 9000 4.6): exactly the
     /// initial_max_streams_bidi we advertise, enforced on each newly opened request
     /// stream so a peer cannot exhaust memory by opening unboundedly many. The wire and
@@ -279,6 +386,13 @@ pub const Connection = struct {
         errdefer conn.deinit();
         conn.tls = tls.server.Server.init(tls_config);
         conn.bidi_limit = flow.StreamLimit.init(own.initial_max_streams_bidi);
+        // The per-stream recv limits we advertise (RFC 9000 18.2), enforced exactly: a
+        // client's request streams are peer-initiated bidi, so their limit is
+        // bidi_remote; its control/QPACK streams are uni.
+        conn.stream_recv_limits = .{
+            .bidi = own.initial_max_stream_data_bidi_remote,
+            .uni = own.initial_max_stream_data_uni,
+        };
         // Advertise the mandatory connection ids (RFC 9000 18.2): the client MUST see
         // its first Initial's destination id echoed as original_destination_connection_id
         // and our source id as initial_source_connection_id, or it fails the handshake
@@ -304,12 +418,15 @@ pub const Connection = struct {
             self.gpa.destroy(s.*);
         }
         self.streams.deinit(self.gpa);
+        self.stream_recv_windows.deinit(self.gpa);
         var sit = self.send_streams.valueIterator();
         while (sit.next()) |s| {
             s.*.deinit();
             self.gpa.destroy(s.*);
         }
         self.send_streams.deinit(self.gpa);
+        self.stream_send_windows.deinit(self.gpa);
+        self.pending_send_max.deinit(self.gpa);
         self.stop_sending.deinit(self.gpa);
         self.stop_sending_inflight.deinit(self.gpa);
         self.peer_stop_sending.deinit(self.gpa);
@@ -446,6 +563,20 @@ pub const Connection = struct {
             self.gpa.destroy(s);
             return error.OutOfMemory;
         };
+        // This send stream's flow-control window (RFC 9000 19.10), the peer's advertised
+        // per-stream limit selected by the stream we send on; an inbound MAX_STREAM_DATA
+        // raises it later.
+        const send_limit = self.peerSendInitial(id);
+        var win = flow.SendWindow.init(send_limit);
+        // A MAX_STREAM_DATA that arrived before this send half existed granted a higher
+        // limit; apply it now so the grant is not lost (a limit only grows).
+        if (self.pending_send_max.fetchRemove(id)) |e| win.onMaxData(e.value);
+        self.stream_send_windows.put(self.gpa, id, win) catch {
+            _ = self.send_streams.remove(id);
+            s.deinit();
+            self.gpa.destroy(s);
+            return error.OutOfMemory;
+        };
         // The peer already asked us to stop sending on this stream (STOP_SENDING
         // arrived before we created it): the stream is born reset, so any data the
         // caller writes is replaced by the RESET_STREAM.
@@ -517,6 +648,27 @@ pub const Connection = struct {
             self.max_data_pending = false;
         }
 
+        // Advertise each per-stream window that slid (RFC 9000 19.10), one
+        // MAX_STREAM_DATA per stream, so a long upload is not stalled at its limit. The
+        // value is granted here; the packet number is recorded so a lost frame is
+        // re-sent (the limit only grows, so a duplicate is harmless).
+        var sit = self.stream_recv_windows.iterator();
+        while (sit.next()) |entry| {
+            const sw = entry.value_ptr;
+            if (!sw.pending) continue;
+            // Build with the candidate limit but commit the window only after the send
+            // succeeds: an OOM must not raise the local limit past what was advertised.
+            const next = sw.window.nextLimit();
+            var sf: std.ArrayListUnmanaged(u8) = .empty;
+            defer sf.deinit(self.gpa);
+            frame.encodeMaxStreamData(&sf, self.gpa, entry.key_ptr.*, next) catch return error.OutOfMemory;
+            while (sf.items.len < 20) sf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+            const pn = try self.buildPacket(space, sf.items, true, now);
+            _ = sw.window.grant(); // commit the advertised limit now the frame is on the wire
+            sw.sent_pn = pn;
+            sw.pending = false;
+        }
+
         // Advertise a raised bidi-stream cap if one is pending, so a peer serving a long
         // run of requests is not stuck at the old MAX_STREAMS limit (RFC 9000 4.6). The
         // value was granted in dropStream; emit it and record the pn so a lost frame is
@@ -561,14 +713,15 @@ pub const Connection = struct {
                 var chunk = s.peek(packet_room) orelse break;
                 const is_new = chunk.offset >= s.sent;
                 if (is_new and chunk.data.len > 0) {
-                    // New bytes are bounded by BOTH the peer's flow-control grant
-                    // (MAX_DATA, RFC 9000 4.1) and the congestion window (RFC 9002 7):
-                    // a retransmit or a pure FIN below is exempt, since neither
-                    // presents fresh offsets. cwnd limits bytes in flight, so a packet
-                    // already counts its header+tag; gate the new stream bytes against
-                    // the smaller of the two remaining budgets.
-                    const credit = @min(self.conn_send_window.available(), self.cc.available());
-                    if (credit == 0) break; // out of window or out of cwnd: keep new bytes queued
+                    // New bytes are bounded by the peer's connection grant (MAX_DATA),
+                    // this stream's own grant (MAX_STREAM_DATA, RFC 9000 4.1 / 19.10),
+                    // and the congestion window (RFC 9002 7). A retransmit or a pure FIN
+                    // below is exempt, since neither presents fresh offsets. cwnd limits
+                    // bytes in flight; gate the new stream bytes against the smallest of
+                    // the remaining budgets.
+                    const stream_credit = if (self.stream_send_windows.getPtr(id)) |w| w.available() else std.math.maxInt(u64);
+                    const credit = @min(@min(self.conn_send_window.available(), stream_credit), self.cc.available());
+                    if (credit == 0) break; // out of a window or out of cwnd: keep new bytes queued
                     if (chunk.data.len > credit) chunk = s.peek(@intCast(credit)).?; // shrink to fit
                 }
                 if (chunk.data.len == 0 and !chunk.fin) break;
@@ -581,7 +734,10 @@ pub const Connection = struct {
                 st.stream_sent.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
                 const pn = try self.buildPacket(space, frames.items, true, now);
                 st.stream_sent.putAssumeCapacity(pn, .{ .id = id, .offset = chunk.offset, .len = chunk.data.len, .fin = chunk.fin });
-                if (is_new) self.conn_send_window.onSent(chunk.data.len); // monotonic: only new offsets
+                if (is_new) {
+                    self.conn_send_window.onSent(chunk.data.len); // monotonic: only new offsets
+                    if (self.stream_send_windows.getPtr(id)) |w| w.onSent(chunk.data.len);
+                }
                 s.commit(chunk.offset, chunk.data.len, chunk.fin);
             }
         }
@@ -627,6 +783,7 @@ pub const Connection = struct {
                     // does not linger (dropStream could not free it while in flight).
                     if (s.fullyAcked()) {
                         _ = self.send_streams.remove(e.value.id);
+                        _ = self.stream_send_windows.remove(e.value.id);
                         s.deinit();
                         self.gpa.destroy(s);
                     }
@@ -638,13 +795,20 @@ pub const Connection = struct {
                     s.onResetAck();
                     if (s.fullyAcked()) {
                         _ = self.send_streams.remove(e.value);
+                        _ = self.stream_send_windows.remove(e.value);
                         s.deinit();
                         self.gpa.destroy(s);
                     }
                 }
             }
-            if (self.stop_sending_inflight.fetchRemove(pn)) |e| _ = self.stop_sending.remove(e.value); // acked: done
-            if (self.max_streams_sent == pn) self.max_streams_sent = null; // the advertised cap is confirmed
+            // These frames ride only the Application space, so their connection-wide
+            // pn records must be matched only against Application pns - an Initial or
+            // Handshake pn N must not be mistaken for Application pn N.
+            if (space == .application) {
+                if (self.stop_sending_inflight.fetchRemove(pn)) |e| _ = self.stop_sending.remove(e.value); // acked: done
+                if (self.max_streams_sent == pn) self.max_streams_sent = null; // the advertised cap is confirmed
+                _ = self.onMaxStreamDataPn(pn, false); // a confirmed MAX_STREAM_DATA
+            }
         }
         // ACK progress resets the PTO backoff (in recovery), so release the fire-once
         // latch: a fresh PTO epoch may arm even if another packet sharing the fired
@@ -676,14 +840,19 @@ pub const Connection = struct {
             if (st.reset_sent.fetchRemove(pn)) |e| {
                 if (self.send_streams.get(e.value)) |s| s.onResetLost();
             }
-            // A lost STOP_SENDING: clear in_flight so the next flushSend re-emits it.
-            if (self.stop_sending_inflight.fetchRemove(pn)) |e| {
-                if (self.stop_sending.getPtr(e.value)) |ss| ss.in_flight = false;
-            }
-            // A lost MAX_STREAMS: re-arm so the next flushSend re-advertises the cap.
-            if (self.max_streams_sent == pn) {
-                self.max_streams_sent = null;
-                self.max_streams_pending = true;
+            // The connection-wide control frames below ride only the Application space,
+            // so a lost Initial/Handshake pn N must not re-arm an Application frame.
+            if (space == .application) {
+                // A lost STOP_SENDING: clear in_flight so the next flushSend re-emits it.
+                if (self.stop_sending_inflight.fetchRemove(pn)) |e| {
+                    if (self.stop_sending.getPtr(e.value)) |ss| ss.in_flight = false;
+                }
+                // A lost MAX_STREAMS: re-arm so the next flushSend re-advertises the cap.
+                if (self.max_streams_sent == pn) {
+                    self.max_streams_sent = null;
+                    self.max_streams_pending = true;
+                }
+                _ = self.onMaxStreamDataPn(pn, true); // a lost MAX_STREAM_DATA: re-advertise
             }
         }
         if (crypto_lost) try self.flushCrypto(space, now); // resend the lost handshake bytes now
@@ -776,22 +945,44 @@ pub const Connection = struct {
                 if (s.resetOwed()) return; // the next flushSend re-sends the reset
             }
         }
-        // ... or the STOP_SENDING the probed packet carried: clear in_flight to re-emit.
-        if (self.stop_sending_inflight.get(pn)) |id| {
-            if (self.stop_sending.getPtr(id)) |ss| {
-                ss.in_flight = false;
+        // The connection-wide control frames ride only the Application space, so an
+        // Initial/Handshake probe pn must not match one (its pn is in another space).
+        if (space == .application) {
+            // ... or the STOP_SENDING the probed packet carried: clear in_flight to re-emit.
+            if (self.stop_sending_inflight.get(pn)) |id| {
+                if (self.stop_sending.getPtr(id)) |ss| {
+                    ss.in_flight = false;
+                    return; // the next flushSend re-sends it
+                }
+            }
+            // ... or the MAX_STREAMS the probed packet carried: re-arm it to re-advertise.
+            if (self.max_streams_sent == pn) {
+                self.max_streams_sent = null;
+                self.max_streams_pending = true;
                 return; // the next flushSend re-sends it
             }
-        }
-        // ... or the MAX_STREAMS the probed packet carried: re-arm it to re-advertise.
-        if (self.max_streams_sent == pn) {
-            self.max_streams_sent = null;
-            self.max_streams_pending = true;
-            return; // the next flushSend re-sends it
+            // ... or a MAX_STREAM_DATA the probed packet carried: re-arm it.
+            if (self.onMaxStreamDataPn(pn, true)) return; // the next flushSend re-sends it
         }
         // No data to resend (the range was already acked, or a PING-only packet): a
         // PING is a valid probe that elicits an ACK and keeps the recovery loop alive.
         try self.sendPing(space, now);
+    }
+
+    /// Route an acked/lost packet number to the per-stream MAX_STREAM_DATA it carried,
+    /// if any: clear the in-flight pn on ack, or re-arm the advertisement on loss so
+    /// the next flushSend re-sends it (a lost grant would otherwise stall the stream).
+    /// Returns whether a stream owned this pn (so the PTO probe knows it re-sent).
+    fn onMaxStreamDataPn(self: *Connection, pn: u64, lost: bool) bool {
+        var it = self.stream_recv_windows.valueIterator();
+        while (it.next()) |sw| {
+            if (sw.sent_pn == pn) {
+                sw.sent_pn = null;
+                if (lost) sw.pending = true;
+                return true;
+            }
+        }
+        return false;
     }
 
     fn sendPing(self: *Connection, space: Space, now: u64) Error!void {
@@ -840,6 +1031,12 @@ pub const Connection = struct {
                     const carrier_scid = self.dispatch_initial_scid orelse return error.ProtocolViolation;
                     if (!std.mem.eql(u8, iscid.slice(), carrier_scid)) return error.ProtocolViolation;
                     self.conn_send_window.setInitial(self.peer_tp.initial_max_data);
+                    // Our responses ride bidi streams the client opens, bounded by its
+                    // bidi_local; a bidi stream we open is bounded by its bidi_remote;
+                    // our control/QPACK uni streams by its uni limit (RFC 9000 18.2).
+                    self.stream_send_initial_peer_bidi = self.peer_tp.initial_max_stream_data_bidi_local;
+                    self.stream_send_initial_own_bidi = self.peer_tp.initial_max_stream_data_bidi_remote;
+                    self.stream_send_initial_uni = self.peer_tp.initial_max_stream_data_uni;
 
                     var flight_buf: std.ArrayListUnmanaged(u8) = .empty;
                     defer flight_buf.deinit(self.gpa);
@@ -1098,7 +1295,7 @@ pub const Connection = struct {
                 try self.onStreamFrame(s.stream_id, s.offset, s.data, s.fin);
             },
             .max_data => |m| self.conn_send_window.onMaxData(m),
-            .max_stream_data => {}, // per-stream send windows arrive with the send path
+            .max_stream_data => |m| try self.onMaxStreamData(m.stream_id, m.max),
             .reset_stream => |r| try self.onReset(r.stream_id, r.error_code, r.final_size),
             .stop_sending => |s| try self.onStopSending(s.stream_id, s.error_code),
             .connection_close => |cc| {
@@ -1147,8 +1344,21 @@ pub const Connection = struct {
 
     fn onStreamFrame(self: *Connection, id: u64, offset: u64, data: []const u8, fin: bool) Error!void {
         if (self.isRetired(id)) return; // a late frame for a completed-and-dropped stream
+        // A client may only send on streams it initiated (RFC 9000 19.8); a STREAM
+        // frame on a server-initiated id - or on a send-only unidirectional stream we
+        // own - is a STREAM_STATE_ERROR. Reject before any per-stream state is created.
+        if (!self.peerMaySendOn(id)) return error.ProtocolViolation;
+        // A stream offset past the 62-bit maximum is a FRAME_ENCODING_ERROR (RFC 9000
+        // 4.5); reject it before the arithmetic below could wrap.
+        if (offset > varint.MAX or data.len > varint.MAX - offset) return error.ProtocolViolation;
         try self.noteClientStream(id);
         const s = try self.recvStream(id);
+        // Reject data past this stream's window BEFORE push buffers it (RFC 9000 4.1 /
+        // 19.10), so a single huge over-limit STREAM frame cannot make us allocate it.
+        // The check is on this frame's end offset, not just the high-water mark.
+        if (self.stream_recv_windows.getPtr(id)) |sw| {
+            sw.window.onReceived(offset + data.len) catch return error.FlowControlError;
+        }
         const delta = s.push(offset, data, fin) catch |e| switch (e) {
             error.FinalSizeError => return error.FinalSizeError,
             error.OutOfMemory => return error.OutOfMemory,
@@ -1161,9 +1371,23 @@ pub const Connection = struct {
 
     fn onReset(self: *Connection, id: u64, error_code: u64, final_size: u64) Error!void {
         if (self.isRetired(id)) return; // a reset for an already-completed-and-dropped stream
+        // RESET_STREAM is only valid on a stream the peer initiated (RFC 9000 19.4).
+        if (!self.peerMaySendOn(id)) return error.ProtocolViolation;
         try self.noteClientStream(id);
         const s = try self.recvStream(id);
-        s.onReset(error_code, final_size) catch return error.FinalSizeError;
+        // A RESET_STREAM's final size counts as data received up to that offset (RFC
+        // 9000 4.5): it consumes flow-control credit, so it must stay within both this
+        // stream's window and the connection window, exactly like STREAM data - else a
+        // peer could declare an over-limit final size and bypass the per-stream bound.
+        if (self.stream_recv_windows.getPtr(id)) |sw| {
+            sw.window.onReceived(final_size) catch return error.FlowControlError;
+        }
+        const conn_delta = if (final_size > s.highest_received) final_size - s.highest_received else 0;
+        s.onReset(error_code, final_size) catch return error.FinalSizeError; // validate before charging
+        if (conn_delta > 0) {
+            self.conn_received_total += conn_delta;
+            self.conn_recv_window.onReceived(self.conn_received_total) catch return error.FlowControlError;
+        }
     }
 
     /// Charge a peer-initiated bidirectional stream against the advertised cap (RFC
@@ -1177,12 +1401,60 @@ pub const Connection = struct {
         limit.onOpened(id / 4) catch return error.StreamLimitError;
     }
 
+    /// Whether the peer is permitted to send STREAM/RESET on `id` (RFC 9000 3.2,
+    /// 19.8). A bidirectional stream carries data both ways, so either endpoint may
+    /// send on it; a unidirectional stream is send-only for its initiator, so the
+    /// peer may send on it only if the peer initiated it. Sending on OUR own
+    /// unidirectional stream is a STREAM_STATE_ERROR.
+    fn peerMaySendOn(self: *const Connection, id: u64) bool {
+        const t = stream.StreamType.of(id);
+        if (!t.isUni()) return true; // bidirectional: both endpoints send
+        const peer_is_client = self.role == .server;
+        return t.isClientInitiated() == peer_is_client; // a uni stream: only its initiator sends
+    }
+
+    /// The peer's advertised per-stream send limit for a stream WE send on `id`
+    /// (RFC 9000 18.2): uni for our unidirectional streams, bidi_local when the bidi
+    /// stream was opened by the peer (our responses), bidi_remote when we opened it.
+    fn peerSendInitial(self: *const Connection, id: u64) u64 {
+        const t = stream.StreamType.of(id);
+        if (t.isUni()) return self.stream_send_initial_uni;
+        const we_opened = t.isClientInitiated() != (self.role == .server);
+        return if (we_opened) self.stream_send_initial_own_bidi else self.stream_send_initial_peer_bidi;
+    }
+
+    /// The peer raised our send limit on `id` (RFC 9000 19.10). A MAX_STREAM_DATA may
+    /// only target a stream we send on - a bidirectional stream, or one we initiated;
+    /// for the server that is a bidi or a server-uni id. One for a receive-only stream
+    /// is a STREAM_STATE_ERROR. The grant is applied to the window, or held for a send
+    /// stream not opened yet so a pre-emptive grant is not lost (a limit only grows).
+    fn onMaxStreamData(self: *Connection, id: u64, max: u64) Error!void {
+        const t = stream.StreamType.of(id);
+        const we_send_on = !t.isUni() or (t.isClientInitiated() != (self.role == .server));
+        if (!we_send_on) return error.ProtocolViolation;
+        if (self.stream_send_windows.getPtr(id)) |w| {
+            w.onMaxData(max);
+            return;
+        }
+        // The send window does not exist yet. We open our own streams before sending on
+        // them, so a pre-emptive grant is only meaningful for a PEER-initiated bidi
+        // stream we have not responded on yet. A grant for a stream that already
+        // completed (its window was reclaimed) must NOT be held: the id is never
+        // reused, so the entry would never be consumed and a peer could grow the map
+        // for every retired stream. A grant for any other not-yet-open stream is
+        // dropped (it re-grants from the initial when we open it).
+        if (t == .client_bidi and self.role == .server and !self.isRetired(id)) {
+            try self.noteClientStream(id); // STREAM_LIMIT_ERROR if past the cap; bounds the map
+            const gop = self.pending_send_max.getOrPut(self.gpa, id) catch return error.OutOfMemory;
+            gop.value_ptr.* = if (gop.found_existing) @max(gop.value_ptr.*, max) else max;
+        }
+    }
+
     /// A peer STOP_SENDING (RFC 9000 19.5) asks us to stop sending on `id`. Reset that
-    /// send stream so we stop producing; if the stream does not exist yet (the peer
-    /// cancelled before we started the response), remember the request so the stream
-    /// is born already reset rather than sending data the peer rejected. Only the
-    /// bidirectional request/response streams are auto-reset - a STOP_SENDING aimed at
-    /// the server's own unidirectional infrastructure (control/QPACK) is left to the
+    /// send stream so we stop producing; if it does not exist yet (the peer cancelled
+    /// before we started the response), remember the request so the stream is born
+    /// already reset. Only the bidirectional request/response streams are auto-reset -
+    /// a STOP_SENDING aimed at the server's own control/QPACK streams is left to the
     /// layer above, so it never resets the critical control stream.
     fn onStopSending(self: *Connection, id: u64, error_code: u64) Error!void {
         if (stream.StreamType.of(id) != .client_bidi) return;
@@ -1230,6 +1502,19 @@ pub const Connection = struct {
             self.gpa.destroy(s);
             return error.OutOfMemory;
         };
+        // Give the new stream its own receive window (RFC 9000 19.10) so it cannot pin
+        // more than the advertised per-stream limit. The uni limit applies to a
+        // unidirectional peer stream, the bidi limit to a request stream; a 0 limit is
+        // real (it forbids data). Only the non-server path (null) skips enforcement.
+        if (self.stream_recv_limits) |limits| {
+            const limit = if (stream.StreamType.of(id).isUni()) limits.uni else limits.bidi;
+            self.stream_recv_windows.put(self.gpa, id, .{ .window = flow.Window.init(limit) }) catch {
+                _ = self.streams.remove(id);
+                s.deinit();
+                self.gpa.destroy(s);
+                return error.OutOfMemory;
+            };
+        }
         return s;
     }
 
@@ -1242,6 +1527,7 @@ pub const Connection = struct {
         if (self.send_streams.get(id)) |ss| {
             if (ss.fullyAcked()) {
                 _ = self.send_streams.remove(id);
+                _ = self.stream_send_windows.remove(id);
                 ss.deinit();
                 self.gpa.destroy(ss);
             }
@@ -1250,8 +1536,9 @@ pub const Connection = struct {
         if (!s.isTerminal()) return false;
         // Remember the id as retired BEFORE freeing, so a failure to record it leaves
         // the stream in place rather than dropped-but-resurrectable.
-        self.retired_recv.put(self.gpa, id, {}) catch return false;
+        if (!self.retired_recv.put(self.gpa, id)) return false;
         _ = self.streams.remove(id);
+        _ = self.stream_recv_windows.remove(id);
         s.deinit();
         self.gpa.destroy(s);
         // A finished request frees a bidi slot: re-advertise a higher cap once the
@@ -1285,6 +1572,13 @@ pub const Connection = struct {
             self.conn_recv_window.onConsumed(self.conn_consumed_total);
             // Enough has been consumed to advertise a higher limit; flushSend emits it.
             if (self.conn_recv_window.shouldUpdate()) self.max_data_pending = true;
+            // Slide this stream's own window too (RFC 9000 19.10), so a long upload on
+            // one stream is not throttled by its per-stream limit. The pending flag
+            // lives on the entry, so marking it never allocates and cannot be lost.
+            if (self.stream_recv_windows.getPtr(id)) |sw| {
+                sw.window.onConsumed(s.read_offset);
+                if (sw.window.shouldUpdate()) sw.pending = true;
+            }
         }
     }
 
@@ -1382,7 +1676,6 @@ pub fn testBuildInitialScid(gpa: std.mem.Allocator, dcid: []const u8, scid: []co
     // length = pn(1) + ciphertext(frames + tag)
     const length = 1 + frames.len + crypto.TAG_LEN;
     var lbuf: [8]u8 = undefined;
-    const varint = @import("varint.zig");
     try hdr_buf.appendSlice(gpa, try varint.encode(&lbuf, @intCast(length)));
     const pn_offset = hdr_buf.items.len;
     try hdr_buf.append(gpa, @intCast(pn & 0xff)); // 1-byte pn
@@ -1409,7 +1702,6 @@ fn testBuildHandshake(gpa: std.mem.Allocator, dcid: []const u8, keys: crypto.Key
     try hdr_buf.append(gpa, 0); // scid len 0 (no token field on a Handshake header)
     const length = 1 + frames.len + crypto.TAG_LEN;
     var lbuf: [8]u8 = undefined;
-    const varint = @import("varint.zig");
     try hdr_buf.appendSlice(gpa, try varint.encode(&lbuf, @intCast(length)));
     const pn_offset = hdr_buf.items.len;
     try hdr_buf.append(gpa, @intCast(pn & 0xff));
@@ -1438,9 +1730,18 @@ fn testAppKeys() crypto.Keys {
 pub fn testInstallAppKeys(conn: *Connection) void {
     conn.installKeys(.application, testAppKeys(), testAppKeys());
     // The no-handshake test path skips parsing a client's transport parameters, which
-    // would grant unidirectional-stream credit; stand in for a normal H3 client so the
-    // H3 layer can open its mandatory control + QPACK streams.
+    // would grant stream credit; stand in for a normal H3 client so the H3 layer can
+    // open its mandatory control + QPACK streams and send a response of real size.
     conn.peer_tp.initial_max_streams_uni = 16;
+    conn.peer_tp.initial_max_stream_data_bidi_local = 1 << 16;
+    conn.peer_tp.initial_max_stream_data_uni = 1 << 16;
+    conn.stream_send_initial_peer_bidi = 1 << 16;
+    conn.stream_send_initial_own_bidi = 1 << 16;
+    conn.stream_send_initial_uni = 1 << 16;
+    // A real connection learns the per-stream send grant at the ClientHello, before any
+    // send stream exists; a test may queue data first, so raise any existing windows.
+    var it = conn.stream_send_windows.valueIterator();
+    while (it.next()) |w| w.onMaxData(1 << 16);
 }
 
 // Build a 1-RTT (short-header) Application packet carrying `frames`, sealed with
@@ -1557,6 +1858,18 @@ test "initServer enforces exactly the bidi cap it advertises" {
     try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, badCfg));
 }
 
+test "initServer takes the per-stream recv limit from its transport parameters" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x64, 0x65, 0x66, 0x67 };
+    var cfg = testServerConfig();
+    // initial_max_stream_data_bidi_remote (id 0x06) = 0x4000 (varint 0x80,0x00,0x40,0x00):
+    // the limit a client request stream (peer-initiated bidi) gets.
+    cfg.transport_params = &[_]u8{ 0x06, 0x04, 0x80, 0x00, 0x40, 0x00 };
+    var conn = try Connection.initServer(gpa, &dcid, cfg);
+    defer conn.deinit();
+    try testing.expectEqual(@as(u64, 0x4000), conn.stream_recv_limits.?.bidi);
+}
+
 test "initServer advertises the mandatory connection ids" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x70, 0x71, 0x72, 0x73 };
@@ -1609,6 +1922,124 @@ test "connection flow control sums across streams" {
     const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
     defer gpa.free(dgram);
     try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
+}
+
+test "retired streams merge into ranges bounded by live gaps" {
+    const gpa = testing.allocator;
+    var r = RetiredStreams{};
+    defer r.deinit(gpa);
+
+    // In-order client-bidi retirements (0, 4, 8) merge into ONE range [0,3): memory
+    // stays O(1) however many complete in order.
+    try testing.expect(r.put(gpa, 0));
+    try testing.expect(r.put(gpa, 4));
+    try testing.expect(r.put(gpa, 8));
+    try testing.expectEqual(@as(usize, 1), r.types[0].items.len);
+    try testing.expectEqual(RetiredStreams.Range{ .lo = 0, .hi = 3 }, r.types[0].items[0]);
+    try testing.expect(r.contains(0) and r.contains(8) and !r.contains(12));
+
+    // Stream 12 (index 3) stays OPEN; completions above it (16, 20) form a SECOND
+    // range that grows but does not multiply - two ranges, not one-per-stream.
+    try testing.expect(r.put(gpa, 16));
+    try testing.expect(r.put(gpa, 20));
+    try testing.expectEqual(@as(usize, 2), r.types[0].items.len);
+    try testing.expectEqual(RetiredStreams.Range{ .lo = 4, .hi = 6 }, r.types[0].items[1]);
+
+    // When 12 finally completes, the gap fills and the two ranges bridge into one.
+    try testing.expect(r.put(gpa, 12));
+    try testing.expectEqual(@as(usize, 1), r.types[0].items.len);
+    try testing.expectEqual(RetiredStreams.Range{ .lo = 0, .hi = 6 }, r.types[0].items[0]);
+    try testing.expect(r.contains(20));
+
+    // A re-put is a no-op, and stream types are independent (server-uni id 3).
+    try testing.expect(r.put(gpa, 4)); // already retired
+    try testing.expectEqual(@as(usize, 1), r.types[0].items.len);
+    try testing.expect(r.put(gpa, 3));
+    try testing.expect(r.contains(3) and !r.contains(7));
+}
+
+test "a single stream over its per-stream window is a flow-control error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x1a, 0x1b, 0x1c, 0x1d };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.stream_recv_limits = .{ .bidi = 4, .uni = 0 }; // each bidi stream may send at most 4 bytes, even though
+    conn.conn_recv_window.limit = 1000; // the connection has ample room
+
+    // 5 bytes on a single stream exceeds its 4-byte per-stream window (RFC 9000 19.10),
+    // the evasion the connection-wide check alone would miss.
+    const frames = [_]u8{ 0x0a, 0x00, 0x05, 'a', 'a', 'a', 'a', 'a' };
+    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(dgram);
+    try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
+}
+
+test "a client sending on a server-initiated uni stream is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x4a, 0x4b, 0x4c, 0x4d };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    // Stream 3 is server-initiated unidirectional (our control stream); a client must
+    // not send STREAM data on it (RFC 9000 19.8: STREAM_STATE_ERROR). A client-bidi
+    // (stream 0) or a server-bidi (stream 1, both-ways) would be accepted.
+    const frames = [_]u8{ 0x0a, 0x03, 0x01, 'x' }; // STREAM on stream 3
+    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(dgram);
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+}
+
+test "a unidirectional peer stream uses the uni per-stream limit" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x3a, 0x3b, 0x3c, 0x3d };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.stream_recv_limits = .{ .bidi = 4, .uni = 100 }; // uni streams get their own, larger limit
+    conn.conn_recv_window.limit = 1000;
+
+    // 10 bytes on client-uni stream 2: within the uni limit (100), though over the
+    // bidi limit (4) - so the right parameter must be selected by stream type.
+    const frames = [_]u8{ 0x0a, 0x02, 0x0a } ++ [_]u8{0x7a} ** 10;
+    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(dgram);
+    try conn.receiveDatagram(dgram, 1000); // no FlowControlError
+    try testing.expectEqualStrings(&[_]u8{0x7a} ** 10, conn.streamData(2));
+}
+
+test "consuming a stream advertises a raised MAX_STREAM_DATA" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x2a, 0x2b, 0x2c, 0x2d };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.stream_recv_limits = .{ .bidi = 100, .uni = 100 };
+
+    // Receive 60 bytes on stream 0, then consume them: that crosses the per-stream
+    // auto-tune threshold and queues a MAX_STREAM_DATA, which flushSend emits.
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try frame.encodeStream(&sframe, gpa, 0, 0, &[_]u8{0x7a} ** 60, false);
+    const dgram = try testBuildApp(gpa, &dcid, 0, sframe.items);
+    defer gpa.free(dgram);
+    try conn.receiveDatagram(dgram, 1000);
+    conn.clearSend();
+
+    conn.consumeStream(0, 60);
+    try testing.expect(conn.stream_recv_windows.getPtr(0).?.pending);
+    try conn.flushSend(2000);
+    try testing.expect(!conn.stream_recv_windows.getPtr(0).?.pending); // emitted
+    try testing.expect(conn.stream_recv_windows.getPtr(0).?.sent_pn != null); // recorded for loss recovery
+    try testing.expect(conn.datagramLengths().len >= 1);
+    conn.clearSend();
+
+    // A lost MAX_STREAM_DATA is re-sent (RFC 9000 13.3): otherwise the peer, blocked at
+    // the old limit, never sends more, so no consume re-triggers the advertisement.
+    const d = conn.nextTimeout().?;
+    try conn.onTimeout(d + 1);
+    try conn.flushSend(d + 2);
+    try testing.expect(conn.datagramsToSend().len > 0); // the raised limit rode again
 }
 
 test "an ACK carries every received range, not just the largest" {
@@ -1861,7 +2292,16 @@ fn testServerConfig() tls.flight.Config {
         .ephemeral_seed = [_]u8{0x33} ** 32,
         .signer = tls.sign.Signer.fromSeed([_]u8{0x42} ** 32) catch unreachable,
         .cert_chain = &[_]u8{0xCC} ** 48,
-        .transport_params = &[_]u8{ 0x08, 0x01, 0x08 }, // initial_max_streams_bidi = 8
+        // initial_max_streams_bidi = 8; per-stream recv limits bidi_remote (0x06) and
+        // uni (0x07) = 262144 (varint 0x80,0x04,0x00,0x00), so a request and the
+        // client's control/QPACK streams have room.
+        .transport_params = &[_]u8{
+            0x08, 0x01, 0x08,
+            0x06, 0x04, 0x80,
+            0x04, 0x00, 0x00,
+            0x07, 0x04, 0x80,
+            0x04, 0x00, 0x00,
+        },
     };
 }
 
@@ -2265,7 +2705,6 @@ test "a STOP_SENDING before the send stream exists still resets it" {
 
     // The peer cancels the response (STOP_SENDING on client-bidi stream 0) BEFORE the
     // server has created any send stream for it.
-    const varint = @import("varint.zig");
     var sframe: std.ArrayListUnmanaged(u8) = .empty;
     defer sframe.deinit(gpa);
     try sframe.append(gpa, 0x05);
@@ -2347,6 +2786,134 @@ test "flushSend never sends past the connection send window, and resumes on MAX_
     try conn.flushSend(1000);
     try testing.expectEqual(@as(u64, 10), conn.conn_send_window.sent);
     try testing.expect(!conn.hasPendingSend());
+}
+
+test "flushSend never sends past a stream's send window, and resumes on MAX_STREAM_DATA" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x9a, 0x9b, 0x9c, 0x9d };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    try conn.sendStreamData(1, "abcdefghij", false); // 10 bytes queued (creates the send stream)
+    // Ample connection window, but this stream is granted only 4 bytes (RFC 9000 19.10),
+    // so the per-stream limit - not the connection one - bounds the response.
+    conn.stream_send_windows.getPtr(1).?.* = flow.SendWindow.init(4);
+
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(u64, 4), conn.stream_send_windows.getPtr(1).?.sent);
+    try testing.expect(conn.hasPendingSend());
+
+    // A peer MAX_STREAM_DATA for stream 1 raises the limit; the rest can flow.
+    conn.stream_send_windows.getPtr(1).?.onMaxData(10);
+    conn.clearSend();
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(u64, 10), conn.stream_send_windows.getPtr(1).?.sent);
+    try testing.expect(!conn.hasPendingSend());
+}
+
+test "a MAX_STREAM_DATA before the send stream exists is applied when it opens" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xb1, 0xb2, 0xb3, 0xb4 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.stream_send_initial_peer_bidi = 4; // a small initial bidi send limit
+
+    // The peer grants a higher limit on stream 0 BEFORE we open our send half.
+    const mf = [_]u8{ 0x11, 0x00, 0x40, 0x64 }; // MAX_STREAM_DATA stream 0, max 100
+    const dgram = try testBuildApp(gpa, &dcid, 0, (mf ++ [_]u8{0} ** 16)[0..]);
+    defer gpa.free(dgram);
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expect(conn.pending_send_max.contains(0)); // held until the stream opens
+
+    // Opening the send stream applies the held grant, not the stale initial 4.
+    try conn.sendStreamData(0, "x", false);
+    try testing.expectEqual(@as(u64, 100), conn.stream_send_windows.getPtr(0).?.limit);
+    try testing.expect(!conn.pending_send_max.contains(0)); // consumed
+}
+
+test "a RESET_STREAM final size past the per-stream window is a flow-control error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.stream_recv_limits = .{ .bidi = 4, .uni = 0 }; // a 4-byte per-stream recv window
+    conn.conn_recv_window.limit = 1000;
+
+    // RESET_STREAM (0x04) on stream 0, error 0, final_size 5 - past the 4-byte grant.
+    // The final size counts as received data (RFC 9000 4.5), so it must be rejected.
+    var rf: std.ArrayListUnmanaged(u8) = .empty;
+    defer rf.deinit(gpa);
+    try rf.append(gpa, 0x04);
+    try varint.append(&rf, gpa, 0); // stream id 0
+    try varint.append(&rf, gpa, 0); // error code
+    try varint.append(&rf, gpa, 5); // final size 5
+    const dgram = try testBuildApp(gpa, &dcid, 0, rf.items);
+    defer gpa.free(dgram);
+    try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
+}
+
+test "a MAX_STREAM_DATA for a retired stream is not stashed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xc5, 0xc6, 0xc7, 0xc8 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    // Open, complete and drop a request stream (id 0): a 1-byte body with FIN, consumed.
+    var sf: std.ArrayListUnmanaged(u8) = .empty;
+    defer sf.deinit(gpa);
+    try frame.encodeStream(&sf, gpa, 0, 0, &[_]u8{0x7a}, true);
+    const d0 = try testBuildApp(gpa, &dcid, 0, sf.items);
+    defer gpa.free(d0);
+    try conn.receiveDatagram(d0, 1000);
+    conn.consumeStream(0, 1);
+    try testing.expect(conn.dropStream(0));
+    try testing.expect(conn.isRetired(0));
+
+    // A MAX_STREAM_DATA for the now-retired stream must NOT be held: the id is never
+    // reused, so the entry would never be consumed and a peer could grow the map.
+    const mf = [_]u8{ 0x11, 0x00, 0x40, 0x64 }; // MAX_STREAM_DATA stream 0, max 100
+    const d1 = try testBuildApp(gpa, &dcid, 1, (mf ++ [_]u8{0} ** 16)[0..]);
+    defer gpa.free(d1);
+    try conn.receiveDatagram(d1, 1100);
+    try testing.expect(!conn.pending_send_max.contains(0)); // dropped, not stashed
+}
+
+test "a MAX_STREAM_DATA for a receive-only stream is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xb5, 0xb6, 0xb7, 0xb8 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    // Stream 2 is client-initiated unidirectional - the server only receives on it, so
+    // a MAX_STREAM_DATA flow-controlling our (non-existent) send half is invalid.
+    const mf = [_]u8{ 0x11, 0x02, 0x40, 0x64 }; // MAX_STREAM_DATA stream 2, max 100
+    const dgram = try testBuildApp(gpa, &dcid, 0, (mf ++ [_]u8{0} ** 16)[0..]);
+    defer gpa.free(dgram);
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+}
+
+test "resetting a flow-blocked stream declares only the bytes actually sent" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x9e, 0x9f, 0xa0, 0xa1 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    // Write 10 bytes but the stream is granted only 4: 4 ride a frame, 6 stay queued.
+    try conn.sendStreamData(1, "abcdefghij", false);
+    conn.stream_send_windows.getPtr(1).?.* = flow.SendWindow.init(4);
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(u64, 4), conn.stream_send_windows.getPtr(1).?.sent);
+    conn.clearSend();
+
+    // Reset abandons the unsent 6 bytes; the RESET_STREAM's final size is 4 (the bytes
+    // that actually consumed credit), not 10 - which would exceed the peer's grant and
+    // draw a FLOW_CONTROL_ERROR (RFC 9000 19.4).
+    try conn.resetStream(1, 0x010c);
+    try conn.flushSend(2000);
+    try testing.expectEqual(@as(u64, 4), conn.send_streams.get(1).?.reset_final_size);
 }
 
 test "flushSend never sends past the congestion window, and resumes as it opens" {

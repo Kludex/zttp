@@ -49,6 +49,12 @@ pub const Window = struct {
         return self.limit - self.consumed < self.initial / 2;
     }
 
+    /// The limit a grant would advertise, without recording it - so the caller can
+    /// build the frame first and only commit (grant) once the send cannot fail.
+    pub fn nextLimit(self: *const Window) u64 {
+        return self.consumed + self.initial;
+    }
+
     /// The new limit to advertise, and the side effect of recording it.
     pub fn grant(self: *Window) u64 {
         self.limit = self.consumed + self.initial;
@@ -149,6 +155,10 @@ test "recv window auto-tunes after half consumed" {
     try std.testing.expect(!w.shouldUpdate());
     w.onConsumed(60);
     try std.testing.expect(w.shouldUpdate());
+    // nextLimit previews the grant without committing it, so the caller can build the
+    // frame first and only commit once the send cannot fail.
+    try std.testing.expectEqual(@as(u64, 160), w.nextLimit());
+    try std.testing.expectEqual(@as(u64, 100), w.limit); // unchanged by the preview
     try std.testing.expectEqual(@as(u64, 160), w.grant());
     try std.testing.expect(!w.shouldUpdate());
 }
