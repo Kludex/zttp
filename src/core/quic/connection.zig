@@ -1313,6 +1313,16 @@ pub const Connection = struct {
         return self.streams.contains(id);
     }
 
+    /// How many unidirectional streams the peer's transport parameters let us open
+    /// (RFC 9000 4.6, initial_max_streams_uni). The HTTP/3 layer checks this before
+    /// opening its mandatory control + QPACK streams. Zero until a ClientHello is
+    /// parsed (the RFC default), so the no-handshake test path reports zero - those
+    /// tests set it directly. (A peer MAX_STREAMS would raise it; the send side does
+    /// not yet track that - see the outbound uni-limit follow-up.)
+    pub fn peerMaxStreamsUni(self: *const Connection) u64 {
+        return self.peer_tp.initial_max_streams_uni;
+    }
+
     /// Snapshot the ids of every stream the transport currently knows about, into
     /// `out`, returning how many were written (capped at `out.len`). The HTTP/3
     /// layer iterates these to advance each request stream's parse.
@@ -1427,6 +1437,10 @@ fn testAppKeys() crypto.Keys {
 // which is all the recv path needs) so it can decrypt a testBuildApp datagram.
 pub fn testInstallAppKeys(conn: *Connection) void {
     conn.installKeys(.application, testAppKeys(), testAppKeys());
+    // The no-handshake test path skips parsing a client's transport parameters, which
+    // would grant unidirectional-stream credit; stand in for a normal H3 client so the
+    // H3 layer can open its mandatory control + QPACK streams.
+    conn.peer_tp.initial_max_streams_uni = 16;
 }
 
 // Build a 1-RTT (short-header) Application packet carrying `frames`, sealed with

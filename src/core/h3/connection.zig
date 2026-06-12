@@ -72,6 +72,9 @@ const MAX_FIELD_SECTION_SIZE: u64 = 1 << 16;
 const CONTROL_STREAM_ID: u64 = 3;
 const QPACK_ENCODER_STREAM_ID: u64 = 7;
 const QPACK_DECODER_STREAM_ID: u64 = 11;
+/// The count of server-initiated uni streams HTTP/3 always opens (the three above);
+/// a peer must grant at least this many in initial_max_streams_uni.
+const SERVER_UNI_STREAMS: u64 = 3;
 
 pub const Connection = struct {
     gpa: std.mem.Allocator,
@@ -171,6 +174,13 @@ pub const Connection = struct {
     /// content; the QPACK streams carry no instructions (table capacity 0).
     pub fn initiateControl(self: *Connection) Error!void {
         if (self.control_sent) return;
+        // HTTP/3 needs three server-initiated uni streams (control + the two QPACK
+        // streams). A peer that grants fewer cannot run HTTP/3, so rather than open
+        // streams past its initial_max_streams_uni - which it would answer with a
+        // STREAM_LIMIT_ERROR - close cleanly up front (RFC 9000 4.6 / RFC 9114 6.2).
+        if (self.qc.peerMaxStreamsUni() < SERVER_UNI_STREAMS) {
+            return self.fail(.general_protocol_error, "peer granted too few unidirectional streams for HTTP/3");
+        }
         var settings: std.ArrayListUnmanaged(u8) = .empty;
         defer settings.deinit(self.gpa);
         // SETTINGS_MAX_FIELD_SECTION_SIZE = our decode cap. QPACK capacity and
@@ -191,12 +201,9 @@ pub const Connection = struct {
         try self.streamSend(CONTROL_STREAM_ID, out.items, false);
         // The QPACK encoder/decoder streams: just the type byte each. At table
         // capacity 0 no encoder/decoder instructions are ever sent, but the streams
-        // must exist for the peer's QPACK to consider the connection well-formed.
-        // These three are the only server-initiated uni streams; HTTP/3 cannot run
-        // without them, so a conformant client grants initial_max_streams_uni >= 3.
-        // The send side does not yet track the peer's uni-stream limit (a follow-up,
-        // mirroring the inbound bidi StreamLimit) - moot until server push or a
-        // non-zero QPACK table would open more.
+        // must exist for the peer's QPACK to consider the connection well-formed. The
+        // grant was checked above; full credit accounting (a peer MAX_STREAMS raising
+        // the limit, blocking past it) is a follow-up, mooted here by the fixed count.
         try self.streamSend(QPACK_ENCODER_STREAM_ID, &.{@intFromEnum(h3_stream.UniStreamType.qpack_encoder)}, false);
         try self.streamSend(QPACK_DECODER_STREAM_ID, &.{@intFromEnum(h3_stream.UniStreamType.qpack_decoder)}, false);
     }
@@ -1476,6 +1483,22 @@ test "a reset after the response finished is a no-op" {
     try h3.resetStream(0, 0x010c);
     try qc.flushSend(1000);
     try testing.expectEqual(@as(usize, 0), qc.datagramsToSend().len); // nothing sent
+}
+
+test "a peer granting too few uni streams cannot run HTTP/3" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x3a, 0x3b, 0x3c, 0x3d };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    qc.peer_tp.initial_max_streams_uni = 2; // below the 3 HTTP/3 requires
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // Opening the mandatory streams would exceed the peer's limit, so the connection
+    // is closed cleanly up front rather than provoking a STREAM_LIMIT_ERROR.
+    try testing.expectError(error.H3Error, h3.initiateControl());
+    try testing.expect(qc.closed);
 }
 
 test "the server opens its control stream with a SETTINGS frame" {
