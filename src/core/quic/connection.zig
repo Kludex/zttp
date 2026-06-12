@@ -913,10 +913,13 @@ pub const Connection = struct {
         return self.last_activity + period;
     }
 
-    /// One PTO interval (RFC 9002 6.2.1) for the idle-timeout floor: the RTT-based PTO
-    /// plus the peer's max ack delay (the Application-space term).
+    /// One PTO interval (RFC 9002 6.2.1) for the idle-timeout floor, WITHOUT the
+    /// per-space ack-delay term: that term is the peer's advertised max_ack_delay, and
+    /// folding it into a 3x floor would let a peer inflate the effective idle timeout.
+    /// The floor only guards against closing during loss recovery, so the bare PTO is
+    /// the right conservative basis.
     fn ptoPeriod(self: *const Connection) u64 {
-        return self.rtt.pto() + self.ackDelayFor(.application);
+        return self.rtt.pto();
     }
 
     /// Drive the loss-recovery timers at time `now`. First handle any space whose
@@ -935,6 +938,7 @@ pub const Connection = struct {
             if (now >= deadline) {
                 self.closed = true;
                 self.idle_timed_out = true;
+                self.clearSend(); // 10.1 discards the state: do not emit stale queued packets
                 return;
             }
         }
@@ -2997,14 +3001,18 @@ test "the idle timeout silently closes an inactive connection" {
     try testing.expectEqual(@as(u64, 1_000_000 + 10_000_000), conn.idleDeadline().?);
     try testing.expect(conn.nextTimeout().? <= conn.idleDeadline().?); // the idle bound is included
 
-    // A timeout just before the deadline does not idle-close; at the deadline it does,
-    // with no CONNECTION_CLOSE queued (RFC 9000 10.1: silently discarded).
+    // The received PING already queued an ACK into the outbound buffer (not yet
+    // drained). A timeout just before the deadline does not idle-close.
+    try testing.expect(conn.datagramsToSend().len > 0); // the ACK is queued
     try conn.onTimeout(11_000_000 - 1);
     try testing.expect(!conn.closed);
-    conn.clearSend();
+
+    // At the deadline it idle-closes, and the still-queued packets are discarded too
+    // (RFC 9000 10.1: the state is silently discarded - no stale packets leak out, no
+    // CONNECTION_CLOSE is sent).
     try conn.onTimeout(11_000_000);
     try testing.expect(conn.closed and conn.idleTimedOut());
-    try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len); // nothing sent
+    try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len); // discarded
 }
 
 test "no idle timeout when neither endpoint advertises one" {
