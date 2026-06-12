@@ -1,9 +1,29 @@
 #!/bin/sh -e
 
-# Benchmark against httptools and h11. Local installs default to Debug, whose
-# numbers are meaningless, so rebuild the way wheels ship before measuring.
+# Benchmark each protocol against the fastest Python parser for it: HTTP/1 vs
+# httptools and h11, HTTP/2 vs h2. Local installs default to Debug, whose numbers
+# are meaningless, so rebuild the way wheels ship before measuring.
+#
+# No args runs both with their defaults. To pass flags (e.g. --batch, --repeats,
+# or --only), target one protocol:
+#   scripts/bench http2 --only GET
 
 set -x
 
 HATCH_ZIG_BUILD_MODE=ReleaseSafe uv sync --all-groups
-uv run --no-sync python bench.py "$@"
+
+case "$1" in
+    http1 | http2)
+        proto="$1"
+        shift
+        uv run --no-sync python "benchmarks/$proto.py" "$@"
+        ;;
+    "")
+        uv run --no-sync python benchmarks/http1.py
+        uv run --no-sync python benchmarks/http2.py
+        ;;
+    *)
+        echo "usage: scripts/bench [http1|http2] [args...]" >&2
+        exit 2
+        ;;
+esac

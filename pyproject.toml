@@ -45,6 +45,7 @@ dev = [
 bench = [
     "httptools",
     "h11",
+    "h2",
 ]
 docs = [
     "zensical",
