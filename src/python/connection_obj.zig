@@ -1661,6 +1661,7 @@ fn h3_close(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     var reason_ptr: [*c]const u8 = null;
     var reason_len: c.Py_ssize_t = 0;
     if (c.PyArg_ParseTuple(args, "|Ky#", &code, &reason_ptr, &reason_len) == 0) return null;
+    if (code > core.quic.varint.MAX) return py.raiseValue("error code exceeds the 62-bit QUIC range");
     const reason: []const u8 = if (reason_ptr != null) reason_ptr[0..@intCast(reason_len)] else &.{};
     return e.close(@intCast(code), reason);
 }

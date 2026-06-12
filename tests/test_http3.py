@@ -269,6 +269,17 @@ def test_http3_close_sends_a_connection_close() -> None:
     assert conn.data_to_send() == []
 
 
+def test_http3_close_rejects_an_out_of_range_code() -> None:
+    conn = make_server()
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    conn.data_to_send()
+    conn.receive_datagram(CLIENT_FINISHED, 2000)
+    conn.data_to_send()
+    # A code past the 62-bit QUIC range cannot be encoded.
+    with pytest.raises(ValueError):
+        conn.close(1 << 62)
+
+
 def test_http3_close_before_a_datagram_is_a_protocol_error() -> None:
     conn = make_server()
     with pytest.raises(zttp.LocalProtocolError):
