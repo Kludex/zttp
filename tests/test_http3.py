@@ -11,7 +11,7 @@ import zttp
 SERVER_CONFIG = {
     "certificate": b"\xcc" * 48,
     "private_key": b"\x42" * 32,
-    "transport_params": b"\x08\x01\x08",
+    "transport_params": b"\x08\x01\x08\x06\x04\x80\x04\x00\x00\x07\x04\x80\x04\x00\x00",
     "random": b"\xab" * 32,
     "ephemeral_seed": b"\x33" * 32,
 }
@@ -21,6 +21,8 @@ SERVER_CONFIG = {
 # and grants initial_max_data 65536 plus initial_max_streams_uni 3 (so the server may
 # open its control + QPACK streams) plus an empty initial_source_connection_id (matching
 # its zero-length Initial scid); the server advertises initial_max_streams_bidi 8 plus
+# initial_max_stream_data_bidi_remote and initial_max_stream_data_uni = 262144 (so the
+# client's request and control/QPACK streams have per-stream flow-control room) plus
 # the auto-injected original_destination/initial_source connection ids, ALPN h3. The
 # ClientHello rides an Initial, the Finished a Handshake packet, the GET request a
 # 1-RTT packet - each sealed with the keys the real handshake derives, so nothing is
@@ -29,9 +31,9 @@ CLIENT_HELLO = bytes.fromhex(
     "c30000000104112233440000409d523e116476af556323a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0d9ccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe88128cdec68e34fd7fd61b26ebfa1cc07be4f74f73519a1f918fbc5bae47921e0ed07b24d11df74b"
 )
 CLIENT_FINISHED = bytes.fromhex(
-    "e50000000104112233440038cecc75a9cb1a1fd3d294606942f3fbd6ed69fcc56d4bf7a56c6704cbe3fdf52293209f8bb0fb3ea577cc8e0bce7ed4832243a04ed488b97f"
+    "e1000000010411223344003884cc75a9cb1a1fd34b6a187741a9a10a1c281b850af2907b24967472de72305629496bd6cdfcd7f81abe4c18b9a609ccc48e1d6f48a8a173"
 )
-GET_REQUEST = bytes.fromhex("4f11223344f5655f22d79dbffd5180e4c1e863acb121a200a66fb43f3234da18b348111c30")
+GET_REQUEST = bytes.fromhex("44112233442db5d28e7dc8a4bea5a5385c6f8fc3f16bbf19f293927a57a1ebd93dda2db54a")
 
 # The pre-conformance ClientHello: no ALPN offer and no initial_source_connection_id,
 # both of which the server now requires.

@@ -263,6 +263,14 @@ pub fn encodeMaxData(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, m
     try varint.append(out, gpa, max);
 }
 
+/// Append a MAX_STREAM_DATA frame (RFC 9000 19.10): the new limit on the data the
+/// peer may send on `stream_id`.
+pub fn encodeMaxStreamData(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, stream_id: u64, max: u64) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.max_stream_data));
+    try varint.append(out, gpa, stream_id);
+    try varint.append(out, gpa, max);
+}
+
 /// Append a MAX_STREAMS frame (RFC 9000 19.11): the new cap on the number of streams
 /// of the given directionality the peer may open. `bidi` selects bidirectional.
 pub fn encodeMaxStreams(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, bidi: bool, max: u64) !void {
@@ -480,6 +488,17 @@ test "encodeResetStream round-trips through decode" {
     try std.testing.expectEqual(@as(u64, 4), r.stream_id);
     try std.testing.expectEqual(@as(u64, 0x010c), r.error_code);
     try std.testing.expectEqual(@as(u64, 42), r.final_size);
+    try std.testing.expectEqual(out.items.len, d.len);
+}
+
+test "encodeMaxStreamData round-trips through decode" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodeMaxStreamData(&out, gpa, 8, 65536);
+    const d = try decode(out.items);
+    try std.testing.expectEqual(@as(u64, 8), d.frame.max_stream_data.stream_id);
+    try std.testing.expectEqual(@as(u64, 65536), d.frame.max_stream_data.max);
     try std.testing.expectEqual(out.items.len, d.len);
 }
 
