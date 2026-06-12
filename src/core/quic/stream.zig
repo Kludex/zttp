@@ -250,12 +250,15 @@ pub const SendStream = struct {
     }
 
     /// Abort the sending part with `error_code` (RFC 9000 19.4). The first reset wins;
-    /// a later reset is a no-op. The final size is FROZEN here (the bytes written so
-    /// far) so every retransmitted RESET_STREAM carries the same value; a later write
-    /// is rejected (see write), which would otherwise change end() and the final size.
+    /// a later reset is a no-op. The final size is the bytes actually SENT, not merely
+    /// written: the unsent tail is abandoned, never rides a frame, and so never
+    /// consumed flow-control credit - declaring a larger final size would put it past
+    /// the peer's MAX_STREAM_DATA grant and draw a FLOW_CONTROL_ERROR. Frozen here so
+    /// every retransmitted RESET_STREAM carries the same value (a later write is
+    /// rejected, see write).
     pub fn reset(self: *SendStream, error_code: u64) void {
         if (self.reset_code != null) return;
-        self.reset_final_size = self.end();
+        self.reset_final_size = self.sent;
         self.reset_code = error_code;
     }
 

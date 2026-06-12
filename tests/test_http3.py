@@ -18,22 +18,25 @@ SERVER_CONFIG = {
 
 # Real handshake datagrams a client produces against SERVER_CONFIG, captured from the
 # Zig transport's test builders (RFC 8448 client key share). The client offers ALPN h3
-# and grants initial_max_data 65536 plus initial_max_streams_uni 3 (so the server may
-# open its control + QPACK streams) plus an empty initial_source_connection_id (matching
-# its zero-length Initial scid); the server advertises initial_max_streams_bidi 8 plus
+# and grants initial_max_data 65536 plus initial_max_stream_data_bidi_local = 262144 (so
+# the server's responses have per-stream send credit on the client's request streams)
+# plus initial_max_stream_data_uni = 262144 (so the server's own control + QPACK streams
+# have per-stream send credit) plus initial_max_streams_uni 3 (so the server may open
+# those streams) plus an empty initial_source_connection_id (matching its zero-length
+# Initial scid); the server advertises initial_max_streams_bidi 8 plus
 # initial_max_stream_data_bidi_remote and initial_max_stream_data_uni = 262144 (so the
-# client's request and control/QPACK streams have per-stream flow-control room) plus
-# the auto-injected original_destination/initial_source connection ids, ALPN h3. The
-# ClientHello rides an Initial, the Finished a Handshake packet, the GET request a
-# 1-RTT packet - each sealed with the keys the real handshake derives, so nothing is
-# forged with test keys. dcid is 11 22 33 44.
+# client's request and control/QPACK streams have per-stream flow-control room) plus the
+# auto-injected original_destination/initial_source connection ids, ALPN h3. The
+# ClientHello rides an Initial, the Finished a Handshake packet, the GET request a 1-RTT
+# packet - each sealed with the keys the real handshake derives, so nothing is forged with
+# test keys. dcid is 11 22 33 44.
 CLIENT_HELLO = bytes.fromhex(
-    "c30000000104112233440000409d523e116476af556323a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0d9ccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe88128cdec68e34fd7fd61b26ebfa1cc07be4f74f73519a1f918fbc5bae47921e0ed07b24d11df74b"
+    "cf000000010411223344000040a9da3e11646aaf556337a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0e5ccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe88128cdec68e34fd7fd61b26f7fa1cc07be4f74577d89f1ce19ccc5a9967d5d27a3c6f662d2d21bb3555e4be0695577cf419f0fa"
 )
 CLIENT_FINISHED = bytes.fromhex(
-    "e1000000010411223344003884cc75a9cb1a1fd34b6a187741a9a10a1c281b850af2907b24967472de72305629496bd6cdfcd7f81abe4c18b9a609ccc48e1d6f48a8a173"
+    "e80000000104112233440038eb9ab5651a300d24b5fe58828ad1f65976b22a13a47adf28d6773f9e9075c7fd7e7c941e5b9b275a24266b9c50e544a6c024b946380a1961"
 )
-GET_REQUEST = bytes.fromhex("44112233442db5d28e7dc8a4bea5a5385c6f8fc3f16bbf19f293927a57a1ebd93dda2db54a")
+GET_REQUEST = bytes.fromhex("4911223344228892f255542d8de028ba73266c15e6ab366496f7acc1cba6da0359f54c2ca7")
 
 # The pre-conformance ClientHello: no ALPN offer and no initial_source_connection_id,
 # both of which the server now requires.
