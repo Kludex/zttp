@@ -1083,11 +1083,30 @@ pub const Connection = struct {
 
     /// Queue a CONNECTION_CLOSE carrying CRYPTO_ERROR for a failed TLS handshake
     /// (RFC 9001 4.8) and return the fatal error. The close rides whatever space
-    /// has keys; a pre-validation amplification stall is swallowed (the error is
-    /// still fatal, the integrator tears the connection down regardless).
+    /// has keys. A pre-validation amplification stall is swallowed (the error is
+    /// still fatal, the integrator tears the connection down regardless), but an
+    /// allocation failure propagates so the caller sees a MemoryError, not a
+    /// misattributed protocol error.
     fn failHandshake(self: *Connection, alert: tls.server.Alert) Error {
-        self.close(false, cryptoErrorCode(alert), "") catch {};
+        try self.queueFatalClose(false, cryptoErrorCode(alert));
         return error.CryptoError;
+    }
+
+    /// Queue a CONNECTION_CLOSE carrying a QUIC TRANSPORT_PARAMETER_ERROR for a
+    /// malformed/forbidden/spoofed transport parameter (RFC 9000 7.3/7.4/18.2), so
+    /// a peer with bad parameters learns why rather than seeing a silent drop.
+    fn failTransportParams(self: *Connection) Error {
+        try self.queueFatalClose(false, @intFromEnum(constants.TransportError.transport_parameter_error));
+        return error.ProtocolViolation;
+    }
+
+    /// Queue a fatal CONNECTION_CLOSE, swallowing only the amplification stall (the
+    /// caller's error is fatal regardless); OutOfMemory propagates.
+    fn queueFatalClose(self: *Connection, app: bool, code: u64) Error!void {
+        self.close(app, code, "") catch |e| switch (e) {
+            error.AmplificationLimited => {},
+            else => return e,
+        };
     }
 
     fn driveTls(self: *Connection, space: Space, now: u64) Error!void {
@@ -1104,15 +1123,15 @@ pub const Connection = struct {
                     // initial_max_data is the send-window ceiling, max_ack_delay feeds
                     // the PTO. Applied before the flight is built/sent.
                     self.peer_tp = transport_params.parse(decoded.value.quic_transport_parameters) catch
-                        return error.ProtocolViolation;
+                        return self.failTransportParams();
                     // RFC 9000 7.3/18.2: a client must not send server-only parameters,
                     // must send initial_source_connection_id, and that id must equal the
                     // Source Connection ID of the Initial carrying this ClientHello -
                     // the handshake-time authentication that defeats id spoofing.
-                    if (self.peer_tp.has_server_only_param) return error.ProtocolViolation;
-                    const iscid = self.peer_tp.initial_scid orelse return error.ProtocolViolation;
-                    const carrier_scid = self.dispatch_initial_scid orelse return error.ProtocolViolation;
-                    if (!std.mem.eql(u8, iscid.slice(), carrier_scid)) return error.ProtocolViolation;
+                    if (self.peer_tp.has_server_only_param) return self.failTransportParams();
+                    const iscid = self.peer_tp.initial_scid orelse return self.failTransportParams();
+                    const carrier_scid = self.dispatch_initial_scid orelse return self.failTransportParams();
+                    if (!std.mem.eql(u8, iscid.slice(), carrier_scid)) return self.failTransportParams();
                     self.conn_send_window.setInitial(self.peer_tp.initial_max_data);
                     // Our responses ride bidi streams the client opens, bounded by its
                     // bidi_local; a bidi stream we open is bounded by its bidi_remote;
@@ -2502,6 +2521,13 @@ test "a client without initial_source_connection_id is rejected" {
     const ch = try buildClientHelloInitialTp(gpa, &dcid, pubkey, &[_]u8{ 0x01, 0x02, 0x40, 0x01 });
     defer gpa.free(ch);
     try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
+
+    // The rejection rode out as a CONNECTION_CLOSE carrying TRANSPORT_PARAMETER_ERROR.
+    try testing.expect(server.closed);
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    try peer.receiveDatagram(server.datagramsToSend(), 2000);
+    try testing.expectEqual(@intFromEnum(constants.TransportError.transport_parameter_error), peer.peer_close.?.error_code);
 }
 
 test "a client whose initial_source_connection_id mismatches its Initial is rejected" {
