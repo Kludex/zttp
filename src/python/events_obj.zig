@@ -753,7 +753,7 @@ fn makeGoaway(g: events.Goaway) py.Object {
     const o = py.allocInstance(goaway_type);
     if (o == null) return null;
     const s: *GoawayObject = @ptrCast(o);
-    s.last_stream_id = u32Obj(g.last_stream_id);
+    s.last_stream_id = c.PyLong_FromUnsignedLongLong(g.last_stream_id);
     s.error_code = u32Obj(g.error_code);
     s.debug = py.fromBytes(g.debug);
     if (s.last_stream_id == null or s.error_code == null or s.debug == null) {
@@ -774,7 +774,7 @@ fn makeSettings(ev: events.SettingsEvent) py.Object {
     }
     for (ev.params, 0..) |p, i| {
         const id = u32Obj(p.id);
-        const value = u32Obj(p.value);
+        const value = c.PyLong_FromUnsignedLongLong(p.value);
         const tup = py.tupleNew(2);
         if (id == null or value == null or tup == null) {
             py.xdecref(id);

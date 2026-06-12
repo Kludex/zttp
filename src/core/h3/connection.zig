@@ -478,6 +478,7 @@ pub const Connection = struct {
             const s = h3_stream.parseSettings(f.payload) catch return self.fail(.settings_error, "malformed SETTINGS");
             u.settings_seen = true;
             self.peer_settings = s;
+            try self.push(.{ .settings = .{ .params = try self.settingsParams(s) } });
             return;
         }
         if (f.ftype == .data or f.ftype == .headers) return self.fail(.frame_unexpected, "DATA/HEADERS on the control stream");
@@ -492,8 +493,37 @@ pub const Connection = struct {
             // will accept - it never grows.
             if (self.goaway_recv) |prev| if (d.value > prev) return self.fail(.id_error, "GOAWAY id increased");
             self.goaway_recv = d.value;
+            // RFC 9114 GOAWAY carries only an id; the H3 layer has no per-connection
+            // error code or debug payload, so the shared event's fields are zero/empty.
+            try self.push(.{ .goaway = .{ .last_stream_id = d.value, .error_code = 0 } });
         }
         // MAX_PUSH_ID / CANCEL_PUSH / grease after SETTINGS: ignored (no push support).
+    }
+
+    /// Materialise the known SETTINGS the peer actually sent as (id, value) pairs,
+    /// backed by the event arena. Only present identifiers are emitted, so the
+    /// integrator sees the wire rather than RFC defaults.
+    fn settingsParams(self: *Connection, s: h3_stream.Settings) Error![]const events.SettingPair {
+        var pairs: [3]events.SettingPair = undefined;
+        var n: usize = 0;
+        if (s.seen_cap) {
+            pairs[n] = .{ .id = settingId(.qpack_max_table_capacity), .value = s.qpack_max_table_capacity };
+            n += 1;
+        }
+        if (s.seen_size) {
+            pairs[n] = .{ .id = settingId(.max_field_section_size), .value = s.max_field_section_size };
+            n += 1;
+        }
+        if (s.seen_blocked) {
+            pairs[n] = .{ .id = settingId(.qpack_blocked_streams), .value = s.qpack_blocked_streams };
+            n += 1;
+        }
+        return self.arena.allocator().dupe(events.SettingPair, pairs[0..n]) catch return error.OutOfMemory;
+    }
+
+    /// The known HTTP/3 SETTINGS ids all fit the shared (u16) SettingPair id.
+    fn settingId(comptime id: h3_stream.SettingId) u16 {
+        return @intFromEnum(id);
     }
 
     fn onFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame) Error!void {
@@ -2167,6 +2197,12 @@ test "the peer's control stream + SETTINGS is read without error" {
     try h3.pump(2);
     try testing.expectEqual(@as(?u64, 2), h3.control_recv_id);
     try testing.expectEqual(@as(u64, 0x400), h3.peer_settings.?.max_field_section_size);
+    // The peer's SETTINGS also surfaces as an event carrying only what it sent.
+    const ev = h3.nextEvent();
+    try testing.expect(ev == .settings);
+    try testing.expectEqual(@as(usize, 1), ev.settings.params.len);
+    try testing.expectEqual(@as(u16, 0x06), ev.settings.params[0].id);
+    try testing.expectEqual(@as(u64, 0x400), ev.settings.params[0].value);
 }
 
 test "a GOAWAY received after SETTINGS is recorded" {
@@ -2187,6 +2223,11 @@ test "a GOAWAY received after SETTINGS is recorded" {
     try qc.receiveDatagram(dgram, 1000);
     try h3.pump(2);
     try testing.expectEqual(@as(?u64, 8), h3.goaway_recv);
+    // SETTINGS (empty) then GOAWAY 8 surface as two events.
+    try testing.expect(h3.nextEvent() == .settings);
+    const ev = h3.nextEvent();
+    try testing.expect(ev == .goaway);
+    try testing.expectEqual(@as(u64, 8), ev.goaway.last_stream_id);
 }
 
 test "a received GOAWAY id may only decrease" {

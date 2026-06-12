@@ -493,6 +493,17 @@ const H3Engine = struct {
         return self.flush();
     }
 
+    /// Send an application CONNECTION_CLOSE (RFC 9000 10.2.2 / RFC 9114) with a
+    /// caller-chosen H3 error code and reason, and packetise it.
+    fn close(self: *H3Engine, error_code: u64, reason: []const u8) py.Object {
+        const q = self.qc orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        q.close(true, error_code, reason) catch |e| switch (e) {
+            error.AmplificationLimited => return py.none(),
+            else => return exceptions.raiseQuic(e),
+        };
+        return self.flush();
+    }
+
     /// Open the control stream + SETTINGS now (RFC 9114 6.2.1), rather than lazily on
     /// the first response, and packetise it. Mirrors H2's initiate_connection.
     fn initiate(self: *H3Engine) py.Object {
@@ -1644,6 +1655,17 @@ fn h3_goaway_received(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.O
     return e.goawayReceived();
 }
 
+fn h3_close(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    var code: c_ulonglong = @intFromEnum(core.h3.errors.ErrorCode.no_error);
+    var reason_ptr: [*c]const u8 = null;
+    var reason_len: c.Py_ssize_t = 0;
+    if (c.PyArg_ParseTuple(args, "|Ky#", &code, &reason_ptr, &reason_len) == 0) return null;
+    if (code > core.quic.varint.MAX) return py.raiseValue("error code exceeds the 62-bit QUIC range");
+    const reason: []const u8 = if (reason_ptr != null) reason_ptr[0..@intCast(reason_len)] else &.{};
+    return e.close(@intCast(code), reason);
+}
+
 // HTTP/2 connection-level send helpers --------------------------------------
 
 fn h2_initiate(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
@@ -1738,6 +1760,7 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "peer_settings", .ml_meth = h3_peer_settings, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's HTTP/3 SETTINGS as a dict (max_field_section_size, qpack_max_table_capacity, qpack_blocked_streams), or None until its SETTINGS frame has been received." },
     .{ .ml_name = "shutdown", .ml_meth = h3_shutdown, .ml_flags = c.METH_O, .ml_doc = "Begin a graceful shutdown: send a GOAWAY announcing stream_id as the first request stream not processed (RFC 9114 5.2). A later GOAWAY may only lower the id. Drain it with data_to_send." },
     .{ .ml_name = "goaway_received", .ml_meth = h3_goaway_received, .ml_flags = c.METH_NOARGS, .ml_doc = "The id of a GOAWAY received from the peer (RFC 9114 5.2), or None - the peer is shutting down and will not process streams at or above this id." },
+    .{ .ml_name = "close", .ml_meth = h3_close, .ml_flags = c.METH_VARARGS, .ml_doc = "Send an application CONNECTION_CLOSE: close(error_code=H3_NO_ERROR, reason=b\"\"). Drain it with data_to_send." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

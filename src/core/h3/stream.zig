@@ -35,10 +35,15 @@ pub const SettingId = enum(u64) {
 };
 
 /// The settings the peer advertised, with RFC defaults for anything unset.
+/// `seen` records which known identifiers were actually present so the event
+/// surfaced to the integrator reflects the wire, not the defaults.
 pub const Settings = struct {
     qpack_max_table_capacity: u64 = 0,
     max_field_section_size: u64 = std.math.maxInt(u64),
     qpack_blocked_streams: u64 = 0,
+    seen_cap: bool = false,
+    seen_size: bool = false,
+    seen_blocked: bool = false,
 };
 
 pub const Error = error{
@@ -54,9 +59,6 @@ pub const Error = error{
 /// act on are detected - the duplicate-error is a MAY for the rest).
 pub fn parseSettings(payload: []const u8) Error!Settings {
     var s = Settings{};
-    var seen_cap = false;
-    var seen_size = false;
-    var seen_blocked = false;
     var pos: usize = 0;
     while (pos < payload.len) {
         const id = varint.decode(payload[pos..]) catch return error.SettingsError;
@@ -68,18 +70,18 @@ pub fn parseSettings(payload: []const u8) Error!Settings {
         if (id.value >= 0x02 and id.value <= 0x05) return error.SettingsError;
         switch (@as(SettingId, @enumFromInt(id.value))) {
             .qpack_max_table_capacity => {
-                if (seen_cap) return error.SettingsError;
-                seen_cap = true;
+                if (s.seen_cap) return error.SettingsError;
+                s.seen_cap = true;
                 s.qpack_max_table_capacity = val.value;
             },
             .max_field_section_size => {
-                if (seen_size) return error.SettingsError;
-                seen_size = true;
+                if (s.seen_size) return error.SettingsError;
+                s.seen_size = true;
                 s.max_field_section_size = val.value;
             },
             .qpack_blocked_streams => {
-                if (seen_blocked) return error.SettingsError;
-                seen_blocked = true;
+                if (s.seen_blocked) return error.SettingsError;
+                s.seen_blocked = true;
                 s.qpack_blocked_streams = val.value;
             },
             _ => {}, // unknown setting: ignored

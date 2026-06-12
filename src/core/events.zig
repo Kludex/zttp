@@ -64,7 +64,7 @@ pub const EndOfMessage = struct {
 /// (and knows an ACK is owed). HTTP/2 only.
 pub const SettingPair = struct {
     id: u16,
-    value: u32,
+    value: u64,
 };
 
 /// A stream was reset by the peer (RFC 9113 6.4). HTTP/2 only.
@@ -81,9 +81,11 @@ pub const StreamReset = struct {
     error_code: u64,
 };
 
-/// The peer is shutting the connection down (RFC 9113 6.8). HTTP/2 only.
+/// The peer is shutting the connection down: HTTP/2 GOAWAY (RFC 9113 6.8) or
+/// HTTP/3 GOAWAY (RFC 9114 5.2). `last_stream_id` is u64 to hold the HTTP/3
+/// 62-bit id losslessly; HTTP/2's 31-bit id fits the same field.
 pub const Goaway = struct {
-    last_stream_id: u32,
+    last_stream_id: u64,
     error_code: u32,
     debug: []const u8 = &.{},
 };
