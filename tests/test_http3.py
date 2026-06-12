@@ -252,6 +252,29 @@ def test_http3_shutdown_sends_a_goaway() -> None:
         conn.shutdown(12)
 
 
+def test_http3_close_sends_a_connection_close() -> None:
+    conn = make_server()
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    conn.data_to_send()
+    conn.receive_datagram(CLIENT_FINISHED, 2000)
+    conn.data_to_send()
+
+    # A caller-chosen application CONNECTION_CLOSE (RFC 9114) leaves as a 1-RTT
+    # datagram; the connection is then closed. The default code is H3_NO_ERROR.
+    conn.close()
+    assert len(conn.data_to_send()) >= 1
+    assert conn.is_closed() is True
+    # An explicit code and reason are accepted; a second close is a no-op.
+    conn.close(0x0101, b"bye")
+    assert conn.data_to_send() == []
+
+
+def test_http3_close_before_a_datagram_is_a_protocol_error() -> None:
+    conn = make_server()
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.close()
+
+
 def test_next_event_before_any_datagram_is_need_data() -> None:
     conn = make_server()
     assert conn.next_event() is zttp.NEED_DATA
