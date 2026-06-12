@@ -48,24 +48,34 @@ the safety-checked (`ReleaseSafe`) build; the run-to-run spread is about 5%.
 
 ## Run it yourself
 
-The benchmark lives in `bench.py`:
+The benchmarks live in `benchmarks/`, one file per protocol, each pitched
+against the fastest Python parser for that protocol:
+
+| File | Compares against |
+| --- | --- |
+| `benchmarks/http1.py` | httptools (C) and h11 (pure Python) |
+| `benchmarks/http2.py` | h2 (the pure-Python `python-hyper` stack) |
 
 ```console
 ./scripts/bench
 ```
 
-It feeds each parser identical bytes and verifies they extract identical data
-before timing, so the comparison is apples to apples. Each parser runs many
-short batches, interleaved round-robin so thermal drift and scheduler placement
-hit all parsers equally, with the GC disabled while a batch is timed; the
-headline is the median batch and the spread is printed alongside it.
+runs both. `./scripts/bench http2` runs one and forwards any extra flags
+(`--batch`, `--repeats`, `--only <substring>`) to it.
 
-The workloads come from the parser-benchmark literature wherever one exists:
-the picohttpparser/llhttp real-world GET, llhttp's chunked POST, httparse's
-short request and response, the wrk and TechEmpower request shapes, plus
-faithful reconstructions of modern traffic (a Chrome navigation, a k8s-ingress
-proxied API call), large uploads delivered whole and in MTU-sized pieces, and
-response parsing in the client role. `--only <substring>` runs a subset.
+The table above is the HTTP/1 suite. Each benchmark feeds its parsers identical
+input and verifies they extract identical data before timing, so the comparison
+is apples to apples; parsers run many short batches interleaved round-robin so
+thermal drift and scheduler placement hit them equally, with the GC disabled
+while a batch is timed; the headline is the median batch with the spread printed
+alongside.
+
+The HTTP/1 workloads come from the parser-benchmark literature wherever one
+exists: the picohttpparser/llhttp real-world GET, llhttp's chunked POST,
+httparse's short request and response, the wrk and TechEmpower request shapes,
+plus faithful reconstructions of modern traffic (a Chrome navigation, a
+k8s-ingress proxied API call), large uploads delivered whole and in MTU-sized
+pieces, and response parsing in the client role.
 
 ## Why it's fast
 
