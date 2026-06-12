@@ -347,6 +347,11 @@ pub const Connection = struct {
             consumed_total += d.len;
         }
         if (self.qc.streamFinished(id) and (rs.state == .headers_done or rs.state == .trailers_done)) {
+            // The stream ended: any bytes the frame loop could not decode are a frame
+            // truncated by the FIN (the loop only breaks on NeedData, and no more bytes
+            // will come), a connection error (RFC 9114 4.1, H3_FRAME_ERROR) - not a
+            // silently-accepted complete request.
+            if (consumed_total < ready.len) return self.fail(.frame_error, "a frame truncated by the stream end");
             // Fewer body bytes than the declared Content-Length is malformed (RFC
             // 9114 4.1.2); the over-count is caught per-DATA above.
             if (rs.content_length) |cl| if (rs.body_received != cl) return error.H3Error;
@@ -1026,6 +1031,36 @@ test "a framing field in trailers is malformed" {
     try testing.expect(h3.nextEvent() == .data);
     try testing.expect(h3.nextEvent() == .rst_stream);
     try testing.expect(!qc.closed);
+}
+
+test "a frame truncated by the FIN after trailers is a connection error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x15, 0x22, 0x33, 0x44 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A valid request with trailers, then a DATA frame header claiming 5 bytes but
+    // carrying none before the FIN - a frame truncated by the stream end. Accepting it
+    // would deliver the request as complete (RFC 9114 4.1: H3_FRAME_ERROR).
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(gpa);
+    try h3_frame.append(&body, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x50 | 0, 0x03, 'e', 'x', 'y' });
+    try h3_frame.append(&body, gpa, .data, "hi");
+    var trailer_block: std.ArrayList(u8) = .empty;
+    defer trailer_block.deinit(gpa);
+    try trailer_block.appendSlice(gpa, &.{ 0x00, 0x00 });
+    try qpack_enc.encodeHeader(&trailer_block, gpa, .{ .name = "x-checksum", .value = "ok" });
+    try h3_frame.append(&body, gpa, .headers, trailer_block.items);
+    try body.appendSlice(gpa, &.{ 0x00, 0x05 }); // DATA (type 0x00) len 5, no payload: truncated
+
+    const dgram = try buildRequestOnFin(gpa, &dcid, 0, 0, body.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try testing.expectError(error.H3Error, h3.pumpAll());
+    try testing.expect(qc.closed); // a frame error closes the connection
 }
 
 test "a CR/LF in a pseudo-header value is malformed" {
