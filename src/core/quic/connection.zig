@@ -317,9 +317,13 @@ pub const Connection = struct {
     /// 0 means we set no idle timeout. The effective period is the min with the peer's.
     own_idle_timeout_ms: u64 = 0,
     /// The monotonic time (us) of the last activity that resets the idle timer (RFC
-    /// 9000 10.1): a received packet that was processed, or an ack-eliciting packet we
-    /// sent. The idle deadline is this plus the effective idle period.
+    /// 9000 10.1): a received packet that was processed, or the FIRST ack-eliciting
+    /// packet we sent since then. The idle deadline is this plus the effective period.
     last_activity: u64 = 0,
+    /// Whether we have sent an ack-eliciting packet since the last received packet (RFC
+    /// 9000 10.1): only the first such send restarts the idle timer, so a stream of PTO
+    /// probes to a silent peer cannot extend the connection past the idle timeout.
+    sent_ack_eliciting_since_recv: bool = false,
     /// The details of a CONNECTION_CLOSE received from the peer (RFC 9000 19.19),
     /// captured so the integrator can report why the peer closed - not just that it
     /// did. Null until a close arrives. `reason` is an owned copy (the decoded slice
@@ -516,7 +520,13 @@ pub const Connection = struct {
         st.rec.onSent(self.gpa, .{ .pn = pn, .sent_time = now, .size = datagram_len, .ack_eliciting = ack_eliciting, .in_flight = ack_eliciting }) catch return error.OutOfMemory;
         if (ack_eliciting) {
             self.cc.onSent(datagram_len);
-            self.last_activity = now; // an ack-eliciting send resets the idle timer (RFC 9000 10.1)
+            // Restart the idle timer only on the FIRST ack-eliciting send since the last
+            // received packet (RFC 9000 10.1); later probes to a silent peer must not
+            // keep pushing the deadline out, or the connection never times out.
+            if (!self.sent_ack_eliciting_since_recv) {
+                self.last_activity = now;
+                self.sent_ack_eliciting_since_recv = true;
+            }
         }
         st.next_pn += 1;
         return pn;
@@ -1307,8 +1317,10 @@ pub const Connection = struct {
 
         // The packet authenticated and is being processed: reset the idle timer (RFC
         // 9000 10.1). A dropped/undecryptable packet never reaches here, so spoofed
-        // traffic cannot keep the connection alive.
+        // traffic cannot keep the connection alive. Receiving also re-arms the "first
+        // ack-eliciting send restarts the timer" rule, so the next probe counts again.
         self.last_activity = now;
+        self.sent_ack_eliciting_since_recv = false;
 
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, pn) else pn;
         st.recv_ranges.add(self.gpa, pn) catch return error.OutOfMemory; // for accurate ACKs
@@ -3029,6 +3041,35 @@ test "no idle timeout when neither endpoint advertises one" {
     try conn.receiveDatagram(d0, 1_000_000);
     try conn.onTimeout(1_000_000_000_000); // a very late tick
     try testing.expect(!conn.closed);
+}
+
+test "probes to a silent peer do not extend the idle timeout" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe9, 0xea, 0xeb, 0xec };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.peer_tp.max_idle_timeout_ms = 10_000; // 10s idle timeout
+
+    // The peer sends once at t=1s; we then respond (an ack-eliciting send), which is the
+    // FIRST since the receive, so it restarts the timer to ~t=1s.
+    const ping = [_]u8{0x01} ** 20;
+    const d0 = try testBuildApp(gpa, &dcid, 0, &ping);
+    defer gpa.free(d0);
+    try conn.receiveDatagram(d0, 1_000_000);
+    try conn.sendStreamData(1, "hi", false);
+    try conn.flushSend(1_500_000);
+    const deadline = conn.idleDeadline().?;
+
+    // The peer then goes silent. We keep probing (more ack-eliciting sends) over the
+    // next several seconds - but these must NOT push the deadline out, since none is
+    // the first since a receive. So the connection still idle-closes at the deadline.
+    try conn.sendStreamData(1, "more", false);
+    try conn.flushSend(5_000_000);
+    try conn.flushSend(9_000_000);
+    try testing.expectEqual(deadline, conn.idleDeadline().?); // unchanged by the probes
+    try conn.onTimeout(deadline);
+    try testing.expect(conn.closed and conn.idleTimedOut());
 }
 
 test "flushSend never sends past the congestion window, and resumes as it opens" {
