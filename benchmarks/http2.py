@@ -282,7 +282,7 @@ def make_zttp(w: Workload) -> Runner:
             conn = Connection(role, protocol=HTTP2)
             if not is_request:
                 for _ in range(count):
-                    conn.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
+                    conn.send_request(b"GET", b"/", b"2", [(b"host", b"x")]).end_message()
             conn.receive_data(wire)
             while conn.next_event() is not NEED_DATA:
                 pass
@@ -336,7 +336,7 @@ def extract_zttp(w: Workload) -> list[Message]:
     conn = zttp.Connection(role, protocol=zttp.HTTP2)
     if w.kind != "request":
         for _ in range(w.messages):
-            conn.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
+            conn.send_request(b"GET", b"/", b"2", [(b"host", b"x")]).end_message()
     conn.receive_data(w.wire)
     pending: dict[int, list[tuple[bytes, bytes]]] = {}
     starts: dict[int, object] = {}
