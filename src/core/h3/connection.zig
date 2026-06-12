@@ -161,8 +161,12 @@ pub const Connection = struct {
     fn rejectStream(self: *Connection, id: u64, code: h3_error.ErrorCode) Error!void {
         self.qc.resetStream(id, @intFromEnum(code)) catch return error.H3Error;
         self.qc.stopSending(id, @intFromEnum(code)) catch return error.H3Error;
+        // Consume the unread bytes so the recv state can reach terminal and dropStream
+        // can reclaim now. A zero-length FIN leaves no pending bytes but still must be
+        // consumed (consumeStream(id, 0) flips a finished stream to data_read);
+        // otherwise the stream lingers in .rejected until an unrelated later repump.
         const pending = self.qc.streamData(id).len;
-        if (pending > 0) self.qc.consumeStream(id, pending);
+        if (pending > 0 or self.qc.streamFinished(id) or self.qc.streamReset(id)) self.qc.consumeStream(id, pending);
         // Drop the stream if the transport can (recv terminal); otherwise mark it
         // .rejected so a later pump quarantines it (drains, no more events) rather than
         // re-parsing a stream we already reset, which could surface a spurious request.
@@ -1374,6 +1378,9 @@ test "the body matching Content-Length is accepted, a mismatch is malformed" {
         try testing.expect(h3.nextEvent() == .data);
         try testing.expect(h3.nextEvent() == .rst_stream);
         try testing.expect(!qc.closed);
+        // The reset reclaims the stream immediately (the zero-length FIN is consumed),
+        // not leaving it pinned until an unrelated later pump.
+        try testing.expect(!qc.hasStream(0));
     }
 }
 
