@@ -157,84 +157,20 @@ var window_update_members = [_]py.MemberDef{
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 
-// -- dealloc ------------------------------------------------------------------
-
-fn deallocRequest(o: ?*c.PyObject) callconv(.c) void {
-    const s: *RequestObject = @ptrCast(o.?);
-    py.gcUntrack(s);
-    py.xdecref(s.method);
-    py.xdecref(s.target);
-    py.xdecref(s.path);
-    py.xdecref(s.query);
-    py.xdecref(s.http_version);
-    py.xdecref(s.headers);
-    py.freeInstance(@ptrCast(s));
-}
-fn deallocResponse(o: ?*c.PyObject) callconv(.c) void {
-    const s: *ResponseObject = @ptrCast(o.?);
-    py.gcUntrack(s);
-    py.xdecref(s.status_code);
-    py.xdecref(s.reason);
-    py.xdecref(s.http_version);
-    py.xdecref(s.headers);
-    py.freeInstance(@ptrCast(s));
-}
-fn deallocData(o: ?*c.PyObject) callconv(.c) void {
-    const s: *DataObject = @ptrCast(o.?);
-    py.gcUntrack(s);
-    py.xdecref(s.data);
-    py.freeInstance(@ptrCast(s));
-}
-fn deallocEom(o: ?*c.PyObject) callconv(.c) void {
-    const s: *EndOfMessageObject = @ptrCast(o.?);
-    py.gcUntrack(s);
-    py.xdecref(s.trailers);
-    py.freeInstance(@ptrCast(s));
-}
-fn deallocRstStream(o: ?*c.PyObject) callconv(.c) void {
-    const s: *RstStreamObject = @ptrCast(o.?);
-    py.gcUntrack(s);
-    py.xdecref(s.stream_id);
-    py.xdecref(s.error_code);
-    py.freeInstance(@ptrCast(s));
-}
-fn deallocGoaway(o: ?*c.PyObject) callconv(.c) void {
-    const s: *GoawayObject = @ptrCast(o.?);
-    py.gcUntrack(s);
-    py.xdecref(s.last_stream_id);
-    py.xdecref(s.error_code);
-    py.xdecref(s.debug);
-    py.freeInstance(@ptrCast(s));
-}
-fn deallocSettings(o: ?*c.PyObject) callconv(.c) void {
-    const s: *SettingsEventObject = @ptrCast(o.?);
-    py.gcUntrack(s);
-    py.xdecref(s.params);
-    py.freeInstance(@ptrCast(s));
-}
-fn deallocPing(o: ?*c.PyObject) callconv(.c) void {
-    const s: *PingObject = @ptrCast(o.?);
-    py.gcUntrack(s);
-    py.xdecref(s.ack);
-    py.xdecref(s.data);
-    py.freeInstance(@ptrCast(s));
-}
-fn deallocWindowUpdate(o: ?*c.PyObject) callconv(.c) void {
-    const s: *WindowUpdateObject = @ptrCast(o.?);
-    py.gcUntrack(s);
-    py.xdecref(s.stream_id);
-    py.xdecref(s.increment);
-    py.freeInstance(@ptrCast(s));
-}
-
 // -- GC support ---------------------------------------------------------------
 
 // The event types hold strong references to Python objects (and Request/
 // Response/EndOfMessage expose mutable header/trailer lists), so they must be
-// GC types with traverse/clear; otherwise a cycle through them leaks. tp_alloc
-// (PyType_GenericAlloc) already GC-tracks a HAVE_GC instance on creation, so we
-// only untrack in dealloc; no explicit track is needed (and double-tracking
-// trips an assertion in a debug build).
+// GC types with dealloc/traverse/clear over every owned reference; otherwise a
+// cycle through them leaks. tp_alloc (PyType_GenericAlloc) already GC-tracks a
+// HAVE_GC instance on creation, so we only untrack in dealloc; no explicit track
+// is needed (and double-tracking trips an assertion in a debug build).
+//
+// dealloc/traverse/clear are identical across the event types up to their field
+// list, so gcOps generates the trio from the struct itself: it walks exactly the
+// `py.Object`-typed fields, skipping `ob_base` and the plain-integer fields. This
+// covers fields the repr/equality lists deliberately omit (Request's path/query),
+// which is why it introspects the type rather than reusing the *_fields tuples.
 
 fn visitObj(obj: py.Object, visit: c.visitproc, arg: ?*anyopaque) c_int {
     if (obj != null) {
@@ -244,132 +180,64 @@ fn visitObj(obj: py.Object, visit: c.visitproc, arg: ?*anyopaque) c_int {
     return 0;
 }
 
-fn traverseRequest(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
-    const s: *RequestObject = @ptrCast(o.?);
-    inline for (.{ s.method, s.target, s.path, s.query, s.http_version, s.headers }) |f| {
-        const r = visitObj(f, visit, arg);
-        if (r != 0) return r;
+/// Names of the `py.Object`-typed fields of an event struct - the owned refs the
+/// GC trio must walk.
+fn objectFields(comptime T: type) []const []const u8 {
+    comptime {
+        var names: []const []const u8 = &.{};
+        for (@typeInfo(T).@"struct".fields) |f| {
+            if (f.type == py.Object) names = names ++ .{f.name};
+        }
+        return names;
     }
-    return 0;
 }
-fn clearRequest(o: ?*c.PyObject) callconv(.c) c_int {
-    const s: *RequestObject = @ptrCast(o.?);
-    py.clear(&s.method);
-    py.clear(&s.target);
-    py.clear(&s.path);
-    py.clear(&s.query);
-    py.clear(&s.http_version);
-    py.clear(&s.headers);
-    return 0;
+
+const GcOps = struct {
+    dealloc: fn (?*c.PyObject) callconv(.c) void,
+    traverse: fn (?*c.PyObject, c.visitproc, ?*anyopaque) callconv(.c) c_int,
+    clear: fn (?*c.PyObject) callconv(.c) c_int,
+};
+
+fn gcOps(comptime T: type) GcOps {
+    const fields = objectFields(T);
+    return .{
+        .dealloc = struct {
+            fn dealloc(o: ?*c.PyObject) callconv(.c) void {
+                const s: *T = @ptrCast(o.?);
+                py.gcUntrack(s);
+                inline for (fields) |name| py.xdecref(@field(s, name));
+                py.freeInstance(@ptrCast(s));
+            }
+        }.dealloc,
+        .traverse = struct {
+            fn traverse(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+                const s: *T = @ptrCast(o.?);
+                inline for (fields) |name| {
+                    const r = visitObj(@field(s, name), visit, arg);
+                    if (r != 0) return r;
+                }
+                return 0;
+            }
+        }.traverse,
+        .clear = struct {
+            fn clear(o: ?*c.PyObject) callconv(.c) c_int {
+                const s: *T = @ptrCast(o.?);
+                inline for (fields) |name| py.clear(&@field(s, name));
+                return 0;
+            }
+        }.clear,
+    };
 }
-fn traverseResponse(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
-    const s: *ResponseObject = @ptrCast(o.?);
-    inline for (.{ s.status_code, s.reason, s.http_version, s.headers }) |f| {
-        const r = visitObj(f, visit, arg);
-        if (r != 0) return r;
-    }
-    return 0;
-}
-fn clearResponse(o: ?*c.PyObject) callconv(.c) c_int {
-    const s: *ResponseObject = @ptrCast(o.?);
-    py.clear(&s.status_code);
-    py.clear(&s.reason);
-    py.clear(&s.http_version);
-    py.clear(&s.headers);
-    return 0;
-}
-fn traverseData(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
-    const s: *DataObject = @ptrCast(o.?);
-    inline for (.{s.data}) |f| {
-        const r = visitObj(f, visit, arg);
-        if (r != 0) return r;
-    }
-    return 0;
-}
-fn clearData(o: ?*c.PyObject) callconv(.c) c_int {
-    const s: *DataObject = @ptrCast(o.?);
-    py.clear(&s.data);
-    return 0;
-}
-fn traverseEom(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
-    const s: *EndOfMessageObject = @ptrCast(o.?);
-    inline for (.{s.trailers}) |f| {
-        const r = visitObj(f, visit, arg);
-        if (r != 0) return r;
-    }
-    return 0;
-}
-fn clearEom(o: ?*c.PyObject) callconv(.c) c_int {
-    const s: *EndOfMessageObject = @ptrCast(o.?);
-    py.clear(&s.trailers);
-    return 0;
-}
-fn traverseRstStream(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
-    const s: *RstStreamObject = @ptrCast(o.?);
-    inline for (.{ s.stream_id, s.error_code }) |f| {
-        const r = visitObj(f, visit, arg);
-        if (r != 0) return r;
-    }
-    return 0;
-}
-fn clearRstStream(o: ?*c.PyObject) callconv(.c) c_int {
-    const s: *RstStreamObject = @ptrCast(o.?);
-    py.clear(&s.stream_id);
-    py.clear(&s.error_code);
-    return 0;
-}
-fn traverseGoaway(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
-    const s: *GoawayObject = @ptrCast(o.?);
-    inline for (.{ s.last_stream_id, s.error_code, s.debug }) |f| {
-        const r = visitObj(f, visit, arg);
-        if (r != 0) return r;
-    }
-    return 0;
-}
-fn clearGoaway(o: ?*c.PyObject) callconv(.c) c_int {
-    const s: *GoawayObject = @ptrCast(o.?);
-    py.clear(&s.last_stream_id);
-    py.clear(&s.error_code);
-    py.clear(&s.debug);
-    return 0;
-}
-fn traverseSettings(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
-    const s: *SettingsEventObject = @ptrCast(o.?);
-    return visitObj(s.params, visit, arg);
-}
-fn clearSettings(o: ?*c.PyObject) callconv(.c) c_int {
-    const s: *SettingsEventObject = @ptrCast(o.?);
-    py.clear(&s.params);
-    return 0;
-}
-fn traversePing(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
-    const s: *PingObject = @ptrCast(o.?);
-    inline for (.{ s.ack, s.data }) |f| {
-        const r = visitObj(f, visit, arg);
-        if (r != 0) return r;
-    }
-    return 0;
-}
-fn clearPing(o: ?*c.PyObject) callconv(.c) c_int {
-    const s: *PingObject = @ptrCast(o.?);
-    py.clear(&s.ack);
-    py.clear(&s.data);
-    return 0;
-}
-fn traverseWindowUpdate(o: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
-    const s: *WindowUpdateObject = @ptrCast(o.?);
-    inline for (.{ s.stream_id, s.increment }) |f| {
-        const r = visitObj(f, visit, arg);
-        if (r != 0) return r;
-    }
-    return 0;
-}
-fn clearWindowUpdate(o: ?*c.PyObject) callconv(.c) c_int {
-    const s: *WindowUpdateObject = @ptrCast(o.?);
-    py.clear(&s.stream_id);
-    py.clear(&s.increment);
-    return 0;
-}
+
+const request_gc = gcOps(RequestObject);
+const response_gc = gcOps(ResponseObject);
+const data_gc = gcOps(DataObject);
+const eom_gc = gcOps(EndOfMessageObject);
+const rst_stream_gc = gcOps(RstStreamObject);
+const goaway_gc = gcOps(GoawayObject);
+const settings_gc = gcOps(SettingsEventObject);
+const ping_gc = gcOps(PingObject);
+const window_update_gc = gcOps(WindowUpdateObject);
 
 // -- repr & equality ----------------------------------------------------------
 
@@ -517,15 +385,15 @@ fn slots(comptime dealloc: anytype, comptime members: anytype, comptime traverse
     };
 }
 
-var request_slots = slots(deallocRequest, &request_members, traverseRequest, clearRequest, reprRequest, cmpRequest);
-var response_slots = slots(deallocResponse, &response_members, traverseResponse, clearResponse, reprResponse, cmpResponse);
-var data_slots = slots(deallocData, &data_members, traverseData, clearData, reprData, cmpData);
-var eom_slots = slots(deallocEom, &eom_members, traverseEom, clearEom, reprEom, cmpEom);
-var rst_stream_slots = slots(deallocRstStream, &rst_stream_members, traverseRstStream, clearRstStream, reprRstStream, cmpRstStream);
-var goaway_slots = slots(deallocGoaway, &goaway_members, traverseGoaway, clearGoaway, reprGoaway, cmpGoaway);
-var settings_slots = slots(deallocSettings, &settings_members, traverseSettings, clearSettings, reprSettings, cmpSettings);
-var ping_slots = slots(deallocPing, &ping_members, traversePing, clearPing, reprPing, cmpPing);
-var window_update_slots = slots(deallocWindowUpdate, &window_update_members, traverseWindowUpdate, clearWindowUpdate, reprWindowUpdate, cmpWindowUpdate);
+var request_slots = slots(request_gc.dealloc, &request_members, request_gc.traverse, request_gc.clear, reprRequest, cmpRequest);
+var response_slots = slots(response_gc.dealloc, &response_members, response_gc.traverse, response_gc.clear, reprResponse, cmpResponse);
+var data_slots = slots(data_gc.dealloc, &data_members, data_gc.traverse, data_gc.clear, reprData, cmpData);
+var eom_slots = slots(eom_gc.dealloc, &eom_members, eom_gc.traverse, eom_gc.clear, reprEom, cmpEom);
+var rst_stream_slots = slots(rst_stream_gc.dealloc, &rst_stream_members, rst_stream_gc.traverse, rst_stream_gc.clear, reprRstStream, cmpRstStream);
+var goaway_slots = slots(goaway_gc.dealloc, &goaway_members, goaway_gc.traverse, goaway_gc.clear, reprGoaway, cmpGoaway);
+var settings_slots = slots(settings_gc.dealloc, &settings_members, settings_gc.traverse, settings_gc.clear, reprSettings, cmpSettings);
+var ping_slots = slots(ping_gc.dealloc, &ping_members, ping_gc.traverse, ping_gc.clear, reprPing, cmpPing);
+var window_update_slots = slots(window_update_gc.dealloc, &window_update_members, window_update_gc.traverse, window_update_gc.clear, reprWindowUpdate, cmpWindowUpdate);
 
 fn spec(comptime name: [*c]const u8, comptime size: usize, sl: anytype) py.Spec {
     return .{

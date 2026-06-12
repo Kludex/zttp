@@ -43,7 +43,9 @@ const H1Engine = struct {
     writer: ?*Writer = null,
     /// The method of the message the next response answers (server: the parsed
     /// request; client: the request we sent), so the connection auto-derives
-    /// bodyless framing. Cleared per cycle by start_next_cycle.
+    /// bodyless framing. NOT cleared by start_next_cycle - it is overwritten when
+    /// the next request is parsed, so send_response can read it before the previous
+    /// response is serialized (see next_message).
     req_method: [16]u8 = undefined,
     req_method_len: usize = 0,
     /// Connection signals for the last parsed request, captured at event time so

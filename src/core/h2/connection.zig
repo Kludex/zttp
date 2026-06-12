@@ -399,7 +399,7 @@ pub const Connection = struct {
         const t = s.creditSendWindow(increment);
         switch (t.action) {
             .ok => self.push(.{ .window_update = .{ .stream_id = f.header.stream_id, .increment = increment } }),
-            .stream_error => self.push(.{ .rst_stream = .{ .stream_id = f.header.stream_id, .error_code = @intFromEnum(t.code) } }),
+            .stream_error => self.pushRst(f.header.stream_id, t.code),
             .connection_error => return error.FlowControlError,
         }
     }
@@ -428,21 +428,21 @@ pub const Connection = struct {
             // a closed/evicted id is a stream error STREAM_CLOSED (RFC 9113 5.1,
             // mirroring stream.classifyRecv's .closed branch).
             if (self.isIdle(f.header.stream_id)) return error.ProtocolError;
-            self.push(.{ .rst_stream = .{ .stream_id = f.header.stream_id, .error_code = @intFromEnum(ErrorCode.stream_closed) } });
+            self.pushRst(f.header.stream_id, .stream_closed);
             return;
         };
         const classify = s.classifyRecv(.data, end_stream);
         switch (classify.action) {
             .ok => {},
             .stream_error => {
-                self.push(.{ .rst_stream = .{ .stream_id = f.header.stream_id, .error_code = @intFromEnum(classify.code) } });
+                self.pushRst(f.header.stream_id, classify.code);
                 return;
             },
             .connection_error => return error.ProtocolError,
         }
         const wt = s.debitRecvWindow(f.header.length);
         if (wt.action == .stream_error) {
-            self.push(.{ .rst_stream = .{ .stream_id = f.header.stream_id, .error_code = @intFromEnum(ErrorCode.flow_control_error) } });
+            self.pushRst(f.header.stream_id, .flow_control_error);
             return;
         }
         s.recordData(content.len);
@@ -481,6 +481,8 @@ pub const Connection = struct {
         s.recvApply(.rst_stream, false);
         self.evictStream(f.header.stream_id);
         try self.chargeReset();
+        // Surface the peer's RST verbatim (not pushRst: the wire code is an
+        // arbitrary u32, passed through rather than one of our ErrorCode resets).
         self.push(.{ .rst_stream = .{ .stream_id = f.header.stream_id, .error_code = code } });
     }
 
@@ -587,7 +589,7 @@ pub const Connection = struct {
         if (refused) {
             // Decoded for HPACK sync; the request is not surfaced and no stream
             // record exists, so nothing to close.
-            self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(ErrorCode.refused_stream) } });
+            self.pushRst(id, .refused_stream);
             return;
         }
 
@@ -661,7 +663,7 @@ pub const Connection = struct {
         s.recvApply(.rst_stream, false); // -> closed
         self.evictStream(id);
         try self.chargeReset();
-        self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(code) } });
+        self.pushRst(id, code);
     }
 
     const CollapseError = error{ Malformed, OutOfMemory };
@@ -1136,6 +1138,13 @@ pub const Connection = struct {
         const slot = (self.pending_head + self.pending_len) % PENDING_CAP;
         self.pending[slot] = ev;
         self.pending_len += 1;
+    }
+
+    /// Queue a RST_STREAM event for `id` with `code`. This is the bare emit: it
+    /// does not touch stream state - callers that own a live stream record go
+    /// through `resetStream`, which applies state and charges churn before this.
+    fn pushRst(self: *Connection, id: u32, code: ErrorCode) void {
+        self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(code) } });
     }
 
     fn popPending(self: *Connection) Event {
