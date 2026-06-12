@@ -68,6 +68,7 @@ pub fn raiseQuic(e: QuicError) py.Object {
         error.FlowControlError => "QUIC flow-control error",
         error.StreamLimitError => "QUIC stream limit exceeded",
         error.FinalSizeError => "QUIC final size error",
+        error.CryptoError => "QUIC TLS handshake failed (CRYPTO_ERROR)",
         // A send-side backpressure signal the send paths handle (defer the bytes), so
         // it never escapes to here; mapped only to keep the switch exhaustive.
         error.AmplificationLimited => "QUIC anti-amplification limit",

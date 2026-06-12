@@ -52,8 +52,18 @@ pub const Error = error{
     /// address is validated (RFC 9000 8.1). Not fatal: the send path stops and
     /// resumes once the client's later packets raise the budget.
     AmplificationLimited,
+    /// The TLS handshake failed (RFC 9001 4.8): a CONNECTION_CLOSE carrying
+    /// CRYPTO_ERROR (0x0100 | alert) has been queued, so the peer learns which TLS
+    /// rule broke. Fatal, like ProtocolViolation, but with a specific cause.
+    CryptoError,
     OutOfMemory,
 };
+
+/// The QUIC error code for a TLS alert (RFC 9001 4.8): the CRYPTO_ERROR range is
+/// 0x0100-0x01ff, the low byte being the TLS alert description.
+fn cryptoErrorCode(alert: tls.server.Alert) u64 {
+    return 0x0100 | @as(u64, @intFromEnum(alert));
+}
 
 /// One packet-number space's protection keys, recovery state, and CRYPTO receive
 /// reassembly. Initial keys are derived up front; Handshake/Application keys arrive
@@ -1071,6 +1081,15 @@ pub const Connection = struct {
         try self.driveTls(space, now);
     }
 
+    /// Queue a CONNECTION_CLOSE carrying CRYPTO_ERROR for a failed TLS handshake
+    /// (RFC 9001 4.8) and return the fatal error. The close rides whatever space
+    /// has keys; a pre-validation amplification stall is swallowed (the error is
+    /// still fatal, the integrator tears the connection down regardless).
+    fn failHandshake(self: *Connection, alert: tls.server.Alert) Error {
+        self.close(false, cryptoErrorCode(alert), "") catch {};
+        return error.CryptoError;
+    }
+
     fn driveTls(self: *Connection, space: Space, now: u64) Error!void {
         const server = if (self.tls) |*s| s else return; // only the server drives the handshake here
         const st = &self.spaces[@intFromEnum(space)];
@@ -1079,7 +1098,7 @@ pub const Connection = struct {
             const msg = tls.handshake.peek(buf) orelse break; // need more CRYPTO bytes
             switch (msg.msg_type) {
                 .client_hello => {
-                    const decoded = tls.client_hello.parse(buf[0..msg.len]) catch return error.ProtocolViolation;
+                    const decoded = tls.client_hello.parse(buf[0..msg.len]) catch return self.failHandshake(.decode_error);
 
                     // Honour the client's transport parameters (RFC 9000 7.4): its
                     // initial_max_data is the send-window ceiling, max_ack_delay feeds
@@ -1104,7 +1123,7 @@ pub const Connection = struct {
 
                     var flight_buf: std.ArrayListUnmanaged(u8) = .empty;
                     defer flight_buf.deinit(self.gpa);
-                    const outcome = server.onClientHello(&flight_buf, self.gpa, decoded.value) catch return error.ProtocolViolation;
+                    const outcome = server.onClientHello(&flight_buf, self.gpa, decoded.value) catch |e| return self.failHandshake(tls.server.alertFor(e));
 
                     // A server RECVs with the client traffic secret, SENDs with the server one.
                     self.installKeys(.handshake, outcome.built.handshake_secrets.clientKeys(), outcome.built.handshake_secrets.serverKeys());
@@ -1118,12 +1137,12 @@ pub const Connection = struct {
                     continue;
                 },
                 .finished => {
-                    const body = tls.handshake.finishedBody(msg.body) catch return error.ProtocolViolation;
-                    server.onClientFinished(body) catch return error.ProtocolViolation;
+                    const body = tls.handshake.finishedBody(msg.body) catch return self.failHandshake(.decode_error);
+                    server.onClientFinished(body) catch |e| return self.failHandshake(tls.server.alertFor(e));
                     st.crypto.advance(msg.len);
                     try self.confirmHandshake(now);
                 },
-                else => return error.ProtocolViolation, // unexpected message at the server
+                else => return self.failHandshake(.unexpected_message), // unexpected message at the server
             }
         }
     }
@@ -2632,7 +2651,7 @@ test "a STREAM frame in an Initial packet is a protocol violation" {
     try testing.expectError(error.ProtocolViolation, server.receiveDatagram(dgram, 1000));
 }
 
-test "a malformed ClientHello (no supported_versions) poisons the connection" {
+test "a malformed ClientHello closes with CRYPTO_ERROR (decode_error)" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x31, 0x32, 0x33, 0x34 };
     var pubkey: [32]u8 = undefined;
@@ -2652,7 +2671,18 @@ test "a malformed ClientHello (no supported_versions) poisons the connection" {
     try frame.encodeCrypto(&frames, gpa, 0, ch.items);
     const dgram = try testBuildInitial(gpa, &dcid, .client, 0, frames.items);
     defer gpa.free(dgram);
-    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(dgram, 1000));
+    try testing.expectError(error.CryptoError, server.receiveDatagram(dgram, 1000));
+
+    // RFC 9001 4.8: the failure rode out as a CONNECTION_CLOSE carrying
+    // CRYPTO_ERROR (0x0100 | decode_error). A peer deriving the same Initial keys
+    // from the dcid reads it back.
+    try testing.expect(server.closed);
+    var peer = try Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    try peer.receiveDatagram(server.datagramsToSend(), 2000);
+    const pc = peer.peer_close.?;
+    try testing.expect(!pc.app);
+    try testing.expectEqual(cryptoErrorCode(.decode_error), pc.error_code);
 }
 
 // ---- STREAM send tests -----------------------------------------------------
