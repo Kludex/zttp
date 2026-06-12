@@ -36,7 +36,9 @@ pub const Error = error{
     OutOfMemory,
 };
 
-const ReqState = enum { idle, headers_done, done, rejected };
+// A request stream's receive progress (RFC 9114 4.1): the lone HEADERS, then DATA,
+// then an optional single trailing HEADERS (trailers), then the FIN.
+const ReqState = enum { idle, headers_done, trailers_done, done, rejected };
 
 const RequestStream = struct {
     state: ReqState = .idle,
@@ -47,6 +49,10 @@ const RequestStream = struct {
     /// Whether a peer-reset event has already been emitted for this stream, so a
     /// re-pump (if the stream could not yet be dropped) does not re-fire it.
     rst_emitted: bool = false,
+    /// The decoded trailing field section (RFC 9114 4.1), held until the FIN folds it
+    /// into the end_of_message event. Empty when the request had no trailers. The
+    /// slices live in the connection arena, like the request headers.
+    trailers: []const Header = &.{},
 };
 
 /// Outbound (response) state per stream, so the send API cannot serialize invalid
@@ -329,11 +335,11 @@ pub const Connection = struct {
             };
             consumed_total += d.len;
         }
-        if (self.qc.streamFinished(id) and rs.state == .headers_done) {
+        if (self.qc.streamFinished(id) and (rs.state == .headers_done or rs.state == .trailers_done)) {
             // Fewer body bytes than the declared Content-Length is malformed (RFC
             // 9114 4.1.2); the over-count is caught per-DATA above.
             if (rs.content_length) |cl| if (rs.body_received != cl) return error.H3Error;
-            try self.push(.{ .end_of_message = .{ .trailers = &.{}, .stream_id = id } });
+            try self.push(.{ .end_of_message = .{ .trailers = rs.trailers, .stream_id = id } });
             rs.state = .done;
         }
         // Consume BEFORE dropping: consuming the last byte of a finished stream is
@@ -460,14 +466,26 @@ pub const Connection = struct {
 
     fn onFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame) Error!void {
         switch (f.ftype) {
-            .headers => {
-                if (rs.state != .idle) return self.failStream(.message_error); // trailers after body are a follow-up
-                const req = try self.decodeRequest(id, f.payload, rs);
-                try self.push(.{ .request = req });
-                rs.state = .headers_done;
+            .headers => switch (rs.state) {
+                // The request head.
+                .idle => {
+                    const req = try self.decodeRequest(id, f.payload, rs);
+                    try self.push(.{ .request = req });
+                    rs.state = .headers_done;
+                },
+                // A HEADERS after the body is the single permitted trailing field
+                // section (RFC 9114 4.1). Decoded now, surfaced with the FIN.
+                .headers_done => {
+                    rs.trailers = try self.decodeTrailers(f.payload);
+                    rs.state = .trailers_done;
+                },
+                // A second trailing section, or one before any request head, is
+                // malformed.
+                else => return self.failStream(.message_error),
             },
             .data => {
-                if (rs.state != .headers_done) return self.fail(.frame_unexpected, "DATA before HEADERS"); // RFC 9114 4.1
+                // DATA is legal only between the head and the trailers (RFC 9114 4.1).
+                if (rs.state != .headers_done) return self.fail(.frame_unexpected, "DATA outside the request body"); // RFC 9114 4.1
                 rs.body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return self.fail(.message_error, "request body length overflow");
                 // More body than the declared Content-Length is malformed (RFC 9114 4.1.2).
                 if (rs.content_length) |cl| if (rs.body_received > cl) return self.fail(.message_error, "body exceeds Content-Length");
@@ -556,6 +574,26 @@ pub const Connection = struct {
             .headers = headers.items,
             .stream_id = id,
         };
+    }
+
+    /// Decode a trailing field section (RFC 9114 4.1). Trailers are ordinary fields
+    /// only: a pseudo-header is forbidden, and the same name/value rules as the
+    /// request headers apply (lowercase token names, no connection-specific fields,
+    /// no CR/LF/NUL smuggling). The result is materialised into the arena so it
+    /// outlives the next QPACK decode, like the request headers.
+    fn decodeTrailers(self: *Connection, block: []const u8) Error![]const Header {
+        const decoded = self.qpack_dec.decode(block) catch return self.failStream(.message_error);
+        const a = self.arena.allocator();
+        var trailers: std.ArrayListUnmanaged(Header) = .empty;
+        for (decoded) |h| {
+            if (h.name.len > 0 and h.name[0] == ':') return self.failStream(.message_error); // no pseudo-headers in trailers
+            if (!fields.isValidFieldName(h.name)) return self.failStream(.message_error);
+            if (!fields.validValue(h.value)) return self.failStream(.message_error);
+            if (fields.isConnectionSpecific(h.name)) return self.failStream(.message_error);
+            if (eql(h.name, "te")) return self.failStream(.message_error); // TE is a header-section field only (RFC 9110 10.1.4)
+            trailers.append(a, .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) }) catch return error.OutOfMemory;
+        }
+        return trailers.items;
     }
 
     fn dupe(self: *Connection, bytes: []const u8) Error![]const u8 {
@@ -738,6 +776,70 @@ test "decode a GET request over HTTP/3" {
     try testing.expectEqualStrings("3", ev.request.http_version);
     try testing.expectEqualStrings("host", ev.request.headers[0].name);
     try testing.expectEqualStrings("exy", ev.request.headers[0].value);
+}
+
+test "a request's trailing HEADERS surfaces as end_of_message trailers" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // HEADERS (GET / host exy), then a DATA frame, then a trailing HEADERS carrying one
+    // ordinary field (x-checksum: ok) - the trailers - then the FIN.
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(gpa);
+    try h3_frame.append(&body, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x50 | 0, 0x03, 'e', 'x', 'y' });
+    try h3_frame.append(&body, gpa, .data, "hi");
+    var trailer_block: std.ArrayList(u8) = .empty;
+    defer trailer_block.deinit(gpa);
+    try trailer_block.appendSlice(gpa, &.{ 0x00, 0x00 }); // QPACK prefix RIC=0, Base=0
+    try qpack_enc.encodeHeader(&trailer_block, gpa, .{ .name = "x-checksum", .value = "ok" });
+    try h3_frame.append(&body, gpa, .headers, trailer_block.items);
+
+    const dgram = try buildRequestOnFin(gpa, &dcid, 0, 0, body.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pumpAll();
+
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expect(h3.nextEvent() == .data);
+    const eom = h3.nextEvent();
+    try testing.expect(eom == .end_of_message);
+    try testing.expectEqual(@as(usize, 1), eom.end_of_message.trailers.len);
+    try testing.expectEqualStrings("x-checksum", eom.end_of_message.trailers[0].name);
+    try testing.expectEqualStrings("ok", eom.end_of_message.trailers[0].value);
+}
+
+test "a pseudo-header in trailers is malformed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x12, 0x22, 0x33, 0x44 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // The trailing section indexes :method GET (a pseudo-header), forbidden in trailers.
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(gpa);
+    try h3_frame.append(&body, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x50 | 0, 0x03, 'e', 'x', 'y' });
+    try h3_frame.append(&body, gpa, .data, "hi");
+    try h3_frame.append(&body, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17 }); // :method in trailers
+
+    const dgram = try buildRequestOnFin(gpa, &dcid, 0, 0, body.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pumpAll();
+
+    // The request head and body still surfaced; the bad trailers reset the stream
+    // (no end_of_message), and the connection stays up.
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expect(h3.nextEvent() == .data);
+    try testing.expect(h3.nextEvent() == .need_data);
+    try testing.expect(!qc.closed);
 }
 
 test "a CR/LF in a pseudo-header value is malformed" {
