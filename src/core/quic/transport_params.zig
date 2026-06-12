@@ -31,6 +31,11 @@ pub const ConnectionId = struct {
 /// (x1000) downstream cannot overflow on a hostile value.
 const MAX_ACK_DELAY_MS_CAP: u64 = 1 << 14;
 
+/// max_idle_timeout has no RFC ceiling, but the timer code converts ms to us (x1000),
+/// which a hostile 62-bit varint would overflow. ~49 days is far longer than any real
+/// idle timeout, so clamp here - a connection that quiet is closed by other means.
+const MAX_IDLE_TIMEOUT_MS_CAP: u64 = 1 << 32;
+
 /// The parameters this stack reads. Each defaults to the RFC 9000 18.2 default for
 /// an absent parameter, so a parsed value is always usable directly.
 pub const TransportParameters = struct {
@@ -98,7 +103,7 @@ pub fn parse(buf: []const u8) Error!TransportParameters {
         seen[seen_n] = id;
         seen_n += 1;
         switch (@as(Id, @enumFromInt(id))) {
-            .max_idle_timeout => tp.max_idle_timeout_ms = try intParam(value),
+            .max_idle_timeout => tp.max_idle_timeout_ms = @min(try intParam(value), MAX_IDLE_TIMEOUT_MS_CAP),
             .initial_max_data => tp.initial_max_data = try intParam(value),
             .initial_max_stream_data_bidi_local => tp.initial_max_stream_data_bidi_local = try intParam(value),
             .initial_max_stream_data_bidi_remote => tp.initial_max_stream_data_bidi_remote = try intParam(value),
@@ -193,6 +198,14 @@ test "max_ack_delay is clamped so the us conversion cannot overflow" {
     const buf = [_]u8{ 0x0b, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     const tp = try parse(&buf);
     try testing.expectEqual(MAX_ACK_DELAY_MS_CAP, tp.max_ack_delay_ms);
+}
+
+test "max_idle_timeout is clamped so the us conversion cannot overflow" {
+    // 0x01 len 8, value the max 62-bit varint -> a huge ms value the idle timer would
+    // overflow when multiplying by 1000; clamped to the cap.
+    const buf = [_]u8{ 0x01, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    const tp = try parse(&buf);
+    try testing.expectEqual(MAX_IDLE_TIMEOUT_MS_CAP, tp.max_idle_timeout_ms);
 }
 
 test "appendBytesParam round-trips a connection id through parse" {
