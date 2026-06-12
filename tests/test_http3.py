@@ -150,6 +150,52 @@ def test_http3_sends_a_response() -> None:
     assert all(isinstance(d, bytes) for d in datagrams)
 
 
+def _handshaken_with_request() -> zttp.H3Connection:
+    conn = make_server()
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    conn.data_to_send()
+    conn.receive_datagram(CLIENT_FINISHED, 2000)
+    conn.data_to_send()
+    conn.receive_datagram(GET_REQUEST, 3000)
+    conn.data_to_send()
+    return conn
+
+
+def test_http3_sends_an_interim_response() -> None:
+    conn = _handshaken_with_request()
+    stream = conn.stream(0)
+    # 103 Early Hints (an interim 1xx), then the final response on the same stream.
+    stream.send_informational(103, [(b"link", b"</s.css>; rel=preload")])
+    stream.send_response(200, [(b"content-length", b"0")])
+    stream.end_message()
+    assert len(conn.data_to_send()) >= 1
+
+
+def test_http3_rejects_a_non_interim_informational_status() -> None:
+    conn = _handshaken_with_request()
+    with pytest.raises(ValueError):
+        conn.stream(0).send_informational(200)
+
+
+def test_http3_sends_response_trailers() -> None:
+    conn = _handshaken_with_request()
+    stream = conn.stream(0)
+    stream.send_response(200)
+    stream.send_data(b"hi")
+    stream.end_message([(b"x-checksum", b"ok")])
+    assert len(conn.data_to_send()) >= 1
+
+
+def test_http3_rejects_a_pseudo_header_in_trailers() -> None:
+    conn = _handshaken_with_request()
+    stream = conn.stream(0)
+    stream.send_response(200)
+    # A pseudo-header is illegal in trailers; the H3 send path surfaces the violation
+    # as a protocol error (the whole H3 error set maps through RemoteProtocolError).
+    with pytest.raises(zttp.RemoteProtocolError):
+        stream.end_message([(b":status", b"200")])
+
+
 def test_http3_stream_reset() -> None:
     conn = make_server()
     conn.receive_datagram(CLIENT_HELLO, 1000)

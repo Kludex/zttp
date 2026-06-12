@@ -463,6 +463,18 @@ const H3Engine = struct {
         return self.flush();
     }
 
+    fn endMessage(self: *H3Engine, id: u64, trailers: []const events.Header) py.Object {
+        const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        h.endMessage(id, trailers) catch |e| return exceptions.raiseH3(e);
+        return self.flush();
+    }
+
+    fn sendInformational(self: *H3Engine, id: u64, status: u16, headers: []const events.Header) py.Object {
+        const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        h.sendInformational(id, status, headers) catch |e| return exceptions.raiseH3(e);
+        return self.flush();
+    }
+
     /// Cancel a request stream with `error_code` (RFC 9114 4.4): RESET_STREAM the
     /// response and STOP_SENDING the request, then packetise.
     fn resetStream(self: *H3Engine, id: u64, error_code: u64) py.Object {
@@ -715,22 +727,22 @@ fn stream_send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwds: ?*c.Py
 fn stream_send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *StreamObject = @ptrCast(self_obj.?);
     const e = self.engine() orelse return null;
-    const h2 = switch (e) {
-        .h2 => |x| x,
-        .h3 => return py.raise(exceptions.LocalProtocolError, "HTTP/3 interim responses are not supported yet"),
-    };
     var status: c_long = 0;
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
     if (status < 100 or status > 199) return py.raiseValue("informational status code must be in 100..199");
-    if (status == 101) return py.raiseValue("HTTP/2 has no 101 Switching Protocols");
+    // 101 Switching Protocols is an HTTP/1.1 mechanism; neither HTTP/2 nor HTTP/3 use it.
+    if (status == 101) return py.raiseValue("HTTP/2 and HTTP/3 have no 101 Switching Protocols");
     var hdrs: ?BorrowedHeaders = null;
     defer if (hdrs) |*h| h.deinit();
     if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
         hdrs = borrowHeaders(hdrs_seq) orelse return null;
     }
     var h = hdrs orelse BorrowedHeaders{ .headers = &.{}, .refs = &.{} };
-    return h2.sendInformational(@intCast(self.stream_id), @intCast(status), &h);
+    return switch (e) {
+        .h2 => |x| x.sendInformational(@intCast(self.stream_id), @intCast(status), &h),
+        .h3 => |x| x.sendInformational(self.stream_id, @intCast(status), h.headers),
+    };
 }
 
 fn stream_send_window_get(self_obj: ?*c.PyObject, _: ?*anyopaque) callconv(.c) py.Object {
@@ -770,13 +782,23 @@ fn stream_end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     const e = self.engine() orelse return null;
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
+    var hdrs: ?BorrowedHeaders = null;
+    defer if (hdrs) |*h| h.deinit();
     if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
-        return py.raise(exceptions.LocalProtocolError, "send-side trailers are not supported yet");
+        hdrs = borrowHeaders(hdrs_seq) orelse return null;
     }
-    return switch (e) {
-        .h2 => |x| x.endStream(@intCast(self.stream_id)),
-        .h3 => |x| x.endStream(self.stream_id),
-    };
+    switch (e) {
+        // HTTP/2 send-side trailers are still a follow-up; an empty/absent list is the
+        // ordinary END_STREAM.
+        .h2 => |x| {
+            if (hdrs != null) return py.raise(exceptions.LocalProtocolError, "HTTP/2 send-side trailers are not supported yet");
+            return x.endStream(@intCast(self.stream_id));
+        },
+        .h3 => |x| {
+            const t = if (hdrs) |h| h.headers else &[_]events.Header{};
+            return x.endMessage(self.stream_id, t);
+        },
+    }
 }
 
 // The default HTTP/3 reset code: H3_REQUEST_CANCELLED (RFC 9114 8.1).
@@ -815,7 +837,7 @@ var stream_methods = [_]py.MethodDef{
     .{ .ml_name = "send_response", .ml_meth = @ptrCast(&stream_send_response), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Serialize a response head on this stream: send_response(status, headers=None, end_stream=False). Pass end_stream=True for a bodyless response (204 / 304 / HEAD) to ride END_STREAM on the HEADERS frame and skip the trailing empty DATA frame." },
     .{ .ml_name = "send_informational", .ml_meth = stream_send_informational, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response head on this stream: send_informational(status, headers=None). The final response still follows on the same stream." },
     .{ .ml_name = "send_data", .ml_meth = stream_send_data, .ml_flags = c.METH_O, .ml_doc = "Queue body bytes on this stream (flow-controlled; parked until the send window allows)." },
-    .{ .ml_name = "end_message", .ml_meth = stream_end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message on this stream (empty END_STREAM DATA)." },
+    .{ .ml_name = "end_message", .ml_meth = stream_end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message on this stream: end_message(trailers=None). HTTP/3 sends a trailing HEADERS frame for trailers; HTTP/2 send-side trailers are not supported yet." },
     .{ .ml_name = "reset", .ml_meth = stream_reset, .ml_flags = c.METH_VARARGS, .ml_doc = "Send RST_STREAM to cancel this stream: reset(error_code=CANCEL)." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
