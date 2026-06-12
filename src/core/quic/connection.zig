@@ -131,6 +131,45 @@ const StreamRecvLimits = struct {
     uni: u64,
 };
 
+/// Tracks which receive streams have completed-and-dropped, so a late frame for one
+/// is ignored rather than resurrecting it - in bounded memory. Streams of one type
+/// carry ids base, base+4, base+8, ... and mostly complete in order, so a contiguous
+/// `below[type]` watermark (every id of that type with index < below is retired)
+/// covers the bulk; only out-of-order completions above the watermark sit in
+/// `sparse`, drained as the watermark advances. Memory is O(reorder window), not
+/// O(total streams).
+const RetiredStreams = struct {
+    below: [4]u64 = .{ 0, 0, 0, 0 }, // per StreamType: ids with index < below[type] are retired
+    sparse: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    fn deinit(self: *RetiredStreams, gpa: std.mem.Allocator) void {
+        self.sparse.deinit(gpa);
+    }
+
+    fn contains(self: *const RetiredStreams, id: u64) bool {
+        const ty = @intFromEnum(stream.StreamType.of(id));
+        if (id / 4 < self.below[ty]) return true;
+        return self.sparse.contains(id);
+    }
+
+    /// Record `id` as retired. Returns false only on allocator failure (the caller
+    /// then leaves the stream in place rather than dropping it unrecorded).
+    fn put(self: *RetiredStreams, gpa: std.mem.Allocator, id: u64) bool {
+        const ty = @intFromEnum(stream.StreamType.of(id));
+        const index = id / 4;
+        if (index < self.below[ty]) return true; // already covered by the watermark
+        if (index == self.below[ty]) {
+            // Extends the contiguous run: advance the watermark, then drain any sparse
+            // entries it now reaches (an earlier out-of-order completion).
+            self.below[ty] += 1;
+            while (self.sparse.remove(ty + (self.below[ty] * 4))) self.below[ty] += 1;
+            return true;
+        }
+        self.sparse.put(gpa, id, {}) catch return false; // an out-of-order gap
+        return true;
+    }
+};
+
 /// A CONNECTION_CLOSE the peer sent (RFC 9000 19.19), retained so the integrator can
 /// surface why the connection ended. `app` distinguishes the application-error
 /// variant; `reason` is an owned, length-capped copy of the human-readable phrase.
@@ -257,12 +296,13 @@ pub const Connection = struct {
     /// did. Null until a close arrives. `reason` is an owned copy (the decoded slice
     /// points into the datagram), capped so a hostile reason cannot grow it.
     peer_close: ?PeerClose = null,
-    /// The receive-stream ids that completed and were dropped (see dropStream). A late
-    /// frame for one of these is ignored rather than resurrecting the stream. A set,
-    /// not a watermark: stream ids complete out of order, so a watermark would treat a
-    /// legitimate new lower id as retired. One u64 per retired stream is far smaller
-    /// than the RecvStream it replaces, so this still bounds the per-stream memory.
-    retired_recv: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// The receive streams that completed and were dropped (see dropStream): a late
+    /// frame for one is ignored rather than resurrecting it. A contiguous per-type
+    /// watermark covers the common in-order completions in O(1) memory; a small sparse
+    /// set holds only the out-of-order gaps and is drained as the watermark catches up,
+    /// so this stays bounded by the reorder window even when MAX_STREAMS replenishment
+    /// lets a connection serve unboundedly many streams.
+    retired_recv: RetiredStreams = .{},
     /// The cap on client-initiated bidirectional streams (RFC 9000 4.6): exactly the
     /// initial_max_streams_bidi we advertise, enforced on each newly opened request
     /// stream so a peer cannot exhaust memory by opening unboundedly many. The wire and
@@ -1447,7 +1487,7 @@ pub const Connection = struct {
         if (!s.isTerminal()) return false;
         // Remember the id as retired BEFORE freeing, so a failure to record it leaves
         // the stream in place rather than dropped-but-resurrectable.
-        self.retired_recv.put(self.gpa, id, {}) catch return false;
+        if (!self.retired_recv.put(self.gpa, id)) return false;
         _ = self.streams.remove(id);
         _ = self.stream_recv_windows.remove(id);
         s.deinit();
@@ -1832,6 +1872,37 @@ test "connection flow control sums across streams" {
     const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
     defer gpa.free(dgram);
     try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
+}
+
+test "retired streams compress in-order completions into a watermark" {
+    const gpa = testing.allocator;
+    var r = RetiredStreams{};
+    defer r.deinit(gpa);
+
+    // In-order client-bidi retirements (0, 4, 8) advance the watermark - no sparse
+    // entries, so memory stays O(1) however many complete.
+    try testing.expect(r.put(gpa, 0));
+    try testing.expect(r.put(gpa, 4));
+    try testing.expect(r.put(gpa, 8));
+    try testing.expectEqual(@as(u64, 3), r.below[0]); // ids < index 3 retired
+    try testing.expectEqual(@as(usize, 0), r.sparse.count());
+    try testing.expect(r.contains(0));
+    try testing.expect(r.contains(8));
+    try testing.expect(!r.contains(12)); // not yet retired
+
+    // An out-of-order completion (16, skipping 12) sits in the sparse set...
+    try testing.expect(r.put(gpa, 16));
+    try testing.expectEqual(@as(usize, 1), r.sparse.count());
+    try testing.expect(r.contains(16));
+    // ...then 12 fills the gap and the watermark swallows both, draining the sparse set.
+    try testing.expect(r.put(gpa, 12));
+    try testing.expectEqual(@as(u64, 5), r.below[0]); // through index 4 (id 16)
+    try testing.expectEqual(@as(usize, 0), r.sparse.count());
+
+    // Different stream types are tracked independently (server-uni ids 3, 7).
+    try testing.expect(r.put(gpa, 3));
+    try testing.expect(r.contains(3));
+    try testing.expect(!r.contains(7));
 }
 
 test "a single stream over its per-stream window is a flow-control error" {
