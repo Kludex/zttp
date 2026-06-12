@@ -18,19 +18,20 @@ SERVER_CONFIG = {
 
 # Real handshake datagrams a client produces against SERVER_CONFIG, captured from the
 # Zig transport's test builders (RFC 8448 client key share). The client offers ALPN h3
-# and sends initial_max_data 65536 plus an empty initial_source_connection_id (matching
+# and grants initial_max_data 65536 plus initial_max_streams_uni 3 (so the server may
+# open its control + QPACK streams) plus an empty initial_source_connection_id (matching
 # its zero-length Initial scid); the server advertises initial_max_streams_bidi 8 plus
 # the auto-injected original_destination/initial_source connection ids, ALPN h3. The
 # ClientHello rides an Initial, the Finished a Handshake packet, the GET request a
 # 1-RTT packet - each sealed with the keys the real handshake derives, so nothing is
 # forged with test keys. dcid is 11 22 33 44.
 CLIENT_HELLO = bytes.fromhex(
-    "c30000000104112233440000409a4d3e11647baf556326a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0d6ccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe88128cdec68e34fd7fd61b26e8fa1cc07be4f74f73a9c70ecfbb1b97070125376ff97745d8"
+    "c30000000104112233440000409d523e116476af556323a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0d9ccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe88128cdec68e34fd7fd61b26ebfa1cc07be4f74f73519a1f918fbc5bae47921e0ed07b24d11df74b"
 )
 CLIENT_FINISHED = bytes.fromhex(
-    "e30000000104112233440038521018f79775a3640f2215b80d21cc2fc497a8218eb66c61b7f32c2cf3ef87f008a094742f77ba82ce447bf75e9cc43b899b1e4b29776e44"
+    "e50000000104112233440038cecc75a9cb1a1fd3d294606942f3fbd6ed69fcc56d4bf7a56c6704cbe3fdf52293209f8bb0fb3ea577cc8e0bce7ed4832243a04ed488b97f"
 )
-GET_REQUEST = bytes.fromhex("59112233445eade7548c087d84f41357686d9338e06a82c87b33299a3cdccdb9ed483eccf2")
+GET_REQUEST = bytes.fromhex("4f11223344f5655f22d79dbffd5180e4c1e863acb121a200a66fb43f3234da18b348111c30")
 
 # The pre-conformance ClientHello: no ALPN offer and no initial_source_connection_id,
 # both of which the server now requires.
@@ -176,11 +177,13 @@ def test_http3_initiate_connection_sends_the_control_stream() -> None:
     conn.receive_datagram(CLIENT_FINISHED, 2000)
     conn.data_to_send()
 
-    # The control stream + SETTINGS leaves as a 1-RTT datagram; idempotent.
+    # The control stream + SETTINGS and the two QPACK streams (RFC 9204 4.2) leave as
+    # 1-RTT datagrams; idempotent. The byte-level stream contents are asserted in the
+    # Zig core test - here we only confirm the flush happens once.
     conn.initiate_connection()
     datagrams = conn.data_to_send()
     assert len(datagrams) >= 1
-    conn.initiate_connection()  # no second control stream
+    conn.initiate_connection()  # no second set of streams
     assert conn.data_to_send() == []
 
 

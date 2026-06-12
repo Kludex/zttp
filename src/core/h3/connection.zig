@@ -65,9 +65,16 @@ const UniStream = struct {
 /// as SETTINGS_MAX_FIELD_SECTION_SIZE so it does not send a larger one.
 const MAX_FIELD_SECTION_SIZE: u64 = 1 << 16;
 
-/// The first server-initiated unidirectional stream id (RFC 9000 2.1): server uni
-/// ids are 4*N+3, so the control stream is 3.
+/// The server-initiated unidirectional stream ids (RFC 9000 2.1): server uni ids are
+/// 4*N+3. The control stream is the first; the two QPACK streams (RFC 9204 4.2) are
+/// the next two. A peer MUST open all three regardless of QPACK table capacity, so
+/// strict clients (nghttp3, quiche) abort if the encoder/decoder streams are missing.
 const CONTROL_STREAM_ID: u64 = 3;
+const QPACK_ENCODER_STREAM_ID: u64 = 7;
+const QPACK_DECODER_STREAM_ID: u64 = 11;
+/// The count of server-initiated uni streams HTTP/3 always opens (the three above);
+/// a peer must grant at least this many in initial_max_streams_uni.
+const SERVER_UNI_STREAMS: u64 = 3;
 
 pub const Connection = struct {
     gpa: std.mem.Allocator,
@@ -158,13 +165,22 @@ pub const Connection = struct {
         }
     }
 
-    /// Open our unidirectional control stream and send SETTINGS as its first frame
-    /// (RFC 9114 6.2.1, 7.2.4). A conformant peer treats the absence of our SETTINGS
-    /// as H3_MISSING_SETTINGS and may refuse to send requests, so this must precede
-    /// any response. Idempotent: the control stream is opened at most once. The
-    /// stream-type byte (0x00) prefixes the SETTINGS frame on the same stream.
+    /// Open our three server-initiated unidirectional streams (RFC 9114 6.2.1,
+    /// RFC 9204 4.2): the control stream carrying SETTINGS, plus the QPACK encoder and
+    /// decoder streams. A conformant peer treats the absence of our SETTINGS as
+    /// H3_MISSING_SETTINGS and may refuse to send requests, and strict clients abort
+    /// if the QPACK streams are missing - so all three must precede any response.
+    /// Idempotent: each is opened at most once. Each stream's type byte prefixes its
+    /// content; the QPACK streams carry no instructions (table capacity 0).
     pub fn initiateControl(self: *Connection) Error!void {
         if (self.control_sent) return;
+        // HTTP/3 needs three server-initiated uni streams (control + the two QPACK
+        // streams). A peer that grants fewer cannot run HTTP/3, so rather than open
+        // streams past its initial_max_streams_uni - which it would answer with a
+        // STREAM_LIMIT_ERROR - close cleanly up front (RFC 9000 4.6 / RFC 9114 6.2).
+        if (self.qc.peerMaxStreamsUni() < SERVER_UNI_STREAMS) {
+            return self.fail(.general_protocol_error, "peer granted too few unidirectional streams for HTTP/3");
+        }
         var settings: std.ArrayListUnmanaged(u8) = .empty;
         defer settings.deinit(self.gpa);
         // SETTINGS_MAX_FIELD_SECTION_SIZE = our decode cap. QPACK capacity and
@@ -176,8 +192,20 @@ pub const Connection = struct {
         defer out.deinit(self.gpa);
         out.append(self.gpa, @intFromEnum(h3_stream.UniStreamType.control)) catch return error.OutOfMemory;
         h3_frame.append(&out, self.gpa, .settings, settings.items) catch return error.OutOfMemory;
-        try self.streamSend(CONTROL_STREAM_ID, out.items, false);
+
+        // Commit BEFORE sending: a failure partway through (OOM) must not let a later
+        // call re-open the control stream and queue a second SETTINGS, which a peer
+        // treats as a connection error. A half-initialised connection is already
+        // degraded; re-attempting would corrupt it, not recover it.
         self.control_sent = true;
+        try self.streamSend(CONTROL_STREAM_ID, out.items, false);
+        // The QPACK encoder/decoder streams: just the type byte each. At table
+        // capacity 0 no encoder/decoder instructions are ever sent, but the streams
+        // must exist for the peer's QPACK to consider the connection well-formed. The
+        // grant was checked above; full credit accounting (a peer MAX_STREAMS raising
+        // the limit, blocking past it) is a follow-up, mooted here by the fixed count.
+        try self.streamSend(QPACK_ENCODER_STREAM_ID, &.{@intFromEnum(h3_stream.UniStreamType.qpack_encoder)}, false);
+        try self.streamSend(QPACK_DECODER_STREAM_ID, &.{@intFromEnum(h3_stream.UniStreamType.qpack_decoder)}, false);
     }
 
     /// Begin a graceful shutdown: send a GOAWAY on the control stream (RFC 9114 5.2)
@@ -1457,6 +1485,22 @@ test "a reset after the response finished is a no-op" {
     try testing.expectEqual(@as(usize, 0), qc.datagramsToSend().len); // nothing sent
 }
 
+test "a peer granting too few uni streams cannot run HTTP/3" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x3a, 0x3b, 0x3c, 0x3d };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    qc.peer_tp.initial_max_streams_uni = 2; // below the 3 HTTP/3 requires
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // Opening the mandatory streams would exceed the peer's limit, so the connection
+    // is closed cleanly up front rather than provoking a STREAM_LIMIT_ERROR.
+    try testing.expectError(error.H3Error, h3.initiateControl());
+    try testing.expect(qc.closed);
+}
+
 test "the server opens its control stream with a SETTINGS frame" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x31, 0x33, 0x37, 0x39 };
@@ -1491,6 +1535,18 @@ test "the server opens its control stream with a SETTINGS frame" {
     try testing.expectEqual(h3_frame.FrameType.settings, f.frame.ftype);
     const s = try h3_stream.parseSettings(f.frame.payload);
     try testing.expectEqual(@as(u64, 1 << 16), s.max_field_section_size);
+
+    // The two QPACK streams are opened too (RFC 9204 4.2): stream 7 is the encoder
+    // (type 0x02), stream 11 the decoder (type 0x03), each just its type byte since
+    // table capacity 0 means no instructions ever follow.
+    const enc = peer.streamData(7);
+    const et = h3_stream.decodeUniType(enc).?;
+    try testing.expectEqual(h3_stream.UniStreamType.qpack_encoder, et.utype);
+    try testing.expectEqual(@as(usize, enc.len), et.len); // nothing after the type byte
+    const dec = peer.streamData(11);
+    const dt = h3_stream.decodeUniType(dec).?;
+    try testing.expectEqual(h3_stream.UniStreamType.qpack_decoder, dt.utype);
+    try testing.expectEqual(@as(usize, dec.len), dt.len);
 }
 
 test "shutdown sends a GOAWAY on the control stream after SETTINGS" {
