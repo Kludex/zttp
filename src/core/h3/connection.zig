@@ -127,6 +127,8 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
+        var it = self.streams.valueIterator();
+        while (it.next()) |rs| if (rs.trailers.len > 0) freeHeaders(self.gpa, rs.trailers);
         self.streams.deinit(self.gpa);
         self.send_state.deinit(self.gpa);
         self.uni_streams.deinit(self.gpa);
@@ -165,7 +167,7 @@ pub const Connection = struct {
         // .rejected so a later pump quarantines it (drains, no more events) rather than
         // re-parsing a stream we already reset, which could surface a spurious request.
         if (self.qc.dropStream(id)) {
-            _ = self.streams.remove(id);
+            self.freeStream(id);
         } else if (self.streams.getPtr(id)) |rs| {
             rs.state = .rejected;
         }
@@ -309,7 +311,7 @@ pub const Connection = struct {
             const pending = self.qc.streamData(id).len;
             const finished = self.qc.streamFinished(id) or self.qc.streamReset(id);
             if (pending > 0 or finished) self.qc.consumeStream(id, pending);
-            if (finished and self.qc.dropStream(id)) _ = self.streams.remove(id);
+            if (finished and self.qc.dropStream(id)) self.freeStream(id);
             return;
         }
 
@@ -329,6 +331,13 @@ pub const Connection = struct {
                 error.StreamError => {
                     const code = self.pending_reject orelse h3_error.ErrorCode.message_error;
                     self.pending_reject = null;
+                    // If the integrator already saw the request (e.g. malformed
+                    // trailers after the head and body), surface a terminal rst_stream
+                    // so it stops waiting on an end_of_message that will never come.
+                    if (rs.state != .idle and !rs.rst_emitted) {
+                        rs.rst_emitted = true;
+                        try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(code) } });
+                    }
                     return self.rejectStream(id, code); // rs dangles after the drop inside
                 },
                 else => return e,
@@ -339,7 +348,11 @@ pub const Connection = struct {
             // Fewer body bytes than the declared Content-Length is malformed (RFC
             // 9114 4.1.2); the over-count is caught per-DATA above.
             if (rs.content_length) |cl| if (rs.body_received != cl) return error.H3Error;
-            try self.push(.{ .end_of_message = .{ .trailers = rs.trailers, .stream_id = id } });
+            // The event borrows from the per-event arena (reclaimed on the next drain,
+            // like the request headers); rs.trailers is the gpa copy that survived
+            // across pumps and is freed when the stream drops below.
+            const ev_trailers = try self.arenaDupeHeaders(rs.trailers);
+            try self.push(.{ .end_of_message = .{ .trailers = ev_trailers, .stream_id = id } });
             rs.state = .done;
         }
         // Consume BEFORE dropping: consuming the last byte of a finished stream is
@@ -367,7 +380,7 @@ pub const Connection = struct {
         // cancellation leaves the request side open, so the stream stays until the peer
         // also ends it; the QUIC send half is retained until its bytes are acked.
         if (rs.state == .done or self.qc.streamReset(id)) {
-            if (self.qc.dropStream(id)) _ = self.streams.remove(id); // rs dangles after this
+            if (self.qc.dropStream(id)) self.freeStream(id); // rs dangles after this
         }
     }
 
@@ -579,25 +592,64 @@ pub const Connection = struct {
     /// Decode a trailing field section (RFC 9114 4.1). Trailers are ordinary fields
     /// only: a pseudo-header is forbidden, and the same name/value rules as the
     /// request headers apply (lowercase token names, no connection-specific fields,
-    /// no CR/LF/NUL smuggling). The result is materialised into the arena so it
-    /// outlives the next QPACK decode, like the request headers.
+    /// no CR/LF/NUL smuggling). The result is owned by `gpa` (not the per-event arena)
+    /// because the trailing HEADERS and the FIN that emits them can land in different
+    /// pumps, between which the arena is reset on event drain - freed in freeStream.
     fn decodeTrailers(self: *Connection, block: []const u8) Error![]const Header {
         const decoded = self.qpack_dec.decode(block) catch return self.failStream(.message_error);
-        const a = self.arena.allocator();
         var trailers: std.ArrayListUnmanaged(Header) = .empty;
+        errdefer freeHeaders(self.gpa, trailers.items);
         for (decoded) |h| {
-            if (h.name.len > 0 and h.name[0] == ':') return self.failStream(.message_error); // no pseudo-headers in trailers
-            if (!fields.isValidFieldName(h.name)) return self.failStream(.message_error);
+            if (!isValidTrailerField(h)) return self.failStream(.message_error);
             if (!fields.validValue(h.value)) return self.failStream(.message_error);
-            if (fields.isConnectionSpecific(h.name)) return self.failStream(.message_error);
-            if (eql(h.name, "te")) return self.failStream(.message_error); // TE is a header-section field only (RFC 9110 10.1.4)
-            trailers.append(a, .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) }) catch return error.OutOfMemory;
+            const name = self.gpa.dupe(u8, h.name) catch return error.OutOfMemory;
+            errdefer self.gpa.free(name);
+            const value = self.gpa.dupe(u8, h.value) catch return error.OutOfMemory;
+            trailers.append(self.gpa, .{ .name = name, .value = value }) catch return error.OutOfMemory;
         }
-        return trailers.items;
+        return trailers.toOwnedSlice(self.gpa) catch return error.OutOfMemory;
+    }
+
+    /// Whether a field name is legal in a trailer section (RFC 9110 6.5.1): a lowercase
+    /// token, not a pseudo-header, not connection-specific, and not one of the framing,
+    /// routing, or control fields that only make sense in the header section.
+    fn isValidTrailerField(h: Header) bool {
+        if (!fields.isValidFieldName(h.name)) return false; // pseudo-headers ':' and uppercase fail here
+        if (fields.isConnectionSpecific(h.name)) return false;
+        // Framing/routing/control fields the trailer section must not carry.
+        const forbidden = [_][]const u8{ "content-length", "host", "te", "trailer", "content-type", "cache-control", "expect", "max-forwards", "authorization", "set-cookie" };
+        for (forbidden) |name| if (eql(h.name, name)) return false;
+        return true;
+    }
+
+    /// Free a gpa-owned header list (each name and value, then the slice).
+    fn freeHeaders(gpa: std.mem.Allocator, headers: []const Header) void {
+        for (headers) |h| {
+            gpa.free(h.name);
+            gpa.free(h.value);
+        }
+        gpa.free(headers);
+    }
+
+    /// Drop a request stream from the H3 map, freeing the gpa-owned trailers it held.
+    fn freeStream(self: *Connection, id: u64) void {
+        if (self.streams.fetchRemove(id)) |kv| {
+            if (kv.value.trailers.len > 0) freeHeaders(self.gpa, kv.value.trailers);
+        }
     }
 
     fn dupe(self: *Connection, bytes: []const u8) Error![]const u8 {
         return self.arena.allocator().dupe(u8, bytes) catch return error.OutOfMemory;
+    }
+
+    /// Copy a header list into the per-event arena, so an emitted event can borrow it
+    /// safely until the next event drain (when the arena is reset).
+    fn arenaDupeHeaders(self: *Connection, headers: []const Header) Error![]const Header {
+        if (headers.len == 0) return &.{};
+        const a = self.arena.allocator();
+        const out = a.alloc(Header, headers.len) catch return error.OutOfMemory;
+        for (headers, out) |h, *o| o.* = .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
+        return out;
     }
 
     fn push(self: *Connection, ev: H3Event) Error!void {
@@ -661,6 +713,7 @@ pub const Connection = struct {
     /// response. Rejected once the final HEADERS has been sent.
     pub fn sendInformational(self: *Connection, id: u64, status: u16, headers: []const Header) Error!void {
         if (status < 100 or status > 199) return error.H3Error; // interim status range
+        if (status == 101) return error.H3Error; // Switching Protocols is HTTP/1.1 only
         if (try self.sendStateOf(id) != .idle) return error.H3Error; // only before the final response
         try self.sendHeaderSection(id, status, headers);
     }
@@ -711,9 +764,13 @@ pub const Connection = struct {
     pub fn endMessage(self: *Connection, id: u64, trailers: []const Header) Error!void {
         if (try self.sendStateOf(id) != .headers_sent) return error.H3Error;
         if (trailers.len > 0) {
-            // validateResponseHeader rejects pseudo-headers (':' is not a token char),
-            // connection-specific fields, and control bytes - exactly the trailer rules.
-            for (trailers) |h| try validateResponseHeader(h);
+            // Trailers are ordinary fields only (RFC 9110 6.5.1): no pseudo-header, no
+            // framing/routing/control field, no control bytes - the same rule the recv
+            // side enforces, plus the response value strictness.
+            for (trailers) |h| {
+                if (!isValidTrailerField(h)) return error.H3Error;
+                try validateResponseHeader(h); // value strictness (no CR/LF/NUL/edge-whitespace)
+            }
             var section: std.ArrayList(u8) = .empty;
             defer section.deinit(self.gpa);
             section.appendSlice(self.gpa, &.{ 0x00, 0x00 }) catch return error.OutOfMemory; // QPACK prefix RIC=0, Base=0
@@ -851,6 +908,54 @@ test "a request's trailing HEADERS surfaces as end_of_message trailers" {
     try testing.expectEqualStrings("ok", eom.end_of_message.trailers[0].value);
 }
 
+test "trailers arriving before the FIN in a separate datagram still surface" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x13, 0x22, 0x33, 0x44 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // Datagram 1: HEADERS + DATA + the trailing HEADERS, NO fin. The trailers are
+    // decoded now and stashed across pumps; an intervening event drain resets the
+    // arena, so the stash must be gpa-owned (the use-after-free this guards).
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(gpa);
+    try h3_frame.append(&body, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x50 | 0, 0x03, 'e', 'x', 'y' });
+    try h3_frame.append(&body, gpa, .data, "hi");
+    var trailer_block: std.ArrayList(u8) = .empty;
+    defer trailer_block.deinit(gpa);
+    try trailer_block.appendSlice(gpa, &.{ 0x00, 0x00 });
+    try qpack_enc.encodeHeader(&trailer_block, gpa, .{ .name = "x-checksum", .value = "ok" });
+    try h3_frame.append(&body, gpa, .headers, trailer_block.items);
+    const d1 = try buildRequest(gpa, &dcid, 0, body.items); // no FIN
+    defer gpa.free(d1);
+    try qc.receiveDatagram(d1, 1000);
+    try h3.pumpAll();
+    // Drain the request + data events: this resets the arena while trailers are stashed.
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expect(h3.nextEvent() == .data);
+    try testing.expect(h3.nextEvent() == .need_data);
+
+    // Datagram 2: an empty STREAM frame at the body's end offset carrying the FIN.
+    var sf: std.ArrayListUnmanaged(u8) = .empty;
+    defer sf.deinit(gpa);
+    try sf.append(gpa, 0x0f); // STREAM, OFF|LEN|FIN
+    try varint.append(&sf, gpa, 0); // stream id 0
+    try varint.append(&sf, gpa, body.items.len); // offset = bytes already sent
+    try varint.append(&sf, gpa, 0); // length 0
+    const d2 = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 1, sf.items);
+    defer gpa.free(d2);
+    try qc.receiveDatagram(d2, 1100);
+    try h3.pumpAll();
+
+    const eom = h3.nextEvent();
+    try testing.expect(eom == .end_of_message);
+    try testing.expectEqual(@as(usize, 1), eom.end_of_message.trailers.len);
+    try testing.expectEqualStrings("ok", eom.end_of_message.trailers[0].value);
+}
+
 test "a pseudo-header in trailers is malformed" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x12, 0x22, 0x33, 0x44 };
@@ -873,10 +978,43 @@ test "a pseudo-header in trailers is malformed" {
     try h3.pumpAll();
 
     // The request head and body still surfaced; the bad trailers reset the stream
-    // (no end_of_message), and the connection stays up.
+    // (a terminal rst_stream, no end_of_message), and the connection stays up.
     try testing.expect(h3.nextEvent() == .request);
     try testing.expect(h3.nextEvent() == .data);
+    try testing.expect(h3.nextEvent() == .rst_stream);
     try testing.expect(h3.nextEvent() == .need_data);
+    try testing.expect(!qc.closed);
+}
+
+test "a framing field in trailers is malformed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x14, 0x22, 0x33, 0x44 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // The trailer section carries content-length, a framing field forbidden in
+    // trailers (RFC 9110 6.5.1) - it resets the stream, connection stays up.
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(gpa);
+    try h3_frame.append(&body, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x50 | 0, 0x03, 'e', 'x', 'y' });
+    try h3_frame.append(&body, gpa, .data, "hi");
+    var trailer_block: std.ArrayList(u8) = .empty;
+    defer trailer_block.deinit(gpa);
+    try trailer_block.appendSlice(gpa, &.{ 0x00, 0x00 });
+    try qpack_enc.encodeHeader(&trailer_block, gpa, .{ .name = "content-length", .value = "2" });
+    try h3_frame.append(&body, gpa, .headers, trailer_block.items);
+
+    const dgram = try buildRequestOnFin(gpa, &dcid, 0, 0, body.items);
+    defer gpa.free(dgram);
+    try qc.receiveDatagram(dgram, 1000);
+    try h3.pumpAll();
+
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expect(h3.nextEvent() == .data);
+    try testing.expect(h3.nextEvent() == .rst_stream);
     try testing.expect(!qc.closed);
 }
 
@@ -1584,8 +1722,12 @@ test "a server sends response trailers as a trailing HEADERS frame" {
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
+    // A framing field (content-length) and TE are forbidden in a trailer section,
+    // checked before anything goes on the wire.
     try h3.sendResponse(0, 200, &.{});
     try h3.sendData(0, "hi");
+    try testing.expectError(error.H3Error, h3.endMessage(0, &[_]Header{.{ .name = "content-length", .value = "2" }}));
+    try testing.expectError(error.H3Error, h3.endMessage(0, &[_]Header{.{ .name = "te", .value = "trailers" }}));
     const trailers = [_]Header{.{ .name = "x-checksum", .value = "ok" }};
     try h3.endMessage(0, &trailers);
     // A pseudo-header in trailers is rejected; the send half is already finished.
@@ -1630,6 +1772,8 @@ test "a server sends a 1xx interim response before the final one" {
     const hints = [_]Header{.{ .name = "link", .value = "</style.css>; rel=preload" }};
     try h3.sendInformational(0, 103, &hints);
     try h3.sendInformational(0, 100, &.{}); // a second interim is allowed
+    // 101 Switching Protocols does not exist in HTTP/3.
+    try testing.expectError(error.H3Error, h3.sendInformational(0, 101, &.{}));
     try h3.sendResponse(0, 200, &.{});
     try h3.endStream(0);
     // sendResponse rejects a 1xx; sendInformational rejects a final status and a
