@@ -176,11 +176,13 @@ def test_http3_initiate_connection_sends_the_control_stream() -> None:
     conn.receive_datagram(CLIENT_FINISHED, 2000)
     conn.data_to_send()
 
-    # The control stream + SETTINGS leaves as a 1-RTT datagram; idempotent.
+    # The control stream + SETTINGS and the two QPACK streams (RFC 9204 4.2) leave as
+    # 1-RTT datagrams; idempotent. The byte-level stream contents are asserted in the
+    # Zig core test - here we only confirm the flush happens once.
     conn.initiate_connection()
     datagrams = conn.data_to_send()
     assert len(datagrams) >= 1
-    conn.initiate_connection()  # no second control stream
+    conn.initiate_connection()  # no second set of streams
     assert conn.data_to_send() == []
 
 
