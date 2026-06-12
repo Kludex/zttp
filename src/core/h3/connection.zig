@@ -684,7 +684,28 @@ pub const Connection = struct {
     /// Finish the response on stream `id` (send the stream FIN). The head must have
     /// been sent; a second endStream is rejected.
     pub fn endStream(self: *Connection, id: u64) Error!void {
+        return self.endMessage(id, &.{});
+    }
+
+    /// Finish the response on stream `id`, optionally with a trailing field section
+    /// (RFC 9114 4.1). `trailers` carries ordinary fields only - no pseudo-headers -
+    /// and is sent as a trailing HEADERS frame just before the FIN. With no trailers
+    /// this is a bare FIN. The head must have been sent; a second call is rejected.
+    pub fn endMessage(self: *Connection, id: u64, trailers: []const Header) Error!void {
         if (try self.sendStateOf(id) != .headers_sent) return error.H3Error;
+        if (trailers.len > 0) {
+            // validateResponseHeader rejects pseudo-headers (':' is not a token char),
+            // connection-specific fields, and control bytes - exactly the trailer rules.
+            for (trailers) |h| try validateResponseHeader(h);
+            var section: std.ArrayList(u8) = .empty;
+            defer section.deinit(self.gpa);
+            section.appendSlice(self.gpa, &.{ 0x00, 0x00 }) catch return error.OutOfMemory; // QPACK prefix RIC=0, Base=0
+            for (trailers) |h| qpack_enc.encodeHeader(&section, self.gpa, h) catch return error.OutOfMemory;
+            var frame: std.ArrayListUnmanaged(u8) = .empty;
+            defer frame.deinit(self.gpa);
+            h3_frame.append(&frame, self.gpa, .headers, section.items) catch return error.OutOfMemory;
+            try self.streamSend(id, frame.items, false);
+        }
         try self.streamSend(id, &.{}, true);
         try self.setSendState(id, .fin_sent);
     }
@@ -1535,6 +1556,48 @@ test "a server sends a response: HEADERS then DATA then FIN" {
     const d2 = try h3_frame.decode(got[d1.len..]);
     try testing.expectEqual(h3_frame.FrameType.data, d2.frame.ftype);
     try testing.expectEqualStrings("hello", d2.frame.payload);
+}
+
+test "a server sends response trailers as a trailing HEADERS frame" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x9a, 0xab, 0xbc, 0xcd };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    try h3.sendResponse(0, 200, &.{});
+    try h3.sendData(0, "hi");
+    const trailers = [_]Header{.{ .name = "x-checksum", .value = "ok" }};
+    try h3.endMessage(0, &trailers);
+    // A pseudo-header in trailers is rejected; the send half is already finished.
+    try testing.expectError(error.H3Error, h3.endMessage(0, &[_]Header{.{ .name = ":status", .value = "200" }}));
+
+    try qc.flushSend(1000);
+    var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    quic_conn.testInstallAppKeys(&peer);
+    const buf = qc.datagramsToSend();
+    var off: usize = 0;
+    for (qc.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+    const got = peer.streamData(0);
+    try testing.expect(peer.streamFinished(0));
+
+    // HEADERS, then DATA, then a trailing HEADERS whose QPACK block decodes to the trailer.
+    const d1 = try h3_frame.decode(got);
+    const d2 = try h3_frame.decode(got[d1.len..]);
+    const d3 = try h3_frame.decode(got[d1.len + d2.len ..]);
+    try testing.expectEqual(h3_frame.FrameType.headers, d3.frame.ftype);
+    var dec = qpack.Decoder.init(gpa, 1 << 16);
+    defer dec.deinit();
+    const fields_out = try dec.decode(d3.frame.payload);
+    try testing.expectEqual(@as(usize, 1), fields_out.len);
+    try testing.expectEqualStrings("x-checksum", fields_out[0].name);
+    try testing.expectEqualStrings("ok", fields_out[0].value);
 }
 
 test "the server resets a request stream" {
