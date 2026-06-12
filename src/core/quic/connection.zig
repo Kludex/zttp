@@ -132,40 +132,58 @@ const StreamRecvLimits = struct {
 };
 
 /// Tracks which receive streams have completed-and-dropped, so a late frame for one
-/// is ignored rather than resurrecting it - in bounded memory. Streams of one type
-/// carry ids base, base+4, base+8, ... and mostly complete in order, so a contiguous
-/// `below[type]` watermark (every id of that type with index < below is retired)
-/// covers the bulk; only out-of-order completions above the watermark sit in
-/// `sparse`, drained as the watermark advances. Memory is O(reorder window), not
-/// O(total streams).
+/// is ignored rather than resurrecting it - in memory bounded by the number of live
+/// gaps, not the total stream count. Streams of one type carry indices 0, 1, 2, ...
+/// (id = type + index*4). Retired indices are kept as a sorted list of merged
+/// half-open `[lo, hi)` ranges per type: in-order completion grows the first range,
+/// and out-of-order completions above a still-open stream form additional ranges that
+/// merge as the gaps fill. The number of ranges is at most one more than the number
+/// of currently-open streams of that type - which the stream cap bounds - so a peer
+/// that pins a low stream open cannot grow this without bound.
 const RetiredStreams = struct {
-    below: [4]u64 = .{ 0, 0, 0, 0 }, // per StreamType: ids with index < below[type] are retired
-    sparse: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Per StreamType: the sorted, non-overlapping, non-adjacent retired-index ranges.
+    types: [4]std.ArrayListUnmanaged(Range) = .{ .empty, .empty, .empty, .empty },
+
+    const Range = struct { lo: u64, hi: u64 }; // retired indices [lo, hi)
 
     fn deinit(self: *RetiredStreams, gpa: std.mem.Allocator) void {
-        self.sparse.deinit(gpa);
+        for (&self.types) |*list| list.deinit(gpa);
     }
 
     fn contains(self: *const RetiredStreams, id: u64) bool {
-        const ty = @intFromEnum(stream.StreamType.of(id));
-        if (id / 4 < self.below[ty]) return true;
-        return self.sparse.contains(id);
+        const index = id / 4;
+        for (self.types[@intFromEnum(stream.StreamType.of(id))].items) |r| {
+            if (index < r.lo) return false; // ranges are sorted; nothing lower matches
+            if (index < r.hi) return true;
+        }
+        return false;
     }
 
-    /// Record `id` as retired. Returns false only on allocator failure (the caller
-    /// then leaves the stream in place rather than dropping it unrecorded).
+    /// Record `id` as retired, merging it into the range list. Returns false only on
+    /// allocator failure (the caller then leaves the stream in place rather than
+    /// dropping it unrecorded).
     fn put(self: *RetiredStreams, gpa: std.mem.Allocator, id: u64) bool {
-        const ty = @intFromEnum(stream.StreamType.of(id));
+        const list = &self.types[@intFromEnum(stream.StreamType.of(id))];
         const index = id / 4;
-        if (index < self.below[ty]) return true; // already covered by the watermark
-        if (index == self.below[ty]) {
-            // Extends the contiguous run: advance the watermark, then drain any sparse
-            // entries it now reaches (an earlier out-of-order completion).
-            self.below[ty] += 1;
-            while (self.sparse.remove(ty + (self.below[ty] * 4))) self.below[ty] += 1;
-            return true;
+        // Find the first range starting at or after `index`; `index` belongs just before it.
+        var i: usize = 0;
+        while (i < list.items.len and list.items[i].lo <= index) : (i += 1) {
+            if (index < list.items[i].hi) return true; // already retired
         }
-        self.sparse.put(gpa, id, {}) catch return false; // an out-of-order gap
+        // i is the insertion point. Try to extend the previous range's hi, the next
+        // range's lo, or both (which merges them); otherwise insert a singleton.
+        const touch_prev = i > 0 and list.items[i - 1].hi == index;
+        const touch_next = i < list.items.len and list.items[i].lo == index + 1;
+        if (touch_prev and touch_next) {
+            list.items[i - 1].hi = list.items[i].hi; // bridge the two ranges
+            _ = list.orderedRemove(i);
+        } else if (touch_prev) {
+            list.items[i - 1].hi = index + 1;
+        } else if (touch_next) {
+            list.items[i].lo = index;
+        } else {
+            list.insert(gpa, i, .{ .lo = index, .hi = index + 1 }) catch return false;
+        }
         return true;
     }
 };
@@ -219,12 +237,12 @@ pub const Connection = struct {
     /// an inbound MAX_STREAM_DATA), so a response cannot overrun one stream's grant and
     /// be reset. Created lazily with the send stream from `stream_send_initial`.
     stream_send_windows: std.AutoHashMapUnmanaged(u64, flow.SendWindow) = .empty,
-    /// The peer's initial per-stream send limits: bidi for our responses (which ride
-    /// the client's request streams, so initial_max_stream_data_bidi_local - the limit
-    /// the client set on the streams it initiated) and uni for the server's own
-    /// control/QPACK streams (initial_max_stream_data_uni). Learned at the ClientHello;
-    /// until then 0. Selected by stream type when a send window is created.
-    stream_send_initial: u64 = 0,
+    /// The peer's initial per-stream send limits, by the stream we send on (RFC 9000
+    /// 18.2): for a bidi stream the PEER opened (our responses), bidi_local; for one WE
+    /// opened, bidi_remote; for our unidirectional control/QPACK streams, uni. Learned
+    /// at the ClientHello; until then 0. Selected by stream type/initiator on creation.
+    stream_send_initial_peer_bidi: u64 = 0, // bidi the peer opened: bidi_local
+    stream_send_initial_own_bidi: u64 = 0, // bidi we opened: bidi_remote
     stream_send_initial_uni: u64 = 0,
     /// A peer MAX_STREAM_DATA for a send stream we have not created yet (it granted
     /// credit before we opened our half): held by stream id so the higher limit is
@@ -546,9 +564,9 @@ pub const Connection = struct {
             return error.OutOfMemory;
         };
         // This send stream's flow-control window (RFC 9000 19.10), the peer's advertised
-        // per-stream limit - uni for our control/QPACK streams, bidi for responses; an
-        // inbound MAX_STREAM_DATA raises it later.
-        const send_limit = if (stream.StreamType.of(id).isUni()) self.stream_send_initial_uni else self.stream_send_initial;
+        // per-stream limit selected by the stream we send on; an inbound MAX_STREAM_DATA
+        // raises it later.
+        const send_limit = self.peerSendInitial(id);
         var win = flow.SendWindow.init(send_limit);
         // A MAX_STREAM_DATA that arrived before this send half existed granted a higher
         // limit; apply it now so the grant is not lost (a limit only grows).
@@ -1013,11 +1031,11 @@ pub const Connection = struct {
                     const carrier_scid = self.dispatch_initial_scid orelse return error.ProtocolViolation;
                     if (!std.mem.eql(u8, iscid.slice(), carrier_scid)) return error.ProtocolViolation;
                     self.conn_send_window.setInitial(self.peer_tp.initial_max_data);
-                    // Our responses ride the client's request streams (client-initiated
-                    // bidi), so the bidi send limit is the one the client set on the
-                    // streams IT opens (bidi_local); our own control/QPACK uni streams
-                    // are bounded by the client's initial_max_stream_data_uni.
-                    self.stream_send_initial = self.peer_tp.initial_max_stream_data_bidi_local;
+                    // Our responses ride bidi streams the client opens, bounded by its
+                    // bidi_local; a bidi stream we open is bounded by its bidi_remote;
+                    // our control/QPACK uni streams by its uni limit (RFC 9000 18.2).
+                    self.stream_send_initial_peer_bidi = self.peer_tp.initial_max_stream_data_bidi_local;
+                    self.stream_send_initial_own_bidi = self.peer_tp.initial_max_stream_data_bidi_remote;
                     self.stream_send_initial_uni = self.peer_tp.initial_max_stream_data_uni;
 
                     var flight_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1383,6 +1401,16 @@ pub const Connection = struct {
         return t.isClientInitiated() == peer_is_client; // a uni stream: only its initiator sends
     }
 
+    /// The peer's advertised per-stream send limit for a stream WE send on `id`
+    /// (RFC 9000 18.2): uni for our unidirectional streams, bidi_local when the bidi
+    /// stream was opened by the peer (our responses), bidi_remote when we opened it.
+    fn peerSendInitial(self: *const Connection, id: u64) u64 {
+        const t = stream.StreamType.of(id);
+        if (t.isUni()) return self.stream_send_initial_uni;
+        const we_opened = t.isClientInitiated() != (self.role == .server);
+        return if (we_opened) self.stream_send_initial_own_bidi else self.stream_send_initial_peer_bidi;
+    }
+
     /// A peer STOP_SENDING (RFC 9000 19.5) asks us to stop sending on `id`. Reset that
     /// send stream so we stop producing; if the stream does not exist yet (the peer
     /// cancelled before we started the response), remember the request so the stream
@@ -1401,7 +1429,16 @@ pub const Connection = struct {
         if (!we_send_on) return error.ProtocolViolation;
         if (self.stream_send_windows.getPtr(id)) |w| {
             w.onMaxData(max);
-        } else {
+            return;
+        }
+        // The send window does not exist yet. We open our own streams before sending on
+        // them, so a pre-emptive grant is only meaningful for a PEER-initiated bidi
+        // stream (a request we will respond on) - and only one the peer actually opened,
+        // charged against the bidi cap so the held map cannot grow past it. A grant for
+        // any other not-yet-open stream is dropped (it would re-grant from the initial
+        // when we open it anyway).
+        if (t == .client_bidi and self.role == .server) {
+            try self.noteClientStream(id); // STREAM_LIMIT_ERROR if past the cap; bounds the map
             const gop = self.pending_send_max.getOrPut(self.gpa, id) catch return error.OutOfMemory;
             gop.value_ptr.* = if (gop.found_existing) @max(gop.value_ptr.*, max) else max;
         }
@@ -1686,7 +1723,8 @@ pub fn testInstallAppKeys(conn: *Connection) void {
     conn.peer_tp.initial_max_streams_uni = 16;
     conn.peer_tp.initial_max_stream_data_bidi_local = 1 << 16;
     conn.peer_tp.initial_max_stream_data_uni = 1 << 16;
-    conn.stream_send_initial = 1 << 16;
+    conn.stream_send_initial_peer_bidi = 1 << 16;
+    conn.stream_send_initial_own_bidi = 1 << 16;
     conn.stream_send_initial_uni = 1 << 16;
     // A real connection learns the per-stream send grant at the ClientHello, before any
     // send stream exists; a test may queue data first, so raise any existing windows.
@@ -1874,35 +1912,38 @@ test "connection flow control sums across streams" {
     try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
 }
 
-test "retired streams compress in-order completions into a watermark" {
+test "retired streams merge into ranges bounded by live gaps" {
     const gpa = testing.allocator;
     var r = RetiredStreams{};
     defer r.deinit(gpa);
 
-    // In-order client-bidi retirements (0, 4, 8) advance the watermark - no sparse
-    // entries, so memory stays O(1) however many complete.
+    // In-order client-bidi retirements (0, 4, 8) merge into ONE range [0,3): memory
+    // stays O(1) however many complete in order.
     try testing.expect(r.put(gpa, 0));
     try testing.expect(r.put(gpa, 4));
     try testing.expect(r.put(gpa, 8));
-    try testing.expectEqual(@as(u64, 3), r.below[0]); // ids < index 3 retired
-    try testing.expectEqual(@as(usize, 0), r.sparse.count());
-    try testing.expect(r.contains(0));
-    try testing.expect(r.contains(8));
-    try testing.expect(!r.contains(12)); // not yet retired
+    try testing.expectEqual(@as(usize, 1), r.types[0].items.len);
+    try testing.expectEqual(RetiredStreams.Range{ .lo = 0, .hi = 3 }, r.types[0].items[0]);
+    try testing.expect(r.contains(0) and r.contains(8) and !r.contains(12));
 
-    // An out-of-order completion (16, skipping 12) sits in the sparse set...
+    // Stream 12 (index 3) stays OPEN; completions above it (16, 20) form a SECOND
+    // range that grows but does not multiply - two ranges, not one-per-stream.
     try testing.expect(r.put(gpa, 16));
-    try testing.expectEqual(@as(usize, 1), r.sparse.count());
-    try testing.expect(r.contains(16));
-    // ...then 12 fills the gap and the watermark swallows both, draining the sparse set.
-    try testing.expect(r.put(gpa, 12));
-    try testing.expectEqual(@as(u64, 5), r.below[0]); // through index 4 (id 16)
-    try testing.expectEqual(@as(usize, 0), r.sparse.count());
+    try testing.expect(r.put(gpa, 20));
+    try testing.expectEqual(@as(usize, 2), r.types[0].items.len);
+    try testing.expectEqual(RetiredStreams.Range{ .lo = 4, .hi = 6 }, r.types[0].items[1]);
 
-    // Different stream types are tracked independently (server-uni ids 3, 7).
+    // When 12 finally completes, the gap fills and the two ranges bridge into one.
+    try testing.expect(r.put(gpa, 12));
+    try testing.expectEqual(@as(usize, 1), r.types[0].items.len);
+    try testing.expectEqual(RetiredStreams.Range{ .lo = 0, .hi = 6 }, r.types[0].items[0]);
+    try testing.expect(r.contains(20));
+
+    // A re-put is a no-op, and stream types are independent (server-uni id 3).
+    try testing.expect(r.put(gpa, 4)); // already retired
+    try testing.expectEqual(@as(usize, 1), r.types[0].items.len);
     try testing.expect(r.put(gpa, 3));
-    try testing.expect(r.contains(3));
-    try testing.expect(!r.contains(7));
+    try testing.expect(r.contains(3) and !r.contains(7));
 }
 
 test "a single stream over its per-stream window is a flow-control error" {
@@ -2764,7 +2805,7 @@ test "a MAX_STREAM_DATA before the send stream exists is applied when it opens" 
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
     testInstallAppKeys(&conn);
-    conn.stream_send_initial = 4; // a small initial bidi send limit
+    conn.stream_send_initial_peer_bidi = 4; // a small initial bidi send limit
 
     // The peer grants a higher limit on stream 0 BEFORE we open our send half.
     const mf = [_]u8{ 0x11, 0x00, 0x40, 0x64 }; // MAX_STREAM_DATA stream 0, max 100
