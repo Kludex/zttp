@@ -53,6 +53,12 @@ pub const TransportParameters = struct {
     /// or retry_source_connection_id). A server MUST reject a client list carrying
     /// any of these as a TRANSPORT_PARAMETER_ERROR.
     has_server_only_param: bool = false,
+    /// A connection-id parameter the server derives per-connection and appends itself
+    /// (original_destination_connection_id or initial_source_connection_id) appeared.
+    /// A server's base configuration blob carrying one would duplicate it on the
+    /// wire; unlike the broader server-only set, stateless_reset_token and
+    /// preferred_address are NOT flagged - a server may legitimately advertise those.
+    has_injected_cid_param: bool = false,
 };
 
 const Id = enum(u64) {
@@ -106,8 +112,12 @@ pub fn parse(buf: []const u8) Error!TransportParameters {
                 var cid = ConnectionId{ .len = @intCast(value.len) };
                 @memcpy(cid.buf[0..value.len], value);
                 tp.initial_scid = cid;
+                tp.has_injected_cid_param = true; // 0x0f: a server appends this itself
             },
-            .original_destination_connection_id,
+            .original_destination_connection_id => {
+                tp.has_server_only_param = true;
+                tp.has_injected_cid_param = true; // 0x00: a server appends this itself
+            },
             .stateless_reset_token,
             .preferred_address,
             .retry_source_connection_id,
@@ -212,4 +222,15 @@ test "a server-only parameter is flagged" {
     const tp = try parse(&[_]u8{ 0x00, 0x02, 0x11, 0x22 });
     try testing.expect(tp.has_server_only_param);
     try testing.expect(!(try parse(&[_]u8{ 0x0f, 0x00 })).has_server_only_param);
+}
+
+test "only the injected connection-id parameters are flagged for a server base blob" {
+    // The two ids the server appends itself (0x00 ODCID, 0x0f initial_scid) are
+    // flagged so a base blob carrying one is caught as a duplicate...
+    try testing.expect((try parse(&[_]u8{ 0x00, 0x01, 0xaa })).has_injected_cid_param);
+    try testing.expect((try parse(&[_]u8{ 0x0f, 0x00 })).has_injected_cid_param);
+    // ...but a stateless_reset_token (0x02) or preferred_address (0x0d) is a server's
+    // own to advertise, so it is NOT an injected-id conflict.
+    try testing.expect(!(try parse(&[_]u8{0x02} ++ [_]u8{0x10} ++ [_]u8{0xcc} ** 16)).has_injected_cid_param);
+    try testing.expect((try parse(&[_]u8{0x02} ++ [_]u8{0x10} ++ [_]u8{0xcc} ** 16)).has_server_only_param);
 }

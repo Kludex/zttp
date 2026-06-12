@@ -271,8 +271,10 @@ pub const Connection = struct {
         // malformed own blob is a configuration bug, surfaced before anything is built.
         // The connection-id parameters are appended below, so a base blob already
         // carrying one would duplicate it on the wire - also a configuration bug.
+        // Only those two ids are rejected: a server may legitimately advertise the
+        // other server-only parameters (stateless_reset_token, preferred_address).
         const own = transport_params.parse(tls_config.transport_params) catch return error.ProtocolViolation;
-        if (own.has_server_only_param or own.initial_scid != null) return error.ProtocolViolation;
+        if (own.has_injected_cid_param) return error.ProtocolViolation;
         var conn = try init(gpa, .server, client_dcid);
         errdefer conn.deinit();
         conn.tls = tls.server.Server.init(tls_config);
@@ -1559,11 +1561,20 @@ test "initServer advertises the mandatory connection ids" {
     // The TLS driver ships exactly this blob in EncryptedExtensions.
     try testing.expectEqualSlices(u8, conn.own_tp.?, conn.tls.?.config.transport_params);
 
-    // A base blob already carrying a connection-id parameter would duplicate it on
-    // the wire: a configuration bug, rejected up front.
+    // A base blob already carrying one of the two ids initServer injects would
+    // duplicate it on the wire: a configuration bug, rejected up front.
     var dupCfg = testServerConfig();
     dupCfg.transport_params = &[_]u8{ 0x0f, 0x00 }; // initial_source_connection_id
     try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, dupCfg));
+
+    // But a base blob carrying a server-only parameter the server itself does NOT
+    // inject (stateless_reset_token, 0x02) is legitimate and rides through verbatim.
+    var srtCfg = testServerConfig();
+    const srt = [_]u8{0x02} ++ [_]u8{0x10} ++ [_]u8{0xcc} ** 16; // 16-byte token
+    srtCfg.transport_params = &srt;
+    var srtConn = try Connection.initServer(gpa, &dcid, srtCfg);
+    defer srtConn.deinit();
+    try testing.expect(std.mem.indexOf(u8, srtConn.own_tp.?, &srt) != null);
 }
 
 test "connection flow control sums across streams" {
