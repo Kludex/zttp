@@ -161,8 +161,12 @@ pub const Connection = struct {
     fn rejectStream(self: *Connection, id: u64, code: h3_error.ErrorCode) Error!void {
         self.qc.resetStream(id, @intFromEnum(code)) catch return error.H3Error;
         self.qc.stopSending(id, @intFromEnum(code)) catch return error.H3Error;
+        // Consume the unread bytes so the recv state can reach terminal and dropStream
+        // can reclaim now. A zero-length FIN leaves no pending bytes but still must be
+        // consumed (consumeStream(id, 0) flips a finished stream to data_read);
+        // otherwise the stream lingers in .rejected until an unrelated later repump.
         const pending = self.qc.streamData(id).len;
-        if (pending > 0) self.qc.consumeStream(id, pending);
+        if (pending > 0 or self.qc.streamFinished(id) or self.qc.streamReset(id)) self.qc.consumeStream(id, pending);
         // Drop the stream if the transport can (recv terminal); otherwise mark it
         // .rejected so a later pump quarantines it (drains, no more events) rather than
         // re-parsing a stream we already reset, which could surface a spurious request.
@@ -352,9 +356,17 @@ pub const Connection = struct {
             // will come), a connection error (RFC 9114 4.1, H3_FRAME_ERROR) - not a
             // silently-accepted complete request.
             if (consumed_total < ready.len) return self.fail(.frame_error, "a frame truncated by the stream end");
-            // Fewer body bytes than the declared Content-Length is malformed (RFC
-            // 9114 4.1.2); the over-count is caught per-DATA above.
-            if (rs.content_length) |cl| if (rs.body_received != cl) return error.H3Error;
+            // Fewer body bytes than the declared Content-Length is a malformed message
+            // (RFC 9114 4.1.2); the over-count is caught per-DATA above. Like any
+            // malformed request it resets just this stream - and since the request was
+            // already surfaced, a terminal rst_stream so the integrator stops waiting.
+            if (rs.content_length) |cl| if (rs.body_received != cl) {
+                if (!rs.rst_emitted) {
+                    try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(h3_error.ErrorCode.message_error) } });
+                    rs.rst_emitted = true;
+                }
+                return self.rejectStream(id, .message_error); // drains the stream and drops it
+            };
             // The event borrows from the per-event arena (reclaimed on the next drain,
             // like the request headers); rs.trailers is the gpa copy that survived
             // across pumps and is freed when the stream drops below.
@@ -504,11 +516,15 @@ pub const Connection = struct {
                 else => return self.failStream(.message_error),
             },
             .data => {
-                // DATA is legal only between the head and the trailers (RFC 9114 4.1).
-                if (rs.state != .headers_done) return self.fail(.frame_unexpected, "DATA outside the request body"); // RFC 9114 4.1
-                rs.body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return self.fail(.message_error, "request body length overflow");
-                // More body than the declared Content-Length is malformed (RFC 9114 4.1.2).
-                if (rs.content_length) |cl| if (rs.body_received > cl) return self.fail(.message_error, "body exceeds Content-Length");
+                // DATA outside the head..trailers window is an invalid frame SEQUENCE,
+                // a connection error (RFC 9114 4.1, H3_FRAME_UNEXPECTED).
+                if (rs.state != .headers_done) return self.fail(.frame_unexpected, "DATA outside the request body");
+                // A body that disagrees with the declared Content-Length is a malformed
+                // MESSAGE (RFC 9114 4.1.2), so it resets just this stream - matching how
+                // the header-side Content-Length checks already fail. One client's bad
+                // body must not tear down every multiplexed request.
+                rs.body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return self.failStream(.message_error);
+                if (rs.content_length) |cl| if (rs.body_received > cl) return self.failStream(.message_error);
                 const body = try self.dupe(f.payload);
                 try self.push(.{ .data = .{ .data = body, .stream_id = id } });
             },
@@ -1250,7 +1266,7 @@ test "two disagreeing Content-Length values are malformed" {
     try testing.expect(!try pumpHeaders(testing.allocator, &(.{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1 } ++ cl ++ .{ 0x01, '1' } ++ cl ++ .{ 0x01, '2' })));
 }
 
-test "more body than Content-Length is malformed at the DATA frame" {
+test "more body than Content-Length resets the stream, not the connection" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0xd1, 0xd2, 0xd3, 0xd4 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
@@ -1265,7 +1281,12 @@ test "more body than Content-Length is malformed at the DATA frame" {
     const dgram = try buildRequest(gpa, &dcid, 0, h3_bytes.items);
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
-    try testing.expectError(error.H3Error, h3.pump(0));
+    // A malformed message (RFC 9114 4.1.2) resets just this stream: the request was
+    // surfaced, then a terminal rst_stream; the connection stays up.
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expect(h3.nextEvent() == .rst_stream);
+    try testing.expect(!qc.closed);
 }
 
 test "a request with a body yields request then data" {
@@ -1350,7 +1371,16 @@ test "the body matching Content-Length is accepted, a mismatch is malformed" {
         const dgram = try buildRequestFin(gpa, &dcid, h3_bytes.items);
         defer gpa.free(dgram);
         try qc.receiveDatagram(dgram, 1000);
-        try testing.expectError(error.H3Error, h3.pump(0));
+        // Too few body bytes at the FIN is a malformed message: the request and its
+        // data surfaced, then a terminal rst_stream - the connection is not torn down.
+        try h3.pump(0);
+        try testing.expect(h3.nextEvent() == .request);
+        try testing.expect(h3.nextEvent() == .data);
+        try testing.expect(h3.nextEvent() == .rst_stream);
+        try testing.expect(!qc.closed);
+        // The reset reclaims the stream immediately (the zero-length FIN is consumed),
+        // not leaving it pinned until an unrelated later pump.
+        try testing.expect(!qc.hasStream(0));
     }
 }
 
@@ -1635,7 +1665,10 @@ test "DATA before HEADERS is rejected" {
     const dgram = try buildRequest(gpa, &dcid, 0, h3_bytes.items);
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
+    // An invalid frame SEQUENCE (RFC 9114 4.1) is a connection error, unlike a
+    // malformed message (a bad Content-Length), which only resets the stream.
     try testing.expectError(error.H3Error, h3.pump(0));
+    try testing.expect(qc.closed);
 }
 
 // Build a 1-RTT packet whose STREAM frame carries `h3_bytes` at `offset` on stream
