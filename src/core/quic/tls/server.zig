@@ -14,6 +14,28 @@ const client_hello = @import("client_hello.zig");
 
 pub const State = enum { wait_client_hello, flight_sent, complete };
 
+/// The TLS 1.3 alert descriptions (RFC 8446 6) this server raises. QUIC carries a
+/// fatal alert as a CONNECTION_CLOSE with code CRYPTO_ERROR (0x0100 | alert), so a
+/// peer learns which TLS rule was broken (RFC 9001 4.8).
+pub const Alert = enum(u8) {
+    unexpected_message = 10,
+    decode_error = 50,
+    decrypt_error = 51,
+    internal_error = 80,
+    no_application_protocol = 120,
+};
+
+/// The alert a handshake error maps to. A malformed handshake message decodes to
+/// `decode_error`; the rest follow RFC 8446's named conditions.
+pub fn alertFor(e: Error) Alert {
+    return switch (e) {
+        error.UnexpectedMessage => .unexpected_message,
+        error.BadFinished => .decrypt_error,
+        error.NoAlpnOverlap => .no_application_protocol,
+        error.Internal, error.OutOfMemory => .internal_error,
+    };
+}
+
 pub const Error = error{
     /// A handshake message arrived in a state that forbids it (e.g. a second
     /// ClientHello). The connection maps this to PROTOCOL_VIOLATION.
