@@ -11,24 +11,33 @@ import zttp
 SERVER_CONFIG = {
     "certificate": b"\xcc" * 48,
     "private_key": b"\x42" * 32,
-    "transport_params": b"\x00\x01",
+    "transport_params": b"\x08\x01\x08",
     "random": b"\xab" * 32,
     "ephemeral_seed": b"\x33" * 32,
 }
 
 # Real handshake datagrams a client produces against SERVER_CONFIG, captured from the
-# Zig transport's test builders (RFC 8448 client key share; client transport params
-# grant initial_max_data 65536 so the server can send a response). The ClientHello
-# rides an Initial, the Finished a Handshake packet, the GET request a 1-RTT packet -
-# each sealed with the keys the real handshake derives, so nothing is forged with test
-# keys. dcid is 11 22 33 44.
+# Zig transport's test builders (RFC 8448 client key share). The client offers ALPN h3
+# and grants initial_max_data 65536 plus initial_max_streams_uni 3 (so the server may
+# open its control + QPACK streams) plus an empty initial_source_connection_id (matching
+# its zero-length Initial scid); the server advertises initial_max_streams_bidi 8 plus
+# the auto-injected original_destination/initial_source connection ids, ALPN h3. The
+# ClientHello rides an Initial, the Finished a Handshake packet, the GET request a
+# 1-RTT packet - each sealed with the keys the real handshake derives, so nothing is
+# forged with test keys. dcid is 11 22 33 44.
 CLIENT_HELLO = bytes.fromhex(
-    "c50000000104112233440000408f483e116484af5563d1a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0cbccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe883b8cddc289b6944cd68dfb2ecf25008c78255eef81817c25a8"
+    "c30000000104112233440000409d523e116476af556323a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0d9ccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe88128cdec68e34fd7fd61b26ebfa1cc07be4f74f73519a1f918fbc5bae47921e0ed07b24d11df74b"
 )
 CLIENT_FINISHED = bytes.fromhex(
-    "ec00000001041122334400382752efb16776726f129f2798e7cee3ab080e10925a8331338a626e045753f05e8faf92e68fa71b216c74ad62328c98266e9a02dfc1e04b73"
+    "e50000000104112233440038cecc75a9cb1a1fd3d294606942f3fbd6ed69fcc56d4bf7a56c6704cbe3fdf52293209f8bb0fb3ea577cc8e0bce7ed4832243a04ed488b97f"
 )
-GET_REQUEST = bytes.fromhex("43112233444d9d682e5bf0ebaf0a11b98027c97bf97fd885a8313873436ad9bbdfce745335")
+GET_REQUEST = bytes.fromhex("4f11223344f5655f22d79dbffd5180e4c1e863acb121a200a66fb43f3234da18b348111c30")
+
+# The pre-conformance ClientHello: no ALPN offer and no initial_source_connection_id,
+# both of which the server now requires.
+LEGACY_CLIENT_HELLO = bytes.fromhex(
+    "c50000000104112233440000408f483e116484af5563d1a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0cbccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe883b8cddc289b6944cd68dfb2ecf25008c78255eef81817c25a8"
+)
 
 
 def make_server() -> zttp.H3Connection:
@@ -84,6 +93,13 @@ def test_first_datagram_must_be_an_initial() -> None:
     conn = make_server()
     with pytest.raises(zttp.RemoteProtocolError):
         conn.receive_datagram(b"\x40not-a-long-header")
+
+
+def test_a_non_conformant_client_hello_is_rejected() -> None:
+    # No ALPN and no initial_source_connection_id - both now mandatory.
+    conn = make_server()
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.receive_datagram(LEGACY_CLIENT_HELLO, 1000)
 
 
 def test_handshake_emits_a_flight() -> None:
@@ -161,11 +177,13 @@ def test_http3_initiate_connection_sends_the_control_stream() -> None:
     conn.receive_datagram(CLIENT_FINISHED, 2000)
     conn.data_to_send()
 
-    # The control stream + SETTINGS leaves as a 1-RTT datagram; idempotent.
+    # The control stream + SETTINGS and the two QPACK streams (RFC 9204 4.2) leave as
+    # 1-RTT datagrams; idempotent. The byte-level stream contents are asserted in the
+    # Zig core test - here we only confirm the flush happens once.
     conn.initiate_connection()
     datagrams = conn.data_to_send()
     assert len(datagrams) >= 1
-    conn.initiate_connection()  # no second control stream
+    conn.initiate_connection()  # no second set of streams
     assert conn.data_to_send() == []
 
 

@@ -153,6 +153,10 @@ pub const Connection = struct {
     /// A peer STOP_SENDING received before we created the matching send stream (id ->
     /// error code), applied when the stream is lazily created so it is born reset.
     peer_stop_sending: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// Every peer STOP_SENDING received (id -> error code), surfaced to the layer
+    /// above so a response cancellation is observable even when the request side was
+    /// not reset; the layer consumes it via takeStopSending.
+    stop_sending_recv: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Built datagrams waiting to be drained by `datagramsToSend` (one contiguous
     /// buffer; `out_lengths` records each datagram's byte length in order).
     out: std.ArrayListUnmanaged(u8) = .empty,
@@ -160,15 +164,37 @@ pub const Connection = struct {
     /// The server TLS handshake driver, attached by `initServer`; null on a client
     /// or a connection that does not run the handshake (the recv-pipeline tests).
     tls: ?tls.server.Server = null,
+    /// The full transport-parameter blob this server advertises: the integrator's
+    /// base parameters plus the mandatory per-connection ids initServer appends.
+    /// Connection-owned (the TLS driver borrows it); null outside the server path.
+    own_tp: ?[]u8 = null,
     /// The client's transport parameters (RFC 9000 18.2), parsed from the
     /// ClientHello; until then the RFC defaults apply. Drives the send window and
     /// the PTO ack-delay.
     peer_tp: transport_params.TransportParameters = .{},
     peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
+    /// The Source Connection ID of the Initial packet currently being dispatched,
+    /// borrowed from that datagram for the span of `dispatchFrames`. The ClientHello
+    /// handler validates the client's initial_source_connection_id against THIS - the
+    /// id on the very packet that carried the ClientHello (RFC 9000 7.3) - rather
+    /// than a persistent anchor. Initial keys are derivable from the dcid, so a
+    /// pre-committed anchor could be poisoned by a spoofed PADDING-only Initial that
+    /// still opens under AEAD; binding the check to the ClientHello's own packet
+    /// removes that, since a spoof carrying CRYPTO is already fatal on reassembly.
+    dispatch_initial_scid: ?[]const u8 = null,
     handshake_confirmed: bool = false, // the client Finished verified; HANDSHAKE_DONE sent
     /// The connection-level recv window grew enough to advertise a new MAX_DATA
     /// (RFC 9000 4.1); flushSend emits it so the peer is not stalled at its grant.
     max_data_pending: bool = false,
+    /// Enough request streams completed to advertise a higher bidi cap (RFC 9000 4.6);
+    /// flushSend emits a MAX_STREAMS (carrying `bidi_limit.max`, already granted) so the
+    /// peer is not stuck at the old limit.
+    max_streams_pending: bool = false,
+    /// The packet number an emitted MAX_STREAMS is riding, so a lost one is re-sent (RFC
+    /// 9000 13.3): without this a lost MAX_STREAMS would deadlock the peer, which - being
+    /// out of stream credit - cannot open the streams whose completion would re-trigger
+    /// the advertisement. Cleared when that packet is acked.
+    max_streams_sent: ?u64 = null,
     /// Anti-amplification (RFC 9000 8.1): until the client's address is validated, the
     /// server may send at most AMPLIFICATION_FACTOR x the bytes it has received. A
     /// received Handshake packet (only a real client can produce one) validates the
@@ -188,6 +214,13 @@ pub const Connection = struct {
     /// legitimate new lower id as retired. One u64 per retired stream is far smaller
     /// than the RecvStream it replaces, so this still bounds the per-stream memory.
     retired_recv: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// The cap on client-initiated bidirectional streams (RFC 9000 4.6): exactly the
+    /// initial_max_streams_bidi we advertise, enforced on each newly opened request
+    /// stream so a peer cannot exhaust memory by opening unboundedly many. The wire and
+    /// the enforced value are always identical (a server advertising 0 rejects every
+    /// bidi stream). `null` on the non-server `init` path, which advertises nothing, so
+    /// the recv-pipeline tests open streams unchecked; initServer always sets it.
+    bidi_limit: ?flow.StreamLimit = null,
 
     /// `client_dcid` is the destination connection id on the client's first
     /// Initial: both endpoints derive the Initial keys from it. The server picks
@@ -228,10 +261,35 @@ pub const Connection = struct {
     /// A server connection with the TLS handshake driver attached: incoming CRYPTO
     /// drives the handshake, which installs per-space keys and emits the server
     /// flight. `tls_config` supplies the ServerHello randomness, ephemeral seed,
-    /// signing key, certificate, and transport parameters.
+    /// signing key, certificate, and transport parameters. The integrator's
+    /// transport-parameter blob carries only the limits it chooses; the mandatory
+    /// per-connection ids (RFC 9000 7.3) are appended here, since only the
+    /// connection knows them.
     pub fn initServer(gpa: std.mem.Allocator, client_dcid: []const u8, tls_config: tls.flight.Config) Error!Connection {
+        // Enforce exactly the bidi cap we advertise (RFC 9000 4.6): parse it from our
+        // own transport parameters so the wire and the enforced value never diverge. A
+        // malformed own blob is a configuration bug, surfaced before anything is built.
+        // The connection-id parameters are appended below, so a base blob already
+        // carrying one would duplicate it on the wire - also a configuration bug.
+        // Only those two ids are rejected: a server may legitimately advertise the
+        // other server-only parameters (stateless_reset_token, preferred_address).
+        const own = transport_params.parse(tls_config.transport_params) catch return error.ProtocolViolation;
+        if (own.has_injected_cid_param) return error.ProtocolViolation;
         var conn = try init(gpa, .server, client_dcid);
+        errdefer conn.deinit();
         conn.tls = tls.server.Server.init(tls_config);
+        conn.bidi_limit = flow.StreamLimit.init(own.initial_max_streams_bidi);
+        // Advertise the mandatory connection ids (RFC 9000 18.2): the client MUST see
+        // its first Initial's destination id echoed as original_destination_connection_id
+        // and our source id as initial_source_connection_id, or it fails the handshake
+        // with TRANSPORT_PARAMETER_ERROR. The augmented blob is connection-owned.
+        var full: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer full.deinit(gpa);
+        try full.appendSlice(gpa, tls_config.transport_params);
+        try transport_params.appendBytesParam(&full, gpa, 0x00, client_dcid); // original_destination_connection_id
+        try transport_params.appendBytesParam(&full, gpa, 0x0f, conn.scid); // initial_source_connection_id
+        conn.own_tp = try full.toOwnedSlice(gpa);
+        conn.tls.?.config.transport_params = conn.own_tp.?;
         return conn;
     }
 
@@ -239,6 +297,7 @@ pub const Connection = struct {
         self.gpa.free(self.dcid);
         self.gpa.free(self.scid);
         self.gpa.free(self.peer_scid);
+        if (self.own_tp) |tp| self.gpa.free(tp);
         var it = self.streams.valueIterator();
         while (it.next()) |s| {
             s.*.deinit();
@@ -254,6 +313,7 @@ pub const Connection = struct {
         self.stop_sending.deinit(self.gpa);
         self.stop_sending_inflight.deinit(self.gpa);
         self.peer_stop_sending.deinit(self.gpa);
+        self.stop_sending_recv.deinit(self.gpa);
         self.retired_recv.deinit(self.gpa);
         self.out.deinit(self.gpa);
         self.out_lengths.deinit(self.gpa);
@@ -457,6 +517,21 @@ pub const Connection = struct {
             self.max_data_pending = false;
         }
 
+        // Advertise a raised bidi-stream cap if one is pending, so a peer serving a long
+        // run of requests is not stuck at the old MAX_STREAMS limit (RFC 9000 4.6). The
+        // value was granted in dropStream; emit it and record the pn so a lost frame is
+        // re-sent (the cap only grows, so a duplicate is harmless).
+        if (self.max_streams_pending) {
+            if (self.bidi_limit) |*limit| {
+                var msf: std.ArrayListUnmanaged(u8) = .empty;
+                defer msf.deinit(self.gpa);
+                frame.encodeMaxStreams(&msf, self.gpa, true, limit.max) catch return error.OutOfMemory;
+                while (msf.items.len < 20) msf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+                self.max_streams_sent = try self.buildPacket(space, msf.items, true, now);
+            }
+            self.max_streams_pending = false;
+        }
+
         // A conservative single-packet budget: one STREAM frame per packet.
         const packet_room = constants.MIN_INITIAL_DATAGRAM - 64;
         var it = self.send_streams.iterator();
@@ -569,6 +644,7 @@ pub const Connection = struct {
                 }
             }
             if (self.stop_sending_inflight.fetchRemove(pn)) |e| _ = self.stop_sending.remove(e.value); // acked: done
+            if (self.max_streams_sent == pn) self.max_streams_sent = null; // the advertised cap is confirmed
         }
         // ACK progress resets the PTO backoff (in recovery), so release the fire-once
         // latch: a fresh PTO epoch may arm even if another packet sharing the fired
@@ -603,6 +679,11 @@ pub const Connection = struct {
             // A lost STOP_SENDING: clear in_flight so the next flushSend re-emits it.
             if (self.stop_sending_inflight.fetchRemove(pn)) |e| {
                 if (self.stop_sending.getPtr(e.value)) |ss| ss.in_flight = false;
+            }
+            // A lost MAX_STREAMS: re-arm so the next flushSend re-advertises the cap.
+            if (self.max_streams_sent == pn) {
+                self.max_streams_sent = null;
+                self.max_streams_pending = true;
             }
         }
         if (crypto_lost) try self.flushCrypto(space, now); // resend the lost handshake bytes now
@@ -702,6 +783,12 @@ pub const Connection = struct {
                 return; // the next flushSend re-sends it
             }
         }
+        // ... or the MAX_STREAMS the probed packet carried: re-arm it to re-advertise.
+        if (self.max_streams_sent == pn) {
+            self.max_streams_sent = null;
+            self.max_streams_pending = true;
+            return; // the next flushSend re-sends it
+        }
         // No data to resend (the range was already acked, or a PING-only packet): a
         // PING is a valid probe that elicits an ACK and keeps the recovery loop alive.
         try self.sendPing(space, now);
@@ -744,6 +831,14 @@ pub const Connection = struct {
                     // the PTO. Applied before the flight is built/sent.
                     self.peer_tp = transport_params.parse(decoded.value.quic_transport_parameters) catch
                         return error.ProtocolViolation;
+                    // RFC 9000 7.3/18.2: a client must not send server-only parameters,
+                    // must send initial_source_connection_id, and that id must equal the
+                    // Source Connection ID of the Initial carrying this ClientHello -
+                    // the handshake-time authentication that defeats id spoofing.
+                    if (self.peer_tp.has_server_only_param) return error.ProtocolViolation;
+                    const iscid = self.peer_tp.initial_scid orelse return error.ProtocolViolation;
+                    const carrier_scid = self.dispatch_initial_scid orelse return error.ProtocolViolation;
+                    if (!std.mem.eql(u8, iscid.slice(), carrier_scid)) return error.ProtocolViolation;
                     self.conn_send_window.setInitial(self.peer_tp.initial_max_data);
 
                     var flight_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -903,20 +998,15 @@ pub const Connection = struct {
         };
         const total = hdr.pn_offset + @as(usize, @intCast(hdr.length));
         if (total > buf.len) return error.Dropped;
-        // Adopt the peer's source connection id (from its first long header) as the
-        // destination of everything we send (RFC 9000 7.2). Until this, peer_scid
-        // defaults to the client dcid - fine for tests that use one shared id.
-        if (!self.peer_scid_set and hdr.scid.len > 0) {
-            const sc = self.gpa.dupe(u8, hdr.scid) catch return error.OutOfMemory;
-            self.gpa.free(self.peer_scid);
-            self.peer_scid = sc;
-            self.peer_scid_set = true;
-        }
         // A long header's length is known, so a packet we cannot decrypt (no keys
         // for the space yet, or a bad tag) is SKIPPED, not fatal: we return its
         // length so the caller keeps walking any coalesced packets behind it
-        // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2.
-        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, now) catch |e| switch (e) {
+        // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2. The
+        // header's scid rides along so it is adopted only AFTER the packet
+        // authenticates: a spoofed Initial racing the client's must not steer
+        // where replies go or poison the id its transport parameters are checked
+        // against (that would let an off-path attacker kill the handshake).
+        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, now, hdr.scid) catch |e| switch (e) {
             error.Dropped => return total,
             else => return e,
         };
@@ -926,11 +1016,11 @@ pub const Connection = struct {
     fn receiveShort(self: *Connection, buf: []const u8, now: u64) Error!usize {
         const hdr = packet.parseShort(buf, self.dcid.len) catch return error.Dropped;
         // A short-header packet is the rest of the datagram (no length field).
-        try self.decryptAndDispatch(buf, hdr.pn_offset, .application, false, now);
+        try self.decryptAndDispatch(buf, hdr.pn_offset, .application, false, now, null);
         return buf.len;
     }
 
-    fn decryptAndDispatch(self: *Connection, pkt: []const u8, pn_offset: usize, space: Space, long: bool, now: u64) Error!void {
+    fn decryptAndDispatch(self: *Connection, pkt: []const u8, pn_offset: usize, space: Space, long: bool, now: u64, peer_scid_hdr: ?[]const u8) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
         const keys = st.recv_keys orelse return error.Dropped; // no keys for this space yet
         // Work on a mutable copy: header protection removal and decryption mutate.
@@ -948,6 +1038,17 @@ pub const Connection = struct {
         defer self.gpa.free(plaintext);
         const payload = crypto.open(keys, pn, header, ciphertext, plaintext) catch return error.Dropped;
 
+        // The packet authenticated: NOW the peer's source connection id can be
+        // trusted. Adopt it as the destination of everything we send (RFC 9000 7.2).
+        if (peer_scid_hdr) |scid| {
+            if (!self.peer_scid_set and scid.len > 0) {
+                const sc = self.gpa.dupe(u8, scid) catch return error.OutOfMemory;
+                self.gpa.free(self.peer_scid);
+                self.peer_scid = sc;
+                self.peer_scid_set = true;
+            }
+        }
+
         // A decryptable Handshake packet proves the peer received our Initial/
         // handshake keys, so its address is validated and the 3x send limit lifts
         // (RFC 9000 8.1).
@@ -955,6 +1056,11 @@ pub const Connection = struct {
 
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, pn) else pn;
         st.recv_ranges.add(self.gpa, pn) catch return error.OutOfMemory; // for accurate ACKs
+        // Expose this Initial's scid to the ClientHello handler so it can check the
+        // client's initial_source_connection_id against the carrier packet's id
+        // (RFC 9000 7.3); borrowed for the dispatch only, then cleared.
+        self.dispatch_initial_scid = if (space == .initial) peer_scid_hdr else null;
+        defer self.dispatch_initial_scid = null;
         try self.dispatchFrames(payload, space, now);
 
         // Acknowledge the space if it carried an ack-eliciting frame this packet.
@@ -1041,6 +1147,7 @@ pub const Connection = struct {
 
     fn onStreamFrame(self: *Connection, id: u64, offset: u64, data: []const u8, fin: bool) Error!void {
         if (self.isRetired(id)) return; // a late frame for a completed-and-dropped stream
+        try self.noteClientStream(id);
         const s = try self.recvStream(id);
         const delta = s.push(offset, data, fin) catch |e| switch (e) {
             error.FinalSizeError => return error.FinalSizeError,
@@ -1054,8 +1161,20 @@ pub const Connection = struct {
 
     fn onReset(self: *Connection, id: u64, error_code: u64, final_size: u64) Error!void {
         if (self.isRetired(id)) return; // a reset for an already-completed-and-dropped stream
+        try self.noteClientStream(id);
         const s = try self.recvStream(id);
         s.onReset(error_code, final_size) catch return error.FinalSizeError;
+    }
+
+    /// Charge a peer-initiated bidirectional stream against the advertised cap (RFC
+    /// 9000 4.6): a STREAM_LIMIT_ERROR if `id` is beyond it. Idempotent - the limit
+    /// records the high-water count, so re-noting an already-open stream is a no-op.
+    /// Only client-bidi request streams are gated here; enforcement is off (null) on
+    /// the non-server path, and uni control streams are bounded by their own logic.
+    fn noteClientStream(self: *Connection, id: u64) Error!void {
+        const limit = if (self.bidi_limit) |*l| l else return; // unenforced (non-server) path
+        if (stream.StreamType.of(id) != .client_bidi) return;
+        limit.onOpened(id / 4) catch return error.StreamLimitError;
     }
 
     /// A peer STOP_SENDING (RFC 9000 19.5) asks us to stop sending on `id`. Reset that
@@ -1067,11 +1186,32 @@ pub const Connection = struct {
     /// layer above, so it never resets the critical control stream.
     fn onStopSending(self: *Connection, id: u64, error_code: u64) Error!void {
         if (stream.StreamType.of(id) != .client_bidi) return;
+        // Charge the stream against the bidi cap before stashing any state for it (RFC
+        // 9000 4.6): a STOP_SENDING for a never-seen high id is otherwise an unchecked
+        // way to grow peer_stop_sending / stop_sending_recv unbounded.
+        try self.noteClientStream(id);
+        // Record the cancellation so the layer above can surface it (takeStopSending),
+        // even when the request side is never reset - the integrator would otherwise
+        // only discover it as a late error when it tries to send the response.
+        self.stop_sending_recv.put(self.gpa, id, error_code) catch return error.OutOfMemory;
         if (self.send_streams.get(id)) |s| {
             s.reset(error_code);
         } else {
             self.peer_stop_sending.put(self.gpa, id, error_code) catch return error.OutOfMemory;
         }
+    }
+
+    /// The error code of a peer STOP_SENDING received for `id`, or null, WITHOUT
+    /// consuming it (so the caller can retry if surfacing the event fails).
+    pub fn peekStopSending(self: *Connection, id: u64) ?u64 {
+        return self.stop_sending_recv.get(id);
+    }
+
+    /// Take (and clear) the error code of a peer STOP_SENDING received for `id`, or
+    /// null. The layer above surfaces the response cancellation once and consumes it.
+    pub fn takeStopSending(self: *Connection, id: u64) ?u64 {
+        if (self.stop_sending_recv.fetchRemove(id)) |e| return e.value;
+        return null;
     }
 
     /// Whether `id` names a recv stream that already completed and was dropped, so a
@@ -1114,6 +1254,17 @@ pub const Connection = struct {
         _ = self.streams.remove(id);
         s.deinit();
         self.gpa.destroy(s);
+        // A finished request frees a bidi slot: re-advertise a higher cap once the
+        // headroom ahead of the highest opened stream runs low (RFC 9000 4.6), so a
+        // long-lived connection serving many requests is not stranded at the limit. The
+        // grant happens here (once per slide); flushSend just emits the new max, so a
+        // retransmit re-sends the same value rather than ratcheting it up each time.
+        if (self.bidi_limit) |*limit| {
+            if (stream.StreamType.of(id) == .client_bidi and limit.shouldUpdate()) {
+                _ = limit.grant();
+                self.max_streams_pending = true;
+            }
+        }
         return true;
     }
 
@@ -1162,12 +1313,36 @@ pub const Connection = struct {
         return self.streams.contains(id);
     }
 
+    /// How many unidirectional streams the peer's transport parameters let us open
+    /// (RFC 9000 4.6, initial_max_streams_uni). The HTTP/3 layer checks this before
+    /// opening its mandatory control + QPACK streams. Zero until a ClientHello is
+    /// parsed (the RFC default), so the no-handshake test path reports zero - those
+    /// tests set it directly. (A peer MAX_STREAMS would raise it; the send side does
+    /// not yet track that - see the outbound uni-limit follow-up.)
+    pub fn peerMaxStreamsUni(self: *const Connection) u64 {
+        return self.peer_tp.initial_max_streams_uni;
+    }
+
     /// Snapshot the ids of every stream the transport currently knows about, into
     /// `out`, returning how many were written (capped at `out.len`). The HTTP/3
     /// layer iterates these to advance each request stream's parse.
     pub fn streamIds(self: *Connection, out: []u64) usize {
         var n: usize = 0;
         var it = self.streams.keyIterator();
+        while (it.next()) |k| {
+            if (n >= out.len) break;
+            out[n] = k.*;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Snapshot the ids with an unconsumed peer STOP_SENDING (RFC 9000 19.5), so the
+    /// HTTP/3 layer can surface a response cancellation even for a request whose recv
+    /// stream has already completed and is gone from `streamIds`.
+    pub fn stopSendingIds(self: *Connection, out: []u64) usize {
+        var n: usize = 0;
+        var it = self.stop_sending_recv.keyIterator();
         while (it.next()) |k| {
             if (n >= out.len) break;
             out[n] = k.*;
@@ -1184,6 +1359,12 @@ const testing = std.testing;
 // protection. Returns an owned datagram the caller frees. Exposed (test-only) so
 // the HTTP/3 layer's tests can drive a request through the real transport.
 pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
+    return testBuildInitialScid(gpa, dcid, &.{}, sender, pn, frames);
+}
+
+// testBuildInitial with a caller-chosen source connection id, so a test can forge an
+// Initial whose scid differs from the legitimate client's (RFC 9000 7.3 spoofing).
+pub fn testBuildInitialScid(gpa: std.mem.Allocator, dcid: []const u8, scid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
     const keys = blk: {
         const ik = crypto.InitialKeys.derive(dcid);
         break :blk if (sender == .client) ik.client else ik.server;
@@ -1195,7 +1376,8 @@ pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, 
     try hdr_buf.appendSlice(gpa, &[_]u8{ 0, 0, 0, 1 }); // version 1
     try hdr_buf.append(gpa, @intCast(dcid.len));
     try hdr_buf.appendSlice(gpa, dcid);
-    try hdr_buf.append(gpa, 0); // scid len 0
+    try hdr_buf.append(gpa, @intCast(scid.len));
+    try hdr_buf.appendSlice(gpa, scid);
     try hdr_buf.append(gpa, 0); // token len 0 (varint)
     // length = pn(1) + ciphertext(frames + tag)
     const length = 1 + frames.len + crypto.TAG_LEN;
@@ -1255,6 +1437,10 @@ fn testAppKeys() crypto.Keys {
 // which is all the recv path needs) so it can decrypt a testBuildApp datagram.
 pub fn testInstallAppKeys(conn: *Connection) void {
     conn.installKeys(.application, testAppKeys(), testAppKeys());
+    // The no-handshake test path skips parsing a client's transport parameters, which
+    // would grant unidirectional-stream credit; stand in for a normal H3 client so the
+    // H3 layer can open its mandatory control + QPACK streams.
+    conn.peer_tp.initial_max_streams_uni = 16;
 }
 
 // Build a 1-RTT (short-header) Application packet carrying `frames`, sealed with
@@ -1320,6 +1506,89 @@ test "consume re-grants connection flow-control credit" {
     try testing.expectEqualStrings("abc", conn.streamData(0));
     conn.consumeStream(0, 3);
     try testing.expectEqualStrings("", conn.streamData(0));
+}
+
+test "a bidi stream past the advertised cap is a stream-limit error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x51, 0x52, 0x53, 0x54 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.bidi_limit = flow.StreamLimit.init(2); // allow client-bidi 0 and 4, reject 8
+
+    // Two request streams open within the cap (ids 0 and 4); a STREAM frame each.
+    const s0 = [_]u8{ 0x0b, 0x00, 0x01, 'a' }; // STREAM|LEN|FIN id 0
+    const d0 = try testBuildApp(gpa, &dcid, 0, &s0);
+    defer gpa.free(d0);
+    try conn.receiveDatagram(d0, 1000);
+    const s4 = [_]u8{ 0x0b, 0x04, 0x01, 'b' }; // id 4
+    const d4 = try testBuildApp(gpa, &dcid, 1, &s4);
+    defer gpa.free(d4);
+    try conn.receiveDatagram(d4, 1000);
+
+    // The third (id 8) is one beyond the cap of 2: STREAM_LIMIT_ERROR.
+    const s8 = [_]u8{ 0x0b, 0x08, 0x01, 'c' }; // id 8
+    const d8 = try testBuildApp(gpa, &dcid, 2, &s8);
+    defer gpa.free(d8);
+    try testing.expectError(error.StreamLimitError, conn.receiveDatagram(d8, 1000));
+}
+
+test "initServer enforces exactly the bidi cap it advertises" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x60, 0x61, 0x62, 0x63 };
+
+    // The cap enforced is the initial_max_streams_bidi the config advertises (8 here).
+    var conn = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer conn.deinit();
+    try testing.expectEqual(@as(u64, 8), conn.bidi_limit.?.max);
+
+    // A config advertising no initial_max_streams_bidi enforces 0: a conformant client
+    // opens no request stream, and the server rejects any it does open.
+    var noneCfg = testServerConfig();
+    noneCfg.transport_params = &.{};
+    var none = try Connection.initServer(gpa, &dcid, noneCfg);
+    defer none.deinit();
+    try testing.expectEqual(@as(u64, 0), none.bidi_limit.?.max);
+
+    // A malformed own transport-parameter blob is a configuration bug, not silently
+    // defaulted: initServer surfaces it.
+    var badCfg = testServerConfig();
+    badCfg.transport_params = &[_]u8{ 0x08, 0x08, 0x00 }; // len 8, only 1 byte follows
+    try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, badCfg));
+}
+
+test "initServer advertises the mandatory connection ids" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x70, 0x71, 0x72, 0x73 };
+    var conn = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer conn.deinit();
+
+    // The advertised blob is the integrator base plus original_destination_connection_id
+    // (the client's first dcid) and initial_source_connection_id (our scid) - the two
+    // a conformant client validates before completing the handshake (RFC 9000 7.3).
+    var expected: std.ArrayListUnmanaged(u8) = .empty;
+    defer expected.deinit(gpa);
+    try expected.appendSlice(gpa, testServerConfig().transport_params);
+    try transport_params.appendBytesParam(&expected, gpa, 0x00, &dcid);
+    try transport_params.appendBytesParam(&expected, gpa, 0x0f, conn.scid);
+    try testing.expectEqualSlices(u8, expected.items, conn.own_tp.?);
+    // The TLS driver ships exactly this blob in EncryptedExtensions.
+    try testing.expectEqualSlices(u8, conn.own_tp.?, conn.tls.?.config.transport_params);
+
+    // A base blob already carrying one of the two ids initServer injects would
+    // duplicate it on the wire: a configuration bug, rejected up front.
+    var dupCfg = testServerConfig();
+    dupCfg.transport_params = &[_]u8{ 0x0f, 0x00 }; // initial_source_connection_id
+    try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, dupCfg));
+
+    // But a base blob carrying a server-only parameter the server itself does NOT
+    // inject (stateless_reset_token, 0x02) is legitimate and rides through verbatim.
+    var srtCfg = testServerConfig();
+    const srt = [_]u8{0x02} ++ [_]u8{0x10} ++ [_]u8{0xcc} ** 16; // 16-byte token
+    srtCfg.transport_params = &srt;
+    var srtConn = try Connection.initServer(gpa, &dcid, srtCfg);
+    defer srtConn.deinit();
+    try testing.expect(std.mem.indexOf(u8, srtConn.own_tp.?, &srt) != null);
 }
 
 test "connection flow control sums across streams" {
@@ -1424,6 +1693,81 @@ test "consuming stream data advertises a raised MAX_DATA" {
     try testing.expect(conn.datagramLengths().len >= 1);
 }
 
+test "completing request streams advertises a raised MAX_STREAMS" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x55, 0x56, 0x57, 0x58 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.bidi_limit = flow.StreamLimit.init(4); // window 4: opening 3 trips the auto-tune
+
+    // Open, drain and drop three request streams (ids 0, 4, 8). Each is one byte with
+    // FIN, consumed to terminal so dropStream reclaims it and frees a bidi slot.
+    var pn: u64 = 0;
+    for ([_]u64{ 0, 4, 8 }) |id| {
+        var sframe: std.ArrayListUnmanaged(u8) = .empty;
+        defer sframe.deinit(gpa);
+        try frame.encodeStream(&sframe, gpa, id, 0, &[_]u8{0x7a}, true);
+        const dgram = try testBuildApp(gpa, &dcid, pn, sframe.items);
+        defer gpa.free(dgram);
+        try conn.receiveDatagram(dgram, 1000);
+        conn.consumeStream(id, 1);
+        try testing.expect(conn.dropStream(id));
+        pn += 1;
+    }
+    conn.clearSend();
+
+    // Three of four opened crossed the auto-tune threshold: the cap slid to opened (3)
+    // + window (4) and a MAX_STREAMS is queued, which flushSend emits.
+    try testing.expect(conn.max_streams_pending);
+    try testing.expectEqual(@as(u64, 7), conn.bidi_limit.?.max);
+    try conn.flushSend(2000);
+    try testing.expect(!conn.max_streams_pending); // emitted
+    try testing.expect(conn.datagramLengths().len >= 1);
+    try testing.expect(conn.max_streams_sent != null); // recorded for loss recovery
+    conn.clearSend();
+
+    // A lost MAX_STREAMS must be re-sent, or the peer - out of stream credit - can never
+    // open the streams whose completion would re-trigger the advertisement (RFC 9000 13.3).
+    const d = conn.nextTimeout().?;
+    try conn.onTimeout(d + 1);
+    try conn.flushSend(d + 2);
+    try testing.expect(conn.datagramsToSend().len > 0); // the cap rode again
+}
+
+test "a cap of one request still slides after the request completes" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x59, 0x5a, 0x5b, 0x5c };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.bidi_limit = flow.StreamLimit.init(1); // one request at a time
+
+    // The one allowed request (stream 0): a single byte with FIN, drained to terminal.
+    var s0: std.ArrayListUnmanaged(u8) = .empty;
+    defer s0.deinit(gpa);
+    try frame.encodeStream(&s0, gpa, 0, 0, &[_]u8{0x7a}, true);
+    const d0 = try testBuildApp(gpa, &dcid, 0, s0.items);
+    defer gpa.free(d0);
+    try conn.receiveDatagram(d0, 1000);
+    conn.consumeStream(0, 1);
+    try testing.expect(conn.dropStream(0));
+
+    // Completing it slides the cap to 2 and queues a MAX_STREAMS (the window-of-1 edge).
+    try testing.expect(conn.max_streams_pending);
+    try testing.expectEqual(@as(u64, 2), conn.bidi_limit.?.max);
+    try conn.flushSend(2000);
+
+    // The next request (stream 4) is now within the raised cap.
+    var s4: std.ArrayListUnmanaged(u8) = .empty;
+    defer s4.deinit(gpa);
+    try frame.encodeStream(&s4, gpa, 4, 0, &[_]u8{0x7a}, true);
+    const d4 = try testBuildApp(gpa, &dcid, 1, s4.items);
+    defer gpa.free(d4);
+    try conn.receiveDatagram(d4, 2100); // no StreamLimitError
+    try testing.expectEqualStrings("z", conn.streamData(4));
+}
+
 // ---- TLS handshake seam tests ----------------------------------------------
 
 // The RFC 8448 section 3 client x25519 public key, the same value tls/keyshare.zig
@@ -1433,6 +1777,14 @@ const RFC_CLIENT_PUBKEY = "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d54136
 // Build a QUIC-valid ClientHello carrying `pubkey` as its x25519 key_share, framed
 // as a handshake message (type 0x01 || u24 len || body) ready to ride a CRYPTO frame.
 fn buildClientHello(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pubkey: [32]u8) !void {
+    // max_idle_timeout, plus the mandatory initial_source_connection_id (RFC 9000
+    // 7.3) - empty, matching the zero-length scid testBuildInitial writes.
+    return buildClientHelloTp(out, gpa, pubkey, &[_]u8{ 0x01, 0x02, 0x40, 0x01, 0x0f, 0x00 });
+}
+
+// buildClientHello with a caller-chosen transport-parameter body, for the tests
+// that probe how the server validates a client's parameters.
+fn buildClientHelloTp(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pubkey: [32]u8, tp: []const u8) !void {
     const w = tls.wire.Writer{ .out = out, .gpa = gpa };
     try w.u8v(0x01);
     const msg = try w.open(3);
@@ -1475,7 +1827,7 @@ fn buildClientHello(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pu
     try w.close(ks);
     try w.u16v(0x0039); // quic_transport_parameters
     const qtp = try w.open(2);
-    try w.bytes(&[_]u8{ 0x01, 0x02, 0x40, 0x01 });
+    try w.bytes(tp);
     try w.close(qtp);
     try w.close(exts);
     try w.close(msg);
@@ -1492,13 +1844,24 @@ fn buildClientHelloInitial(gpa: std.mem.Allocator, dcid: []const u8, pubkey: [32
     return testBuildInitial(gpa, dcid, .client, 0, frames.items);
 }
 
+// buildClientHelloInitial with a caller-chosen client transport-parameter body.
+fn buildClientHelloInitialTp(gpa: std.mem.Allocator, dcid: []const u8, pubkey: [32]u8, tp: []const u8) ![]u8 {
+    var ch: std.ArrayListUnmanaged(u8) = .empty;
+    defer ch.deinit(gpa);
+    try buildClientHelloTp(&ch, gpa, pubkey, tp);
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeCrypto(&frames, gpa, 0, ch.items);
+    return testBuildInitial(gpa, dcid, .client, 0, frames.items);
+}
+
 fn testServerConfig() tls.flight.Config {
     return .{
         .random = [_]u8{0xAB} ** 32,
         .ephemeral_seed = [_]u8{0x33} ** 32,
         .signer = tls.sign.Signer.fromSeed([_]u8{0x42} ** 32) catch unreachable,
         .cert_chain = &[_]u8{0xCC} ** 48,
-        .transport_params = &[_]u8{ 0x00, 0x01 },
+        .transport_params = &[_]u8{ 0x08, 0x01, 0x08 }, // initial_max_streams_bidi = 8
     };
 }
 
@@ -1580,14 +1943,81 @@ test "the client's transport parameters set the connection send window" {
     _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
     var server = try Connection.initServer(gpa, &dcid, testServerConfig());
     defer server.deinit();
-    // The test ClientHello carries quic_transport_parameters {0x01,0x02,0x40,0x01}:
-    // id 0x01 (max_idle_timeout), len 2, value varint 0x4001 = 1 -> initial_max_data
-    // is absent, so the send window becomes 0 (the client granted no data yet).
+    // The test ClientHello's transport parameters carry max_idle_timeout and the
+    // mandatory empty initial_source_connection_id - initial_max_data is absent, so
+    // the send window becomes 0 (the client granted no data yet).
     const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
     defer gpa.free(ch);
     try server.receiveDatagram(ch, 1000);
     try testing.expectEqual(@as(u64, 0), server.peer_tp.initial_max_data);
     try testing.expectEqual(@as(u64, 0), server.conn_send_window.limit); // set from the (absent) grant
+}
+
+test "a client without initial_source_connection_id is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+    // RFC 9000 7.3: absence of initial_source_connection_id from either peer is a
+    // TRANSPORT_PARAMETER_ERROR. Only max_idle_timeout here.
+    const ch = try buildClientHelloInitialTp(gpa, &dcid, pubkey, &[_]u8{ 0x01, 0x02, 0x40, 0x01 });
+    defer gpa.free(ch);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
+}
+
+test "a client whose initial_source_connection_id mismatches its Initial is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+    // The Initial's scid is empty, but the parameter claims aa bb (RFC 9000 7.3:
+    // the values are authenticated against the header to defeat id spoofing).
+    const ch = try buildClientHelloInitialTp(gpa, &dcid, pubkey, &[_]u8{ 0x0f, 0x02, 0xaa, 0xbb });
+    defer gpa.free(ch);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
+}
+
+test "a client sending a server-only transport parameter is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+    // A valid (empty) initial_source_connection_id plus an ODCID, which only a
+    // server may send (RFC 9000 18.2).
+    const ch = try buildClientHelloInitialTp(gpa, &dcid, pubkey, &[_]u8{ 0x0f, 0x00, 0x00, 0x01, 0xcc });
+    defer gpa.free(ch);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
+}
+
+test "a spoofed Initial with a different scid does not break the real handshake" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    // Initial keys are derivable from the dcid, so an off-path attacker who saw it can
+    // forge a Initial that opens under AEAD with a DIFFERENT scid (aa bb) carrying only
+    // a PING. The connection-id check is bound to the ClientHello's own packet, not a
+    // persistent anchor, so this must not make the real client's check fail later.
+    const spoof = try testBuildInitialScid(gpa, &dcid, &[_]u8{ 0xaa, 0xbb }, .client, 0, &[_]u8{0x01} ** 20);
+    defer gpa.free(spoof);
+    try server.receiveDatagram(spoof, 900); // accepted (a valid PING), but does not poison
+
+    // The authentic ClientHello (zero-length scid, matching its empty initial_scid
+    // parameter) still validates and the server flight goes out.
+    const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
+    defer gpa.free(ch);
+    try server.receiveDatagram(ch, 1000);
+    try testing.expect(server.datagramLengths().len >= 1); // the server flight went out
+    try testing.expect(server.tls.?.state == .flight_sent);
 }
 
 test "a lost handshake CRYPTO packet is retransmitted on loss" {

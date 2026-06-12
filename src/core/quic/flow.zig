@@ -95,15 +95,19 @@ pub const SendWindow = struct {
 };
 
 /// The concurrency cap on streams a peer may open (RFC 9000 4.6, MAX_STREAMS).
-/// Bidi and uni are tracked separately by the caller with two of these.
+/// Bidi and uni are tracked separately by the caller with two of these. It mirrors
+/// `Window`: the cap slides above the highest stream opened so a steady stream of
+/// short-lived requests is never starved, re-advertising once headroom runs low.
 pub const StreamLimit = struct {
     /// The maximum stream count the peer may open (a count, not an id).
     max: u64,
-    /// The highest stream count opened so far.
+    /// The highest stream count opened so far; the floor the cap slides above.
     opened: u64 = 0,
+    /// The headroom to keep ahead of `opened`; a new cap is `opened + window`.
+    window: u64,
 
     pub fn init(max: u64) StreamLimit {
-        return .{ .max = max };
+        return .{ .max = max, .window = max };
     }
 
     pub const Error = error{
@@ -118,12 +122,18 @@ pub const StreamLimit = struct {
         self.opened = @max(self.opened, index + 1);
     }
 
+    /// Should a higher cap be advertised? True once the headroom ahead of the highest
+    /// opened stream falls below half the window (RFC 9000 4.6 auto-tuning). The half is
+    /// rounded up so a window of 1 still trips after its single slot is used - an
+    /// integer `window / 2` would be 0, a threshold unsigned headroom can never fall
+    /// below, stranding a one-request-at-a-time server.
     pub fn shouldUpdate(self: *const StreamLimit) bool {
-        return self.max - self.opened < self.max / 2;
+        return self.max - self.opened < (self.window + 1) / 2;
     }
 
-    pub fn grant(self: *StreamLimit, increment: u64) u64 {
-        self.max += increment;
+    /// Slide the cap to `opened + window` and record it; the new value to advertise.
+    pub fn grant(self: *StreamLimit) u64 {
+        self.max = self.opened + self.window;
         return self.max;
     }
 };
@@ -163,4 +173,25 @@ test "stream limit rejects too many streams" {
     try l.onOpened(0);
     try l.onOpened(2);
     try std.testing.expectError(error.StreamLimitError, l.onOpened(3));
+}
+
+test "stream limit re-advertises once headroom runs low" {
+    var l = StreamLimit.init(4);
+    try std.testing.expect(!l.shouldUpdate());
+    try l.onOpened(0);
+    try l.onOpened(1);
+    try l.onOpened(2); // 3 of 4 opened: headroom 1 < window/2 (2)
+    try std.testing.expect(l.shouldUpdate());
+    try std.testing.expectEqual(@as(u64, 7), l.grant()); // opened 3 + window 4
+    try std.testing.expect(!l.shouldUpdate());
+    try l.onOpened(6); // the newly granted ids are now usable
+}
+
+test "a window of 1 still slides after its single slot is used" {
+    var l = StreamLimit.init(1);
+    try std.testing.expect(!l.shouldUpdate()); // nothing opened yet
+    try l.onOpened(0); // the one allowed stream
+    try std.testing.expect(l.shouldUpdate()); // would be never-true with `window / 2`
+    try std.testing.expectEqual(@as(u64, 2), l.grant()); // opened 1 + window 1
+    try l.onOpened(1); // the next stream is now permitted
 }

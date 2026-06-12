@@ -65,9 +65,16 @@ const UniStream = struct {
 /// as SETTINGS_MAX_FIELD_SECTION_SIZE so it does not send a larger one.
 const MAX_FIELD_SECTION_SIZE: u64 = 1 << 16;
 
-/// The first server-initiated unidirectional stream id (RFC 9000 2.1): server uni
-/// ids are 4*N+3, so the control stream is 3.
+/// The server-initiated unidirectional stream ids (RFC 9000 2.1): server uni ids are
+/// 4*N+3. The control stream is the first; the two QPACK streams (RFC 9204 4.2) are
+/// the next two. A peer MUST open all three regardless of QPACK table capacity, so
+/// strict clients (nghttp3, quiche) abort if the encoder/decoder streams are missing.
 const CONTROL_STREAM_ID: u64 = 3;
+const QPACK_ENCODER_STREAM_ID: u64 = 7;
+const QPACK_DECODER_STREAM_ID: u64 = 11;
+/// The count of server-initiated uni streams HTTP/3 always opens (the three above);
+/// a peer must grant at least this many in initial_max_streams_uni.
+const SERVER_UNI_STREAMS: u64 = 3;
 
 pub const Connection = struct {
     gpa: std.mem.Allocator,
@@ -158,13 +165,22 @@ pub const Connection = struct {
         }
     }
 
-    /// Open our unidirectional control stream and send SETTINGS as its first frame
-    /// (RFC 9114 6.2.1, 7.2.4). A conformant peer treats the absence of our SETTINGS
-    /// as H3_MISSING_SETTINGS and may refuse to send requests, so this must precede
-    /// any response. Idempotent: the control stream is opened at most once. The
-    /// stream-type byte (0x00) prefixes the SETTINGS frame on the same stream.
+    /// Open our three server-initiated unidirectional streams (RFC 9114 6.2.1,
+    /// RFC 9204 4.2): the control stream carrying SETTINGS, plus the QPACK encoder and
+    /// decoder streams. A conformant peer treats the absence of our SETTINGS as
+    /// H3_MISSING_SETTINGS and may refuse to send requests, and strict clients abort
+    /// if the QPACK streams are missing - so all three must precede any response.
+    /// Idempotent: each is opened at most once. Each stream's type byte prefixes its
+    /// content; the QPACK streams carry no instructions (table capacity 0).
     pub fn initiateControl(self: *Connection) Error!void {
         if (self.control_sent) return;
+        // HTTP/3 needs three server-initiated uni streams (control + the two QPACK
+        // streams). A peer that grants fewer cannot run HTTP/3, so rather than open
+        // streams past its initial_max_streams_uni - which it would answer with a
+        // STREAM_LIMIT_ERROR - close cleanly up front (RFC 9000 4.6 / RFC 9114 6.2).
+        if (self.qc.peerMaxStreamsUni() < SERVER_UNI_STREAMS) {
+            return self.fail(.general_protocol_error, "peer granted too few unidirectional streams for HTTP/3");
+        }
         var settings: std.ArrayListUnmanaged(u8) = .empty;
         defer settings.deinit(self.gpa);
         // SETTINGS_MAX_FIELD_SECTION_SIZE = our decode cap. QPACK capacity and
@@ -176,8 +192,20 @@ pub const Connection = struct {
         defer out.deinit(self.gpa);
         out.append(self.gpa, @intFromEnum(h3_stream.UniStreamType.control)) catch return error.OutOfMemory;
         h3_frame.append(&out, self.gpa, .settings, settings.items) catch return error.OutOfMemory;
-        try self.streamSend(CONTROL_STREAM_ID, out.items, false);
+
+        // Commit BEFORE sending: a failure partway through (OOM) must not let a later
+        // call re-open the control stream and queue a second SETTINGS, which a peer
+        // treats as a connection error. A half-initialised connection is already
+        // degraded; re-attempting would corrupt it, not recover it.
         self.control_sent = true;
+        try self.streamSend(CONTROL_STREAM_ID, out.items, false);
+        // The QPACK encoder/decoder streams: just the type byte each. At table
+        // capacity 0 no encoder/decoder instructions are ever sent, but the streams
+        // must exist for the peer's QPACK to consider the connection well-formed. The
+        // grant was checked above; full credit accounting (a peer MAX_STREAMS raising
+        // the limit, blocking past it) is a follow-up, mooted here by the fixed count.
+        try self.streamSend(QPACK_ENCODER_STREAM_ID, &.{@intFromEnum(h3_stream.UniStreamType.qpack_encoder)}, false);
+        try self.streamSend(QPACK_DECODER_STREAM_ID, &.{@intFromEnum(h3_stream.UniStreamType.qpack_decoder)}, false);
     }
 
     /// Begin a graceful shutdown: send a GOAWAY on the control stream (RFC 9114 5.2)
@@ -216,6 +244,23 @@ pub const Connection = struct {
         var ids: [64]u64 = undefined;
         const n = self.qc.streamIds(&ids);
         for (ids[0..n]) |id| try self.pump(id);
+        // Surface any peer STOP_SENDING (a response cancellation) left for a stream
+        // whose recv side already completed and is gone from streamIds, so a cancelled
+        // GET is reported rather than discovered only when a response write fails.
+        var ss: [64]u64 = undefined;
+        const m = self.qc.stopSendingIds(&ss);
+        for (ss[0..m]) |id| try self.surfaceStopSending(id);
+    }
+
+    /// Emit a one-shot rst_stream event for a peer STOP_SENDING on `id` (consuming it),
+    /// unless the stream is still tracked - in which case pumpRequest surfaces it with
+    /// the right rst_emitted bookkeeping. For a completed/untracked stream there is no
+    /// RequestStream, so the consume itself makes it fire once.
+    fn surfaceStopSending(self: *Connection, id: u64) Error!void {
+        if (self.streams.contains(id)) return; // a live stream: pumpRequest handles it
+        const code = self.qc.peekStopSending(id) orelse return;
+        try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = code } });
+        _ = self.qc.takeStopSending(id); // consume only after the event is queued
     }
 
     pub fn pump(self: *Connection, id: u64) Error!void {
@@ -295,18 +340,26 @@ pub const Connection = struct {
         // what moves its receive state to terminal, which dropStream then reclaims.
         if (consumed_total > 0) self.qc.consumeStream(id, consumed_total);
         // A peer RESET_STREAM cancels the request: surface it as an event (with the
-        // peer's error code) once, before the stream is dropped, so the integrator is
-        // not left waiting on a request that silently vanished. The flag guards against
-        // a re-fire if the stream cannot be dropped yet (e.g. an allocator failure).
-        if (self.qc.streamReset(id) and !rs.rst_emitted) {
-            try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = self.qc.streamResetCode(id) orelse 0 } });
+        // The peer cancelled this stream - by RESET_STREAM on the request side, or by
+        // STOP_SENDING on the response side (it aborted the response, perhaps before we
+        // even started it). Either way surface it once as an rst_stream event so the
+        // integrator stops working on it, rather than discovering the cancellation only
+        // when a later response write fails. The flag guards against a re-fire if the
+        // stream cannot be dropped yet (e.g. an allocator failure).
+        const reset_code = self.qc.streamResetCode(id); // non-destructive
+        const stop_code = self.qc.peekStopSending(id); // non-destructive
+        if ((reset_code != null or stop_code != null) and !rs.rst_emitted) {
+            // Push BEFORE consuming the STOP_SENDING, so an OOM here leaves the code in
+            // place for the next pump to retry rather than losing the cancellation.
+            try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = reset_code orelse stop_code orelse 0 } });
             rs.rst_emitted = true;
+            _ = self.qc.takeStopSending(id); // consume now that the event is queued
         }
-        // Drop the per-stream state on both layers once the request is fully
-        // delivered (EOM) OR the peer reset the stream, so an open-then-reset storm
-        // cannot grow the maps (the memory half of the Rapid-Reset class). The QUIC
-        // send half is retained until its bytes are acked, so a still-in-flight
-        // response is not freed from under recovery.
+        // Drop the per-stream state on both layers once the request is fully delivered
+        // (EOM) OR the peer reset the request side, so an open-then-reset storm cannot
+        // grow the maps (the memory half of the Rapid-Reset class). A STOP_SENDING-only
+        // cancellation leaves the request side open, so the stream stays until the peer
+        // also ends it; the QUIC send half is retained until its bytes are acked.
         if (rs.state == .done or self.qc.streamReset(id)) {
             if (self.qc.dropStream(id)) _ = self.streams.remove(id); // rs dangles after this
         }
@@ -1154,6 +1207,85 @@ test "a peer STOP_SENDING resets our send half" {
     try testing.expect(peer.streamReset(0));
 }
 
+test "a peer STOP_SENDING surfaces an rst_stream event" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xa4, 0xa5, 0xa6, 0xa7 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A full request arrives on stream 0 (the H3 layer now tracks it).
+    var req: std.ArrayListUnmanaged(u8) = .empty;
+    defer req.deinit(gpa);
+    try h3_frame.append(&req, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 });
+    const rdgram = try buildRequest(gpa, &dcid, 0, req.items); // no FIN: request side stays open
+    defer gpa.free(rdgram);
+    try qc.receiveDatagram(rdgram, 1000);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .request);
+
+    // The peer cancels ONLY the response side with STOP_SENDING (no RESET_STREAM).
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x05);
+    try varint.append(&sframe, gpa, 0);
+    try varint.append(&sframe, gpa, 0x10);
+    const sdgram = try quic_conn.testBuildApp(gpa, &dcid, 1, sframe.items);
+    defer gpa.free(sdgram);
+    try qc.receiveDatagram(sdgram, 1100);
+    try h3.pump(0);
+
+    // The cancellation surfaces as an rst_stream event with the peer's code.
+    const ev = h3.nextEvent();
+    try testing.expect(ev == .rst_stream);
+    try testing.expectEqual(@as(u64, 0x10), ev.rst_stream.error_code);
+}
+
+test "a STOP_SENDING after a completed request still surfaces" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xa8, 0xa9, 0xaa, 0xab };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A complete GET (HEADERS + FIN): the request finishes and its stream is dropped.
+    var req: std.ArrayListUnmanaged(u8) = .empty;
+    defer req.deinit(gpa);
+    try h3_frame.append(&req, gpa, .headers, &.{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 });
+    const rdgram = try buildRequestOnFin(gpa, &dcid, 0, 0, req.items);
+    defer gpa.free(rdgram);
+    try qc.receiveDatagram(rdgram, 1000);
+    try h3.pumpAll();
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expect(h3.nextEvent() == .end_of_message);
+    var ids: [4]u64 = undefined;
+    try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids)); // the stream is gone
+
+    // The peer later cancels the response with STOP_SENDING on the now-gone stream.
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x05);
+    try varint.append(&sframe, gpa, 0);
+    try varint.append(&sframe, gpa, 0x10);
+    const sdgram = try quic_conn.testBuildApp(gpa, &dcid, 1, sframe.items);
+    defer gpa.free(sdgram);
+    try qc.receiveDatagram(sdgram, 1100);
+    try h3.pumpAll();
+
+    // It is still surfaced, even though the stream is no longer tracked.
+    const ev = h3.nextEvent();
+    try testing.expect(ev == .rst_stream);
+    try testing.expectEqual(@as(u64, 0x10), ev.rst_stream.error_code);
+    // And it fires exactly once.
+    try testing.expect(h3.nextEvent() == .need_data);
+    try h3.pumpAll();
+    try testing.expect(h3.nextEvent() == .need_data);
+}
+
 // Build a request datagram on `stream_id` with the FIN bit set, at packet number `pn`.
 fn buildRequestOnFin(gpa: std.mem.Allocator, dcid: []const u8, stream_id: u64, pn: u64, h3_bytes: []const u8) ![]u8 {
     var sframe: std.ArrayListUnmanaged(u8) = .empty;
@@ -1353,6 +1485,22 @@ test "a reset after the response finished is a no-op" {
     try testing.expectEqual(@as(usize, 0), qc.datagramsToSend().len); // nothing sent
 }
 
+test "a peer granting too few uni streams cannot run HTTP/3" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x3a, 0x3b, 0x3c, 0x3d };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    qc.peer_tp.initial_max_streams_uni = 2; // below the 3 HTTP/3 requires
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // Opening the mandatory streams would exceed the peer's limit, so the connection
+    // is closed cleanly up front rather than provoking a STREAM_LIMIT_ERROR.
+    try testing.expectError(error.H3Error, h3.initiateControl());
+    try testing.expect(qc.closed);
+}
+
 test "the server opens its control stream with a SETTINGS frame" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x31, 0x33, 0x37, 0x39 };
@@ -1387,6 +1535,18 @@ test "the server opens its control stream with a SETTINGS frame" {
     try testing.expectEqual(h3_frame.FrameType.settings, f.frame.ftype);
     const s = try h3_stream.parseSettings(f.frame.payload);
     try testing.expectEqual(@as(u64, 1 << 16), s.max_field_section_size);
+
+    // The two QPACK streams are opened too (RFC 9204 4.2): stream 7 is the encoder
+    // (type 0x02), stream 11 the decoder (type 0x03), each just its type byte since
+    // table capacity 0 means no instructions ever follow.
+    const enc = peer.streamData(7);
+    const et = h3_stream.decodeUniType(enc).?;
+    try testing.expectEqual(h3_stream.UniStreamType.qpack_encoder, et.utype);
+    try testing.expectEqual(@as(usize, enc.len), et.len); // nothing after the type byte
+    const dec = peer.streamData(11);
+    const dt = h3_stream.decodeUniType(dec).?;
+    try testing.expectEqual(h3_stream.UniStreamType.qpack_decoder, dt.utype);
+    try testing.expectEqual(@as(usize, dec.len), dt.len);
 }
 
 test "shutdown sends a GOAWAY on the control stream after SETTINGS" {

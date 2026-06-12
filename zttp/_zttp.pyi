@@ -151,7 +151,9 @@ class H2Connection(Connection):
 
 class H3Connection(Connection):
     # Fed by UDP datagrams rather than a byte stream. The QUIC handshake is driven
-    # from the server credentials passed at construction. `now` is the integrator's
+    # from the server credentials passed at construction; `alpn` defaults to b"h3"
+    # (ALPN is mandatory in QUIC - the parameter overrides the token, e.g. for an
+    # interop draft name, it is not an opt-out). `now` is the integrator's
     # monotonic clock. data_to_send returns one bytes per UDP datagram (QUIC datagram
     # boundaries are semantic), not the byte stream the base returns. Sends go through
     # a Stream handle (conn.stream(req.stream_id)), the same surface HTTP/2 uses; a
