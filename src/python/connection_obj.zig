@@ -387,6 +387,12 @@ const H3Engine = struct {
             }
             const hdr = core.quic.packet.parseLong(dgram) catch
                 return py.raise(exceptions.RemoteProtocolError, "malformed QUIC Initial packet");
+            // Only an Initial's dcid is the original destination id the server must
+            // echo as a transport parameter; a Handshake/0-RTT first datagram would
+            // seed the connection with the wrong one.
+            if (hdr.ltype != .initial) {
+                return py.raise(exceptions.RemoteProtocolError, "the first HTTP/3 datagram must be a long-header Initial");
+            }
             const q = gpa.create(QuicConnection) catch return c.PyErr_NoMemory();
             q.* = QuicConnection.initServer(gpa, hdr.dcid, self.config.flightConfig()) catch |e| {
                 gpa.destroy(q);
@@ -1043,20 +1049,23 @@ fn buildServerConfig(cert_obj: ?*c.PyObject, key_obj: ?*c.PyObject, tp_obj: ?*c.
         _ = c.PyErr_NoMemory();
         return null;
     };
-    var alpn: ?[]u8 = null;
-    if (alpn_obj != null and !py.isNone(alpn_obj)) {
-        const alpn_src = py.asBytes(alpn_obj) orelse {
+    // ALPN is mandatory in QUIC (RFC 9001 8.1) and an HTTP/3 server's protocol is
+    // "h3"; the parameter overrides the token (e.g. an interop draft name), it is
+    // not an opt-out of negotiation.
+    const alpn_src: []const u8 = if (alpn_obj != null and !py.isNone(alpn_obj))
+        py.asBytes(alpn_obj) orelse {
             gpa.free(cert);
             gpa.free(tp_copy);
             return null;
-        };
-        alpn = gpa.dupe(u8, alpn_src) catch {
-            gpa.free(cert);
-            gpa.free(tp_copy);
-            _ = c.PyErr_NoMemory();
-            return null;
-        };
-    }
+        }
+    else
+        "h3";
+    const alpn = gpa.dupe(u8, alpn_src) catch {
+        gpa.free(cert);
+        gpa.free(tp_copy);
+        _ = c.PyErr_NoMemory();
+        return null;
+    };
     return .{
         .cert = cert,
         .transport_params = tp_copy,

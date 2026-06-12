@@ -164,11 +164,24 @@ pub const Connection = struct {
     /// The server TLS handshake driver, attached by `initServer`; null on a client
     /// or a connection that does not run the handshake (the recv-pipeline tests).
     tls: ?tls.server.Server = null,
+    /// The full transport-parameter blob this server advertises: the integrator's
+    /// base parameters plus the mandatory per-connection ids initServer appends.
+    /// Connection-owned (the TLS driver borrows it); null outside the server path.
+    own_tp: ?[]u8 = null,
     /// The client's transport parameters (RFC 9000 18.2), parsed from the
     /// ClientHello; until then the RFC defaults apply. Drives the send window and
     /// the PTO ack-delay.
     peer_tp: transport_params.TransportParameters = .{},
     peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
+    /// The Source Connection ID of the Initial packet currently being dispatched,
+    /// borrowed from that datagram for the span of `dispatchFrames`. The ClientHello
+    /// handler validates the client's initial_source_connection_id against THIS - the
+    /// id on the very packet that carried the ClientHello (RFC 9000 7.3) - rather
+    /// than a persistent anchor. Initial keys are derivable from the dcid, so a
+    /// pre-committed anchor could be poisoned by a spoofed PADDING-only Initial that
+    /// still opens under AEAD; binding the check to the ClientHello's own packet
+    /// removes that, since a spoof carrying CRYPTO is already fatal on reassembly.
+    dispatch_initial_scid: ?[]const u8 = null,
     handshake_confirmed: bool = false, // the client Finished verified; HANDSHAKE_DONE sent
     /// The connection-level recv window grew enough to advertise a new MAX_DATA
     /// (RFC 9000 4.1); flushSend emits it so the peer is not stalled at its grant.
@@ -248,15 +261,35 @@ pub const Connection = struct {
     /// A server connection with the TLS handshake driver attached: incoming CRYPTO
     /// drives the handshake, which installs per-space keys and emits the server
     /// flight. `tls_config` supplies the ServerHello randomness, ephemeral seed,
-    /// signing key, certificate, and transport parameters.
+    /// signing key, certificate, and transport parameters. The integrator's
+    /// transport-parameter blob carries only the limits it chooses; the mandatory
+    /// per-connection ids (RFC 9000 7.3) are appended here, since only the
+    /// connection knows them.
     pub fn initServer(gpa: std.mem.Allocator, client_dcid: []const u8, tls_config: tls.flight.Config) Error!Connection {
         // Enforce exactly the bidi cap we advertise (RFC 9000 4.6): parse it from our
         // own transport parameters so the wire and the enforced value never diverge. A
         // malformed own blob is a configuration bug, surfaced before anything is built.
+        // The connection-id parameters are appended below, so a base blob already
+        // carrying one would duplicate it on the wire - also a configuration bug.
+        // Only those two ids are rejected: a server may legitimately advertise the
+        // other server-only parameters (stateless_reset_token, preferred_address).
         const own = transport_params.parse(tls_config.transport_params) catch return error.ProtocolViolation;
+        if (own.has_injected_cid_param) return error.ProtocolViolation;
         var conn = try init(gpa, .server, client_dcid);
+        errdefer conn.deinit();
         conn.tls = tls.server.Server.init(tls_config);
         conn.bidi_limit = flow.StreamLimit.init(own.initial_max_streams_bidi);
+        // Advertise the mandatory connection ids (RFC 9000 18.2): the client MUST see
+        // its first Initial's destination id echoed as original_destination_connection_id
+        // and our source id as initial_source_connection_id, or it fails the handshake
+        // with TRANSPORT_PARAMETER_ERROR. The augmented blob is connection-owned.
+        var full: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer full.deinit(gpa);
+        try full.appendSlice(gpa, tls_config.transport_params);
+        try transport_params.appendBytesParam(&full, gpa, 0x00, client_dcid); // original_destination_connection_id
+        try transport_params.appendBytesParam(&full, gpa, 0x0f, conn.scid); // initial_source_connection_id
+        conn.own_tp = try full.toOwnedSlice(gpa);
+        conn.tls.?.config.transport_params = conn.own_tp.?;
         return conn;
     }
 
@@ -264,6 +297,7 @@ pub const Connection = struct {
         self.gpa.free(self.dcid);
         self.gpa.free(self.scid);
         self.gpa.free(self.peer_scid);
+        if (self.own_tp) |tp| self.gpa.free(tp);
         var it = self.streams.valueIterator();
         while (it.next()) |s| {
             s.*.deinit();
@@ -797,6 +831,14 @@ pub const Connection = struct {
                     // the PTO. Applied before the flight is built/sent.
                     self.peer_tp = transport_params.parse(decoded.value.quic_transport_parameters) catch
                         return error.ProtocolViolation;
+                    // RFC 9000 7.3/18.2: a client must not send server-only parameters,
+                    // must send initial_source_connection_id, and that id must equal the
+                    // Source Connection ID of the Initial carrying this ClientHello -
+                    // the handshake-time authentication that defeats id spoofing.
+                    if (self.peer_tp.has_server_only_param) return error.ProtocolViolation;
+                    const iscid = self.peer_tp.initial_scid orelse return error.ProtocolViolation;
+                    const carrier_scid = self.dispatch_initial_scid orelse return error.ProtocolViolation;
+                    if (!std.mem.eql(u8, iscid.slice(), carrier_scid)) return error.ProtocolViolation;
                     self.conn_send_window.setInitial(self.peer_tp.initial_max_data);
 
                     var flight_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -956,20 +998,15 @@ pub const Connection = struct {
         };
         const total = hdr.pn_offset + @as(usize, @intCast(hdr.length));
         if (total > buf.len) return error.Dropped;
-        // Adopt the peer's source connection id (from its first long header) as the
-        // destination of everything we send (RFC 9000 7.2). Until this, peer_scid
-        // defaults to the client dcid - fine for tests that use one shared id.
-        if (!self.peer_scid_set and hdr.scid.len > 0) {
-            const sc = self.gpa.dupe(u8, hdr.scid) catch return error.OutOfMemory;
-            self.gpa.free(self.peer_scid);
-            self.peer_scid = sc;
-            self.peer_scid_set = true;
-        }
         // A long header's length is known, so a packet we cannot decrypt (no keys
         // for the space yet, or a bad tag) is SKIPPED, not fatal: we return its
         // length so the caller keeps walking any coalesced packets behind it
-        // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2.
-        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, now) catch |e| switch (e) {
+        // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2. The
+        // header's scid rides along so it is adopted only AFTER the packet
+        // authenticates: a spoofed Initial racing the client's must not steer
+        // where replies go or poison the id its transport parameters are checked
+        // against (that would let an off-path attacker kill the handshake).
+        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, now, hdr.scid) catch |e| switch (e) {
             error.Dropped => return total,
             else => return e,
         };
@@ -979,11 +1016,11 @@ pub const Connection = struct {
     fn receiveShort(self: *Connection, buf: []const u8, now: u64) Error!usize {
         const hdr = packet.parseShort(buf, self.dcid.len) catch return error.Dropped;
         // A short-header packet is the rest of the datagram (no length field).
-        try self.decryptAndDispatch(buf, hdr.pn_offset, .application, false, now);
+        try self.decryptAndDispatch(buf, hdr.pn_offset, .application, false, now, null);
         return buf.len;
     }
 
-    fn decryptAndDispatch(self: *Connection, pkt: []const u8, pn_offset: usize, space: Space, long: bool, now: u64) Error!void {
+    fn decryptAndDispatch(self: *Connection, pkt: []const u8, pn_offset: usize, space: Space, long: bool, now: u64, peer_scid_hdr: ?[]const u8) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
         const keys = st.recv_keys orelse return error.Dropped; // no keys for this space yet
         // Work on a mutable copy: header protection removal and decryption mutate.
@@ -1001,6 +1038,17 @@ pub const Connection = struct {
         defer self.gpa.free(plaintext);
         const payload = crypto.open(keys, pn, header, ciphertext, plaintext) catch return error.Dropped;
 
+        // The packet authenticated: NOW the peer's source connection id can be
+        // trusted. Adopt it as the destination of everything we send (RFC 9000 7.2).
+        if (peer_scid_hdr) |scid| {
+            if (!self.peer_scid_set and scid.len > 0) {
+                const sc = self.gpa.dupe(u8, scid) catch return error.OutOfMemory;
+                self.gpa.free(self.peer_scid);
+                self.peer_scid = sc;
+                self.peer_scid_set = true;
+            }
+        }
+
         // A decryptable Handshake packet proves the peer received our Initial/
         // handshake keys, so its address is validated and the 3x send limit lifts
         // (RFC 9000 8.1).
@@ -1008,6 +1056,11 @@ pub const Connection = struct {
 
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, pn) else pn;
         st.recv_ranges.add(self.gpa, pn) catch return error.OutOfMemory; // for accurate ACKs
+        // Expose this Initial's scid to the ClientHello handler so it can check the
+        // client's initial_source_connection_id against the carrier packet's id
+        // (RFC 9000 7.3); borrowed for the dispatch only, then cleared.
+        self.dispatch_initial_scid = if (space == .initial) peer_scid_hdr else null;
+        defer self.dispatch_initial_scid = null;
         try self.dispatchFrames(payload, space, now);
 
         // Acknowledge the space if it carried an ack-eliciting frame this packet.
@@ -1296,6 +1349,12 @@ const testing = std.testing;
 // protection. Returns an owned datagram the caller frees. Exposed (test-only) so
 // the HTTP/3 layer's tests can drive a request through the real transport.
 pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
+    return testBuildInitialScid(gpa, dcid, &.{}, sender, pn, frames);
+}
+
+// testBuildInitial with a caller-chosen source connection id, so a test can forge an
+// Initial whose scid differs from the legitimate client's (RFC 9000 7.3 spoofing).
+pub fn testBuildInitialScid(gpa: std.mem.Allocator, dcid: []const u8, scid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
     const keys = blk: {
         const ik = crypto.InitialKeys.derive(dcid);
         break :blk if (sender == .client) ik.client else ik.server;
@@ -1307,7 +1366,8 @@ pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, 
     try hdr_buf.appendSlice(gpa, &[_]u8{ 0, 0, 0, 1 }); // version 1
     try hdr_buf.append(gpa, @intCast(dcid.len));
     try hdr_buf.appendSlice(gpa, dcid);
-    try hdr_buf.append(gpa, 0); // scid len 0
+    try hdr_buf.append(gpa, @intCast(scid.len));
+    try hdr_buf.appendSlice(gpa, scid);
     try hdr_buf.append(gpa, 0); // token len 0 (varint)
     // length = pn(1) + ciphertext(frames + tag)
     const length = 1 + frames.len + crypto.TAG_LEN;
@@ -1481,6 +1541,40 @@ test "initServer enforces exactly the bidi cap it advertises" {
     var badCfg = testServerConfig();
     badCfg.transport_params = &[_]u8{ 0x08, 0x08, 0x00 }; // len 8, only 1 byte follows
     try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, badCfg));
+}
+
+test "initServer advertises the mandatory connection ids" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x70, 0x71, 0x72, 0x73 };
+    var conn = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer conn.deinit();
+
+    // The advertised blob is the integrator base plus original_destination_connection_id
+    // (the client's first dcid) and initial_source_connection_id (our scid) - the two
+    // a conformant client validates before completing the handshake (RFC 9000 7.3).
+    var expected: std.ArrayListUnmanaged(u8) = .empty;
+    defer expected.deinit(gpa);
+    try expected.appendSlice(gpa, testServerConfig().transport_params);
+    try transport_params.appendBytesParam(&expected, gpa, 0x00, &dcid);
+    try transport_params.appendBytesParam(&expected, gpa, 0x0f, conn.scid);
+    try testing.expectEqualSlices(u8, expected.items, conn.own_tp.?);
+    // The TLS driver ships exactly this blob in EncryptedExtensions.
+    try testing.expectEqualSlices(u8, conn.own_tp.?, conn.tls.?.config.transport_params);
+
+    // A base blob already carrying one of the two ids initServer injects would
+    // duplicate it on the wire: a configuration bug, rejected up front.
+    var dupCfg = testServerConfig();
+    dupCfg.transport_params = &[_]u8{ 0x0f, 0x00 }; // initial_source_connection_id
+    try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, dupCfg));
+
+    // But a base blob carrying a server-only parameter the server itself does NOT
+    // inject (stateless_reset_token, 0x02) is legitimate and rides through verbatim.
+    var srtCfg = testServerConfig();
+    const srt = [_]u8{0x02} ++ [_]u8{0x10} ++ [_]u8{0xcc} ** 16; // 16-byte token
+    srtCfg.transport_params = &srt;
+    var srtConn = try Connection.initServer(gpa, &dcid, srtCfg);
+    defer srtConn.deinit();
+    try testing.expect(std.mem.indexOf(u8, srtConn.own_tp.?, &srt) != null);
 }
 
 test "connection flow control sums across streams" {
@@ -1669,6 +1763,14 @@ const RFC_CLIENT_PUBKEY = "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d54136
 // Build a QUIC-valid ClientHello carrying `pubkey` as its x25519 key_share, framed
 // as a handshake message (type 0x01 || u24 len || body) ready to ride a CRYPTO frame.
 fn buildClientHello(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pubkey: [32]u8) !void {
+    // max_idle_timeout, plus the mandatory initial_source_connection_id (RFC 9000
+    // 7.3) - empty, matching the zero-length scid testBuildInitial writes.
+    return buildClientHelloTp(out, gpa, pubkey, &[_]u8{ 0x01, 0x02, 0x40, 0x01, 0x0f, 0x00 });
+}
+
+// buildClientHello with a caller-chosen transport-parameter body, for the tests
+// that probe how the server validates a client's parameters.
+fn buildClientHelloTp(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pubkey: [32]u8, tp: []const u8) !void {
     const w = tls.wire.Writer{ .out = out, .gpa = gpa };
     try w.u8v(0x01);
     const msg = try w.open(3);
@@ -1711,7 +1813,7 @@ fn buildClientHello(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pu
     try w.close(ks);
     try w.u16v(0x0039); // quic_transport_parameters
     const qtp = try w.open(2);
-    try w.bytes(&[_]u8{ 0x01, 0x02, 0x40, 0x01 });
+    try w.bytes(tp);
     try w.close(qtp);
     try w.close(exts);
     try w.close(msg);
@@ -1722,6 +1824,17 @@ fn buildClientHelloInitial(gpa: std.mem.Allocator, dcid: []const u8, pubkey: [32
     var ch: std.ArrayListUnmanaged(u8) = .empty;
     defer ch.deinit(gpa);
     try buildClientHello(&ch, gpa, pubkey);
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeCrypto(&frames, gpa, 0, ch.items);
+    return testBuildInitial(gpa, dcid, .client, 0, frames.items);
+}
+
+// buildClientHelloInitial with a caller-chosen client transport-parameter body.
+fn buildClientHelloInitialTp(gpa: std.mem.Allocator, dcid: []const u8, pubkey: [32]u8, tp: []const u8) ![]u8 {
+    var ch: std.ArrayListUnmanaged(u8) = .empty;
+    defer ch.deinit(gpa);
+    try buildClientHelloTp(&ch, gpa, pubkey, tp);
     var frames: std.ArrayListUnmanaged(u8) = .empty;
     defer frames.deinit(gpa);
     try frame.encodeCrypto(&frames, gpa, 0, ch.items);
@@ -1816,14 +1929,81 @@ test "the client's transport parameters set the connection send window" {
     _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
     var server = try Connection.initServer(gpa, &dcid, testServerConfig());
     defer server.deinit();
-    // The test ClientHello carries quic_transport_parameters {0x01,0x02,0x40,0x01}:
-    // id 0x01 (max_idle_timeout), len 2, value varint 0x4001 = 1 -> initial_max_data
-    // is absent, so the send window becomes 0 (the client granted no data yet).
+    // The test ClientHello's transport parameters carry max_idle_timeout and the
+    // mandatory empty initial_source_connection_id - initial_max_data is absent, so
+    // the send window becomes 0 (the client granted no data yet).
     const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
     defer gpa.free(ch);
     try server.receiveDatagram(ch, 1000);
     try testing.expectEqual(@as(u64, 0), server.peer_tp.initial_max_data);
     try testing.expectEqual(@as(u64, 0), server.conn_send_window.limit); // set from the (absent) grant
+}
+
+test "a client without initial_source_connection_id is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+    // RFC 9000 7.3: absence of initial_source_connection_id from either peer is a
+    // TRANSPORT_PARAMETER_ERROR. Only max_idle_timeout here.
+    const ch = try buildClientHelloInitialTp(gpa, &dcid, pubkey, &[_]u8{ 0x01, 0x02, 0x40, 0x01 });
+    defer gpa.free(ch);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
+}
+
+test "a client whose initial_source_connection_id mismatches its Initial is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+    // The Initial's scid is empty, but the parameter claims aa bb (RFC 9000 7.3:
+    // the values are authenticated against the header to defeat id spoofing).
+    const ch = try buildClientHelloInitialTp(gpa, &dcid, pubkey, &[_]u8{ 0x0f, 0x02, 0xaa, 0xbb });
+    defer gpa.free(ch);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
+}
+
+test "a client sending a server-only transport parameter is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+    // A valid (empty) initial_source_connection_id plus an ODCID, which only a
+    // server may send (RFC 9000 18.2).
+    const ch = try buildClientHelloInitialTp(gpa, &dcid, pubkey, &[_]u8{ 0x0f, 0x00, 0x00, 0x01, 0xcc });
+    defer gpa.free(ch);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
+}
+
+test "a spoofed Initial with a different scid does not break the real handshake" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var pubkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    // Initial keys are derivable from the dcid, so an off-path attacker who saw it can
+    // forge a Initial that opens under AEAD with a DIFFERENT scid (aa bb) carrying only
+    // a PING. The connection-id check is bound to the ClientHello's own packet, not a
+    // persistent anchor, so this must not make the real client's check fail later.
+    const spoof = try testBuildInitialScid(gpa, &dcid, &[_]u8{ 0xaa, 0xbb }, .client, 0, &[_]u8{0x01} ** 20);
+    defer gpa.free(spoof);
+    try server.receiveDatagram(spoof, 900); // accepted (a valid PING), but does not poison
+
+    // The authentic ClientHello (zero-length scid, matching its empty initial_scid
+    // parameter) still validates and the server flight goes out.
+    const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
+    defer gpa.free(ch);
+    try server.receiveDatagram(ch, 1000);
+    try testing.expect(server.datagramLengths().len >= 1); // the server flight went out
+    try testing.expect(server.tls.?.state == .flight_sent);
 }
 
 test "a lost handshake CRYPTO packet is retransmitted on loss" {

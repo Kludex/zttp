@@ -17,18 +17,26 @@ SERVER_CONFIG = {
 }
 
 # Real handshake datagrams a client produces against SERVER_CONFIG, captured from the
-# Zig transport's test builders (RFC 8448 client key share; the client transport params
-# grant initial_max_data 65536 so the server can send a response, the server advertises
-# initial_max_streams_bidi 8). The ClientHello rides an Initial, the Finished a Handshake
-# packet, the GET request a 1-RTT packet - each sealed with the keys the real handshake
-# derives, so nothing is forged with test keys. dcid is 11 22 33 44.
+# Zig transport's test builders (RFC 8448 client key share). The client offers ALPN h3
+# and sends initial_max_data 65536 plus an empty initial_source_connection_id (matching
+# its zero-length Initial scid); the server advertises initial_max_streams_bidi 8 plus
+# the auto-injected original_destination/initial_source connection ids, ALPN h3. The
+# ClientHello rides an Initial, the Finished a Handshake packet, the GET request a
+# 1-RTT packet - each sealed with the keys the real handshake derives, so nothing is
+# forged with test keys. dcid is 11 22 33 44.
 CLIENT_HELLO = bytes.fromhex(
-    "c50000000104112233440000408f483e116484af5563d1a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0cbccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe883b8cddc289b6944cd68dfb2ecf25008c78255eef81817c25a8"
+    "c30000000104112233440000409a4d3e11647baf556326a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0d6ccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe88128cdec68e34fd7fd61b26e8fa1cc07be4f74f73a9c70ecfbb1b97070125376ff97745d8"
 )
 CLIENT_FINISHED = bytes.fromhex(
-    "ef00000001041122334400389752efb16776726f311fc8f83518999b83e43201874da34629db68e1a148f7270cb0277e2cd047788f1e7c69e7aa96f6f64dc4f02a3aff97"
+    "e30000000104112233440038521018f79775a3640f2215b80d21cc2fc497a8218eb66c61b7f32c2cf3ef87f008a094742f77ba82ce447bf75e9cc43b899b1e4b29776e44"
 )
-GET_REQUEST = bytes.fromhex("53112233447b8268f6a6591dc327e27a69cbfb7b3fa33d1bfce2894c49f816ecbace313565")
+GET_REQUEST = bytes.fromhex("59112233445eade7548c087d84f41357686d9338e06a82c87b33299a3cdccdb9ed483eccf2")
+
+# The pre-conformance ClientHello: no ALPN offer and no initial_source_connection_id,
+# both of which the server now requires.
+LEGACY_CLIENT_HELLO = bytes.fromhex(
+    "c50000000104112233440000408f483e116484af5563d1a75f6008b3bd937f3813bffcd39197feb9abf2d8e61aa5539d39a5ad06de38a6dc8d18f8fce9149a9ff0cbccfed7b594a6ba97093d0bb9c28a356e228c80d2cb5b9d032fc90398e3d954fe2ae7920f670e3c6f5cdffb8c35d5c75e16582b613c34d322445b10160480d791fe883b8cddc289b6944cd68dfb2ecf25008c78255eef81817c25a8"
+)
 
 
 def make_server() -> zttp.H3Connection:
@@ -84,6 +92,13 @@ def test_first_datagram_must_be_an_initial() -> None:
     conn = make_server()
     with pytest.raises(zttp.RemoteProtocolError):
         conn.receive_datagram(b"\x40not-a-long-header")
+
+
+def test_a_non_conformant_client_hello_is_rejected() -> None:
+    # No ALPN and no initial_source_connection_id - both now mandatory.
+    conn = make_server()
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.receive_datagram(LEGACY_CLIENT_HELLO, 1000)
 
 
 def test_handshake_emits_a_flight() -> None:
