@@ -648,14 +648,32 @@ pub const Connection = struct {
     /// enforced here. `headers` must not contain pseudo-headers (names beginning
     /// ":") - the server supplies :status.
     pub fn sendResponse(self: *Connection, id: u64, status: u16, headers: []const Header) Error!void {
+        if (status < 200 or status > 599) return error.H3Error; // the final response (1xx goes via sendInformational)
+        if (try self.sendStateOf(id) != .idle) return error.H3Error; // the final HEADERS once, before DATA/FIN
+        try self.sendHeaderSection(id, status, headers);
+        try self.setSendState(id, .headers_sent);
+    }
+
+    /// Send a 1xx interim response on stream `id` (RFC 9114 4.1 / RFC 9110 15.2): a
+    /// HEADERS frame whose field section is just `:status` (100-199) plus `headers`,
+    /// e.g. 103 Early Hints. Any number may precede the final sendResponse, so it
+    /// leaves the send state untouched - a later DATA/FIN still belongs to the final
+    /// response. Rejected once the final HEADERS has been sent.
+    pub fn sendInformational(self: *Connection, id: u64, status: u16, headers: []const Header) Error!void {
+        if (status < 100 or status > 199) return error.H3Error; // interim status range
+        if (try self.sendStateOf(id) != .idle) return error.H3Error; // only before the final response
+        try self.sendHeaderSection(id, status, headers);
+    }
+
+    /// Serialize and send one response HEADERS frame: the QPACK field section is the
+    /// prefix (RIC 0, Base 0), then `:status`, then `headers`. Shared by the final
+    /// response and the interim 1xx path; the state transition is the caller's.
+    fn sendHeaderSection(self: *Connection, id: u64, status: u16, headers: []const Header) Error!void {
         if (quic_stream.StreamType.of(id) != .client_bidi) return error.H3Error; // responses ride the request stream
-        if (status < 100 or status > 599) return error.H3Error; // RFC 9110 status range
-        if (try self.sendStateOf(id) != .idle) return error.H3Error; // HEADERS once, before DATA/FIN
         for (headers) |h| try validateResponseHeader(h);
         // Our control stream + SETTINGS must precede any response (RFC 9114 6.2.1).
         try self.initiateControl();
 
-        // The QPACK field section: prefix (RIC 0, Base 0), then :status, then headers.
         var section: std.ArrayList(u8) = .empty;
         defer section.deinit(self.gpa);
         section.appendSlice(self.gpa, &.{ 0x00, 0x00 }) catch return error.OutOfMemory;
@@ -668,7 +686,6 @@ pub const Connection = struct {
         defer frame.deinit(self.gpa);
         h3_frame.append(&frame, self.gpa, .headers, section.items) catch return error.OutOfMemory;
         try self.streamSend(id, frame.items, false);
-        try self.setSendState(id, .headers_sent);
     }
 
     /// Send a chunk of response body on stream `id` as an HTTP/3 DATA frame. The
@@ -1598,6 +1615,53 @@ test "a server sends response trailers as a trailing HEADERS frame" {
     try testing.expectEqual(@as(usize, 1), fields_out.len);
     try testing.expectEqualStrings("x-checksum", fields_out[0].name);
     try testing.expectEqualStrings("ok", fields_out[0].value);
+}
+
+test "a server sends a 1xx interim response before the final one" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x9b, 0xac, 0xbd, 0xce };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // 103 Early Hints (an interim response), repeatable, then the final 200.
+    const hints = [_]Header{.{ .name = "link", .value = "</style.css>; rel=preload" }};
+    try h3.sendInformational(0, 103, &hints);
+    try h3.sendInformational(0, 100, &.{}); // a second interim is allowed
+    try h3.sendResponse(0, 200, &.{});
+    try h3.endStream(0);
+    // sendResponse rejects a 1xx; sendInformational rejects a final status and a
+    // second call after the final HEADERS.
+    try testing.expectError(error.H3Error, h3.sendResponse(4, 103, &.{}));
+    try testing.expectError(error.H3Error, h3.sendInformational(0, 200, &.{}));
+    try testing.expectError(error.H3Error, h3.sendInformational(0, 103, &.{}));
+
+    try qc.flushSend(1000);
+    var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer peer.deinit();
+    quic_conn.testInstallAppKeys(&peer);
+    const buf = qc.datagramsToSend();
+    var off: usize = 0;
+    for (qc.datagramLengths()) |len| {
+        try peer.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+    const got = peer.streamData(0);
+
+    // Three HEADERS frames ride in order: 103, 100, 200. Decode the first's :status.
+    const d1 = try h3_frame.decode(got);
+    try testing.expectEqual(h3_frame.FrameType.headers, d1.frame.ftype);
+    var dec = qpack.Decoder.init(gpa, 1 << 16);
+    defer dec.deinit();
+    const f1 = try dec.decode(d1.frame.payload);
+    try testing.expectEqualStrings(":status", f1[0].name);
+    try testing.expectEqualStrings("103", f1[0].value);
+    const d2 = try h3_frame.decode(got[d1.len..]);
+    try testing.expectEqual(h3_frame.FrameType.headers, d2.frame.ftype); // the second interim (100)
+    const d3 = try h3_frame.decode(got[d1.len + d2.len ..]);
+    try testing.expectEqual(h3_frame.FrameType.headers, d3.frame.ftype); // the final 200
 }
 
 test "the server resets a request stream" {
