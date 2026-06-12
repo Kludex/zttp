@@ -1092,6 +1092,14 @@ pub const Connection = struct {
         return error.CryptoError;
     }
 
+    /// Map a TLS server error to its CRYPTO_ERROR close, but let an allocation
+    /// failure surface as OutOfMemory (a local resource fault, not a peer protocol
+    /// error) rather than a misattributed CryptoError.
+    fn failHandshakeErr(self: *Connection, e: tls.server.Error) Error {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        return self.failHandshake(tls.server.alertFor(e));
+    }
+
     /// Queue a CONNECTION_CLOSE carrying a QUIC TRANSPORT_PARAMETER_ERROR for a
     /// malformed/forbidden/spoofed transport parameter (RFC 9000 7.3/7.4/18.2), so
     /// a peer with bad parameters learns why rather than seeing a silent drop.
@@ -1142,7 +1150,7 @@ pub const Connection = struct {
 
                     var flight_buf: std.ArrayListUnmanaged(u8) = .empty;
                     defer flight_buf.deinit(self.gpa);
-                    const outcome = server.onClientHello(&flight_buf, self.gpa, decoded.value) catch |e| return self.failHandshake(tls.server.alertFor(e));
+                    const outcome = server.onClientHello(&flight_buf, self.gpa, decoded.value) catch |e| return self.failHandshakeErr(e);
 
                     // A server RECVs with the client traffic secret, SENDs with the server one.
                     self.installKeys(.handshake, outcome.built.handshake_secrets.clientKeys(), outcome.built.handshake_secrets.serverKeys());
@@ -1157,7 +1165,7 @@ pub const Connection = struct {
                 },
                 .finished => {
                     const body = tls.handshake.finishedBody(msg.body) catch return self.failHandshake(.decode_error);
-                    server.onClientFinished(body) catch |e| return self.failHandshake(tls.server.alertFor(e));
+                    server.onClientFinished(body) catch |e| return self.failHandshakeErr(e);
                     st.crypto.advance(msg.len);
                     try self.confirmHandshake(now);
                 },
