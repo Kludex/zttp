@@ -278,6 +278,15 @@ def test_is_closed_starts_false() -> None:
     assert conn.is_closed() is False
 
 
+def test_idle_timed_out_starts_false() -> None:
+    # The server config advertises no max_idle_timeout, so the connection never idle
+    # times out; the query is exposed and reports a plain bool.
+    conn = make_server()
+    assert conn.idle_timed_out() is False
+    conn.receive_datagram(CLIENT_HELLO, 1000)
+    assert conn.idle_timed_out() is False
+
+
 def test_close_info_is_none_until_the_peer_closes() -> None:
     conn = make_server()
     assert conn.close_info() is None

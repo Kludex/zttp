@@ -534,6 +534,11 @@ const H3Engine = struct {
         return q.closed;
     }
 
+    fn idleTimedOut(self: *const H3Engine) bool {
+        const q = self.qc orelse return false;
+        return q.idleTimedOut();
+    }
+
     /// The id of a GOAWAY received from the peer (RFC 9114 5.2), or None - so an
     /// integrator learns the peer is shutting down and stops opening new streams.
     fn goawayReceived(self: *const H3Engine) py.Object {
@@ -1607,6 +1612,11 @@ fn h3_is_closed(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     return py.boolean(e.isClosed());
 }
 
+fn h3_idle_timed_out(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    return py.boolean(e.idleTimedOut());
+}
+
 fn h3_close_info(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const e = h3(@ptrCast(self_obj.?)) orelse return null;
     return e.closeInfo();
@@ -1722,7 +1732,8 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "next_timeout", .ml_meth = h3_next_timeout, .ml_flags = c.METH_NOARGS, .ml_doc = "The next loss/PTO deadline (same clock as now), or None if no timer is armed." },
     .{ .ml_name = "handle_timeout", .ml_meth = h3_handle_timeout, .ml_flags = c.METH_O, .ml_doc = "Fire the timer at time now: handle_timeout(now). Re-queues probes; drain them with data_to_send." },
     .{ .ml_name = "initiate_connection", .ml_meth = h3_initiate, .ml_flags = c.METH_NOARGS, .ml_doc = "Open the control stream and send SETTINGS now (RFC 9114 6.2.1), rather than lazily on the first response. Idempotent. Drain it with data_to_send." },
-    .{ .ml_name = "is_closed", .ml_meth = h3_is_closed, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection has been closed (a peer CONNECTION_CLOSE was received)." },
+    .{ .ml_name = "is_closed", .ml_meth = h3_is_closed, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection has been closed (a peer CONNECTION_CLOSE, or the idle timeout fired)." },
+    .{ .ml_name = "idle_timed_out", .ml_meth = h3_idle_timed_out, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection was silently closed by the idle timeout (RFC 9000 10.1), as opposed to a CONNECTION_CLOSE." },
     .{ .ml_name = "close_info", .ml_meth = h3_close_info, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's CONNECTION_CLOSE as (error_code, reason, is_application), or None if the peer has not closed." },
     .{ .ml_name = "peer_settings", .ml_meth = h3_peer_settings, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's HTTP/3 SETTINGS as a dict (max_field_section_size, qpack_max_table_capacity, qpack_blocked_streams), or None until its SETTINGS frame has been received." },
     .{ .ml_name = "shutdown", .ml_meth = h3_shutdown, .ml_flags = c.METH_O, .ml_doc = "Begin a graceful shutdown: send a GOAWAY announcing stream_id as the first request stream not processed (RFC 9114 5.2). A later GOAWAY may only lower the id. Drain it with data_to_send." },

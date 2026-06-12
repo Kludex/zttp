@@ -309,6 +309,17 @@ pub const Connection = struct {
     sent_bytes: u64 = 0,
     address_validated: bool = false,
     closed: bool = false,
+    /// Whether the connection was silently closed by the idle timeout (RFC 9000 10.1),
+    /// as opposed to a peer or local CONNECTION_CLOSE. Surfaced so the integrator can
+    /// tell an idle close from an error close.
+    idle_timed_out: bool = false,
+    /// Our own advertised max_idle_timeout (ms), parsed from our transport parameters;
+    /// 0 means we set no idle timeout. The effective period is the min with the peer's.
+    own_idle_timeout_ms: u64 = 0,
+    /// The monotonic time (us) of the last activity that resets the idle timer (RFC
+    /// 9000 10.1): a received packet that was processed, or an ack-eliciting packet we
+    /// sent. The idle deadline is this plus the effective idle period.
+    last_activity: u64 = 0,
     /// The details of a CONNECTION_CLOSE received from the peer (RFC 9000 19.19),
     /// captured so the integrator can report why the peer closed - not just that it
     /// did. Null until a close arrives. `reason` is an owned copy (the decoded slice
@@ -393,6 +404,9 @@ pub const Connection = struct {
             .bidi = own.initial_max_stream_data_bidi_remote,
             .uni = own.initial_max_stream_data_uni,
         };
+        // Our advertised idle timeout (RFC 9000 10.1); the effective period is the min
+        // with the peer's, learned at the ClientHello.
+        conn.own_idle_timeout_ms = own.max_idle_timeout_ms;
         // Advertise the mandatory connection ids (RFC 9000 18.2): the client MUST see
         // its first Initial's destination id echoed as original_destination_connection_id
         // and our source id as initial_source_connection_id, or it fails the handshake
@@ -500,7 +514,10 @@ pub const Connection = struct {
         // packets count toward bytes_in_flight - charging a pure ACK would inflate it
         // permanently, since the ACK/loss paths only credit back in-flight packets.
         st.rec.onSent(self.gpa, .{ .pn = pn, .sent_time = now, .size = datagram_len, .ack_eliciting = ack_eliciting, .in_flight = ack_eliciting }) catch return error.OutOfMemory;
-        if (ack_eliciting) self.cc.onSent(datagram_len);
+        if (ack_eliciting) {
+            self.cc.onSent(datagram_len);
+            self.last_activity = now; // an ack-eliciting send resets the idle timer (RFC 9000 10.1)
+        }
         st.next_pn += 1;
         return pn;
     }
@@ -878,7 +895,28 @@ pub const Connection = struct {
             if (st.rec.loss_time) |t| earliest = minOpt(earliest, t);
             if (st.rec.ptoDeadline(&self.rtt, self.ackDelayFor(@enumFromInt(i)))) |t| earliest = minOpt(earliest, t);
         }
+        if (self.idleDeadline()) |t| earliest = minOpt(earliest, t);
         return earliest;
+    }
+
+    /// The absolute time (us) the connection is silently closed for inactivity (RFC
+    /// 9000 10.1), or null when neither endpoint set an idle timeout. The period is the
+    /// smaller of the two advertised max_idle_timeout values (a zero on one side means
+    /// no limit there, so the other governs), floored at three PTOs so loss recovery
+    /// cannot trip it. Measured from the last activity that resets the timer.
+    fn idleDeadline(self: *const Connection) ?u64 {
+        const own = self.own_idle_timeout_ms;
+        const peer = self.peer_tp.max_idle_timeout_ms;
+        const effective_ms = if (own == 0) peer else if (peer == 0) own else @min(own, peer);
+        if (effective_ms == 0) return null;
+        const period = @max(effective_ms * std.time.us_per_ms, 3 * self.ptoPeriod());
+        return self.last_activity + period;
+    }
+
+    /// One PTO interval (RFC 9002 6.2.1) for the idle-timeout floor: the RTT-based PTO
+    /// plus the peer's max ack delay (the Application-space term).
+    fn ptoPeriod(self: *const Connection) u64 {
+        return self.rtt.pto() + self.ackDelayFor(.application);
     }
 
     /// Drive the loss-recovery timers at time `now`. First handle any space whose
@@ -888,6 +926,18 @@ pub const Connection = struct {
     /// I/O happens here - the next flushSend emits whatever was queued.
     pub fn onTimeout(self: *Connection, now: u64) Error!void {
         if (self.closed) return error.ProtocolViolation;
+
+        // (0) Idle timeout (RFC 9000 10.1): if the inactivity period elapsed, the
+        // connection is silently closed - no CONNECTION_CLOSE is sent, the state is
+        // simply discarded. Checked first so a black-holed peer (no loss/PTO progress)
+        // is eventually reclaimed.
+        if (self.idleDeadline()) |deadline| {
+            if (now >= deadline) {
+                self.closed = true;
+                self.idle_timed_out = true;
+                return;
+            }
+        }
 
         // (1) Time-threshold losses first (RFC 9002 6.2.1: loss_time takes precedence).
         for (&self.spaces, 0..) |*st, i| {
@@ -1250,6 +1300,11 @@ pub const Connection = struct {
         // handshake keys, so its address is validated and the 3x send limit lifts
         // (RFC 9000 8.1).
         if (space == .handshake) self.address_validated = true;
+
+        // The packet authenticated and is being processed: reset the idle timer (RFC
+        // 9000 10.1). A dropped/undecryptable packet never reaches here, so spoofed
+        // traffic cannot keep the connection alive.
+        self.last_activity = now;
 
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, pn) else pn;
         st.recv_ranges.add(self.gpa, pn) catch return error.OutOfMemory; // for accurate ACKs
@@ -1615,6 +1670,13 @@ pub const Connection = struct {
     /// not yet track that - see the outbound uni-limit follow-up.)
     pub fn peerMaxStreamsUni(self: *const Connection) u64 {
         return self.peer_tp.initial_max_streams_uni;
+    }
+
+    /// Whether the connection was silently closed by the idle timeout (RFC 9000 10.1)
+    /// rather than by a peer or local CONNECTION_CLOSE, so the integrator can tell an
+    /// inactivity close from an error close.
+    pub fn idleTimedOut(self: *const Connection) bool {
+        return self.idle_timed_out;
     }
 
     /// Snapshot the ids of every stream the transport currently knows about, into
@@ -2914,6 +2976,51 @@ test "resetting a flow-blocked stream declares only the bytes actually sent" {
     try conn.resetStream(1, 0x010c);
     try conn.flushSend(2000);
     try testing.expectEqual(@as(u64, 4), conn.send_streams.get(1).?.reset_final_size);
+}
+
+test "the idle timeout silently closes an inactive connection" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.own_idle_timeout_ms = 30_000; // we advertise 30s
+    conn.peer_tp.max_idle_timeout_ms = 10_000; // the peer 10s; the smaller governs
+
+    // Activity at t=1s arms the timer; the effective period is 10s (well above 3*PTO),
+    // so the idle deadline is 11s. (nextTimeout also folds in the PTO, which is sooner;
+    // the idle deadline is checked directly here.)
+    const ping = [_]u8{0x01} ** 20;
+    const d0 = try testBuildApp(gpa, &dcid, 0, &ping);
+    defer gpa.free(d0);
+    try conn.receiveDatagram(d0, 1_000_000);
+    try testing.expectEqual(@as(u64, 1_000_000 + 10_000_000), conn.idleDeadline().?);
+    try testing.expect(conn.nextTimeout().? <= conn.idleDeadline().?); // the idle bound is included
+
+    // A timeout just before the deadline does not idle-close; at the deadline it does,
+    // with no CONNECTION_CLOSE queued (RFC 9000 10.1: silently discarded).
+    try conn.onTimeout(11_000_000 - 1);
+    try testing.expect(!conn.closed);
+    conn.clearSend();
+    try conn.onTimeout(11_000_000);
+    try testing.expect(conn.closed and conn.idleTimedOut());
+    try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len); // nothing sent
+}
+
+test "no idle timeout when neither endpoint advertises one" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe5, 0xe6, 0xe7, 0xe8 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    // Both max_idle_timeout default to 0: no idle deadline, so a long-quiet connection
+    // is not closed by onTimeout (only the integrator's own policy would).
+    const ping = [_]u8{0x01} ** 20;
+    const d0 = try testBuildApp(gpa, &dcid, 0, &ping);
+    defer gpa.free(d0);
+    try conn.receiveDatagram(d0, 1_000_000);
+    try conn.onTimeout(1_000_000_000_000); // a very late tick
+    try testing.expect(!conn.closed);
 }
 
 test "flushSend never sends past the congestion window, and resumes as it opens" {
