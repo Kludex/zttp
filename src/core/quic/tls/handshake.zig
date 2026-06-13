@@ -14,6 +14,7 @@ const finished = @import("finished.zig");
 pub const MsgType = enum(u8) {
     client_hello = 0x01,
     server_hello = 0x02,
+    new_session_ticket = 0x04,
     encrypted_extensions = 0x08,
     certificate = 0x0b,
     certificate_verify = 0x0f,

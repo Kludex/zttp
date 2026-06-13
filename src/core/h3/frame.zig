@@ -62,6 +62,16 @@ pub fn isReserved(t: u64) bool {
     return (t - 0x21) % 0x1f == 0;
 }
 
+/// HTTP/2 frame type code points that have no HTTP/3 equivalent (RFC 9114
+/// 7.2.8/11.2.1). These are different from grease values: receiving one is
+/// H3_FRAME_UNEXPECTED, not "ignore unknown".
+pub fn isReservedHttp2(t: FrameType) bool {
+    return switch (@intFromEnum(t)) {
+        0x02, 0x06, 0x08, 0x09 => true,
+        else => false,
+    };
+}
+
 /// Append a frame to a growing buffer (the writer side). Used by the H3 writer to
 /// emit DATA/HEADERS/SETTINGS.
 pub fn append(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, ftype: FrameType, payload: []const u8) !void {
@@ -109,4 +119,13 @@ test "isReserved matches the grease formula" {
     try std.testing.expect(isReserved(0x21));
     try std.testing.expect(isReserved(0x21 + 0x1f));
     try std.testing.expect(!isReserved(0x04)); // SETTINGS
+}
+
+test "HTTP/2-only frame type code points are reserved errors" {
+    try std.testing.expect(isReservedHttp2(@enumFromInt(0x02)));
+    try std.testing.expect(isReservedHttp2(@enumFromInt(0x06)));
+    try std.testing.expect(isReservedHttp2(@enumFromInt(0x08)));
+    try std.testing.expect(isReservedHttp2(@enumFromInt(0x09)));
+    try std.testing.expect(!isReservedHttp2(.data));
+    try std.testing.expect(!isReservedHttp2(@enumFromInt(0x21))); // grease is ignored
 }

@@ -8,6 +8,11 @@
 
 const std = @import("std");
 
+/// The largest number of out-of-order fragments retained for one receive stream.
+/// Flow control already caps bytes; this caps allocator/list pressure from a peer
+/// sending one-byte fragments in reverse order.
+pub const MAX_RECV_FRAGMENTS: usize = 1024;
+
 /// The four stream-id classes (RFC 9000 2.1), the low two bits of the id.
 pub const StreamType = enum(u2) {
     client_bidi = 0x0,
@@ -42,6 +47,9 @@ pub const Error = error{
     /// Data arrived past the final size, or a second/conflicting FIN moved the
     /// final size (RFC 9000 4.5): FINAL_SIZE_ERROR.
     FinalSizeError,
+    /// The peer fragmented one receive stream beyond the implementation's retention
+    /// bound. This is a connection-level resource abuse signal.
+    StreamBufferExceeded,
     OutOfMemory,
 };
 
@@ -87,7 +95,7 @@ pub const RecvStream = struct {
     /// buffered. A FIN fixes the final size. Returns how much the stream's highest
     /// received offset grew, which the connection charges against its window.
     pub fn push(self: *RecvStream, offset: u64, data: []const u8, fin: bool) Error!u64 {
-        const end = offset + data.len;
+        const end = std.math.add(u64, offset, data.len) catch return error.FinalSizeError;
         if (self.final_size) |fs| {
             if (end > fs) return error.FinalSizeError;
             if (fin and end != fs) return error.FinalSizeError;
@@ -116,6 +124,7 @@ pub const RecvStream = struct {
     }
 
     fn buffer(self: *RecvStream, offset: u64, data: []const u8) Error!void {
+        if (self.pending.items.len >= MAX_RECV_FRAGMENTS) return error.StreamBufferExceeded;
         const copy = try self.gpa.dupe(u8, data);
         errdefer self.gpa.free(copy);
         // Keep pending sorted by offset for an in-order drain.
@@ -131,7 +140,7 @@ pub const RecvStream = struct {
             var i: usize = 0;
             while (i < self.pending.items.len) {
                 const f = self.pending.items[i];
-                const fend = f.offset + f.data.len;
+                const fend = std.math.add(u64, f.offset, f.data.len) catch return error.FinalSizeError;
                 if (fend <= self.contiguous) {
                     self.gpa.free(f.data);
                     _ = self.pending.orderedRemove(i);
@@ -175,12 +184,16 @@ pub const RecvStream = struct {
         return if (self.final_size) |fs| self.contiguous >= fs else false;
     }
 
-    pub fn onReset(self: *RecvStream, error_code: u64, final_size: u64) Error!void {
+    pub fn onReset(self: *RecvStream, error_code: u64, final_size: u64) Error!u64 {
         if (self.final_size) |fs| {
             if (fs != final_size) return error.FinalSizeError;
         } else self.final_size = final_size;
+        const new_high = @max(self.highest_received, final_size);
+        const delta = new_high - self.highest_received;
+        self.highest_received = new_high;
         self.reset_code = error_code;
         self.state = .reset_recvd;
+        return delta;
     }
 
     /// The stream will deliver nothing more: the application has read every byte
@@ -297,6 +310,14 @@ pub const SendStream = struct {
         if (self.lost.items.len > 0 or self.fin_lost) return true;
         if (self.sent < self.end()) return true;
         return self.finOwedAtEnd();
+    }
+
+    /// Bytes written by the application but not yet admitted into a STREAM frame.
+    /// This excludes retained unacked bytes and lost retransmit ranges; it is the
+    /// queued body pressure an upper layer can surface to integrators.
+    pub fn pendingNewBytes(self: *const SendStream) usize {
+        if (self.sent >= self.end()) return 0;
+        return @intCast(self.end() - self.sent);
     }
 
     /// The next chunk to frame, capped at `max` bytes: a lost range first, then a
@@ -511,6 +532,28 @@ test "data past a known final size is a final-size error" {
     defer s.deinit();
     _ = try s.push(0, "abc", true); // final size = 3
     try std.testing.expectError(error.FinalSizeError, s.push(3, "d", false));
+}
+
+test "offset overflow is rejected before stream reassembly" {
+    const gpa = std.testing.allocator;
+    var s = RecvStream.init(gpa);
+    defer s.deinit();
+    try std.testing.expectError(error.FinalSizeError, s.push(std.math.maxInt(u64), "x", false));
+}
+
+test "out-of-order receive fragments are bounded" {
+    const gpa = std.testing.allocator;
+    var s = RecvStream.init(gpa);
+    defer s.deinit();
+
+    var i: usize = 0;
+    while (i < MAX_RECV_FRAGMENTS) : (i += 1) {
+        const offset: u64 = @intCast((i + 1) * 2);
+        _ = try s.push(offset, "x", false);
+    }
+
+    const overflow_offset: u64 = @intCast((MAX_RECV_FRAGMENTS + 1) * 2);
+    try std.testing.expectError(error.StreamBufferExceeded, s.push(overflow_offset, "x", false));
 }
 
 test "a conflicting FIN offset is rejected" {

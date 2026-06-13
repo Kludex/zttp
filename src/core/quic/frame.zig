@@ -28,13 +28,19 @@ pub const AckRange = struct {
     len: u64,
 };
 
+pub const EcnCounts = struct {
+    ect0: u64,
+    ect1: u64,
+    ce: u64,
+};
+
 /// A parsed frame. A tagged union mirroring the RFC 9000 frame catalogue; the
 /// variants the read path acts on carry their fields, and the many pure-signal
 /// frames (PING, HANDSHAKE_DONE, ...) are bare tags.
 pub const Frame = union(enum) {
     padding: usize, // a run of PADDING octets, collapsed to its count
     ping,
-    ack: struct { largest: u64, delay: u64, first_range: u64, ranges: []const u8 }, // ranges left raw; decoded lazily
+    ack: struct { largest: u64, delay: u64, first_range: u64, ranges: []const u8, ecn: ?EcnCounts = null }, // ranges left raw; decoded lazily
     reset_stream: struct { stream_id: u64, error_code: u64, final_size: u64 },
     stop_sending: struct { stream_id: u64, error_code: u64 },
     crypto: struct { offset: u64, data: []const u8 },
@@ -85,6 +91,11 @@ const Cursor = struct {
     }
 };
 
+fn validateOffsetLen(offset: u64, len: u64) Error!void {
+    const end = std.math.add(u64, offset, len) catch return error.FrameEncodingError;
+    if (end > varint.MAX) return error.FrameEncodingError;
+}
+
 /// Decode the frame at the start of `buf`. PADDING runs are collapsed into one
 /// `padding` frame so a packet full of padding does not yield thousands of
 /// events. Returns Truncated if any field runs past the payload end.
@@ -110,6 +121,7 @@ pub fn decode(buf: []const u8) Error!Decoded {
         .crypto => blk: {
             const offset = try cur.vint();
             const dlen = try cur.vint();
+            try validateOffsetLen(offset, dlen);
             break :blk .{ .crypto = .{ .offset = offset, .data = try cur.take(@intCast(dlen)) } };
         },
         .new_token => blk: {
@@ -145,8 +157,10 @@ fn decodeStream(cur: *Cursor, raw: u64) Error!Decoded {
     const offset = if (has_off) try cur.vint() else 0;
     const data = if (has_len) blk: {
         const dlen = try cur.vint();
+        try validateOffsetLen(offset, dlen);
         break :blk try cur.take(@intCast(dlen));
     } else cur.buf[cur.pos..]; // no length => the frame runs to the packet end
+    if (!has_len) try validateOffsetLen(offset, @intCast(data.len));
     if (!has_len) cur.pos = cur.buf.len;
     return .{ .frame = .{ .stream = .{ .stream_id = stream_id, .offset = offset, .data = data, .fin = fin } }, .len = cur.pos };
 }
@@ -163,12 +177,15 @@ fn decodeAck(cur: *Cursor, ecn: bool) Error!Frame {
         _ = try cur.vint(); // ack range length
     }
     const ranges = cur.buf[ranges_start..cur.pos];
+    var ecn_counts: ?EcnCounts = null;
     if (ecn) {
-        _ = try cur.vint(); // ECT0
-        _ = try cur.vint(); // ECT1
-        _ = try cur.vint(); // ECN-CE
+        ecn_counts = .{
+            .ect0 = try cur.vint(),
+            .ect1 = try cur.vint(),
+            .ce = try cur.vint(),
+        };
     }
-    return .{ .ack = .{ .largest = largest, .delay = delay, .first_range = first_range, .ranges = ranges } };
+    return .{ .ack = .{ .largest = largest, .delay = delay, .first_range = first_range, .ranges = ranges, .ecn = ecn_counts } };
 }
 
 fn decodeNewCid(cur: *Cursor) Error!Frame {
@@ -263,6 +280,14 @@ pub fn encodeMaxData(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, m
     try varint.append(out, gpa, max);
 }
 
+/// Append a NEW_TOKEN frame (RFC 9000 19.7): an address-validation token a server
+/// gives a client for a future connection.
+pub fn encodeNewToken(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, token: []const u8) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.new_token));
+    try varint.append(out, gpa, token.len);
+    try out.appendSlice(gpa, token);
+}
+
 /// Append a MAX_STREAM_DATA frame (RFC 9000 19.10): the new limit on the data the
 /// peer may send on `stream_id`.
 pub fn encodeMaxStreamData(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, stream_id: u64, max: u64) !void {
@@ -276,6 +301,46 @@ pub fn encodeMaxStreamData(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Alloca
 pub fn encodeMaxStreams(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, bidi: bool, max: u64) !void {
     try varint.append(out, gpa, @intFromEnum(if (bidi) FrameType.max_streams_bidi else FrameType.max_streams_uni));
     try varint.append(out, gpa, max);
+}
+
+/// Append a DATA_BLOCKED frame (RFC 9000 19.12): our send side is blocked by the
+/// peer's connection-level MAX_DATA limit.
+pub fn encodeDataBlocked(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, limit: u64) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.data_blocked));
+    try varint.append(out, gpa, limit);
+}
+
+/// Append a STREAM_DATA_BLOCKED frame (RFC 9000 19.13): our send side is blocked
+/// by this stream's MAX_STREAM_DATA limit.
+pub fn encodeStreamDataBlocked(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, stream_id: u64, limit: u64) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.stream_data_blocked));
+    try varint.append(out, gpa, stream_id);
+    try varint.append(out, gpa, limit);
+}
+
+/// Append a STREAMS_BLOCKED frame (RFC 9000 19.14): our stream creation is blocked
+/// by the peer's MAX_STREAMS limit for the selected directionality.
+pub fn encodeStreamsBlocked(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, bidi: bool, limit: u64) !void {
+    try varint.append(out, gpa, @intFromEnum(if (bidi) FrameType.streams_blocked_bidi else FrameType.streams_blocked_uni));
+    try varint.append(out, gpa, limit);
+}
+
+/// Append a NEW_CONNECTION_ID frame (RFC 9000 19.15). The stateless reset token is
+/// exactly 16 octets.
+pub fn encodeNewConnectionId(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, seq: u64, retire_prior_to: u64, cid: []const u8, token: [16]u8) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.new_connection_id));
+    try varint.append(out, gpa, seq);
+    try varint.append(out, gpa, retire_prior_to);
+    try out.append(gpa, @intCast(cid.len));
+    try out.appendSlice(gpa, cid);
+    try out.appendSlice(gpa, &token);
+}
+
+/// Append a RETIRE_CONNECTION_ID frame (RFC 9000 19.16): the peer no longer uses
+/// a locally-issued connection id with `seq`.
+pub fn encodeRetireConnectionId(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, seq: u64) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.retire_connection_id));
+    try varint.append(out, gpa, seq);
 }
 
 /// Append a RESET_STREAM frame (RFC 9000 19.4): abruptly terminate the sending part
@@ -311,6 +376,16 @@ pub fn encodeConnectionClose(
     if (!app) try varint.append(out, gpa, frame_type); // transport variant only
     try varint.append(out, gpa, reason.len);
     try out.appendSlice(gpa, reason);
+}
+
+pub fn encodePathChallenge(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, data: [8]u8) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.path_challenge));
+    try out.appendSlice(gpa, &data);
+}
+
+pub fn encodePathResponse(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, data: [8]u8) !void {
+    try varint.append(out, gpa, @intFromEnum(FrameType.path_response));
+    try out.appendSlice(gpa, &data);
 }
 
 /// Append a CRYPTO frame (RFC 9000 19.6): the handshake byte stream for one
@@ -360,6 +435,27 @@ test "PADDING collapses a run" {
     try std.testing.expectEqual(@as(usize, 3), d.len);
 }
 
+test "PATH_CHALLENGE and PATH_RESPONSE round-trip" {
+    const gpa = std.testing.allocator;
+    const data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodePathChallenge(&out, gpa, data);
+    try encodePathResponse(&out, gpa, data);
+
+    const c = try decode(out.items);
+    switch (c.frame) {
+        .path_challenge => |got| try std.testing.expectEqualSlices(u8, &data, &got),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const r = try decode(out.items[c.len..]);
+    switch (r.frame) {
+        .path_response => |got| try std.testing.expectEqualSlices(u8, &data, &got),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "decode a STREAM frame with offset, length, and FIN" {
     // type 0x0f (OFF|LEN|FIN), id=4, off=8, len=3, "abc"
     const d = try decode(&.{ 0x0f, 0x04, 0x08, 0x03, 'a', 'b', 'c' });
@@ -386,6 +482,18 @@ test "decode a CRYPTO frame" {
     try std.testing.expectEqualStrings("hello", cr.data);
 }
 
+test "STREAM and CRYPTO offset plus length must fit the QUIC varint range" {
+    const max = [_]u8{0xff} ** 8;
+    const crypto_over = [_]u8{0x06} ++ max ++ [_]u8{ 0x01, 'x' };
+    try std.testing.expectError(error.FrameEncodingError, decode(&crypto_over));
+
+    const stream_over = [_]u8{ 0x0e, 0x00 } ++ max ++ [_]u8{ 0x01, 'x' };
+    try std.testing.expectError(error.FrameEncodingError, decode(&stream_over));
+
+    const stream_no_len_over = [_]u8{ 0x0c, 0x00 } ++ max ++ [_]u8{'x'};
+    try std.testing.expectError(error.FrameEncodingError, decode(&stream_no_len_over));
+}
+
 test "decode an ACK frame and walk its ranges" {
     // largest=10, delay=0, range_count=1, first_range=2, [gap=1, len=3]
     const d = try decode(&.{ 0x02, 0x0a, 0x00, 0x01, 0x02, 0x01, 0x03 });
@@ -397,6 +505,16 @@ test "decode an ACK frame and walk its ranges" {
     try std.testing.expectEqual(@as(u64, 1), r.gap);
     try std.testing.expectEqual(@as(u64, 3), r.len);
     try std.testing.expect(it.next() == null);
+}
+
+test "decode an ACK_ECN frame retains ECN counts" {
+    // largest=5, delay=0, range_count=0, first_range=0, ect0=7, ect1=0, ce=2.
+    const d = try decode(&.{ 0x03, 0x05, 0x00, 0x00, 0x00, 0x07, 0x00, 0x02 });
+    const ack = d.frame.ack;
+    try std.testing.expectEqual(@as(u64, 5), ack.largest);
+    try std.testing.expectEqual(@as(u64, 7), ack.ecn.?.ect0);
+    try std.testing.expectEqual(@as(u64, 0), ack.ecn.?.ect1);
+    try std.testing.expectEqual(@as(u64, 2), ack.ecn.?.ce);
 }
 
 test "decode MAX_STREAMS variants" {

@@ -53,18 +53,18 @@ pub const Error = error{
 };
 
 /// Parse a SETTINGS frame payload (a sequence of id/value varint pairs) into a
-/// `Settings`. A repeated known identifier is a connection error (RFC 9114 7.2.4);
-/// unknown settings are ignored, and an unbounded number of distinct unknown ids is
-/// legal, so the distinct count is not capped (only duplicates of the settings we
-/// act on are detected - the duplicate-error is a MAY for the rest).
+/// `Settings`. A repeated identifier is a connection error (RFC 9114 7.2.4);
+/// unknown settings are ignored after duplicate detection.
 pub fn parseSettings(payload: []const u8) Error!Settings {
     var s = Settings{};
     var pos: usize = 0;
     while (pos < payload.len) {
+        const id_start = pos;
         const id = varint.decode(payload[pos..]) catch return error.SettingsError;
         pos += id.len;
         const val = varint.decode(payload[pos..]) catch return error.SettingsError;
         pos += val.len;
+        if (settingSeen(payload[0..id_start], id.value)) return error.SettingsError;
         // The HTTP/2 setting ids 0x02-0x05 are reserved in HTTP/3 and their receipt
         // MUST be a connection error (RFC 9114 7.2.4.1), not ignored as unknown.
         if (id.value >= 0x02 and id.value <= 0x05) return error.SettingsError;
@@ -90,6 +90,18 @@ pub fn parseSettings(payload: []const u8) Error!Settings {
     return s;
 }
 
+fn settingSeen(prefix: []const u8, want: u64) bool {
+    var pos: usize = 0;
+    while (pos < prefix.len) {
+        const id = varint.decode(prefix[pos..]) catch return true;
+        pos += id.len;
+        const val = varint.decode(prefix[pos..]) catch return true;
+        pos += val.len;
+        if (id.value == want) return true;
+    }
+    return false;
+}
+
 test "decode the uni-stream type prefixes" {
     try std.testing.expectEqual(UniStreamType.control, decodeUniType(&.{0x00}).?.utype);
     try std.testing.expectEqual(UniStreamType.qpack_encoder, decodeUniType(&.{0x02}).?.utype);
@@ -112,11 +124,20 @@ test "a repeated setting is an error" {
     try std.testing.expectError(error.SettingsError, parseSettings(&.{ 0x01, 0x10, 0x01, 0x20 }));
 }
 
+test "a truncated SETTINGS payload is an error" {
+    try std.testing.expectError(error.SettingsError, parseSettings(&.{0x06}));
+    try std.testing.expectError(error.SettingsError, parseSettings(&.{0x40}));
+    try std.testing.expectError(error.SettingsError, parseSettings(&.{ 0x06, 0x40 }));
+}
+
 test "many distinct unknown settings are accepted" {
-    // Unknown ids are ignored and not capped (RFC 9114 7.2.4); only a known-id
-    // duplicate is an error.
+    // Unknown ids are ignored and not capped (RFC 9114 7.2.4).
     const s = try parseSettings(&.{ 0x21, 0x00, 0x22, 0x00, 0x23, 0x00, 0x24, 0x00, 0x25, 0x00 });
     try std.testing.expectEqual(@as(u64, 0), s.qpack_max_table_capacity);
+}
+
+test "a repeated unknown setting is an error" {
+    try std.testing.expectError(error.SettingsError, parseSettings(&.{ 0x21, 0x00, 0x21, 0x01 }));
 }
 
 test "a reserved HTTP/2 setting id is a connection error" {

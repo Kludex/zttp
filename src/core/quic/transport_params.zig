@@ -1,9 +1,9 @@
 //! QUIC transport parameters (RFC 9000 18.2): a peer advertises its limits in the
 //! TLS quic_transport_parameters extension as a sequence of (id, length, value)
 //! triples, each field a QUIC varint. The server reads the client's to learn the
-//! flow-control grants, stream limits, and timers it must honour. Only the
-//! integer-valued parameters this stack acts on are surfaced; unknown ids (and the
-//! reserved GREASE ids) are skipped, as RFC 9000 18.1 requires.
+//! flow-control grants, stream limits, timers, and migration constraints it must
+//! honour. Unknown ids (and the reserved GREASE ids) are skipped, as RFC 9000
+//! 18.1 requires.
 
 const std = @import("std");
 const varint = @import("varint.zig");
@@ -16,20 +16,31 @@ pub const Error = error{
     Malformed,
 };
 
-/// A connection id carried in a transport parameter (RFC 9000 18.2): at most 20
-/// bytes in QUIC version 1 (RFC 9000 17.2).
-pub const ConnectionId = struct {
-    buf: [20]u8 = undefined,
-    len: u8 = 0,
-
-    pub fn slice(self: *const ConnectionId) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
-
 /// RFC 9000 18.2 caps max_ack_delay at 2^14 ms; clamp here so the us conversion
 /// (x1000) downstream cannot overflow on a hostile value.
 const MAX_ACK_DELAY_MS_CAP: u64 = 1 << 14;
+/// ack_delay_exponent values above 20 are invalid (RFC 9000 18.2).
+const MAX_ACK_DELAY_EXPONENT: u64 = 20;
+const MAX_CID_LEN: usize = 20;
+/// Stream-count parameters cannot exceed 2^60, otherwise the implied largest
+/// stream ID would not fit in a QUIC varint (RFC 9000 4.6 and 19.11).
+pub const MAX_STREAM_COUNT: u64 = 1 << 60;
+
+pub const ConnectionId = struct {
+    bytes: [MAX_CID_LEN]u8 = [_]u8{0} ** MAX_CID_LEN,
+    len: u8 = 0,
+
+    pub fn init(value: []const u8) Error!ConnectionId {
+        if (value.len > MAX_CID_LEN) return error.Malformed;
+        var cid = ConnectionId{ .len = @intCast(value.len) };
+        @memcpy(cid.bytes[0..value.len], value);
+        return cid;
+    }
+
+    pub fn slice(self: *const ConnectionId) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
 
 /// max_idle_timeout has no RFC ceiling, but the timer code converts ms to us (x1000),
 /// which a hostile 62-bit varint would overflow. ~49 days is far longer than any real
@@ -39,6 +50,7 @@ const MAX_IDLE_TIMEOUT_MS_CAP: u64 = 1 << 32;
 /// The parameters this stack reads. Each defaults to the RFC 9000 18.2 default for
 /// an absent parameter, so a parsed value is always usable directly.
 pub const TransportParameters = struct {
+    original_destination_connection_id: ?ConnectionId = null,
     initial_max_data: u64 = 0,
     initial_max_stream_data_bidi_local: u64 = 0,
     initial_max_stream_data_bidi_remote: u64 = 0,
@@ -46,13 +58,14 @@ pub const TransportParameters = struct {
     initial_max_streams_bidi: u64 = 0,
     initial_max_streams_uni: u64 = 0,
     max_idle_timeout_ms: u64 = 0, // 0 = no idle timeout
+    max_udp_payload_size: u64 = 65527, // RFC 9000 18.2 default
+    stateless_reset_token: ?[16]u8 = null,
+    ack_delay_exponent: u64 = 3, // RFC 9000 18.2 default
     max_ack_delay_ms: u64 = 25, // RFC 9000 18.2 default
+    disable_active_migration: bool = false,
     active_connection_id_limit: u64 = 2, // RFC 9000 18.2 default
-    /// The sender's initial_source_connection_id (RFC 9000 7.3): both endpoints MUST
-    /// send it, and the receiver MUST check it against the Source Connection ID of
-    /// the peer's first packet. Null when absent - the caller decides whether that
-    /// is fatal (it is, for a peer's parameters).
-    initial_scid: ?ConnectionId = null,
+    initial_source_connection_id: ?ConnectionId = null,
+    retry_source_connection_id: ?ConnectionId = null,
     /// A parameter only a server may send appeared (RFC 9000 18.2:
     /// original_destination_connection_id, stateless_reset_token, preferred_address,
     /// or retry_source_connection_id). A server MUST reject a client list carrying
@@ -70,13 +83,16 @@ const Id = enum(u64) {
     original_destination_connection_id = 0x00,
     max_idle_timeout = 0x01,
     stateless_reset_token = 0x02,
+    max_udp_payload_size = 0x03,
     initial_max_data = 0x04,
     initial_max_stream_data_bidi_local = 0x05,
     initial_max_stream_data_bidi_remote = 0x06,
     initial_max_stream_data_uni = 0x07,
     initial_max_streams_bidi = 0x08,
     initial_max_streams_uni = 0x09,
+    ack_delay_exponent = 0x0a,
     max_ack_delay = 0x0b,
+    disable_active_migration = 0x0c,
     preferred_address = 0x0d,
     active_connection_id_limit = 0x0e,
     initial_source_connection_id = 0x0f,
@@ -103,30 +119,49 @@ pub fn parse(buf: []const u8) Error!TransportParameters {
         seen[seen_n] = id;
         seen_n += 1;
         switch (@as(Id, @enumFromInt(id))) {
+            .original_destination_connection_id => {
+                tp.original_destination_connection_id = try cidParam(value);
+                tp.has_server_only_param = true;
+                tp.has_injected_cid_param = true;
+            },
             .max_idle_timeout => tp.max_idle_timeout_ms = @min(try intParam(value), MAX_IDLE_TIMEOUT_MS_CAP),
+            .stateless_reset_token => {
+                if (value.len != 16) return error.Malformed;
+                tp.stateless_reset_token = value[0..16].*;
+                tp.has_server_only_param = true;
+            },
+            .max_udp_payload_size => {
+                tp.max_udp_payload_size = try intParam(value);
+                if (tp.max_udp_payload_size < 1200) return error.Malformed;
+            },
             .initial_max_data => tp.initial_max_data = try intParam(value),
             .initial_max_stream_data_bidi_local => tp.initial_max_stream_data_bidi_local = try intParam(value),
             .initial_max_stream_data_bidi_remote => tp.initial_max_stream_data_bidi_remote = try intParam(value),
             .initial_max_stream_data_uni => tp.initial_max_stream_data_uni = try intParam(value),
-            .initial_max_streams_bidi => tp.initial_max_streams_bidi = try intParam(value),
-            .initial_max_streams_uni => tp.initial_max_streams_uni = try intParam(value),
+            .initial_max_streams_bidi => tp.initial_max_streams_bidi = try streamCountParam(value),
+            .initial_max_streams_uni => tp.initial_max_streams_uni = try streamCountParam(value),
+            .ack_delay_exponent => {
+                tp.ack_delay_exponent = try intParam(value);
+                if (tp.ack_delay_exponent > MAX_ACK_DELAY_EXPONENT) return error.Malformed;
+            },
             .max_ack_delay => tp.max_ack_delay_ms = @min(try intParam(value), MAX_ACK_DELAY_MS_CAP),
-            .active_connection_id_limit => tp.active_connection_id_limit = try intParam(value),
+            .active_connection_id_limit => {
+                tp.active_connection_id_limit = try intParam(value);
+                if (tp.active_connection_id_limit < 2) return error.Malformed;
+            },
+            .disable_active_migration => {
+                if (value.len != 0) return error.Malformed;
+                tp.disable_active_migration = true;
+            },
             .initial_source_connection_id => {
-                if (value.len > 20) return error.Malformed; // RFC 9000 17.2: at most 20 bytes in v1
-                var cid = ConnectionId{ .len = @intCast(value.len) };
-                @memcpy(cid.buf[0..value.len], value);
-                tp.initial_scid = cid;
-                tp.has_injected_cid_param = true; // 0x0f: a server appends this itself
+                tp.initial_source_connection_id = try cidParam(value);
+                tp.has_injected_cid_param = true;
             },
-            .original_destination_connection_id => {
+            .retry_source_connection_id => {
+                tp.retry_source_connection_id = try cidParam(value);
                 tp.has_server_only_param = true;
-                tp.has_injected_cid_param = true; // 0x00: a server appends this itself
             },
-            .stateless_reset_token,
-            .preferred_address,
-            .retry_source_connection_id,
-            => tp.has_server_only_param = true,
+            .preferred_address => tp.has_server_only_param = true,
             _ => {}, // unknown / GREASE: skip (RFC 9000 18.1)
         }
     }
@@ -150,6 +185,34 @@ fn intParam(value: []const u8) Error!u64 {
     return d.value;
 }
 
+fn streamCountParam(value: []const u8) Error!u64 {
+    const n = try intParam(value);
+    if (n > MAX_STREAM_COUNT) return error.Malformed;
+    return n;
+}
+
+fn cidParam(value: []const u8) Error!ConnectionId {
+    return ConnectionId.init(value);
+}
+
+fn appendCidParam(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, id: Id, cid: []const u8) !void {
+    try varint.append(out, gpa, @intFromEnum(id));
+    try varint.append(out, gpa, cid.len);
+    try out.appendSlice(gpa, cid);
+}
+
+pub fn appendOriginalDestinationConnectionId(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, cid: []const u8) !void {
+    try appendCidParam(out, gpa, .original_destination_connection_id, cid);
+}
+
+pub fn appendInitialSourceConnectionId(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, cid: []const u8) !void {
+    try appendCidParam(out, gpa, .initial_source_connection_id, cid);
+}
+
+pub fn appendRetrySourceConnectionId(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, cid: []const u8) !void {
+    try appendCidParam(out, gpa, .retry_source_connection_id, cid);
+}
+
 fn take(buf: []const u8, pos: *usize) varint.Error!u64 {
     const d = try varint.decode(buf[pos.*..]);
     pos.* += d.len;
@@ -162,23 +225,44 @@ test "parses the integer parameters and skips unknown ids" {
     // id 0x04 (initial_max_data) len 4 value 0x80010000 (varint 65536); then an
     // unknown id 0x21 len 1 value 0x05 (skipped); then 0x0b (max_ack_delay) len 1 value 20.
     const buf = [_]u8{
+        0x00, 0x04, 'o', 'd', 'c', 'i', // original_destination_connection_id
         0x04, 0x04, 0x80, 0x01, 0x00, 0x00, // initial_max_data = 65536
         0x21, 0x01, 0x05, // unknown id, skipped
+        0x02, 0x10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, // stateless_reset_token
+        0x03, 0x02, 0x44, 0xb0, // max_udp_payload_size = 1200
+        0x0a, 0x01, 0x04, // ack_delay_exponent = 4
         0x0b, 0x01, 0x14, // max_ack_delay = 20
+        0x0c, 0x00, // disable_active_migration
         0x08, 0x01, 0x03, // initial_max_streams_bidi = 3
+        0x0f, 0x03, 'i', 's', 'c', // initial_source_connection_id
+        0x10, 0x03, 'r', 's', 'c', // retry_source_connection_id
     };
     const tp = try parse(&buf);
+    try testing.expectEqualStrings("odci", tp.original_destination_connection_id.?.slice());
     try testing.expectEqual(@as(u64, 65536), tp.initial_max_data);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, &tp.stateless_reset_token.?);
+    try testing.expectEqual(@as(u64, 1200), tp.max_udp_payload_size);
+    try testing.expectEqual(@as(u64, 4), tp.ack_delay_exponent);
     try testing.expectEqual(@as(u64, 20), tp.max_ack_delay_ms);
+    try testing.expect(tp.disable_active_migration);
     try testing.expectEqual(@as(u64, 3), tp.initial_max_streams_bidi);
     try testing.expectEqual(@as(u64, 2), tp.active_connection_id_limit); // unset -> default
+    try testing.expectEqualStrings("isc", tp.initial_source_connection_id.?.slice());
+    try testing.expectEqualStrings("rsc", tp.retry_source_connection_id.?.slice());
 }
 
 test "absent parameters keep their RFC defaults" {
     const tp = try parse(&.{});
+    try testing.expect(tp.original_destination_connection_id == null);
     try testing.expectEqual(@as(u64, 0), tp.initial_max_data);
+    try testing.expect(tp.stateless_reset_token == null);
+    try testing.expectEqual(@as(u64, 65527), tp.max_udp_payload_size);
+    try testing.expectEqual(@as(u64, 3), tp.ack_delay_exponent);
     try testing.expectEqual(@as(u64, 25), tp.max_ack_delay_ms);
+    try testing.expect(!tp.disable_active_migration);
     try testing.expectEqual(@as(u64, 2), tp.active_connection_id_limit);
+    try testing.expect(tp.initial_source_connection_id == null);
+    try testing.expect(tp.retry_source_connection_id == null);
 }
 
 test "a parameter running past the buffer is malformed" {
@@ -214,15 +298,15 @@ test "appendBytesParam round-trips a connection id through parse" {
     defer out.deinit(gpa);
     try appendBytesParam(&out, gpa, 0x0f, &[_]u8{ 0xaa, 0xbb, 0xcc });
     const tp = try parse(out.items);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xbb, 0xcc }, tp.initial_scid.?.slice());
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xbb, 0xcc }, tp.initial_source_connection_id.?.slice());
 }
 
 test "an empty initial_source_connection_id is present, not absent" {
     // A zero-length connection id is legal (RFC 9000 17.2); the parameter being
     // present-with-empty must be distinguishable from the parameter missing.
     const tp = try parse(&[_]u8{ 0x0f, 0x00 });
-    try testing.expectEqual(@as(usize, 0), tp.initial_scid.?.slice().len);
-    try testing.expectEqual(@as(?ConnectionId, null), (try parse(&.{})).initial_scid);
+    try testing.expectEqual(@as(usize, 0), tp.initial_source_connection_id.?.slice().len);
+    try testing.expectEqual(@as(?ConnectionId, null), (try parse(&.{})).initial_source_connection_id);
 }
 
 test "a connection id past 20 bytes is malformed" {
@@ -246,4 +330,50 @@ test "only the injected connection-id parameters are flagged for a server base b
     // own to advertise, so it is NOT an injected-id conflict.
     try testing.expect(!(try parse(&[_]u8{0x02} ++ [_]u8{0x10} ++ [_]u8{0xcc} ** 16)).has_injected_cid_param);
     try testing.expect((try parse(&[_]u8{0x02} ++ [_]u8{0x10} ++ [_]u8{0xcc} ** 16)).has_server_only_param);
+}
+
+test "active_connection_id_limit below two is malformed" {
+    try testing.expectError(error.Malformed, parse(&[_]u8{ 0x0e, 0x01, 0x01 }));
+}
+
+test "initial max streams above the stream-id range is malformed" {
+    try testing.expectError(error.Malformed, parse(&[_]u8{
+        0x08, 0x08, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    }));
+    try testing.expectError(error.Malformed, parse(&[_]u8{
+        0x09, 0x08, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    }));
+}
+
+test "ack_delay_exponent above twenty is malformed" {
+    try testing.expectError(error.Malformed, parse(&[_]u8{ 0x0a, 0x01, 0x15 }));
+}
+
+test "max_udp_payload_size below 1200 is malformed" {
+    try testing.expectError(error.Malformed, parse(&[_]u8{ 0x03, 0x02, 0x44, 0xaf }));
+}
+
+test "disable_active_migration must be empty" {
+    try testing.expectError(error.Malformed, parse(&[_]u8{ 0x0c, 0x01, 0x00 }));
+}
+
+test "stateless_reset_token must be exactly sixteen bytes" {
+    try testing.expectError(error.Malformed, parse(&[_]u8{ 0x02, 0x0f, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }));
+}
+
+test "connection id parameters are capped at twenty bytes" {
+    try testing.expectError(error.Malformed, parse(&[_]u8{
+        0x0f, 0x15,
+        0,    1,
+        2,    3,
+        4,    5,
+        6,    7,
+        8,    9,
+        10,   11,
+        12,   13,
+        14,   15,
+        16,   17,
+        18,   19,
+        20,
+    }));
 }

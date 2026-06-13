@@ -643,6 +643,7 @@ pub fn fromH3Event(ev: events.H3Event) py.Object {
         .response => |r| makeResponse(r),
         .data => |d| makeData(d),
         .end_of_message => |e| makeEom(e),
+        .connection_closed => py.newRef(connection_closed),
         .need_data => py.newRef(need_data),
         .settings => |s| makeSettings(s),
         .goaway => |g| makeGoaway(g),
@@ -773,7 +774,7 @@ fn makeSettings(ev: events.SettingsEvent) py.Object {
         return null;
     }
     for (ev.params, 0..) |p, i| {
-        const id = u32Obj(p.id);
+        const id = c.PyLong_FromUnsignedLongLong(p.id);
         const value = c.PyLong_FromUnsignedLongLong(p.value);
         const tup = py.tupleNew(2);
         if (id == null or value == null or tup == null) {

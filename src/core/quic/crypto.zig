@@ -21,6 +21,9 @@ pub const TAG_LEN = Aead.tag_length; // 16
 pub const HP_LEN = 16; // header-protection key length (an AES-128 key)
 const SAMPLE_LEN = 16; // header-protection sample length
 
+const RETRY_KEY = [_]u8{ 0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e };
+const RETRY_NONCE = [_]u8{ 0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb };
+
 /// The version-1 Initial salt (RFC 9001 5.2): the fixed input that, mixed with
 /// the client's destination connection id, seeds both Initial secrets.
 pub const INITIAL_SALT_V1 = [_]u8{
@@ -52,7 +55,26 @@ pub const Keys = struct {
         expandLabel(&k.hp, secret, "quic hp", "");
         return k;
     }
+
+    /// QUIC key update advances only the packet-protection key and IV. Header
+    /// protection keys remain fixed for the connection phase (RFC 9001 6).
+    pub fn fromUpdatedSecret(secret: [32]u8, current_hp: [HP_LEN]u8) Keys {
+        var k: Keys = undefined;
+        expandLabel(&k.key, secret, "quic key", "");
+        expandLabel(&k.iv, secret, "quic iv", "");
+        k.hp = current_hp;
+        return k;
+    }
 };
+
+/// QUIC 1-RTT key update (RFC 9001 6): the next traffic secret is
+/// HKDF-Expand-Label(current, "quic ku", "", Hash.length). Packet keys for that
+/// phase are then derived with the normal QUIC key/iv/hp labels.
+pub fn nextTrafficSecret(secret: [32]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    expandLabel(&out, secret, "quic ku", "");
+    return out;
+}
 
 /// Both directions' Initial keys, plus the secrets they came from. The client
 /// protects with `client` and the server with `server`; a receiver uses the
@@ -133,6 +155,14 @@ pub fn open(keys: Keys, pn: u64, header: []const u8, ciphertext: []const u8, out
     std.debug.assert(out.len >= ct.len);
     Aead.decrypt(out[0..ct.len], ct, tag, header, nonce(keys.iv, pn), keys.key) catch return error.DecryptFailed;
     return out[0..ct.len];
+}
+
+/// QUIC v1 Retry integrity tag (RFC 9001 5.8): AES-128-GCM with fixed
+/// key/nonce, empty plaintext, and the Retry pseudo-packet as associated data.
+pub fn retryIntegrityTag(aad: []const u8) [TAG_LEN]u8 {
+    var tag: [TAG_LEN]u8 = undefined;
+    Aead.encrypt(&.{}, &tag, &.{}, aad, RETRY_NONCE, RETRY_KEY);
+    return tag;
 }
 
 /// The header-protection mask for a sample (RFC 9001 5.4.3, AES form): encrypt
@@ -224,6 +254,13 @@ test "wrong packet number fails to open" {
     const ct = seal(keys, 1, "h", "abc", &sealed);
     var opened: [3]u8 = undefined;
     try std.testing.expectError(error.DecryptFailed, open(keys, 2, "h", ct, &opened));
+}
+
+test "Retry integrity tag matches RFC 9001 sample" {
+    const aad = [_]u8{ 0x08, 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 } ++
+        [_]u8{ 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5, 0x74, 0x6f, 0x6b, 0x65, 0x6e };
+    const want = [_]u8{ 0x04, 0xa2, 0x65, 0xba, 0x2e, 0xff, 0x4d, 0x82, 0x90, 0x58, 0xfb, 0x3f, 0x0f, 0x24, 0x96, 0xba };
+    try std.testing.expectEqualSlices(u8, &want, &retryIntegrityTag(&aad));
 }
 
 test "protect then unprotect round-trips and recovers pn_len" {

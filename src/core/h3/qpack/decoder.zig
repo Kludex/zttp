@@ -4,12 +4,11 @@
 //! post-base index, literal with name reference, and literal with literal name -
 //! resolving static-table references and Huffman-decoded literals.
 //!
-//! Scope: the static table and literals, the complete read path when the dynamic
-//! table is disabled (we advertise QPACK_MAX_TABLE_CAPACITY = 0, so a conformant
-//! peer MUST NOT emit dynamic references or post-base indices). A nonzero Required
-//! Insert Count is therefore a protocol error here; full dynamic-table support is
-//! the follow-up. Decoded names/values are staged into an owned store so their
-//! slices stay valid until the next decode, exactly like the HPACK decoder.
+//! Scope: static fields, literals, and dynamic-table entries already delivered on
+//! the encoder stream. A header block whose Required Insert Count is ahead of the
+//! encoder stream returns `error.Blocked`; the HTTP/3 connection stores and resumes
+//! that block. Decoded names/values are staged into an owned store so their slices
+//! stay valid until the next decode, exactly like the HPACK decoder.
 
 const std = @import("std");
 const static_table = @import("static_table.zig");
@@ -21,9 +20,11 @@ pub const Error = error{
     /// The block is truncated, an integer overflows, or a Huffman string is
     /// malformed (RFC 9204 4.1).
     DecompressionFailed,
-    /// A representation referenced the dynamic table (or a nonzero Required Insert
-    /// Count) while it is disabled here.
-    DynamicReferenceUnsupported,
+    /// An encoder-stream instruction is syntactically valid so far but incomplete.
+    NeedData,
+    /// A dynamic reference depends on encoder-stream instructions that have not
+    /// arrived yet.
+    Blocked,
     /// A static-table index is out of range.
     BadIndex,
     OutOfMemory,
@@ -35,12 +36,20 @@ pub const Error = error{
 // after the whole block is decoded and the store can no longer move.
 const Span = struct { off: usize, len: usize };
 const Field = struct { name: Span, value: Span };
+const DynamicEntry = struct { name: []u8, value: []u8, size: usize, abs: u64 };
+pub const EncoderProgress = struct { consumed: usize, inserts: u64 };
 
 pub const Decoder = struct {
     gpa: std.mem.Allocator,
     headers: std.ArrayListUnmanaged(Header) = .empty,
     fields: std.ArrayListUnmanaged(Field) = .empty,
     store: std.ArrayListUnmanaged(u8) = .empty,
+    dynamic: std.ArrayListUnmanaged(DynamicEntry) = .empty,
+    dynamic_size: usize = 0,
+    dynamic_capacity: usize = 0,
+    max_dynamic_capacity: usize = 0,
+    insert_count: u64 = 0,
+    last_required_insert_count: u64 = 0,
     max_field_section_size: usize,
 
     pub fn init(gpa: std.mem.Allocator, max_field_section_size: usize) Decoder {
@@ -51,6 +60,59 @@ pub const Decoder = struct {
         self.headers.deinit(self.gpa);
         self.fields.deinit(self.gpa);
         self.store.deinit(self.gpa);
+        for (self.dynamic.items) |e| {
+            self.gpa.free(e.name);
+            self.gpa.free(e.value);
+        }
+        self.dynamic.deinit(self.gpa);
+    }
+
+    pub fn setMaxDynamicCapacity(self: *Decoder, cap: usize) void {
+        self.max_dynamic_capacity = cap;
+        if (self.dynamic_capacity > cap) {
+            self.dynamic_capacity = cap;
+            self.evictToCapacity();
+        }
+    }
+
+    pub fn processEncoder(self: *Decoder, bytes: []const u8) Error!EncoderProgress {
+        var p = Parser{ .buf = bytes };
+        const before = self.insert_count;
+        while (p.pos < bytes.len) {
+            const start = p.pos;
+            const b = p.buf[p.pos];
+            if (b & 0x80 != 0) {
+                self.encoderInsertNameRef(&p) catch |err| switch (err) {
+                    error.NeedData => return .{ .consumed = start, .inserts = self.insert_count - before },
+                    else => return err,
+                };
+            } else if (b & 0xC0 == 0x40) {
+                self.encoderInsertLiteral(&p) catch |err| switch (err) {
+                    error.NeedData => return .{ .consumed = start, .inserts = self.insert_count - before },
+                    else => return err,
+                };
+            } else if (b & 0xE0 == 0x20) {
+                const cap = p.integer(5) catch |err| switch (err) {
+                    error.NeedData => return .{ .consumed = start, .inserts = self.insert_count - before },
+                    else => return err,
+                };
+                if (cap > self.max_dynamic_capacity) return error.DecompressionFailed;
+                self.dynamic_capacity = @intCast(cap);
+                self.evictToCapacity();
+            } else if (b & 0xE0 == 0x00) {
+                const index = p.integer(5) catch |err| switch (err) {
+                    error.NeedData => return .{ .consumed = start, .inserts = self.insert_count - before },
+                    else => return err,
+                };
+                const e = self.dynamicRelative(index, self.insert_count) orelse return error.BadIndex;
+                try self.insertDynamic(e.name, e.value);
+            } else return error.DecompressionFailed;
+        }
+        return .{ .consumed = p.pos, .inserts = self.insert_count - before };
+    }
+
+    pub fn lastRequiredInsertCount(self: *const Decoder) u64 {
+        return self.last_required_insert_count;
     }
 
     fn intern(self: *Decoder, bytes: []const u8) Error!Span {
@@ -66,28 +128,36 @@ pub const Decoder = struct {
         self.headers.clearRetainingCapacity();
         self.fields.clearRetainingCapacity();
         self.store.clearRetainingCapacity();
+        self.last_required_insert_count = 0;
         var p = Parser{ .buf = block };
 
         // Field-section prefix (RFC 9204 4.5.1): Required Insert Count, then Base.
-        const ric = try p.integer(8);
-        if (ric != 0) return error.DynamicReferenceUnsupported;
+        const encoded_ric = try p.integer(8);
         if (p.pos >= block.len) return error.DecompressionFailed;
-        // Sign bit + Delta Base; with RIC 0 the base is 0, so we just consume it.
-        _ = try p.integer(7);
+        const base_first = p.buf[p.pos];
+        const sign = (base_first & 0x80) != 0;
+        const delta = try p.integer(7);
+        const ric = try self.requiredInsertCount(encoded_ric);
+        if (ric > self.insert_count) return error.Blocked;
+        self.last_required_insert_count = ric;
+        const base = if (sign) blk: {
+            if (delta + 1 > ric) return error.DecompressionFailed;
+            break :blk ric - delta - 1;
+        } else ric + delta;
 
         var section_size: usize = 0;
         while (p.pos < block.len) {
             const b = p.buf[p.pos];
             if (b & 0x80 != 0) {
-                try self.indexed(&p, &section_size);
+                try self.indexed(&p, base, &section_size);
             } else if (b & 0x40 != 0) {
-                try self.literalNameRef(&p, &section_size);
+                try self.literalNameRef(&p, base, &section_size);
             } else if (b & 0x20 != 0) {
                 try self.literalLiteralName(&p, &section_size);
+            } else if (b & 0x10 != 0) {
+                try self.indexedPostBase(&p, base, &section_size);
             } else {
-                // 0x10 = indexed with post-base index, 0x00 = literal with post-base
-                // name ref: both are dynamic-table-only (RFC 9204 4.5.4/4.5.6).
-                return error.DynamicReferenceUnsupported;
+                try self.literalPostBaseNameRef(&p, base, &section_size);
             }
             if (section_size > self.max_field_section_size) return error.DecompressionFailed;
         }
@@ -101,22 +171,43 @@ pub const Decoder = struct {
         return self.headers.items;
     }
 
-    fn indexed(self: *Decoder, p: *Parser, section_size: *usize) Error!void {
-        // 1Tiiiiii: T must be 1 (static table); T=0 is a dynamic reference.
-        if (p.buf[p.pos] & 0x40 == 0) return error.DynamicReferenceUnsupported;
+    fn indexed(self: *Decoder, p: *Parser, base: u64, section_size: *usize) Error!void {
+        const is_static = (p.buf[p.pos] & 0x40) != 0;
         const index = try p.integer(6);
-        const entry = static_table.get(index) orelse return error.BadIndex;
+        if (is_static) {
+            const entry = static_table.get(index) orelse return error.BadIndex;
+            try self.emit(try self.intern(entry.name), try self.intern(entry.value), section_size);
+        } else {
+            const entry = self.dynamicRelative(index, base) orelse return error.BadIndex;
+            try self.emit(try self.intern(entry.name), try self.intern(entry.value), section_size);
+        }
+    }
+
+    fn literalNameRef(self: *Decoder, p: *Parser, base: u64, section_size: *usize) Error!void {
+        const is_static = (p.buf[p.pos] & 0x10) != 0;
+        const index = try p.integer(4);
+        const name = if (is_static) blk: {
+            const entry = static_table.get(index) orelse return error.BadIndex;
+            break :blk try self.intern(entry.name);
+        } else blk: {
+            const entry = self.dynamicRelative(index, base) orelse return error.BadIndex;
+            break :blk try self.intern(entry.name);
+        };
+        const value = try self.string(p, 7);
+        try self.emit(name, value, section_size);
+    }
+
+    fn indexedPostBase(self: *Decoder, p: *Parser, base: u64, section_size: *usize) Error!void {
+        const index = try p.integer(4);
+        const entry = self.dynamicPostBase(index, base) orelse return error.BadIndex;
         try self.emit(try self.intern(entry.name), try self.intern(entry.value), section_size);
     }
 
-    fn literalNameRef(self: *Decoder, p: *Parser, section_size: *usize) Error!void {
-        // 01NTiiii: T must be 1 (static name reference).
-        if (p.buf[p.pos] & 0x10 == 0) return error.DynamicReferenceUnsupported;
-        const index = try p.integer(4);
-        const entry = static_table.get(index) orelse return error.BadIndex;
-        const name = try self.intern(entry.name);
+    fn literalPostBaseNameRef(self: *Decoder, p: *Parser, base: u64, section_size: *usize) Error!void {
+        const index = try p.integer(3);
+        const entry = self.dynamicPostBase(index, base) orelse return error.BadIndex;
         const value = try self.string(p, 7);
-        try self.emit(name, value, section_size);
+        try self.emit(try self.intern(entry.name), value, section_size);
     }
 
     fn literalLiteralName(self: *Decoder, p: *Parser, section_size: *usize) Error!void {
@@ -131,15 +222,103 @@ pub const Decoder = struct {
         self.fields.append(self.gpa, .{ .name = name, .value = value }) catch return error.OutOfMemory;
     }
 
+    fn encoderInsertNameRef(self: *Decoder, p: *Parser) Error!void {
+        const is_static = (p.buf[p.pos] & 0x40) != 0;
+        const index = try p.integer(6);
+        const name = if (is_static) blk: {
+            const entry = static_table.get(index) orelse return error.BadIndex;
+            break :blk entry.name;
+        } else blk: {
+            const entry = self.dynamicRelative(index, self.insert_count) orelse return error.BadIndex;
+            break :blk entry.name;
+        };
+        const value = try self.stringToOwned(p, 7);
+        defer self.gpa.free(value);
+        try self.insertDynamic(name, value);
+    }
+
+    fn encoderInsertLiteral(self: *Decoder, p: *Parser) Error!void {
+        const name = try self.stringToOwned(p, 5);
+        defer self.gpa.free(name);
+        const value = try self.stringToOwned(p, 7);
+        defer self.gpa.free(value);
+        try self.insertDynamic(name, value);
+    }
+
+    fn insertDynamic(self: *Decoder, name: []const u8, value: []const u8) Error!void {
+        const size = name.len + value.len + 32;
+        if (size > self.dynamic_capacity) return error.DecompressionFailed;
+        self.evictUntilFits(size);
+        const name_copy = self.gpa.dupe(u8, name) catch return error.OutOfMemory;
+        errdefer self.gpa.free(name_copy);
+        const value_copy = self.gpa.dupe(u8, value) catch return error.OutOfMemory;
+        errdefer self.gpa.free(value_copy);
+        self.dynamic.append(self.gpa, .{ .name = name_copy, .value = value_copy, .size = size, .abs = self.insert_count }) catch return error.OutOfMemory;
+        self.dynamic_size += size;
+        self.insert_count += 1;
+    }
+
+    fn evictUntilFits(self: *Decoder, need: usize) void {
+        while (self.dynamic_size + need > self.dynamic_capacity and self.dynamic.items.len > 0) {
+            self.evictOldest();
+        }
+    }
+
+    fn evictToCapacity(self: *Decoder) void {
+        while (self.dynamic_size > self.dynamic_capacity and self.dynamic.items.len > 0) self.evictOldest();
+    }
+
+    fn evictOldest(self: *Decoder) void {
+        const e = self.dynamic.orderedRemove(0);
+        self.dynamic_size -= e.size;
+        self.gpa.free(e.name);
+        self.gpa.free(e.value);
+    }
+
+    fn requiredInsertCount(self: *Decoder, encoded: u64) Error!u64 {
+        if (encoded == 0) return 0;
+        const max_entries: u64 = @intCast(self.maxDynamicEntries());
+        if (max_entries == 0) return error.DecompressionFailed;
+        const full_range = std.math.mul(u64, 2, max_entries) catch return error.DecompressionFailed;
+        if (encoded > full_range) return error.DecompressionFailed;
+        const max_value = std.math.add(u64, self.insert_count, max_entries) catch return error.DecompressionFailed;
+        const max_wrapped = (max_value / full_range) * full_range;
+        var ric = std.math.add(u64, max_wrapped, encoded - 1) catch return error.DecompressionFailed;
+        if (ric > max_value) {
+            if (ric <= full_range) return error.DecompressionFailed;
+            ric -= full_range;
+        }
+        if (ric == 0) return error.DecompressionFailed;
+        return ric;
+    }
+
+    fn maxDynamicEntries(self: *const Decoder) usize {
+        return self.max_dynamic_capacity / 32;
+    }
+
+    fn dynamicRelative(self: *const Decoder, index: u64, base: u64) ?DynamicEntry {
+        if (index >= base) return null;
+        return self.dynamicAbsolute(base - index - 1);
+    }
+
+    fn dynamicPostBase(self: *const Decoder, index: u64, base: u64) ?DynamicEntry {
+        return self.dynamicAbsolute(base + index);
+    }
+
+    fn dynamicAbsolute(self: *const Decoder, abs: u64) ?DynamicEntry {
+        for (self.dynamic.items) |e| if (e.abs == abs) return e;
+        return null;
+    }
+
     /// Decode a length-prefixed (optionally Huffman) string into the store and
     /// return its (offset, len) span. `prefix` is the integer prefix width for the
     /// length; the high bit of the prefix byte is the Huffman flag. A span, not a
     /// slice, so a later append that reallocates the store cannot dangle it.
     fn string(self: *Decoder, p: *Parser, prefix: u4) Error!Span {
-        if (p.pos >= p.buf.len) return error.DecompressionFailed;
+        if (p.pos >= p.buf.len) return error.NeedData;
         const huff = (p.buf[p.pos] & (@as(u8, 1) << @intCast(prefix))) != 0;
         const len = try p.integer(prefix);
-        const raw = p.take(len) catch return error.DecompressionFailed;
+        const raw = try p.take(len);
         const start = self.store.items.len;
         if (huff) {
             const need = huffman.decodedLen(raw) catch return error.DecompressionFailed;
@@ -150,6 +329,21 @@ pub const Decoder = struct {
         }
         return .{ .off = start, .len = self.store.items.len - start };
     }
+
+    fn stringToOwned(self: *Decoder, p: *Parser, prefix: u4) Error![]u8 {
+        if (p.pos >= p.buf.len) return error.NeedData;
+        const huff = (p.buf[p.pos] & (@as(u8, 1) << @intCast(prefix))) != 0;
+        const len = try p.integer(prefix);
+        const raw = try p.take(len);
+        if (huff) {
+            const need = huffman.decodedLen(raw) catch return error.DecompressionFailed;
+            const out = self.gpa.alloc(u8, need) catch return error.OutOfMemory;
+            errdefer self.gpa.free(out);
+            _ = huffman.decode(raw, out) catch return error.DecompressionFailed;
+            return out;
+        }
+        return self.gpa.dupe(u8, raw) catch return error.OutOfMemory;
+    }
 };
 
 const Parser = struct {
@@ -159,14 +353,14 @@ const Parser = struct {
     /// A QPACK/HPACK prefix integer (RFC 7541 5.1): `prefix` low bits of the first
     /// byte, then a base-128 continuation if they are all 1.
     fn integer(self: *Parser, prefix: u4) Error!u64 {
-        if (self.pos >= self.buf.len) return error.DecompressionFailed;
+        if (self.pos >= self.buf.len) return error.NeedData;
         const max_prefix: u64 = (@as(u64, 1) << @as(u6, prefix)) - 1;
         var value: u64 = self.buf[self.pos] & max_prefix;
         self.pos += 1;
         if (value < max_prefix) return value;
         var shift: u32 = 0; // wide enough that `shift += 7` never overflows
         while (true) {
-            if (self.pos >= self.buf.len) return error.DecompressionFailed;
+            if (self.pos >= self.buf.len) return error.NeedData;
             const b = self.buf[self.pos];
             self.pos += 1;
             // A shift of 64+ bits, or any result exceeding u64, is malformed: reject
@@ -183,9 +377,10 @@ const Parser = struct {
     }
 
     fn take(self: *Parser, n: u64) Error![]const u8 {
-        if (self.pos + n > self.buf.len) return error.DecompressionFailed;
-        const s = self.buf[self.pos .. self.pos + @as(usize, @intCast(n))];
-        self.pos += @intCast(n);
+        const len: usize = std.math.cast(usize, n) orelse return error.DecompressionFailed;
+        if (len > self.buf.len - self.pos) return error.NeedData;
+        const s = self.buf[self.pos .. self.pos + len];
+        self.pos += len;
         return s;
     }
 };
@@ -253,19 +448,103 @@ test "decode a literal name and literal value (no Huffman)" {
     try testing.expectEqualStrings("x", hs[0].value);
 }
 
-test "a nonzero required insert count is unsupported" {
+test "a header block blocks when its required insert count has not arrived" {
     const gpa = testing.allocator;
     var dec = Decoder.init(gpa, 1 << 20);
     defer dec.deinit();
-    try testing.expectError(error.DynamicReferenceUnsupported, dec.decode(&.{ 0x01, 0x00 }));
+    dec.setMaxDynamicCapacity(128);
+    // Encoded RIC=2 means Required Insert Count=1 in the non-wrapped case.
+    try testing.expectError(error.Blocked, dec.decode(&.{ 0x02, 0x00, 0x80 }));
 }
 
-test "a dynamic indexed reference is unsupported" {
+test "required insert count reconstructs after modulo wraparound" {
+    const gpa = testing.allocator;
+    var dec = Decoder.init(gpa, 1 << 20);
+    defer dec.deinit();
+    dec.setMaxDynamicCapacity(100); // MaxEntries=3, FullRange=6.
+    dec.insert_count = 10;
+
+    // RFC 9204 4.5.1 example: with 10 inserts and a 100-byte table, encoded 4
+    // reconstructs Required Insert Count 9.
+    try testing.expectEqual(@as(u64, 9), try dec.requiredInsertCount(4));
+    try testing.expectError(error.DecompressionFailed, dec.requiredInsertCount(7)); // > FullRange
+
+    dec.insert_count = 0;
+    try testing.expectError(error.DecompressionFailed, dec.requiredInsertCount(1)); // zero must encode as zero
+}
+
+test "a dynamic indexed reference without a matching entry is rejected" {
     const gpa = testing.allocator;
     var dec = Decoder.init(gpa, 1 << 20);
     defer dec.deinit();
     // 0x80 = indexed, T=0 (dynamic).
-    try testing.expectError(error.DynamicReferenceUnsupported, dec.decode(&.{ 0x00, 0x00, 0x80 }));
+    try testing.expectError(error.BadIndex, dec.decode(&.{ 0x00, 0x00, 0x80 }));
+}
+
+test "decode a dynamic relative indexed field after encoder insert literal" {
+    const gpa = testing.allocator;
+    var dec = Decoder.init(gpa, 1 << 20);
+    defer dec.deinit();
+    dec.setMaxDynamicCapacity(128);
+
+    // Encoder stream: Set Dynamic Table Capacity=128, then Insert With Literal
+    // Name x=y. Capacity uses a 5-bit prefix: 31 + 97 = 128.
+    const progress = try dec.processEncoder(&.{ 0x3f, 0x61, 0x41, 'x', 0x01, 'y' });
+    try testing.expectEqual(@as(usize, 6), progress.consumed);
+    try testing.expectEqual(@as(u64, 1), progress.inserts);
+
+    // Header block: RIC=1, Base=1, indexed dynamic relative index 0.
+    const hs = try dec.decode(&.{ 0x02, 0x00, 0x80 });
+    try testing.expectEqual(@as(usize, 1), hs.len);
+    try testing.expectEqualStrings("x", hs[0].name);
+    try testing.expectEqualStrings("y", hs[0].value);
+}
+
+test "encoder stream processing stops before an incomplete instruction" {
+    const gpa = testing.allocator;
+    var dec = Decoder.init(gpa, 1 << 20);
+    defer dec.deinit();
+    dec.setMaxDynamicCapacity(128);
+
+    // A partial capacity integer is not malformed; nothing is consumed yet.
+    try testing.expectEqual(@as(usize, 0), (try dec.processEncoder(&.{0x3f})).consumed);
+    try testing.expectEqual(@as(usize, 2), (try dec.processEncoder(&.{ 0x3f, 0x61 })).consumed);
+
+    // A complete capacity update followed by a partial insert consumes only the
+    // capacity bytes. The caller leaves the insert prefix/name buffered.
+    const partial = try dec.processEncoder(&.{ 0x3f, 0x61, 0x41, 'x' });
+    try testing.expectEqual(@as(usize, 2), partial.consumed);
+    try testing.expectEqual(@as(u64, 0), partial.inserts);
+    const complete = try dec.processEncoder(&.{ 0x41, 'x', 0x01, 'y' });
+    try testing.expectEqual(@as(usize, 4), complete.consumed);
+    try testing.expectEqual(@as(u64, 1), complete.inserts);
+
+    const hs = try dec.decode(&.{ 0x02, 0x00, 0x80 });
+    try testing.expectEqualStrings("x", hs[0].name);
+    try testing.expectEqualStrings("y", hs[0].value);
+}
+
+test "decode a dynamic post-base indexed field" {
+    const gpa = testing.allocator;
+    var dec = Decoder.init(gpa, 1 << 20);
+    defer dec.deinit();
+    dec.setMaxDynamicCapacity(128);
+
+    const progress = try dec.processEncoder(&.{
+        0x3f, 0x61, // Set Dynamic Table Capacity=128.
+        0x41, 'a',
+        0x01, '1',
+        0x41, 'b',
+        0x01, '2',
+    });
+    try testing.expectEqual(@as(usize, 10), progress.consumed);
+    try testing.expectEqual(@as(u64, 2), progress.inserts);
+
+    // RIC=2, Base=1 (sign=1, delta=0), post-base index 0 -> absolute index 1.
+    const hs = try dec.decode(&.{ 0x03, 0x80, 0x10 });
+    try testing.expectEqual(@as(usize, 1), hs.len);
+    try testing.expectEqualStrings("b", hs[0].name);
+    try testing.expectEqualStrings("2", hs[0].value);
 }
 
 test "an out-of-range static index is rejected" {

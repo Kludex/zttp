@@ -142,6 +142,12 @@ pub const StreamLimit = struct {
         self.max = self.opened + self.window;
         return self.max;
     }
+
+    /// The peer raised the maximum number of streams we may open. Like MAX_DATA,
+    /// MAX_STREAMS can only increase the grant; smaller values are ignored.
+    pub fn onMaxStreams(self: *StreamLimit, new_max: u64) void {
+        self.max = @max(self.max, new_max);
+    }
 };
 
 test "recv window rejects data past the limit" {
@@ -204,4 +210,12 @@ test "a window of 1 still slides after its single slot is used" {
     try std.testing.expect(l.shouldUpdate()); // would be never-true with `window / 2`
     try std.testing.expectEqual(@as(u64, 2), l.grant()); // opened 1 + window 1
     try l.onOpened(1); // the next stream is now permitted
+}
+
+test "stream limit ignores smaller MAX_STREAMS" {
+    var l = StreamLimit.init(3);
+    l.onMaxStreams(2);
+    try std.testing.expectEqual(@as(u64, 3), l.max);
+    l.onMaxStreams(4);
+    try std.testing.expectEqual(@as(u64, 4), l.max);
 }

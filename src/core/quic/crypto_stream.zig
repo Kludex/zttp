@@ -54,7 +54,7 @@ pub const CryptoStream = struct {
     /// unlock buffered fragments; bytes ahead of the run are buffered, bounded.
     pub fn push(self: *CryptoStream, offset: u64, data: []const u8) Error!void {
         try self.verifyOverlap(offset, data);
-        const end = offset + data.len;
+        const end = std.math.add(u64, offset, data.len) catch return error.CryptoBufferExceeded;
         if (end <= self.contiguous) return; // wholly duplicate, verified equal above
         if (offset <= self.contiguous) {
             const skip: usize = @intCast(self.contiguous - offset);
@@ -86,7 +86,7 @@ pub const CryptoStream = struct {
     /// A conflicting retransmit is caught wherever it lands: against the full
     /// resident prefix [0, contiguous) and against every buffered fragment.
     fn verifyOverlap(self: *CryptoStream, offset: u64, data: []const u8) Error!void {
-        const end = offset + data.len;
+        const end = std.math.add(u64, offset, data.len) catch return error.CryptoBufferExceeded;
         const lo = offset; // the prefix starts at 0, so compare from the frame start
         const hi = @min(end, self.contiguous);
         if (lo < hi) {
@@ -96,7 +96,8 @@ pub const CryptoStream = struct {
         }
         for (self.pending.items) |f| {
             const flo = @max(offset, f.offset);
-            const fhi = @min(end, f.offset + f.data.len);
+            const fend = std.math.add(u64, f.offset, f.data.len) catch return error.CryptoBufferExceeded;
+            const fhi = @min(end, fend);
             if (flo < fhi) {
                 const a = f.data[@intCast(flo - f.offset)..@intCast(fhi - f.offset)];
                 const b = data[@intCast(flo - offset)..@intCast(fhi - offset)];
@@ -128,7 +129,7 @@ pub const CryptoStream = struct {
             var i: usize = 0;
             while (i < self.pending.items.len) {
                 const f = self.pending.items[i];
-                const fend = f.offset + f.data.len;
+                const fend = std.math.add(u64, f.offset, f.data.len) catch return error.CryptoBufferExceeded;
                 if (fend <= self.contiguous) {
                     self.gpa.free(f.data);
                     _ = self.pending.orderedRemove(i);
@@ -195,6 +196,12 @@ test "a conflict against a buffered out-of-order fragment is caught" {
     defer cs.deinit();
     try cs.push(10, "world"); // buffered above the gap
     try testing.expectError(error.CryptoConflict, cs.push(12, "XX")); // disagrees with [12,14)
+}
+
+test "offset overflow is rejected before CRYPTO reassembly" {
+    var cs = CryptoStream.init(testing.allocator);
+    defer cs.deinit();
+    try testing.expectError(error.CryptoBufferExceeded, cs.push(std.math.maxInt(u64), "x"));
 }
 
 test "buffering beyond MAX_BUFFERED is CryptoBufferExceeded" {

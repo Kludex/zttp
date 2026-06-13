@@ -22,8 +22,8 @@ send surface you get matches the protocol.
 
 ::: zttp.H3Connection
 
-A `Stream` is the per-stream send handle on an HTTP/2 connection; see
-[HTTP/2](../usage/http2.md).
+A `Stream` is the per-stream send handle on HTTP/2 and HTTP/3 connections; see
+[HTTP/2](../usage/http2.md) and [HTTP/3](../usage/http3.md).
 
 ::: zttp.Stream
 

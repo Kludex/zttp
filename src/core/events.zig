@@ -60,10 +60,11 @@ pub const EndOfMessage = struct {
     stream_id: u64 = 0,
 };
 
-/// One peer setting (id, value), surfaced verbatim so the integrator can react
-/// (and knows an ACK is owed). HTTP/2 only.
+/// One peer setting (id, value), surfaced verbatim so the integrator can react.
 pub const SettingPair = struct {
-    id: u16,
+    /// HTTP/2 settings fit in 16/32 bits; HTTP/3 settings are QUIC varints. Keep
+    /// the shared event shape wide enough for both protocols.
+    id: u64,
     value: u64,
 };
 
@@ -90,7 +91,8 @@ pub const Goaway = struct {
     debug: []const u8 = &.{},
 };
 
-/// The peer announced its settings (RFC 9113 6.5); an ACK is owed. HTTP/2 only.
+/// The peer announced its settings (RFC 9113 6.5 / RFC 9114 7.2.4). HTTP/2
+/// SETTINGS need an ACK; HTTP/3 SETTINGS are not acknowledged at the H3 layer.
 pub const SettingsEvent = struct {
     params: []const SettingPair,
 };
@@ -145,14 +147,15 @@ pub const H2Event = union(enum) {
 /// The events the HTTP/3 engine produces. It shares the request/response/data/
 /// end-of-message payloads with H1 and H2, and like H2 has its own union: HTTP/3
 /// keeps only the control events it actually has (`settings`, `goaway`) - flow
-/// control, PING, and RST live down in QUIC, not in the HTTP/3 framing. The
-/// `stream_id` on the shared payloads carries the QUIC request-stream id
-/// (truncated to the shared u32 field; widening it to u64 is a follow-up).
+/// control and PING live down in QUIC, not in the HTTP/3 framing. A QUIC
+/// CONNECTION_CLOSE maps to `connection_closed`, matching the shared pull API.
+/// The `stream_id` on the shared payloads carries the 62-bit QUIC request-stream id.
 pub const H3Event = union(enum) {
     request: Request,
     response: Response,
     data: Data,
     end_of_message: EndOfMessage,
+    connection_closed,
     need_data,
     settings: SettingsEvent,
     goaway: Goaway,

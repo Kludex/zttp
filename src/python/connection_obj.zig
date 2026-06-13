@@ -21,6 +21,7 @@ const H2Writer = core.h2.writer.Writer;
 const QuicConnection = core.quic.connection.Connection;
 const H3Connection = core.h3.connection.Connection;
 const FlightConfig = core.quic.tls.flight.Config;
+const ResumptionCredential = core.quic.tls.flight.ResumptionCredential;
 const Signer = core.quic.tls.sign.Signer;
 
 const gpa = std.heap.c_allocator;
@@ -30,6 +31,38 @@ const CLIENT: c_long = 2;
 const HTTP1: c_long = 1;
 const HTTP2: c_long = 2;
 const HTTP3: c_long = 3;
+const MAX_SERVER_TICKET_STORE: usize = 64;
+
+var server_ticket_store: std.ArrayListUnmanaged(ResumptionCredential) = .empty;
+
+fn rememberServerTicket(identity: []const u8, psk: [32]u8, lifetime: u32, age_add: u32, issued_at_ms: u64, max_early_data_size: ?u32) !void {
+    if (lifetime == 0) return;
+    for (server_ticket_store.items) |*entry| {
+        if (std.mem.eql(u8, entry.identity, identity)) {
+            entry.psk = psk;
+            entry.ticket_lifetime = lifetime;
+            entry.ticket_age_add = age_add;
+            entry.issued_at_ms = issued_at_ms;
+            entry.max_early_data_size = max_early_data_size;
+            entry.early_data_used = false;
+            return;
+        }
+    }
+    const owned_identity = try gpa.dupe(u8, identity);
+    errdefer gpa.free(owned_identity);
+    if (server_ticket_store.items.len == MAX_SERVER_TICKET_STORE) {
+        const oldest = server_ticket_store.orderedRemove(0);
+        gpa.free(oldest.identity);
+    }
+    try server_ticket_store.append(gpa, .{
+        .identity = owned_identity,
+        .psk = psk,
+        .ticket_lifetime = lifetime,
+        .ticket_age_add = age_add,
+        .issued_at_ms = issued_at_ms,
+        .max_early_data_size = max_early_data_size,
+    });
+}
 
 /// The HTTP/1.1 engine: the pull-API reader, the writer, and the per-connection
 /// state the send path needs (the request method the next response answers, the
@@ -177,7 +210,10 @@ const H2Engine = struct {
     fn sendRequestId(self: *H2Engine, mb: []const u8, tb: []const u8, hdrs: *BorrowedHeaders) ?u32 {
         if (!self.ensureHandshake()) return null;
         var regular: []events.Header = hdrs.headers;
-        const authority = h2SplitAuthority(hdrs.headers, &regular);
+        const authority = h2SplitAuthority(hdrs.headers, &regular) catch {
+            _ = py.raise(exceptions.LocalProtocolError, "conflicting host and :authority headers");
+            return null;
+        };
         const id = self.writer.sendRequest(mb, tb, "https", authority, regular, false) catch |e| {
             _ = h2RaiseWrite(e);
             return null;
@@ -217,7 +253,10 @@ const H2Engine = struct {
             settings = settings_buf[0..len];
         }
         var regular: []events.Header = hdrs.headers;
-        const authority = h2SplitAuthority(hdrs.headers, &regular);
+        const authority = h2SplitAuthority(hdrs.headers, &regular) catch {
+            _ = py.raise(exceptions.LocalProtocolError, "conflicting host and :authority headers");
+            return false;
+        };
         self.conn.initiateUpgradeConnection(method, target, "http", if (authority.len == 0) null else authority, regular, settings) catch |e| switch (e) {
             error.Malformed => {
                 _ = py.raise(exceptions.LocalProtocolError, "the upgrade request is not a valid HTTP/2 request (forbidden header or bad pseudo-header)");
@@ -344,6 +383,8 @@ const ServerConfig = struct {
     cert: []u8,
     transport_params: []u8,
     alpn: ?[]u8,
+    resumption_identity: ?[]u8 = null,
+    resumption_psk: ?[32]u8 = null,
     signer: Signer,
     random: [32]u8,
     ephemeral_seed: [32]u8,
@@ -352,9 +393,10 @@ const ServerConfig = struct {
         gpa.free(self.cert);
         gpa.free(self.transport_params);
         if (self.alpn) |a| gpa.free(a);
+        if (self.resumption_identity) |id| gpa.free(id);
     }
 
-    fn flightConfig(self: *const ServerConfig) FlightConfig {
+    fn flightConfig(self: *const ServerConfig, now: u64) FlightConfig {
         return .{
             .random = self.random,
             .ephemeral_seed = self.ephemeral_seed,
@@ -362,16 +404,19 @@ const ServerConfig = struct {
             .cert_chain = self.cert,
             .alpn = self.alpn,
             .transport_params = self.transport_params,
+            .resumption = if (self.resumption_identity) |identity| .{ .identity = identity, .psk = self.resumption_psk.? } else null,
+            .resumption_store = server_ticket_store.items,
+            .now_ms = now / std.time.us_per_ms,
         };
     }
 };
 
-/// The HTTP/3 engine. The QUIC transport and the HTTP/3 engine on top of it are
-/// built lazily on the first datagram - the connection id is read from the client's
-/// first Initial packet, so it is not known at construction. `qc`/`h3` stay null
-/// until then; `config` carries the server credentials forward to that point.
+/// The HTTP/3 engine. A server builds QUIC/H3 lazily on the first datagram because
+/// the client's Initial supplies the connection id. A client builds QUIC/H3 eagerly
+/// at construction because it chooses the connection id and immediately emits its
+/// first Initial.
 const H3Engine = struct {
-    config: ServerConfig,
+    config: ?ServerConfig = null,
     qc: ?*QuicConnection = null,
     h3: ?*H3Connection = null,
     /// The integrator's clock at the last receive_datagram / handle_timeout. A Stream
@@ -379,7 +424,7 @@ const H3Engine = struct {
     /// so it packetises against the most recent time the caller gave us.
     now: u64 = 0,
 
-    fn receiveDatagram(self: *H3Engine, dgram: []const u8, now: u64) py.Object {
+    fn receiveDatagram(self: *H3Engine, dgram: []const u8, now: u64, peer_address: ?[]const u8) py.Object {
         self.now = now;
         if (self.qc == null) {
             // Build the transport from the connection id in the client's first
@@ -396,7 +441,8 @@ const H3Engine = struct {
                 return py.raise(exceptions.RemoteProtocolError, "the first HTTP/3 datagram must be a long-header Initial");
             }
             const q = gpa.create(QuicConnection) catch return c.PyErr_NoMemory();
-            q.* = QuicConnection.initServer(gpa, hdr.dcid, self.config.flightConfig()) catch |e| {
+            const cfg = self.config orelse return py.raise(exceptions.LocalProtocolError, "this HTTP/3 connection has no server configuration");
+            q.* = QuicConnection.initServer(gpa, hdr.dcid, cfg.flightConfig(now)) catch |e| {
                 gpa.destroy(q);
                 return exceptions.raiseQuic(e);
             };
@@ -410,7 +456,11 @@ const H3Engine = struct {
             self.h3 = h;
         }
 
-        self.qc.?.receiveDatagram(dgram, now) catch |e| return exceptions.raiseQuic(e);
+        if (peer_address) |addr| {
+            self.qc.?.receiveDatagramFrom(dgram, now, addr) catch |e| return exceptions.raiseQuic(e);
+        } else {
+            self.qc.?.receiveDatagram(dgram, now) catch |e| return exceptions.raiseQuic(e);
+        }
         self.h3.?.pumpAll() catch |e| return exceptions.raiseH3(e);
         return py.none();
     }
@@ -444,12 +494,62 @@ const H3Engine = struct {
         return list;
     }
 
+    /// Like dataToSend, but preserves the optional address key associated with each
+    /// QUIC datagram so integrators can route migration/path-validation traffic.
+    fn dataToSendWithAddresses(self: *H3Engine) py.Object {
+        const q = self.qc orelse return py.newList(0);
+        const flat = q.datagramsToSend();
+        const lengths = q.datagramLengths();
+        const tokens = q.datagramPathTokens();
+        const list = py.newList(@intCast(lengths.len));
+        if (list == null) return null;
+        var off: usize = 0;
+        for (lengths, 0..) |len, i| {
+            const tuple = py.tupleNew(2);
+            if (tuple == null) {
+                py.decref(list);
+                return null;
+            }
+            const item = py.fromBytes(flat[off .. off + len]);
+            if (item == null) {
+                py.decref(tuple);
+                py.decref(list);
+                return null;
+            }
+            const addr = if (tokens.len > i) blk: {
+                if (tokens[i]) |tok| {
+                    const bytes = q.pathAddress(tok) orelse break :blk py.none();
+                    break :blk py.fromBytes(bytes);
+                }
+                break :blk py.none();
+            } else py.none();
+            if (addr == null) {
+                py.decref(item);
+                py.decref(tuple);
+                py.decref(list);
+                return null;
+            }
+            py.tupleSet(tuple, 0, item);
+            py.tupleSet(tuple, 1, addr);
+            py.listSet(list, @intCast(i), tuple);
+            off += len;
+        }
+        q.clearSend();
+        return list;
+    }
+
     /// Drive a response onto `stream_id`, then packetise so the bytes surface in the
     /// next data_to_send. Send requires 1-RTT keys (the handshake must be complete),
     /// which flushSend enforces by no-op'ing until they exist.
     fn sendResponse(self: *H3Engine, id: u64, status: u16, headers: []const events.Header) py.Object {
         const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
         h.sendResponse(id, status, headers) catch |e| return exceptions.raiseH3(e);
+        return self.flush();
+    }
+
+    fn sendInformational(self: *H3Engine, id: u64, status: u16, headers: []const events.Header) py.Object {
+        const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        h.sendInformational(id, status, headers) catch |e| return exceptions.raiseH3(e);
         return self.flush();
     }
 
@@ -467,13 +567,17 @@ const H3Engine = struct {
 
     fn endMessage(self: *H3Engine, id: u64, trailers: []const events.Header) py.Object {
         const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
-        h.endMessage(id, trailers) catch |e| return exceptions.raiseH3(e);
+        if (trailers.len == 0) {
+            h.endStream(id) catch |e| return exceptions.raiseH3(e);
+        } else {
+            h.sendTrailers(id, trailers) catch |e| return exceptions.raiseH3(e);
+        }
         return self.flush();
     }
 
-    fn sendInformational(self: *H3Engine, id: u64, status: u16, headers: []const events.Header) py.Object {
+    fn sendTrailers(self: *H3Engine, id: u64, trailers: []const events.Header) py.Object {
         const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
-        h.sendInformational(id, status, headers) catch |e| return exceptions.raiseH3(e);
+        h.sendTrailers(id, trailers) catch |e| return exceptions.raiseH3(e);
         return self.flush();
     }
 
@@ -485,22 +589,12 @@ const H3Engine = struct {
         return self.flush();
     }
 
-    /// Begin a graceful shutdown: send a GOAWAY announcing `stream_id` as the first
-    /// request stream we will not process (RFC 9114 5.2), then packetise it.
+    /// Begin a graceful shutdown: send a GOAWAY. Servers announce the first request
+    /// stream they will not process; clients announce the first push ID they will not
+    /// accept (RFC 9114 5.2), then packetise it.
     fn shutdown(self: *H3Engine, stream_id: u64) py.Object {
         const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
         h.shutdown(stream_id) catch |e| return exceptions.raiseH3(e);
-        return self.flush();
-    }
-
-    /// Send an application CONNECTION_CLOSE (RFC 9000 10.2.2 / RFC 9114) with a
-    /// caller-chosen H3 error code and reason, and packetise it.
-    fn close(self: *H3Engine, error_code: u64, reason: []const u8) py.Object {
-        const q = self.qc orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
-        q.close(true, error_code, reason) catch |e| switch (e) {
-            error.AmplificationLimited => return py.none(),
-            else => return exceptions.raiseQuic(e),
-        };
         return self.flush();
     }
 
@@ -510,6 +604,156 @@ const H3Engine = struct {
         const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
         h.initiateControl() catch |e| return exceptions.raiseH3(e);
         return self.flush();
+    }
+
+    fn challengePath(self: *H3Engine, peer_address: []const u8, data: []const u8) py.Object {
+        const q = self.qc orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        if (peer_address.len == 0) return py.raiseValue("peer_address must not be empty");
+        if (data.len != 8) return py.raiseValue("path challenge data must be exactly 8 bytes");
+        q.challengePathOn(data[0..8].*, peer_address) catch |e| return exceptions.raiseQuic(e);
+        return self.flush();
+    }
+
+    fn usePeerConnectionId(self: *H3Engine, seq: u64) py.Object {
+        const q = self.qc orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        q.usePeerConnectionId(seq) catch |e| switch (e) {
+            error.OutOfMemory => return c.PyErr_NoMemory(),
+            else => return py.raiseValue("unknown or retired peer connection id sequence"),
+        };
+        return py.none();
+    }
+
+    fn issueConnectionId(self: *H3Engine, seq: u64, cid: []const u8, token: []const u8, retire_prior_to: u64) py.Object {
+        const q = self.qc orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        if (cid.len == 0 or cid.len > 20) return py.raiseValue("connection_id must be 1..20 bytes");
+        if (token.len != 16) return py.raiseValue("stateless_reset_token must be exactly 16 bytes");
+        q.issueLocalConnectionId(seq, retire_prior_to, cid, token[0..16].*) catch |e| switch (e) {
+            error.OutOfMemory => return c.PyErr_NoMemory(),
+            else => return py.raiseValue("invalid local connection id sequence, retire_prior_to, value, or active connection id limit"),
+        };
+        return self.flush();
+    }
+
+    fn requestKeyUpdate(self: *H3Engine) py.Object {
+        const q = self.qc orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        q.updateApplicationSendKeys() catch |e| switch (e) {
+            error.OutOfMemory => return c.PyErr_NoMemory(),
+            else => return py.raise(exceptions.LocalProtocolError, "cannot request a key update before 1-RTT keys are available"),
+        };
+        return py.none();
+    }
+
+    /// Send a QUIC CONNECTION_CLOSE. By default this is an HTTP/3 application
+    /// close; callers can request a transport close for QUIC transport errors.
+    fn close(self: *H3Engine, app: bool, error_code: u64, reason: []const u8) py.Object {
+        const q = self.qc orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        q.close(app, error_code, reason) catch |e| switch (e) {
+            error.OutOfMemory => return c.PyErr_NoMemory(),
+            else => return exceptions.raiseQuic(e),
+        };
+        return py.none();
+    }
+
+    fn sendSessionTicket(self: *H3Engine, lifetime: u32, age_add: u32, nonce: []const u8, ticket: []const u8, extensions: []const u8, max_early_data_size: ?u32) py.Object {
+        const q = self.qc orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        const psk = q.sendSessionTicket(lifetime, age_add, nonce, ticket, extensions, max_early_data_size, self.now) catch |e| switch (e) {
+            error.OutOfMemory => return c.PyErr_NoMemory(),
+            else => return py.raise(exceptions.LocalProtocolError, "cannot send a TLS session ticket before the HTTP/3 server handshake is confirmed, or the ticket fields are invalid"),
+        };
+        if (psk) |value| {
+            rememberServerTicket(ticket, value, lifetime, age_add, self.now / std.time.us_per_ms, max_early_data_size) catch return c.PyErr_NoMemory();
+        }
+        return if (psk) |value| py.fromBytes(&value) else py.none();
+    }
+
+    fn sendNewToken(self: *H3Engine, token: []const u8) py.Object {
+        const q = self.qc orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        q.sendNewToken(token, self.now) catch |e| switch (e) {
+            error.OutOfMemory => return c.PyErr_NoMemory(),
+            else => return py.raise(exceptions.LocalProtocolError, "cannot send a NEW_TOKEN before the HTTP/3 server handshake is confirmed, or the token is empty"),
+        };
+        return self.flush();
+    }
+
+    fn sessionTickets(self: *const H3Engine) py.Object {
+        const q = self.qc orelse return py.newList(0);
+        const tickets = q.sessionTickets();
+        const list = py.newList(@intCast(tickets.len));
+        if (list == null) return null;
+        for (tickets, 0..) |ticket, i| {
+            const tuple = py.tupleNew(7);
+            if (tuple == null) {
+                py.decref(list);
+                return null;
+            }
+            const lifetime = c.PyLong_FromUnsignedLong(ticket.ticket_lifetime);
+            const age_add = c.PyLong_FromUnsignedLong(ticket.ticket_age_add);
+            const nonce = py.fromBytes(ticket.nonce);
+            const data = py.fromBytes(ticket.ticket);
+            const extensions = py.fromBytes(ticket.extensions);
+            const max_early_data_size = if (ticket.max_early_data_size) |value| c.PyLong_FromUnsignedLong(value) else py.none();
+            const psk = if (ticket.psk) |value| py.fromBytes(&value) else py.none();
+            if (lifetime == null or age_add == null or nonce == null or data == null or extensions == null or max_early_data_size == null or psk == null) {
+                py.xdecref(lifetime);
+                py.xdecref(age_add);
+                py.xdecref(nonce);
+                py.xdecref(data);
+                py.xdecref(extensions);
+                py.xdecref(max_early_data_size);
+                py.xdecref(psk);
+                py.decref(tuple);
+                py.decref(list);
+                return null;
+            }
+            py.tupleSet(tuple, 0, lifetime);
+            py.tupleSet(tuple, 1, age_add);
+            py.tupleSet(tuple, 2, nonce);
+            py.tupleSet(tuple, 3, data);
+            py.tupleSet(tuple, 4, extensions);
+            py.tupleSet(tuple, 5, max_early_data_size);
+            py.tupleSet(tuple, 6, psk);
+            py.listSet(list, @intCast(i), tuple);
+        }
+        return list;
+    }
+
+    fn validationTokens(self: *const H3Engine) py.Object {
+        const q = self.qc orelse return py.newList(0);
+        const tokens = q.validationTokens();
+        const list = py.newList(@intCast(tokens.len));
+        if (list == null) return null;
+        for (tokens, 0..) |token, i| {
+            const item = py.fromBytes(token);
+            if (item == null) {
+                py.decref(list);
+                return null;
+            }
+            py.listSet(list, @intCast(i), item);
+        }
+        return list;
+    }
+
+    /// Serialize a client request head onto the next HTTP/3 request stream. This is
+    /// only reachable once a client-side QUIC connection has been constructed; a
+    /// server-side H3 object still reports local misuse.
+    fn sendRequest(self: *H3Engine, method: []const u8, target: []const u8, hdrs: *BorrowedHeaders) ?u64 {
+        const h = self.h3 orelse {
+            _ = py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+            return null;
+        };
+        var regular: []events.Header = hdrs.headers;
+        const authority = h2SplitAuthority(hdrs.headers, &regular) catch {
+            _ = py.raise(exceptions.LocalProtocolError, "conflicting host and :authority headers");
+            return null;
+        };
+        const id = h.sendRequest(method, target, "https", authority, regular, false) catch |e| {
+            _ = h3RaiseLocal(e);
+            return null;
+        };
+        const flushed = self.flush();
+        if (flushed == null) return null;
+        py.decref(flushed);
+        return id;
     }
 
     fn flush(self: *H3Engine) py.Object {
@@ -616,9 +860,80 @@ const H3Engine = struct {
             q.deinit();
             gpa.destroy(q);
         }
-        self.config.deinit();
+        if (self.config) |*cfg| cfg.deinit();
     }
 };
+
+const ResumptionCredentialArgs = struct {
+    identity: []const u8,
+    psk: [32]u8,
+    obfuscated_ticket_age: u32 = 0,
+    early_data: bool = false,
+};
+
+fn parseResumptionCredential(
+    identity_obj: ?*c.PyObject,
+    psk_obj: ?*c.PyObject,
+    age_obj: ?*c.PyObject,
+    early_obj: ?*c.PyObject,
+) ?ResumptionCredentialArgs {
+    const have_identity = identity_obj != null and !py.isNone(identity_obj);
+    const have_psk = psk_obj != null and !py.isNone(psk_obj);
+    if (!have_identity and !have_psk) {
+        if (age_obj != null and !py.isNone(age_obj)) {
+            _ = py.raiseValue("obfuscated_ticket_age requires resumption_identity and resumption_psk");
+            return null;
+        }
+        if (early_obj != null and !py.isNone(early_obj)) {
+            const early = c.PyObject_IsTrue(early_obj);
+            if (early < 0) return null;
+            if (early != 0) {
+                _ = py.raiseValue("early_data requires resumption_identity and resumption_psk");
+                return null;
+            }
+        }
+        return null;
+    }
+    if (!have_identity or !have_psk) {
+        _ = py.raiseValue("resumption_identity and resumption_psk must be provided together");
+        return null;
+    }
+    const identity = py.asBytes(identity_obj) orelse return null;
+    const psk_src = py.asBytes(psk_obj) orelse return null;
+    if (identity.len == 0 or identity.len > 0xffff) {
+        _ = py.raiseValue("resumption_identity must be 1..65535 bytes");
+        return null;
+    }
+    if (psk_src.len != 32) {
+        _ = py.raiseValue("resumption_psk must be exactly 32 bytes");
+        return null;
+    }
+
+    var age: u32 = 0;
+    if (age_obj != null and !py.isNone(age_obj)) {
+        const value = c.PyLong_AsUnsignedLongLong(age_obj);
+        if (value == @as(c_ulonglong, @bitCast(@as(c_longlong, -1))) and c.PyErr_Occurred() != null) return null;
+        if (value > std.math.maxInt(u32)) {
+            _ = py.raiseValue("obfuscated_ticket_age must fit in uint32");
+            return null;
+        }
+        age = @intCast(value);
+    }
+
+    var early = false;
+    if (early_obj != null and !py.isNone(early_obj)) {
+        const value = c.PyObject_IsTrue(early_obj);
+        if (value < 0) return null;
+        early = value != 0;
+    }
+
+    return .{
+        .identity = identity,
+        .psk = psk_src[0..32].*,
+        .obfuscated_ticket_age = age,
+        .early_data = early,
+    };
+}
 
 /// One Python Connection drives exactly one protocol engine, chosen at
 /// construction. Modelling it as a tagged union (rather than a set of nullable
@@ -766,23 +1081,33 @@ fn stream_send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callcon
 fn stream_send_window_get(self_obj: ?*c.PyObject, _: ?*anyopaque) callconv(.c) py.Object {
     const self: *StreamObject = @ptrCast(self_obj.?);
     const e = self.engine() orelse return null;
-    const h2 = switch (e) {
-        .h2 => |x| x,
-        .h3 => return py.none(), // per-stream send windows are not surfaced for HTTP/3 yet
+    return switch (e) {
+        .h2 => |h2| {
+            const w = h2.conn.streamSendWindow(@intCast(self.stream_id)) orelse return py.none();
+            return c.PyLong_FromLong(w);
+        },
+        .h3 => |h3_engine| {
+            const q = h3_engine.qc orelse return py.none();
+            const w = q.streamSendWindow(self.stream_id) orelse return py.none();
+            return c.PyLong_FromUnsignedLongLong(w);
+        },
     };
-    const w = h2.conn.streamSendWindow(@intCast(self.stream_id)) orelse return py.none();
-    return c.PyLong_FromLong(w);
 }
 
 fn stream_pending_bytes_get(self_obj: ?*c.PyObject, _: ?*anyopaque) callconv(.c) py.Object {
     const self: *StreamObject = @ptrCast(self_obj.?);
     const e = self.engine() orelse return null;
-    const h2 = switch (e) {
-        .h2 => |x| x,
-        .h3 => return py.none(),
+    return switch (e) {
+        .h2 => |h2| {
+            const n = h2.conn.streamPendingBytes(@intCast(self.stream_id)) orelse return py.none();
+            return c.PyLong_FromUnsignedLongLong(n);
+        },
+        .h3 => |h3_engine| {
+            const q = h3_engine.qc orelse return py.none();
+            const n = q.streamPendingBytes(self.stream_id) orelse return py.none();
+            return c.PyLong_FromUnsignedLongLong(n);
+        },
     };
-    const n = h2.conn.streamPendingBytes(@intCast(self.stream_id)) orelse return py.none();
-    return c.PyLong_FromUnsignedLongLong(n);
 }
 
 fn stream_send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
@@ -919,10 +1244,6 @@ fn parseArgs(args: ?*c.PyObject, kwds: ?*c.PyObject, role: *Role, protocol_out: 
         _ = py.raiseValue("protocol must be zttp.HTTP1, zttp.HTTP2, or zttp.HTTP3");
         return false;
     }
-    if (protocol_val == HTTP3 and role.* != .server) {
-        _ = py.raiseValue("HTTP/3 currently supports the server read path only");
-        return false;
-    }
     if (fixed) |f| {
         if (protocol_val != f) {
             _ = py.raiseValue("protocol does not match this Connection subclass; construct zttp.Connection to choose by protocol");
@@ -1012,11 +1333,14 @@ fn new_h2(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
 }
 
 // H3Connection(role, protocol=HTTP3, *, certificate, private_key, transport_params,
-// random, ephemeral_seed, alpn=None). role and protocol stay positional-or-keyword so
-// the Connection(SERVER, HTTP3, certificate=...) factory form works; the credentials
-// are keyword-only (the `$` in the format) and mandatory - a sans-IO QUIC server
-// cannot invent its own certificate or entropy. The bytes are copied into a
-// ServerConfig the engine owns.
+// random, ephemeral_seed, alpn=None, connection_id=None, server_name=None,
+// resumption_identity=None, resumption_psk=None, obfuscated_ticket_age=0,
+// early_data=False, remembered_transport_params=None, validation_token=None).
+// role and protocol stay
+// positional-or-keyword so the Connection(SERVER, HTTP3, ...) factory form works.
+// Server credentials are mandatory only for SERVER. A CLIENT supplies deterministic
+// ClientHello entropy plus the connection id it will use as the first destination
+// connection id.
 fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
     var role_val: c_long = 0;
     var protocol_val: c_long = HTTP3;
@@ -1026,38 +1350,182 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     var random_obj: ?*c.PyObject = null;
     var ephemeral_obj: ?*c.PyObject = null;
     var alpn_obj: ?*c.PyObject = null;
+    var cid_obj: ?*c.PyObject = null;
+    var sni_obj: ?*c.PyObject = null;
+    var resumption_identity_obj: ?*c.PyObject = null;
+    var resumption_psk_obj: ?*c.PyObject = null;
+    var obfuscated_ticket_age_obj: ?*c.PyObject = null;
+    var early_data_obj: ?*c.PyObject = null;
+    var remembered_tp_obj: ?*c.PyObject = null;
+    var validation_token_obj: ?*c.PyObject = null;
     var kwlist = [_][*c]u8{
-        @constCast("role"),           @constCast("protocol"),         @constCast("certificate"),
-        @constCast("private_key"),    @constCast("transport_params"), @constCast("random"),
-        @constCast("ephemeral_seed"), @constCast("alpn"),             null,
+        @constCast("role"),                  @constCast("protocol"),            @constCast("certificate"),
+        @constCast("private_key"),           @constCast("transport_params"),    @constCast("random"),
+        @constCast("ephemeral_seed"),        @constCast("alpn"),                @constCast("connection_id"),
+        @constCast("server_name"),           @constCast("resumption_identity"), @constCast("resumption_psk"),
+        @constCast("obfuscated_ticket_age"), @constCast("early_data"),          @constCast("remembered_transport_params"),
+        @constCast("validation_token"),      null,
     };
-    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$OOOOOO", @ptrCast(&kwlist), &role_val, &protocol_val, &cert_obj, &key_obj, &tp_obj, &random_obj, &ephemeral_obj, &alpn_obj) == 0) return null;
-    if (cert_obj == null or key_obj == null or tp_obj == null or random_obj == null or ephemeral_obj == null) {
-        return py.raiseType("HTTP/3 requires the server credentials: certificate, private_key, transport_params, random, ephemeral_seed");
-    }
-    if (role_val != SERVER) return py.raiseValue("HTTP/3 currently supports the server read path only");
+    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$OOOOOOOOOOOOOO", @ptrCast(&kwlist), &role_val, &protocol_val, &cert_obj, &key_obj, &tp_obj, &random_obj, &ephemeral_obj, &alpn_obj, &cid_obj, &sni_obj, &resumption_identity_obj, &resumption_psk_obj, &obfuscated_ticket_age_obj, &early_data_obj, &remembered_tp_obj, &validation_token_obj) == 0) return null;
     if (protocol_val != HTTP3) return py.raiseValue("protocol does not match this Connection subclass; construct zttp.Connection to choose by protocol");
 
-    const config = buildServerConfig(cert_obj, key_obj, tp_obj, random_obj, ephemeral_obj, alpn_obj) orelse return null;
     const alloc = tp.?.tp_alloc.?;
     const obj = alloc(tp, 0);
-    if (obj == null) {
-        var cfg = config;
-        cfg.deinit();
-        return null;
-    }
+    if (obj == null) return null;
     const self: *ConnectionObject = @ptrCast(obj);
     self.engine = null;
     const engine: *Engine = @ptrCast(@alignCast(&self.engine_storage));
-    engine.* = .{ .h3 = .{ .config = config } };
+    if (role_val == SERVER) {
+        if (cert_obj == null or key_obj == null or tp_obj == null or random_obj == null or ephemeral_obj == null) {
+            py.decref(obj);
+            return py.raiseType("HTTP/3 server requires certificate, private_key, transport_params, random, ephemeral_seed");
+        }
+        if (obfuscated_ticket_age_obj != null and !py.isNone(obfuscated_ticket_age_obj)) {
+            py.decref(obj);
+            return py.raiseValue("obfuscated_ticket_age is only valid for HTTP/3 clients");
+        }
+        if (early_data_obj != null and !py.isNone(early_data_obj)) {
+            const early = c.PyObject_IsTrue(early_data_obj);
+            if (early < 0) {
+                py.decref(obj);
+                return null;
+            }
+            if (early != 0) {
+                py.decref(obj);
+                return py.raiseValue("early_data is only valid for HTTP/3 clients");
+            }
+        }
+        if (remembered_tp_obj != null and !py.isNone(remembered_tp_obj)) {
+            py.decref(obj);
+            return py.raiseValue("remembered_transport_params is only valid for HTTP/3 clients");
+        }
+        if (validation_token_obj != null and !py.isNone(validation_token_obj)) {
+            py.decref(obj);
+            return py.raiseValue("validation_token is only valid for HTTP/3 clients");
+        }
+        const config = buildServerConfig(cert_obj, key_obj, tp_obj, random_obj, ephemeral_obj, alpn_obj, resumption_identity_obj, resumption_psk_obj) orelse {
+            py.decref(obj);
+            return null;
+        };
+        engine.* = .{ .h3 = .{ .config = config } };
+    } else if (role_val == CLIENT) {
+        engine.* = .{ .h3 = buildClientH3(tp, tp_obj, random_obj, ephemeral_obj, alpn_obj, cid_obj, sni_obj, resumption_identity_obj, resumption_psk_obj, obfuscated_ticket_age_obj, early_data_obj, remembered_tp_obj, validation_token_obj) orelse {
+            py.decref(obj);
+            return null;
+        } };
+    } else {
+        py.decref(obj);
+        return py.raiseValue("role must be zttp.SERVER or zttp.CLIENT");
+    }
     self.engine = engine;
     return obj;
+}
+
+fn buildClientH3(
+    _: ?*c.PyTypeObject,
+    tp_obj: ?*c.PyObject,
+    random_obj: ?*c.PyObject,
+    ephemeral_obj: ?*c.PyObject,
+    alpn_obj: ?*c.PyObject,
+    cid_obj: ?*c.PyObject,
+    sni_obj: ?*c.PyObject,
+    resumption_identity_obj: ?*c.PyObject,
+    resumption_psk_obj: ?*c.PyObject,
+    obfuscated_ticket_age_obj: ?*c.PyObject,
+    early_data_obj: ?*c.PyObject,
+    remembered_tp_obj: ?*c.PyObject,
+    validation_token_obj: ?*c.PyObject,
+) ?H3Engine {
+    if (tp_obj == null or random_obj == null or ephemeral_obj == null or cid_obj == null) {
+        _ = py.raiseType("HTTP/3 client requires transport_params, random, ephemeral_seed, connection_id");
+        return null;
+    }
+    const tp_src = py.asBytes(tp_obj) orelse return null;
+    const random_src = py.asBytes(random_obj) orelse return null;
+    const ephemeral_src = py.asBytes(ephemeral_obj) orelse return null;
+    const cid = py.asBytes(cid_obj) orelse return null;
+    if (random_src.len != 32) {
+        _ = py.raiseValue("random must be exactly 32 bytes");
+        return null;
+    }
+    if (ephemeral_src.len != 32) {
+        _ = py.raiseValue("ephemeral_seed must be exactly 32 bytes");
+        return null;
+    }
+    if (cid.len == 0 or cid.len > core.quic.constants.MAX_CID_LEN) {
+        _ = py.raiseValue("connection_id must be 1..20 bytes");
+        return null;
+    }
+    const alpn = if (alpn_obj != null and !py.isNone(alpn_obj)) py.asBytes(alpn_obj) orelse return null else null;
+    const server_name = if (sni_obj != null and !py.isNone(sni_obj)) py.asBytes(sni_obj) orelse return null else null;
+    const validation_token = if (validation_token_obj != null and !py.isNone(validation_token_obj)) blk: {
+        const token = py.asBytes(validation_token_obj) orelse return null;
+        if (token.len == 0) {
+            _ = py.raiseValue("validation_token must not be empty");
+            return null;
+        }
+        break :blk token;
+    } else null;
+    const resumption = parseResumptionCredential(resumption_identity_obj, resumption_psk_obj, obfuscated_ticket_age_obj, early_data_obj);
+    if (resumption == null and c.PyErr_Occurred() != null) return null;
+    const q = gpa.create(QuicConnection) catch {
+        _ = c.PyErr_NoMemory();
+        return null;
+    };
+    q.* = QuicConnection.initClient(gpa, cid, .{
+        .random = random_src[0..32].*,
+        .ephemeral_seed = ephemeral_src[0..32].*,
+        .transport_params = tp_src,
+        .alpn = alpn,
+        .server_name = server_name,
+        .resumption = if (resumption) |r| .{
+            .identity = r.identity,
+            .obfuscated_ticket_age = r.obfuscated_ticket_age,
+            .psk = r.psk,
+            .early_data = r.early_data,
+        } else null,
+        .validation_token = validation_token,
+    }, 0) catch |e| {
+        gpa.destroy(q);
+        _ = exceptions.raiseQuic(e);
+        return null;
+    };
+    if (remembered_tp_obj != null and !py.isNone(remembered_tp_obj)) {
+        const remembered = py.asBytes(remembered_tp_obj) orelse {
+            q.deinit();
+            gpa.destroy(q);
+            return null;
+        };
+        q.applyRememberedPeerTransportParameters(remembered) catch |e| {
+            q.deinit();
+            gpa.destroy(q);
+            _ = exceptions.raiseQuic(e);
+            return null;
+        };
+    }
+    const h = gpa.create(H3Connection) catch {
+        q.deinit();
+        gpa.destroy(q);
+        _ = c.PyErr_NoMemory();
+        return null;
+    };
+    h.* = H3Connection.init(gpa, q);
+    return .{ .qc = q, .h3 = h };
 }
 
 // Copy the integrator's server credentials into an owned ServerConfig, validating
 // the fixed-size seeds and deriving the Signer up front. On any failure sets a Python
 // error, frees whatever was already copied, and returns null.
-fn buildServerConfig(cert_obj: ?*c.PyObject, key_obj: ?*c.PyObject, tp_obj: ?*c.PyObject, random_obj: ?*c.PyObject, ephemeral_obj: ?*c.PyObject, alpn_obj: ?*c.PyObject) ?ServerConfig {
+fn buildServerConfig(
+    cert_obj: ?*c.PyObject,
+    key_obj: ?*c.PyObject,
+    tp_obj: ?*c.PyObject,
+    random_obj: ?*c.PyObject,
+    ephemeral_obj: ?*c.PyObject,
+    alpn_obj: ?*c.PyObject,
+    resumption_identity_obj: ?*c.PyObject,
+    resumption_psk_obj: ?*c.PyObject,
+) ?ServerConfig {
     const cert_src = py.asBytes(cert_obj) orelse return null;
     const key_src = py.asBytes(key_obj) orelse return null;
     const tp_src = py.asBytes(tp_obj) orelse return null;
@@ -1079,6 +1547,8 @@ fn buildServerConfig(cert_obj: ?*c.PyObject, key_obj: ?*c.PyObject, tp_obj: ?*c.
         _ = py.raiseValue("private_key is not a valid signing key seed");
         return null;
     };
+    const resumption = parseResumptionCredential(resumption_identity_obj, resumption_psk_obj, null, null);
+    if (resumption == null and c.PyErr_Occurred() != null) return null;
 
     const cert = gpa.dupe(u8, cert_src) catch {
         _ = c.PyErr_NoMemory();
@@ -1106,10 +1576,24 @@ fn buildServerConfig(cert_obj: ?*c.PyObject, key_obj: ?*c.PyObject, tp_obj: ?*c.
         _ = c.PyErr_NoMemory();
         return null;
     };
+    var resumption_identity: ?[]u8 = null;
+    var resumption_psk: ?[32]u8 = null;
+    if (resumption) |r| {
+        resumption_identity = gpa.dupe(u8, r.identity) catch {
+            gpa.free(cert);
+            gpa.free(tp_copy);
+            gpa.free(alpn);
+            _ = c.PyErr_NoMemory();
+            return null;
+        };
+        resumption_psk = r.psk;
+    }
     return .{
         .cert = cert,
         .transport_params = tp_copy,
         .alpn = alpn,
+        .resumption_identity = resumption_identity,
+        .resumption_psk = resumption_psk,
         .signer = signer,
         .random = random_src[0..32].*,
         .ephemeral_seed = ephemeral_src[0..32].*,
@@ -1164,7 +1648,7 @@ fn h1(self: *ConnectionObject) ?*H1Engine {
             return null;
         },
         .h3 => {
-            _ = py.raiseRuntime("this is an HTTP/3 connection; the write side is not implemented yet");
+            _ = py.raiseRuntime("this is an HTTP/3 connection; send on a Stream (conn.stream(id) or the Stream returned by send_request)");
             return null;
         },
     }
@@ -1194,9 +1678,11 @@ fn receive_datagram(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.
         .h3 => |*e| {
             var dgram_obj: ?*c.PyObject = null;
             var now: c_ulonglong = 0;
-            if (c.PyArg_ParseTuple(args, "O|K", &dgram_obj, &now) == 0) return null;
+            var addr_obj: ?*c.PyObject = null;
+            if (c.PyArg_ParseTuple(args, "O|KO", &dgram_obj, &now, &addr_obj) == 0) return null;
             const dgram = py.asBytes(dgram_obj) orelse return null;
-            return e.receiveDatagram(dgram, @intCast(now));
+            const peer_address = if (addr_obj != null and !py.isNone(addr_obj)) py.asBytes(addr_obj) orelse return null else null;
+            return e.receiveDatagram(dgram, @intCast(now), peer_address);
         },
         else => return py.raiseRuntime("receive_datagram is only valid for an HTTP/3 connection"),
     }
@@ -1336,16 +1822,21 @@ fn borrowHeaders(seq: py.Object) ?BorrowedHeaders {
 
 const asciiEqlIgnoreCase = core.ascii.eqIgnoreCase;
 
+const AuthoritySplitError = error{LocalProtocol};
+
 // Build the HTTP/2 regular-header list and pull out :authority. For a request the
 // adapter derives :authority from a `host` (or `:authority`) field and drops it
 // from the regular headers - HTTP/2 forbids `host` and carries it as a pseudo-
 // header instead. `:scheme` defaults to https.
-fn h2SplitAuthority(headers: []events.Header, out: *[]events.Header) []const u8 {
+fn h2SplitAuthority(headers: []events.Header, out: *[]events.Header) AuthoritySplitError![]const u8 {
     var authority: []const u8 = "";
+    var seen_authority = false;
     var n: usize = 0;
     for (headers) |h| {
         if (asciiEqlIgnoreCase(h.name, "host") or asciiEqlIgnoreCase(h.name, ":authority")) {
-            if (authority.len == 0) authority = h.value;
+            if (seen_authority and !std.mem.eql(u8, authority, h.value)) return error.LocalProtocol;
+            authority = h.value;
+            seen_authority = true;
             continue;
         }
         headers[n] = h;
@@ -1361,6 +1852,13 @@ fn h2RaiseWrite(e: core.h2.writer.WriteError) py.Object {
         error.OutOfMemory => c.PyErr_NoMemory(),
         error.LocalProtocol => py.raise(local, "invalid HTTP/2 send: a pseudo-header order, status, or stream id was rejected"),
         error.InvalidField => py.raise(local, "invalid field: a header name/value contained CR/LF/NUL or an uppercase byte"),
+    };
+}
+
+fn h3RaiseLocal(e: core.h3.connection.Error) py.Object {
+    return switch (e) {
+        error.OutOfMemory => c.PyErr_NoMemory(),
+        error.H3Error, error.StreamError, error.Blocked => py.raise(exceptions.LocalProtocolError, "invalid HTTP/3 send"),
     };
 }
 
@@ -1392,7 +1890,10 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
             e.reader.setRequestMethod(mb);
             return py.none();
         },
-        .h3 => return py.raiseRuntime("the HTTP/3 write side is not implemented yet"),
+        .h3 => |*e| {
+            const id = e.sendRequest(mb, tb, &hdrs) orelse return null;
+            return makeStream(self_obj, id);
+        },
     }
 }
 
@@ -1502,6 +2003,71 @@ fn data_to_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
         .h3 => unreachable,
     }
     return out;
+}
+
+fn h3_data_to_send_with_addresses(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    return switch (engine.*) {
+        .h3 => |*e| e.dataToSendWithAddresses(),
+        else => py.raiseRuntime("data_to_send_with_addresses is only valid for an HTTP/3 connection"),
+    };
+}
+
+fn h3_challenge_path(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    var peer_obj: ?*c.PyObject = null;
+    var data_obj: ?*c.PyObject = null;
+    if (c.PyArg_ParseTuple(args, "OO", &peer_obj, &data_obj) == 0) return null;
+    const peer_address = py.asBytes(peer_obj) orelse return null;
+    const data = py.asBytes(data_obj) orelse return null;
+    return switch (engine.*) {
+        .h3 => |*e| e.challengePath(peer_address, data),
+        else => py.raiseRuntime("challenge_path is only valid for an HTTP/3 connection"),
+    };
+}
+
+fn h3_use_peer_connection_id(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    const seq = c.PyLong_AsUnsignedLongLong(arg);
+    if (seq == @as(c_ulonglong, @bitCast(@as(c_longlong, -1))) and c.PyErr_Occurred() != null) return null;
+    return e.usePeerConnectionId(@intCast(seq));
+}
+
+fn h3_issue_connection_id(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    var seq: c_ulonglong = 0;
+    var cid_obj: ?*c.PyObject = null;
+    var token_obj: ?*c.PyObject = null;
+    var retire_prior_to: c_ulonglong = 0;
+    if (c.PyArg_ParseTuple(args, "KOO|K", &seq, &cid_obj, &token_obj, &retire_prior_to) == 0) return null;
+    const cid = py.asBytes(cid_obj) orelse return null;
+    const token = py.asBytes(token_obj) orelse return null;
+    return e.issueConnectionId(@intCast(seq), cid, token, @intCast(retire_prior_to));
+}
+
+fn h3_request_key_update(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    return e.requestKeyUpdate();
+}
+
+fn h3_close(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    var app_obj: ?*c.PyObject = null;
+    var code: c_ulonglong = 0;
+    var reason_obj: ?*c.PyObject = null;
+    var kwlist = [_][*c]u8{ @constCast("app"), @constCast("error_code"), @constCast("reason"), null };
+    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "|OKO", @ptrCast(&kwlist), &app_obj, &code, &reason_obj) == 0) return null;
+    if (code >= (@as(c_ulonglong, 1) << 62)) return py.raiseValue("error_code must fit in QUIC's 62-bit integer range");
+    var app = true;
+    if (app_obj != null and !py.isNone(app_obj)) {
+        const value = c.PyObject_IsTrue(app_obj);
+        if (value < 0) return null;
+        app = value != 0;
+    }
+    const reason = if (reason_obj != null and !py.isNone(reason_obj)) py.asBytes(reason_obj) orelse return null else @as([]const u8, &.{});
+    return e.close(app, @intCast(code), reason);
 }
 
 fn raiseWrite(e: core.h1.writer.WriteError) py.Object {
@@ -1638,6 +2204,47 @@ fn h3_initiate(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     return e.initiate();
 }
 
+fn h3_send_session_ticket(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    var ticket_obj: py.Object = null;
+    var lifetime: c_ulonglong = 0;
+    var age_add: c_ulonglong = 0;
+    var nonce_obj: py.Object = null;
+    var extensions_obj: py.Object = null;
+    var max_early_obj: py.Object = null;
+    if (c.PyArg_ParseTuple(args, "O|KKOOO", &ticket_obj, &lifetime, &age_add, &nonce_obj, &extensions_obj, &max_early_obj) == 0) return null;
+    if (lifetime > std.math.maxInt(u32) or age_add > std.math.maxInt(u32)) {
+        return py.raiseValue("lifetime and age_add must fit in uint32");
+    }
+    const ticket = py.asBytes(ticket_obj) orelse return null;
+    const nonce = if (nonce_obj != null and !py.isNone(nonce_obj)) py.asBytes(nonce_obj) orelse return null else @as([]const u8, &.{});
+    const extensions = if (extensions_obj != null and !py.isNone(extensions_obj)) py.asBytes(extensions_obj) orelse return null else @as([]const u8, &.{});
+    var max_early_data_size: ?u32 = null;
+    if (max_early_obj != null and !py.isNone(max_early_obj)) {
+        const value = c.PyLong_AsUnsignedLongLong(max_early_obj);
+        if (value == @as(c_ulonglong, @bitCast(@as(c_longlong, -1))) and c.PyErr_Occurred() != null) return null;
+        if (value > std.math.maxInt(u32)) return py.raiseValue("max_early_data_size must fit in uint32");
+        max_early_data_size = @intCast(value);
+    }
+    return e.sendSessionTicket(@intCast(lifetime), @intCast(age_add), nonce, ticket, extensions, max_early_data_size);
+}
+
+fn h3_session_tickets(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    return e.sessionTickets();
+}
+
+fn h3_send_new_token(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    const token = py.asBytes(arg) orelse return null;
+    return e.sendNewToken(token);
+}
+
+fn h3_validation_tokens(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    return e.validationTokens();
+}
+
 fn h3_peer_settings(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const e = h3(@ptrCast(self_obj.?)) orelse return null;
     return e.peerSettings();
@@ -1653,17 +2260,6 @@ fn h3_shutdown(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object
 fn h3_goaway_received(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const e = h3(@ptrCast(self_obj.?)) orelse return null;
     return e.goawayReceived();
-}
-
-fn h3_close(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
-    const e = h3(@ptrCast(self_obj.?)) orelse return null;
-    var code: c_ulonglong = @intFromEnum(core.h3.errors.ErrorCode.no_error);
-    var reason_ptr: [*c]const u8 = null;
-    var reason_len: c.Py_ssize_t = 0;
-    if (c.PyArg_ParseTuple(args, "|Ky#", &code, &reason_ptr, &reason_len) == 0) return null;
-    if (code > core.quic.varint.MAX) return py.raiseValue("error code exceeds the 62-bit QUIC range");
-    const reason: []const u8 = if (reason_ptr != null) reason_ptr[0..@intCast(reason_len)] else &.{};
-    return e.close(@intCast(code), reason);
 }
 
 // HTTP/2 connection-level send helpers --------------------------------------
@@ -1749,18 +2345,28 @@ var h2_getset = [_]c.PyGetSetDef{
 // data_to_send. `now` is the integrator's monotonic clock, in the same unit it later
 // feeds handle_timeout; a Stream send uses the most recent `now` the caller gave.
 var h3_methods = [_]py.MethodDef{
-    .{ .ml_name = "receive_datagram", .ml_meth = receive_datagram, .ml_flags = c.METH_VARARGS, .ml_doc = "Feed one received UDP datagram: receive_datagram(datagram, now=0)." },
+    .{ .ml_name = "receive_datagram", .ml_meth = receive_datagram, .ml_flags = c.METH_VARARGS, .ml_doc = "Feed one received UDP datagram: receive_datagram(datagram, now=0, peer_address=None). peer_address is an optional opaque bytes key for QUIC path validation and migration." },
+    .{ .ml_name = "data_to_send_with_addresses", .ml_meth = h3_data_to_send_with_addresses, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams as (datagram, peer_address) pairs. peer_address is None when no address key is known." },
+    .{ .ml_name = "challenge_path", .ml_meth = h3_challenge_path, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC PATH_CHALLENGE for a peer address: challenge_path(peer_address, data). data must be 8 unpredictable bytes. Drain with data_to_send_with_addresses." },
+    .{ .ml_name = "use_peer_connection_id", .ml_meth = h3_use_peer_connection_id, .ml_flags = c.METH_O, .ml_doc = "Switch future QUIC packets to a peer-issued NEW_CONNECTION_ID sequence: use_peer_connection_id(sequence_number)." },
+    .{ .ml_name = "issue_connection_id", .ml_meth = h3_issue_connection_id, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC NEW_CONNECTION_ID for a local CID: issue_connection_id(sequence_number, connection_id, stateless_reset_token, retire_prior_to=0). Drain with data_to_send." },
+    .{ .ml_name = "request_key_update", .ml_meth = h3_request_key_update, .ml_flags = c.METH_NOARGS, .ml_doc = "Advance QUIC 1-RTT send keys. The next application packet carries the new key phase." },
+    .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
     .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id (the request's stream_id). The handle is the stream-scoped send surface: send_response / send_data / end_message." },
-    .{ .ml_name = "next_timeout", .ml_meth = h3_next_timeout, .ml_flags = c.METH_NOARGS, .ml_doc = "The next loss/PTO deadline (same clock as now), or None if no timer is armed." },
-    .{ .ml_name = "handle_timeout", .ml_meth = h3_handle_timeout, .ml_flags = c.METH_O, .ml_doc = "Fire the timer at time now: handle_timeout(now). Re-queues probes; drain them with data_to_send." },
+    .{ .ml_name = "next_timeout", .ml_meth = h3_next_timeout, .ml_flags = c.METH_NOARGS, .ml_doc = "The next idle/loss/PTO deadline (same clock as now), or None if no timer is armed." },
+    .{ .ml_name = "handle_timeout", .ml_meth = h3_handle_timeout, .ml_flags = c.METH_O, .ml_doc = "Fire the timer at time now: handle_timeout(now). Closes on idle timeout or re-queues probes; drain them with data_to_send." },
     .{ .ml_name = "initiate_connection", .ml_meth = h3_initiate, .ml_flags = c.METH_NOARGS, .ml_doc = "Open the control stream and send SETTINGS now (RFC 9114 6.2.1), rather than lazily on the first response. Idempotent. Drain it with data_to_send." },
     .{ .ml_name = "is_closed", .ml_meth = h3_is_closed, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection has been closed (a peer CONNECTION_CLOSE, or the idle timeout fired)." },
     .{ .ml_name = "idle_timed_out", .ml_meth = h3_idle_timed_out, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection was silently closed by the idle timeout (RFC 9000 10.1), as opposed to a CONNECTION_CLOSE." },
+    .{ .ml_name = "send_session_ticket", .ml_meth = h3_send_session_ticket, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a TLS NewSessionTicket on a confirmed HTTP/3 server connection and return its PSK when available: send_session_ticket(ticket, lifetime=0, age_add=0, nonce=b'', extensions=b'', max_early_data_size=None). Drain it with data_to_send." },
+    .{ .ml_name = "send_new_token", .ml_meth = h3_send_new_token, .ml_flags = c.METH_O, .ml_doc = "Queue a QUIC NEW_TOKEN address-validation token from a confirmed HTTP/3 server connection. Drain it with data_to_send." },
+    .{ .ml_name = "session_tickets", .ml_meth = h3_session_tickets, .ml_flags = c.METH_NOARGS, .ml_doc = "Return received TLS session tickets as (lifetime, age_add, nonce, ticket, extensions, max_early_data_size, psk) tuples." },
+    .{ .ml_name = "validation_tokens", .ml_meth = h3_validation_tokens, .ml_flags = c.METH_NOARGS, .ml_doc = "Return NEW_TOKEN address-validation tokens received from the peer for use as validation_token on a future HTTP/3 client connection." },
+    .{ .ml_name = "close", .ml_meth = @ptrCast(&h3_close), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Send a QUIC CONNECTION_CLOSE: close(app=True, error_code=0, reason=b''). app=True sends an HTTP/3 application close once 1-RTT keys exist; app=False sends a transport close. Drain it with data_to_send." },
     .{ .ml_name = "close_info", .ml_meth = h3_close_info, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's CONNECTION_CLOSE as (error_code, reason, is_application), or None if the peer has not closed." },
     .{ .ml_name = "peer_settings", .ml_meth = h3_peer_settings, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's HTTP/3 SETTINGS as a dict (max_field_section_size, qpack_max_table_capacity, qpack_blocked_streams), or None until its SETTINGS frame has been received." },
-    .{ .ml_name = "shutdown", .ml_meth = h3_shutdown, .ml_flags = c.METH_O, .ml_doc = "Begin a graceful shutdown: send a GOAWAY announcing stream_id as the first request stream not processed (RFC 9114 5.2). A later GOAWAY may only lower the id. Drain it with data_to_send." },
+    .{ .ml_name = "shutdown", .ml_meth = h3_shutdown, .ml_flags = c.METH_O, .ml_doc = "Begin a graceful shutdown: send a GOAWAY. Servers announce the first request stream not processed; clients announce the first push ID not accepted (RFC 9114 5.2). A later GOAWAY may only lower the id. Drain it with data_to_send." },
     .{ .ml_name = "goaway_received", .ml_meth = h3_goaway_received, .ml_flags = c.METH_NOARGS, .ml_doc = "The id of a GOAWAY received from the peer (RFC 9114 5.2), or None - the peer is shutting down and will not process streams at or above this id." },
-    .{ .ml_name = "close", .ml_meth = h3_close, .ml_flags = c.METH_VARARGS, .ml_doc = "Send an application CONNECTION_CLOSE: close(error_code=H3_NO_ERROR, reason=b\"\"). Drain it with data_to_send." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

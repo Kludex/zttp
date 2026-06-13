@@ -78,6 +78,13 @@ pub const Controller = struct {
         self.enterRecovery(largest_lost);
     }
 
+    /// ECN-CE feedback is a congestion signal like loss (RFC 9002 7.3). ACK
+    /// processing has already removed newly-acked bytes from flight, so this only
+    /// enters recovery and reduces the window.
+    pub fn onEcnCe(self: *Controller, largest_acked: u64) void {
+        self.enterRecovery(largest_acked);
+    }
+
     /// A persistent-congestion event (RFC 9002 7.6) collapses the window to the
     /// minimum - the network looks severely congested.
     pub fn onPersistentCongestion(self: *Controller) void {
@@ -115,6 +122,15 @@ test "loss halves the window and enters recovery" {
     cc.onSent(1200);
     cc.onLost(0, 1200);
     try std.testing.expectEqual(@as(u64, 6000), cc.congestion_window); // 12000/2
+    try std.testing.expect(cc.recovery_start != null);
+}
+
+test "ECN-CE halves the window without changing bytes in flight" {
+    var cc = Controller.init(1200);
+    cc.onSent(1200);
+    cc.onEcnCe(0);
+    try std.testing.expectEqual(@as(u64, 1200), cc.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 6000), cc.congestion_window);
     try std.testing.expect(cc.recovery_start != null);
 }
 

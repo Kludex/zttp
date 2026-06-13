@@ -16,6 +16,7 @@ pub const wire = @import("wire.zig");
 pub const extension = @import("extension.zig");
 pub const handshake = @import("handshake.zig");
 pub const client_hello = @import("client_hello.zig");
+pub const client = @import("client.zig");
 pub const flight = @import("flight.zig");
 pub const server = @import("server.zig");
 
@@ -29,6 +30,7 @@ test {
     _ = extension;
     _ = handshake;
     _ = client_hello;
+    _ = client;
     _ = flight;
     _ = server;
 }
