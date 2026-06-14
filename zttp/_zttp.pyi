@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Final, Literal, overload
 
-SERVER: Final[int]
-CLIENT: Final[int]
+SERVER: Final = 1
+CLIENT: Final = 2
 # Literal-typed so Connection(role, HTTP2) selects the H2Connection __new__ overload.
 HTTP1: Final = 1
 HTTP2: Final = 2
@@ -105,11 +105,11 @@ class Connection:
         role: Literal[1],
         protocol: Literal[3],
         *,
-        certificate: bytes,
-        private_key: bytes,
-        transport_params: bytes,
-        random: bytes,
-        ephemeral_seed: bytes,
+        certificate: bytes | None = ...,
+        private_key: bytes | None = ...,
+        transport_params: bytes | None = ...,
+        random: bytes | None = ...,
+        ephemeral_seed: bytes | None = ...,
         alpn: bytes | None = ...,
         resumption_identity: bytes | None = ...,
         resumption_psk: bytes | None = ...,
@@ -120,10 +120,10 @@ class Connection:
         role: Literal[2],
         protocol: Literal[3],
         *,
-        transport_params: bytes,
-        random: bytes,
-        ephemeral_seed: bytes,
-        connection_id: bytes,
+        transport_params: bytes | None = ...,
+        random: bytes | None = ...,
+        ephemeral_seed: bytes | None = ...,
+        connection_id: bytes | None = ...,
         alpn: bytes | None = ...,
         server_name: bytes | None = ...,
         resumption_identity: bytes | None = ...,

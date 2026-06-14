@@ -32,8 +32,76 @@ const HTTP1: c_long = 1;
 const HTTP2: c_long = 2;
 const HTTP3: c_long = 3;
 const MAX_SERVER_TICKET_STORE: usize = 64;
+const DEFAULT_SERVER_TRANSPORT_PARAMS = [_]u8{
+    0x04, 0x04, 0x80, 0x10, 0x00, 0x00, // initial_max_data = 1048576
+    0x08, 0x01, 0x08, // initial_max_streams_bidi = 8
+    0x09, 0x01, 0x08, // initial_max_streams_uni = 8
+    0x06, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_bidi_remote = 262144
+    0x07, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_uni = 262144
+};
+const DEFAULT_CLIENT_TRANSPORT_PARAMS = [_]u8{
+    0x04, 0x04, 0x80, 0x01, 0x00, 0x00, // initial_max_data = 65536
+    0x05, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_bidi_local = 262144
+    0x06, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_bidi_remote = 262144
+    0x07, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_uni = 262144
+    0x08, 0x01, 0x10, // initial_max_streams_bidi = 16
+    0x09, 0x01, 0x10, // initial_max_streams_uni = 16
+};
+const DEFAULT_SERVER_PRIVATE_KEY = [_]u8{0x42} ** 32;
+const DEFAULT_SERVER_CERTIFICATE = [_]u8{
+    0x30, 0x82, 0x01, 0x2e, 0x30, 0x81, 0xd5, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01, 0x30,
+    0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02, 0x30, 0x14, 0x31, 0x12, 0x30,
+    0x10, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x09, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x68, 0x6f, 0x73,
+    0x74, 0x30, 0x1e, 0x17, 0x0d, 0x32, 0x35, 0x31, 0x32, 0x33, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30,
+    0x30, 0x5a, 0x17, 0x0d, 0x33, 0x35, 0x31, 0x32, 0x33, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+    0x5a, 0x30, 0x14, 0x31, 0x12, 0x30, 0x10, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x09, 0x6c, 0x6f,
+    0x63, 0x61, 0x6c, 0x68, 0x6f, 0x73, 0x74, 0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48,
+    0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42,
+    0x00, 0x04, 0x2c, 0xa0, 0x0e, 0x33, 0x92, 0x8e, 0x5b, 0x66, 0xcc, 0x63, 0xa7, 0x0e, 0x91, 0xc7,
+    0x8f, 0x5d, 0x9e, 0x0d, 0xb3, 0x47, 0x11, 0xf9, 0x10, 0x87, 0x78, 0x15, 0x19, 0x12, 0xd3, 0x89,
+    0xc5, 0x89, 0xc6, 0xc8, 0x86, 0x57, 0x2f, 0xd6, 0xda, 0xd9, 0xd0, 0x1e, 0x0b, 0x98, 0xc5, 0xfe,
+    0xc3, 0x27, 0x6e, 0x9a, 0x2e, 0x4b, 0x89, 0x70, 0x51, 0x40, 0xf5, 0x64, 0xf7, 0xeb, 0x65, 0x01,
+    0x6b, 0x95, 0xa3, 0x18, 0x30, 0x16, 0x30, 0x14, 0x06, 0x03, 0x55, 0x1d, 0x11, 0x04, 0x0d, 0x30,
+    0x0b, 0x82, 0x09, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x68, 0x6f, 0x73, 0x74, 0x30, 0x0a, 0x06, 0x08,
+    0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02, 0x03, 0x48, 0x00, 0x30, 0x45, 0x02, 0x20, 0x3f,
+    0x6e, 0x22, 0x2b, 0x56, 0x80, 0x4b, 0x79, 0x42, 0xca, 0x68, 0xec, 0x24, 0x5d, 0x21, 0xa4, 0xc5,
+    0xb7, 0x24, 0x0f, 0x97, 0x0b, 0xfc, 0x7c, 0x80, 0x1a, 0xa7, 0xac, 0x81, 0xd4, 0xa1, 0xaf, 0x02,
+    0x21, 0x00, 0xaf, 0xac, 0xf5, 0xdb, 0x8e, 0xf4, 0xcf, 0x4a, 0x99, 0x13, 0xea, 0xa9, 0x0f, 0xb9,
+    0x00, 0x2b, 0x6e, 0x93, 0x3c, 0xc6, 0x5d, 0x1c, 0x09, 0xf0, 0xd0, 0x60, 0xea, 0xd4, 0xbe, 0x86,
+    0x1e, 0x31,
+};
 
 var server_ticket_store: std.ArrayListUnmanaged(ResumptionCredential) = .empty;
+
+fn randomBytes(comptime len: usize) ?[len]u8 {
+    var out: [len]u8 = undefined;
+    const os = c.PyImport_ImportModule("os") orelse return null;
+    defer py.decref(os);
+    const bytes_obj = c.PyObject_CallMethod(os, "urandom", "n", @as(c.Py_ssize_t, @intCast(len))) orelse return null;
+    defer py.decref(bytes_obj);
+    const src = py.asBytes(bytes_obj) orelse return null;
+    if (src.len != len) {
+        _ = py.raiseRuntime("os.urandom returned an unexpected number of bytes");
+        return null;
+    }
+    @memcpy(out[0..], src);
+    return out;
+}
+
+fn optionalBytes(obj: ?*c.PyObject, default: []const u8) ?[]const u8 {
+    if (obj == null or py.isNone(obj)) return default;
+    return py.asBytes(obj);
+}
+
+fn optionalBytes32(obj: ?*c.PyObject, msg: [*c]const u8) ?[32]u8 {
+    if (obj == null or py.isNone(obj)) return randomBytes(32) orelse return null;
+    const src = py.asBytes(obj) orelse return null;
+    if (src.len != 32) {
+        _ = py.raiseValue(msg);
+        return null;
+    }
+    return src[0..32].*;
+}
 
 fn rememberServerTicket(identity: []const u8, psk: [32]u8, lifetime: u32, age_add: u32, issued_at_ms: u64, max_early_data_size: ?u32) !void {
     if (lifetime == 0) return;
@@ -373,12 +441,12 @@ const H2Engine = struct {
     }
 };
 
-/// The server TLS material the QUIC handshake needs but the sans-IO core cannot
-/// invent: the certificate, signing key, transport parameters, selected ALPN, and
-/// the per-connection entropy (ServerHello random + ephemeral seed). The integrator
-/// supplies it at construction; the bytes are copied so they outlive the Python
-/// args. `signer` is derived from the 32-byte key seed once, up front, so a bad key
-/// is rejected at construction rather than on the first datagram.
+/// The server TLS material the QUIC handshake needs: certificate, signing key,
+/// transport parameters, selected ALPN, and per-connection entropy. zttp supplies
+/// defaults for the simple `Connection(SERVER, protocol=HTTP3)` case, while callers
+/// can still override them for custom credentials, interop, and deterministic tests.
+/// The bytes are copied so they outlive the Python args. `signer` is derived from
+/// the 32-byte key seed once, up front, so a bad key is rejected at construction.
 const ServerConfig = struct {
     cert: []u8,
     transport_params: []u8,
@@ -1332,15 +1400,15 @@ fn new_h2(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     return allocAndBuild(tp, role, HTTP2);
 }
 
-// H3Connection(role, protocol=HTTP3, *, certificate, private_key, transport_params,
-// random, ephemeral_seed, alpn=None, connection_id=None, server_name=None,
-// resumption_identity=None, resumption_psk=None, obfuscated_ticket_age=0,
-// early_data=False, remembered_transport_params=None, validation_token=None).
+// H3Connection(role, protocol=HTTP3, *, certificate=None, private_key=None,
+// transport_params=None, random=None, ephemeral_seed=None, alpn=None,
+// connection_id=None, server_name=None, resumption_identity=None,
+// resumption_psk=None, obfuscated_ticket_age=0, early_data=False,
+// remembered_transport_params=None, validation_token=None).
 // role and protocol stay
 // positional-or-keyword so the Connection(SERVER, HTTP3, ...) factory form works.
-// Server credentials are mandatory only for SERVER. A CLIENT supplies deterministic
-// ClientHello entropy plus the connection id it will use as the first destination
-// connection id.
+// The advanced QUIC/TLS fields are optional overrides; normal callers only choose
+// the role/protocol and any application-level values such as server_name.
 fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
     var role_val: c_long = 0;
     var protocol_val: c_long = HTTP3;
@@ -1376,9 +1444,11 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     self.engine = null;
     const engine: *Engine = @ptrCast(@alignCast(&self.engine_storage));
     if (role_val == SERVER) {
-        if (cert_obj == null or key_obj == null or tp_obj == null or random_obj == null or ephemeral_obj == null) {
+        if ((cert_obj != null and !py.isNone(cert_obj) and (key_obj == null or py.isNone(key_obj))) or
+            (key_obj != null and !py.isNone(key_obj) and (cert_obj == null or py.isNone(cert_obj))))
+        {
             py.decref(obj);
-            return py.raiseType("HTTP/3 server requires certificate, private_key, transport_params, random, ephemeral_seed");
+            return py.raiseType("HTTP/3 server custom credentials require both certificate and private_key");
         }
         if (obfuscated_ticket_age_obj != null and !py.isNone(obfuscated_ticket_age_obj)) {
             py.decref(obj);
@@ -1436,27 +1506,16 @@ fn buildClientH3(
     remembered_tp_obj: ?*c.PyObject,
     validation_token_obj: ?*c.PyObject,
 ) ?H3Engine {
-    if (tp_obj == null or random_obj == null or ephemeral_obj == null or cid_obj == null) {
-        _ = py.raiseType("HTTP/3 client requires transport_params, random, ephemeral_seed, connection_id");
-        return null;
-    }
-    const tp_src = py.asBytes(tp_obj) orelse return null;
-    const random_src = py.asBytes(random_obj) orelse return null;
-    const ephemeral_src = py.asBytes(ephemeral_obj) orelse return null;
-    const cid = py.asBytes(cid_obj) orelse return null;
-    if (random_src.len != 32) {
-        _ = py.raiseValue("random must be exactly 32 bytes");
-        return null;
-    }
-    if (ephemeral_src.len != 32) {
-        _ = py.raiseValue("ephemeral_seed must be exactly 32 bytes");
-        return null;
-    }
+    const tp_src = optionalBytes(tp_obj, &DEFAULT_CLIENT_TRANSPORT_PARAMS) orelse return null;
+    const random = optionalBytes32(random_obj, "random must be exactly 32 bytes") orelse return null;
+    const ephemeral_seed = optionalBytes32(ephemeral_obj, "ephemeral_seed must be exactly 32 bytes") orelse return null;
+    const default_cid = randomBytes(8) orelse return null;
+    const cid = optionalBytes(cid_obj, &default_cid) orelse return null;
     if (cid.len == 0 or cid.len > core.quic.constants.MAX_CID_LEN) {
         _ = py.raiseValue("connection_id must be 1..20 bytes");
         return null;
     }
-    const alpn = if (alpn_obj != null and !py.isNone(alpn_obj)) py.asBytes(alpn_obj) orelse return null else null;
+    const alpn = if (alpn_obj != null and !py.isNone(alpn_obj)) py.asBytes(alpn_obj) orelse return null else "h3";
     const server_name = if (sni_obj != null and !py.isNone(sni_obj)) py.asBytes(sni_obj) orelse return null else null;
     const validation_token = if (validation_token_obj != null and !py.isNone(validation_token_obj)) blk: {
         const token = py.asBytes(validation_token_obj) orelse return null;
@@ -1473,8 +1532,8 @@ fn buildClientH3(
         return null;
     };
     q.* = QuicConnection.initClient(gpa, cid, .{
-        .random = random_src[0..32].*,
-        .ephemeral_seed = ephemeral_src[0..32].*,
+        .random = random,
+        .ephemeral_seed = ephemeral_seed,
         .transport_params = tp_src,
         .alpn = alpn,
         .server_name = server_name,
@@ -1526,21 +1585,13 @@ fn buildServerConfig(
     resumption_identity_obj: ?*c.PyObject,
     resumption_psk_obj: ?*c.PyObject,
 ) ?ServerConfig {
-    const cert_src = py.asBytes(cert_obj) orelse return null;
-    const key_src = py.asBytes(key_obj) orelse return null;
-    const tp_src = py.asBytes(tp_obj) orelse return null;
-    const random_src = py.asBytes(random_obj) orelse return null;
-    const ephemeral_src = py.asBytes(ephemeral_obj) orelse return null;
+    const cert_src = optionalBytes(cert_obj, &DEFAULT_SERVER_CERTIFICATE) orelse return null;
+    const key_src = optionalBytes(key_obj, &DEFAULT_SERVER_PRIVATE_KEY) orelse return null;
+    const tp_src = optionalBytes(tp_obj, &DEFAULT_SERVER_TRANSPORT_PARAMS) orelse return null;
+    const random = optionalBytes32(random_obj, "random must be exactly 32 bytes") orelse return null;
+    const ephemeral_seed = optionalBytes32(ephemeral_obj, "ephemeral_seed must be exactly 32 bytes") orelse return null;
     if (key_src.len != 32) {
         _ = py.raiseValue("private_key must be 32 bytes (the signing key seed)");
-        return null;
-    }
-    if (random_src.len != 32) {
-        _ = py.raiseValue("random must be 32 bytes (the ServerHello random)");
-        return null;
-    }
-    if (ephemeral_src.len != 32) {
-        _ = py.raiseValue("ephemeral_seed must be 32 bytes");
         return null;
     }
     const signer = Signer.fromSeed(key_src[0..32].*) catch {
@@ -1595,8 +1646,8 @@ fn buildServerConfig(
         .resumption_identity = resumption_identity,
         .resumption_psk = resumption_psk,
         .signer = signer,
-        .random = random_src[0..32].*,
-        .ephemeral_seed = ephemeral_src[0..32].*,
+        .random = random,
+        .ephemeral_seed = ephemeral_seed,
     };
 }
 

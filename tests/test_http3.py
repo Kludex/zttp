@@ -138,11 +138,30 @@ def test_http3_validation_token_is_client_only() -> None:
         zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **SERVER_CONFIG, validation_token=b"token")
 
 
-def test_http3_client_requires_connection_id() -> None:
-    config = dict(CLIENT_CONFIG)
-    config.pop("connection_id")
-    with pytest.raises(TypeError):
-        zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
+def test_http3_client_defaults_transport_settings_and_connection_id() -> None:
+    conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
+    datagrams = conn.data_to_send()
+    assert len(datagrams) == 1
+    assert len(datagrams[0]) >= 1200
+
+
+def test_http3_default_client_and_server_exchange_request() -> None:
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+
+    assert transfer(client, server, 1000)
+    assert transfer(server, client, 2000)
+    assert transfer(client, server, 3000)
+
+    stream = client.send_request(b"GET", b"/default", b"3", [(b"host", b"example.test")])
+    stream.end_message()
+    assert transfer(client, server, 4000)
+
+    events = drain_events(server)
+    req = next(e for e in events if isinstance(e, zttp.Request))
+    assert req.method == b"GET"
+    assert req.path == b"/default"
+    assert any(isinstance(e, zttp.EndOfMessage) for e in events)
 
 
 def test_http3_client_server_request_response() -> None:
@@ -677,9 +696,16 @@ def test_http3_send_window_and_pending_bytes_are_none_for_unknown_stream() -> No
     assert handle.pending_bytes is None
 
 
-def test_http3_requires_server_config() -> None:
+def test_http3_server_defaults_transport_settings_and_credentials() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+    assert type(conn) is zttp.H3Connection
+
+
+def test_http3_server_custom_credentials_must_be_a_pair() -> None:
     with pytest.raises(TypeError):
-        zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+        zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, certificate=b"\xcc" * 48)
+    with pytest.raises(TypeError):
+        zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, private_key=b"\x42" * 32)
 
 
 def test_http3_rejects_a_wrong_size_key() -> None:
@@ -719,9 +745,9 @@ def test_first_datagram_must_be_an_initial() -> None:
 
 
 def test_a_non_conformant_client_hello_is_rejected() -> None:
-    # No ALPN - the server requires HTTP/3 clients to negotiate "h3".
+    # Wrong ALPN - the server requires HTTP/3 clients to negotiate "h3".
     config = dict(CLIENT_CONFIG)
-    config.pop("alpn")
+    config["alpn"] = b"http/1.1"
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
     conn = make_server()
     with pytest.raises(zttp.RemoteProtocolError):

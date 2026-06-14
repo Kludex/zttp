@@ -11,11 +11,20 @@ of feeding a byte stream you feed whole datagrams:
 ```python
 import zttp
 
-conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+client = zttp.Connection(
+    zttp.CLIENT,
+    protocol=zttp.HTTP3,
+    server_name=b"example.com",
+)
 ```
 
 As with HTTP/2, the `protocol` argument picks the subtype, so construction
 returns an `H3Connection` and the surface you get matches the wire you chose.
+zttp provides the QUIC transport defaults internally; constructor fields such as
+transport parameters, connection IDs, and handshake entropy are advanced
+overrides for deterministic tests and interoperability work, not the normal user
+API.
 
 !!! warning "Scope"
     HTTP/3 support is still experimental. The public surface is intentionally

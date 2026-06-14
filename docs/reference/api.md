@@ -38,6 +38,11 @@ A `Connection`'s role and protocol are fixed at construction:
 - `zttp.HTTP3`: the same streams over QUIC; you feed UDP datagrams with
   `receive_datagram` (see [HTTP/3](../usage/http3.md)).
 
+For HTTP/3, zttp supplies QUIC transport defaults internally. Optional
+constructor fields such as `transport_params`, `connection_id`, `random`, and
+`ephemeral_seed` are advanced overrides for deterministic tests and
+interoperability work.
+
 ## Events
 
 [`next_event`](#zttp.Connection.next_event) returns one of these. On HTTP/2 and

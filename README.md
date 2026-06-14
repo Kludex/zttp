@@ -50,6 +50,11 @@ import zttp
 h1 = zttp.Connection(zttp.SERVER)                       # HTTP/1.1
 h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)  # HTTP/2
 h3 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)  # HTTP/3
+client = zttp.Connection(
+    zttp.CLIENT,
+    protocol=zttp.HTTP3,
+    server_name=b"example.com",
+)
 ```
 
 On **HTTP/2**, one connection multiplexes many requests, so the `Request` /
@@ -69,9 +74,9 @@ h2.data_to_send()  # the HTTP/2 frames to put on the wire
 On **HTTP/3**, the wire is UDP, so you feed whole datagrams with
 `receive_datagram` and pull the same events. The QUIC transport underneath
 (packet protection, loss recovery, congestion control, stream reassembly) is
-written from scratch in the Zig core. HTTP/3 uses the same stream-scoped send
-surface as HTTP/2, with `Stream` handles for responses, body data, trailers, and
-per-stream cancellation.
+written from scratch in the Zig core, with transport defaults supplied by zttp.
+HTTP/3 uses the same stream-scoped send surface as HTTP/2, with `Stream` handles
+for responses, body data, trailers, and per-stream cancellation.
 
 ```python
 h3.receive_datagram(datagram)
