@@ -9,7 +9,7 @@ import pytest
 pytestmark = pytest.mark.http3_interop
 
 
-def run_interop_smoke(backend: str) -> None:
+def run_interop_smoke(backend: str) -> None:  # pragma: no cover
     script = Path(__file__).resolve().parents[1] / "scripts" / "interop_aioquic.py"
     spec = importlib.util.spec_from_file_location(f"zttp_interop_{backend}", script)
     assert spec is not None
@@ -27,13 +27,13 @@ def run_interop_smoke(backend: str) -> None:
             os.environ["ZTTP_INTEROP_BACKEND"] = old_backend
 
 
-def test_aioquic_interop_smoke() -> None:
+def test_aioquic_interop_smoke() -> None:  # pragma: no cover
     pytest.importorskip("aioquic")
 
     run_interop_smoke("aioquic")
 
 
-def test_qh3_interop_smoke() -> None:
+def test_qh3_interop_smoke() -> None:  # pragma: no cover
     pytest.importorskip("cryptography")
     pytest.importorskip("qh3")
 

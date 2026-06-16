@@ -132,7 +132,7 @@ markers = [
 source_pkgs = ["zttp", "tests"]
 branch = true
 parallel = true
-omit = ["zttp/_zttp*", "tests/test_http3_interop.py"]
+omit = ["zttp/_zttp*"]
 
 [tool.coverage.report]
 precision = 2

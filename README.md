@@ -50,11 +50,6 @@ import zttp
 h1 = zttp.Connection(zttp.SERVER)                       # HTTP/1.1
 h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)  # HTTP/2
 h3 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)  # HTTP/3
-client = zttp.Connection(
-    zttp.CLIENT,
-    protocol=zttp.HTTP3,
-    server_name=b"example.com",
-)
 ```
 
 HTTP/3 support is experimental. The convenience server constructor creates an
