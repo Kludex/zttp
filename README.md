@@ -57,6 +57,9 @@ client = zttp.Connection(
 )
 ```
 
+HTTP/3 support is experimental. The convenience server constructor creates an
+ephemeral TLS identity for local use; it is not production server identity yet.
+
 On **HTTP/2**, one connection multiplexes many requests, so the `Request` /
 `Response` / `Data` / `EndOfMessage` events carry a `stream_id` and you send on
 a `Stream` handle (connection-level control events like `Settings` and `Ping`

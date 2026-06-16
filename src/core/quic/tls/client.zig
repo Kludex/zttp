@@ -152,9 +152,8 @@ pub const Client = struct {
 
         const th_for_cv = self.transcript.hash();
         const cv = parseCertificateVerify(scanned.cv.body) catch return error.BadServerHello;
-        if (cert.len == sign.PUBLIC_SEC1_LEN) {
-            sign.verify(cert, th_for_cv, cv) catch return error.BadServerHello;
-        }
+        const public_sec1 = sign.certificatePublicKeySec1(cert) catch return error.BadServerHello;
+        sign.verify(public_sec1, th_for_cv, cv) catch return error.BadServerHello;
         self.transcript.update(scanned.cv.raw);
 
         const th_for_finished = self.transcript.hash();

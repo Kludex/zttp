@@ -55,6 +55,61 @@ pub fn verify(public_sec1: []const u8, transcript_hash: [transcript.LEN]u8, der_
     try sig.verify(&content(transcript_hash), pk);
 }
 
+/// Extract the P-256 SEC1 public key from the Certificate message's first
+/// certificate. zttp's test/raw-public-key form is already SEC1; X.509 DER is
+/// accepted when it carries an id-ecPublicKey prime256v1 SubjectPublicKeyInfo.
+pub fn certificatePublicKeySec1(cert: []const u8) ![]const u8 {
+    if (cert.len == PUBLIC_SEC1_LEN) {
+        _ = try Ecdsa.PublicKey.fromSec1(cert);
+        return cert;
+    }
+
+    const ec_p256_algorithm = [_]u8{
+        0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // id-ecPublicKey
+        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // prime256v1
+    };
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, cert, search_from, &ec_p256_algorithm)) |alg_pos| {
+        var pos = alg_pos + ec_p256_algorithm.len;
+        if (pos >= cert.len or cert[pos] != 0x03) {
+            search_from = alg_pos + 1;
+            continue;
+        }
+        pos += 1;
+        const bit_string_len = derLength(cert, &pos) catch {
+            search_from = alg_pos + 1;
+            continue;
+        };
+        if (bit_string_len == PUBLIC_SEC1_LEN + 1 and
+            pos + bit_string_len <= cert.len and
+            cert[pos] == 0x00 and
+            cert[pos + 1] == 0x04)
+        {
+            const public_sec1 = cert[pos + 1 .. pos + 1 + PUBLIC_SEC1_LEN];
+            _ = try Ecdsa.PublicKey.fromSec1(public_sec1);
+            return public_sec1;
+        }
+        search_from = alg_pos + 1;
+    }
+    return error.UnsupportedCertificate;
+}
+
+fn derLength(buf: []const u8, pos: *usize) !usize {
+    if (pos.* >= buf.len) return error.InvalidDer;
+    const first = buf[pos.*];
+    pos.* += 1;
+    if ((first & 0x80) == 0) return first;
+
+    const n = first & 0x7f;
+    if (n == 0 or n > @sizeOf(usize) or pos.* + n > buf.len) return error.InvalidDer;
+    var len: usize = 0;
+    for (buf[pos.* .. pos.* + n]) |b| {
+        len = (len << 8) | b;
+    }
+    pos.* += n;
+    return len;
+}
+
 /// The signed octet string (RFC 8446 4.4.3): the context prefix then the hash.
 fn content(transcript_hash: [transcript.LEN]u8) [SERVER_CONTEXT.len + transcript.LEN]u8 {
     var out: [SERVER_CONTEXT.len + transcript.LEN]u8 = undefined;
@@ -71,6 +126,24 @@ test "CertificateVerify round-trips through the client's verify" {
     var buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
     const der = try signer.sign(th, &buf);
     try verify(&signer.publicKeySec1(), th, der);
+}
+
+test "certificatePublicKeySec1 extracts a P-256 key from DER SubjectPublicKeyInfo" {
+    const signer = try Signer.fromSeed([_]u8{0x42} ** 32);
+    const public_key = signer.publicKeySec1();
+    const prefix = [_]u8{
+        0x30, 0x59, // SubjectPublicKeyInfo SEQUENCE
+        0x30, 0x13, // AlgorithmIdentifier SEQUENCE
+        0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // id-ecPublicKey
+        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // prime256v1
+        0x03, 0x42, 0x00, // subjectPublicKey BIT STRING, no unused bits
+    };
+    var der: [prefix.len + PUBLIC_SEC1_LEN]u8 = undefined;
+    @memcpy(der[0..prefix.len], &prefix);
+    @memcpy(der[prefix.len..], &public_key);
+
+    try testing.expectEqualSlices(u8, &public_key, try certificatePublicKeySec1(&der));
+    try testing.expectError(error.UnsupportedCertificate, certificatePublicKeySec1(&[_]u8{0xcc} ** 48));
 }
 
 test "a tampered transcript hash fails verification" {

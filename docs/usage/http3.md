@@ -30,7 +30,9 @@ API.
     HTTP/3 support is still experimental. The public surface is intentionally
     the same event model as HTTP/1.1 and HTTP/2, but the transport underneath is
     new code: QUIC packet protection, loss recovery, flow control, connection
-    migration, TLS 1.3, and QPACK all live inside zttp's core.
+    migration, TLS 1.3, and QPACK all live inside zttp's core. The convenience
+    server constructor generates an ephemeral TLS identity for each connection;
+    it is suitable for local experiments, not for production server identity.
 
 ## How HTTP/3 works
 

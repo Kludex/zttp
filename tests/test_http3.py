@@ -8,8 +8,13 @@ import zttp
 # a fixed signing-key seed, ServerHello random, ephemeral seed, and a stub cert. Real
 # entropy would be per-connection; these are fixed so the captured client datagrams
 # below decrypt reproducibly.
+SERVER_PUBLIC_KEY = bytes.fromhex(
+    "04"
+    "2ca00e33928e5b66cc63a70e91c78f5d9e0db34711f9108778151912d389c5"
+    "89c6c886572fd6dad9d01e0b98c5fec3276e9a2e4b89705140f564f7eb65016b95"
+)
 SERVER_CONFIG = {
-    "certificate": b"\xcc" * 48,
+    "certificate": SERVER_PUBLIC_KEY,
     "private_key": b"\x42" * 32,
     "transport_params": (
         b"\x04\x04\x80\x10\x00\x00"  # initial_max_data = 1048576
@@ -162,6 +167,18 @@ def test_http3_default_client_and_server_exchange_request() -> None:
     assert req.method == b"GET"
     assert req.path == b"/default"
     assert any(isinstance(e, zttp.EndOfMessage) for e in events)
+
+
+def test_http3_client_rejects_unverifiable_server_certificate() -> None:
+    config = dict(SERVER_CONFIG)
+    config["certificate"] = b"\xcc" * 48
+    client = make_client()
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
+
+    transfer(client, server, 1000)
+    with pytest.raises(zttp.RemoteProtocolError):
+        for dgram in server.data_to_send():
+            client.receive_datagram(dgram, 2000)
 
 
 def test_http3_client_server_request_response() -> None:
