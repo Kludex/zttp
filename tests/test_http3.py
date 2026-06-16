@@ -176,9 +176,11 @@ def test_http3_client_rejects_unverifiable_server_certificate() -> None:
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
 
     transfer(client, server, 1000)
+    server_flight = server.data_to_send()
+    assert len(server_flight) >= 2
     with pytest.raises(zttp.RemoteProtocolError):
-        for dgram in server.data_to_send():
-            client.receive_datagram(dgram, 2000)
+        client.receive_datagram(server_flight[0], 2000)
+        client.receive_datagram(server_flight[1], 2000)
 
 
 def test_http3_client_server_request_response() -> None:
