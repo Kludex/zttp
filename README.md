@@ -52,6 +52,9 @@ h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)  # HTTP/2
 h3 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)  # HTTP/3
 ```
 
+HTTP/3 support is experimental. The convenience server constructor creates an
+ephemeral TLS identity for local use; it is not production server identity yet.
+
 On **HTTP/2**, one connection multiplexes many requests, so the `Request` /
 `Response` / `Data` / `EndOfMessage` events carry a `stream_id` and you send on
 a `Stream` handle (connection-level control events like `Settings` and `Ping`
@@ -69,9 +72,9 @@ h2.data_to_send()  # the HTTP/2 frames to put on the wire
 On **HTTP/3**, the wire is UDP, so you feed whole datagrams with
 `receive_datagram` and pull the same events. The QUIC transport underneath
 (packet protection, loss recovery, congestion control, stream reassembly) is
-written from scratch in the Zig core. The server read path is implemented end to
-end; the TLS 1.3 handshake driver, the write side, and the client read path are
-still in progress.
+written from scratch in the Zig core, with transport defaults supplied by zttp.
+HTTP/3 uses the same stream-scoped send surface as HTTP/2, with `Stream` handles
+for responses, body data, trailers, and per-stream cancellation.
 
 ```python
 h3.receive_datagram(datagram)

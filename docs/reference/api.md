@@ -22,8 +22,8 @@ send surface you get matches the protocol.
 
 ::: zttp.H3Connection
 
-A `Stream` is the per-stream send handle on an HTTP/2 connection; see
-[HTTP/2](../usage/http2.md).
+A `Stream` is the per-stream send handle on HTTP/2 and HTTP/3 connections; see
+[HTTP/2](../usage/http2.md) and [HTTP/3](../usage/http3.md).
 
 ::: zttp.Stream
 
@@ -37,6 +37,11 @@ A `Connection`'s role and protocol are fixed at construction:
 - `zttp.HTTP2`: multiplexed streams; you send on a `Stream`.
 - `zttp.HTTP3`: the same streams over QUIC; you feed UDP datagrams with
   `receive_datagram` (see [HTTP/3](../usage/http3.md)).
+
+For HTTP/3, zttp supplies QUIC transport defaults internally. Optional
+constructor fields such as `transport_params`, `connection_id`, `random`, and
+`ephemeral_seed` are advanced overrides for deterministic tests and
+interoperability work.
 
 ## Events
 

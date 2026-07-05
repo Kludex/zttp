@@ -3,7 +3,6 @@
 //! `decode` that maps a 2-byte type to its body decoder. Each body is parsed on a
 //! sub-Reader scoped to exactly its extension_data, and every known branch ends in
 //! `expectEnd`, so trailing bytes inside an extension are rejected, not smuggled.
-//! Adding PSK/0-RTT later is one enum value + one union variant + one switch arm.
 
 const std = @import("std");
 const wire = @import("wire.zig");
@@ -16,6 +15,9 @@ pub const ExtType = enum(u16) {
     supported_groups = 0x000a,
     signature_algorithms = 0x000d,
     alpn = 0x0010,
+    pre_shared_key = 0x0029,
+    early_data = 0x002a,
+    psk_key_exchange_modes = 0x002d,
     supported_versions = 0x002b,
     key_share = 0x0033,
     quic_transport_parameters = 0x0039,
@@ -32,6 +34,9 @@ pub const Extension = union(enum) {
     supported_groups: []const u8, // raw u16 NamedGroup list
     signature_algorithms: []const u8, // raw u16 SignatureScheme list
     alpn: []const u8, // raw ProtocolNameList body
+    pre_shared_key: []const u8, // raw OfferedPsks body
+    early_data, // empty ClientHello early_data extension
+    psk_key_exchange_modes: []const u8, // raw PskKeyExchangeMode list
     supported_versions: bool, // true iff TLS 1.3 (0x0304) is offered
     key_share: KeyShareEntry, // first x25519 entry, if any
     quic_transport_parameters: []const u8, // opaque, handed to the transport
@@ -53,6 +58,9 @@ pub fn decode(r: *wire.Reader) wire.Error!Decoded {
         .supported_groups => .{ .supported_groups = try u16List(&body) },
         .signature_algorithms => .{ .signature_algorithms = try u16List(&body) },
         .alpn => .{ .alpn = try decodeAlpn(&body) },
+        .pre_shared_key => .{ .pre_shared_key = try body.take(body.remaining()) },
+        .early_data => .early_data,
+        .psk_key_exchange_modes => .{ .psk_key_exchange_modes = try u8List(&body) },
         .supported_versions => .{ .supported_versions = try decodeSupportedVersions(&body) },
         .key_share => .{ .key_share = try decodeKeyShare(&body) },
         .quic_transport_parameters => .{ .quic_transport_parameters = try body.take(body.remaining()) },
@@ -60,6 +68,12 @@ pub fn decode(r: *wire.Reader) wire.Error!Decoded {
     };
     try body.expectEnd(); // trailing bytes inside a known extension are illegal
     return .{ .ext_type = raw, .ext = ext };
+}
+
+fn u8List(body: *wire.Reader) wire.Error![]const u8 {
+    const list = try body.vector(1);
+    if (list.buf.len == 0) return error.EncodingError;
+    return list.buf;
 }
 
 /// A u16-length-prefixed list of u16 values (NamedGroup / SignatureScheme). Returns

@@ -15,6 +15,7 @@ const TIME_THRESHOLD_NUM: u64 = 9; // 9/8 of max(srtt, latest_rtt)
 const TIME_THRESHOLD_DEN: u64 = 8;
 const GRANULARITY_US: u64 = 1000; // 1ms timer granularity
 const INITIAL_RTT_US: u64 = 333_000; // RFC 9002 6.2.2 default: 333ms
+const PERSISTENT_CONGESTION_THRESHOLD: u64 = 3; // RFC 9002 7.6
 
 /// One in-flight sent packet awaiting acknowledgement.
 pub const SentPacket = struct {
@@ -55,6 +56,15 @@ pub const RttEstimator = struct {
         return self.smoothed + @max(4 * self.rttvar, GRANULARITY_US);
     }
 };
+
+fn addSaturating(a: u64, b: u64) u64 {
+    return if (b > std.math.maxInt(u64) - a) std.math.maxInt(u64) else a + b;
+}
+
+fn mulSaturating(a: u64, b: u64) u64 {
+    if (a != 0 and b > std.math.maxInt(u64) / a) return std.math.maxInt(u64);
+    return a * b;
+}
 
 /// The result of folding in an ACK: which packets newly acked, and the loss the
 /// caller should report to congestion control. The connection layer uses
@@ -213,6 +223,7 @@ pub const Space = struct {
         rtt: *const RttEstimator,
         cc: *congestion.Controller,
         now: u64,
+        max_ack_delay: u64,
         lost_pns: *std.ArrayListUnmanaged(u64),
         gpa: std.mem.Allocator,
     ) !u64 {
@@ -220,6 +231,10 @@ pub const Space = struct {
         const threshold = @max(rtt.latest, rtt.smoothed) * TIME_THRESHOLD_NUM / TIME_THRESHOLD_DEN;
         self.loss_time = null;
         var lost: u64 = 0;
+        var lost_bytes: u64 = 0;
+        var largest_lost: ?u64 = null;
+        var persistent_start: ?u64 = null;
+        var persistent_end: ?u64 = null;
         var i: usize = 0;
         while (i < self.sent.items.len) {
             const p = self.sent.items[i];
@@ -231,7 +246,14 @@ pub const Space = struct {
             const by_time = now >= p.sent_time + threshold;
             if (by_packet or by_time) {
                 try lost_pns.append(gpa, p.pn); // record before mutating cc / removing
-                if (p.in_flight) cc.onLost(p.pn, p.size);
+                if (p.in_flight) {
+                    lost_bytes = addSaturating(lost_bytes, p.size);
+                    largest_lost = if (largest_lost) |pn| @max(pn, p.pn) else p.pn;
+                }
+                if (p.ack_eliciting and p.in_flight) {
+                    persistent_start = if (persistent_start) |s| @min(s, p.sent_time) else p.sent_time;
+                    persistent_end = if (persistent_end) |e| @max(e, p.sent_time) else p.sent_time;
+                }
                 lost += 1;
                 _ = self.sent.swapRemove(i);
             } else {
@@ -240,7 +262,22 @@ pub const Space = struct {
                 i += 1;
             }
         }
+        if (largest_lost) |pn| cc.onLost(pn, lost_bytes);
+        if (persistent_start) |start| {
+            const end = persistent_end.?;
+            const duration = mulSaturating(addSaturating(rtt.pto(), max_ack_delay), PERSISTENT_CONGESTION_THRESHOLD);
+            if (end >= start and end - start >= duration and self.allAckElicitingLostInPeriod(start, end)) {
+                cc.onPersistentCongestion();
+            }
+        }
         return lost;
+    }
+
+    fn allAckElicitingLostInPeriod(self: *const Space, start: u64, end: u64) bool {
+        for (self.sent.items) |p| {
+            if (p.ack_eliciting and p.sent_time >= start and p.sent_time <= end) return false;
+        }
+        return true;
     }
 
     pub fn hasAckEliciting(self: *const Space) bool {
@@ -352,7 +389,54 @@ test "packet threshold declares an old packet lost" {
     _ = try space.onAck(&rtt, &cc, 2000, 4, 0, 0, &ranges, &sink, gpa);
     var lost_pns: std.ArrayListUnmanaged(u64) = .empty;
     defer lost_pns.deinit(gpa);
-    const lost = try space.detectLost(&rtt, &cc, 2000, &lost_pns, gpa);
+    const lost = try space.detectLost(&rtt, &cc, 2000, 0, &lost_pns, gpa);
     try std.testing.expectEqual(@as(u64, 1), lost);
     try std.testing.expectEqual(@as(usize, 0), space.sent.items.len);
+}
+
+test "one loss detection pass cuts the congestion window once" {
+    const gpa = std.testing.allocator;
+    var space = Space{};
+    defer space.deinit(gpa);
+    var rtt = RttEstimator{};
+    rtt.update(50_000, 0);
+    var cc = congestion.Controller.init(1200);
+    cc.onSent(1200);
+    cc.onSent(1200);
+    try space.onSent(gpa, .{ .pn = 0, .sent_time = 1000, .size = 1200, .ack_eliciting = true, .in_flight = true });
+    try space.onSent(gpa, .{ .pn = 1, .sent_time = 1000, .size = 1200, .ack_eliciting = true, .in_flight = true });
+    space.largest_acked = 4;
+
+    var lost_pns: std.ArrayListUnmanaged(u64) = .empty;
+    defer lost_pns.deinit(gpa);
+    const lost = try space.detectLost(&rtt, &cc, 2000, 0, &lost_pns, gpa);
+
+    try std.testing.expectEqual(@as(u64, 2), lost);
+    try std.testing.expectEqual(@as(u64, 6000), cc.congestion_window);
+    try std.testing.expectEqual(@as(u64, 0), cc.bytes_in_flight);
+}
+
+test "loss over a persistent congestion period collapses the window" {
+    const gpa = std.testing.allocator;
+    var space = Space{};
+    defer space.deinit(gpa);
+    var rtt = RttEstimator{};
+    rtt.update(100_000, 0); // PTO = 300ms; persistent period = 900ms.
+    var cc = congestion.Controller.init(1200);
+
+    const times = [_]u64{ 0, 300_000, 600_000, 900_000 };
+    for (times, 0..) |t, pn| {
+        cc.onSent(1200);
+        try space.onSent(gpa, .{ .pn = @intCast(pn), .sent_time = t, .size = 1200, .ack_eliciting = true, .in_flight = true });
+    }
+    try space.onSent(gpa, .{ .pn = 4, .sent_time = 1_000_000, .size = 0, .ack_eliciting = true, .in_flight = false });
+    space.largest_acked = 4;
+
+    var lost_pns: std.ArrayListUnmanaged(u64) = .empty;
+    defer lost_pns.deinit(gpa);
+    const lost = try space.detectLost(&rtt, &cc, 1_100_000, 0, &lost_pns, gpa);
+
+    try std.testing.expectEqual(@as(u64, 4), lost);
+    try std.testing.expectEqual(@as(u64, 2 * 1200), cc.congestion_window);
+    try std.testing.expectEqual(@as(u64, 0), cc.bytes_in_flight);
 }

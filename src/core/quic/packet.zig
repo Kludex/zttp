@@ -8,6 +8,7 @@
 const std = @import("std");
 const varint = @import("varint.zig");
 const constants = @import("constants.zig");
+const crypto = @import("crypto.zig");
 
 const LongType = constants.LongType;
 
@@ -32,8 +33,18 @@ pub const LongHeader = struct {
     dcid: []const u8,
     scid: []const u8,
     token: []const u8, // Initial only; empty otherwise
+    retry_tag: []const u8 = &.{},
     length: u64,
     pn_offset: usize,
+};
+
+/// The version-independent prefix shared by every long-header packet (RFC 9000
+/// 17.2), including unsupported versions and Version Negotiation packets.
+pub const LongPrefix = struct {
+    version: u32,
+    dcid: []const u8,
+    scid: []const u8,
+    header_len: usize,
 };
 
 /// A parsed short (1-RTT) header. The dcid length is not on the wire - the
@@ -43,22 +54,20 @@ pub const ShortHeader = struct {
     pn_offset: usize, // where the protected packet number begins
 };
 
+pub const SHORT_KEY_PHASE: u8 = 0x04;
+
 /// Is this a long-header packet? (RFC 9000 17.1, the form bit.)
 pub fn isLong(first: u8) bool {
     return (first & constants.HEADER_FORM_LONG) != 0;
 }
 
-/// Parse a long header. Validates the fixed bit and the connection-id lengths,
-/// and locates the packet-number offset. Retry and Version-Negotiation packets
-/// have no length/packet-number; callers branch on `ltype`/version before using
-/// `length`/`pn_offset` (a Retry sets them to 0).
-pub fn parseLong(buf: []const u8) Error!LongHeader {
+/// Parse only the invariant long-header prefix: form/fixed bits, version, and
+/// connection IDs. This works before version dispatch, so the connection layer can
+/// generate Version Negotiation for unsupported versions.
+pub fn parseLongPrefix(buf: []const u8) Error!LongPrefix {
     if (buf.len < 7) return error.Truncated;
-    const first = buf[0];
-    if ((first & constants.FIXED_BIT) == 0) return error.Malformed;
+    if (!isLong(buf[0]) or (buf[0] & constants.FIXED_BIT) == 0) return error.Malformed;
     const version = std.mem.readInt(u32, buf[1..5], .big);
-    if (version == 0) return error.UnknownVersion; // Version Negotiation
-    if (version != constants.VERSION_1) return error.UnknownVersion;
 
     var pos: usize = 5;
     const dcid_len = buf[pos];
@@ -75,10 +84,38 @@ pub fn parseLong(buf: []const u8) Error!LongHeader {
     const scid = buf[pos .. pos + scid_len];
     pos += scid_len;
 
+    return .{ .version = version, .dcid = dcid, .scid = scid, .header_len = pos };
+}
+
+/// Parse a long header. Validates the fixed bit and the connection-id lengths,
+/// and locates the packet-number offset. Retry and Version-Negotiation packets
+/// have no length/packet-number; callers branch on `ltype`/version before using
+/// `length`/`pn_offset` (a Retry sets them to 0).
+pub fn parseLong(buf: []const u8) Error!LongHeader {
+    const prefix = try parseLongPrefix(buf);
+    const first = buf[0];
+    const version = prefix.version;
+    if (version == 0) return error.UnknownVersion; // Version Negotiation
+    if (version != constants.VERSION_1) return error.UnknownVersion;
+
+    var pos: usize = prefix.header_len;
+    const dcid = prefix.dcid;
+    const scid = prefix.scid;
+
     const ltype: LongType = @enumFromInt(@as(u2, @truncate(first >> 4)));
 
     if (ltype == .retry) {
-        return .{ .ltype = ltype, .version = version, .dcid = dcid, .scid = scid, .token = &.{}, .length = 0, .pn_offset = 0 };
+        if (buf.len < pos + crypto.TAG_LEN) return error.Truncated;
+        return .{
+            .ltype = ltype,
+            .version = version,
+            .dcid = dcid,
+            .scid = scid,
+            .token = buf[pos .. buf.len - crypto.TAG_LEN],
+            .retry_tag = buf[buf.len - crypto.TAG_LEN ..],
+            .length = 0,
+            .pn_offset = 0,
+        };
     }
 
     var token: []const u8 = &.{};
@@ -104,6 +141,18 @@ pub fn parseLong(buf: []const u8) Error!LongHeader {
         .length = len_d.value,
         .pn_offset = pos,
     };
+}
+
+pub fn validateRetryIntegrity(gpa: std.mem.Allocator, retry_packet: []const u8, original_dcid: []const u8) !bool {
+    if (retry_packet.len < crypto.TAG_LEN) return false;
+    var pseudo: std.ArrayListUnmanaged(u8) = .empty;
+    defer pseudo.deinit(gpa);
+    try pseudo.append(gpa, @intCast(original_dcid.len));
+    try pseudo.appendSlice(gpa, original_dcid);
+    try pseudo.appendSlice(gpa, retry_packet[0 .. retry_packet.len - crypto.TAG_LEN]);
+    const got = retry_packet[retry_packet.len - crypto.TAG_LEN ..][0..crypto.TAG_LEN].*;
+    const want = crypto.retryIntegrityTag(pseudo.items);
+    return std.crypto.timing_safe.eql([crypto.TAG_LEN]u8, got, want);
 }
 
 /// Parse a short header given the local connection-id length (which is not on the
@@ -187,6 +236,56 @@ pub fn writeLongHeader(
     return out.items.len;
 }
 
+pub fn writeRetry(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    dcid: []const u8,
+    scid: []const u8,
+    token: []const u8,
+    original_dcid: []const u8,
+) !void {
+    const first: u8 = constants.HEADER_FORM_LONG | constants.FIXED_BIT |
+        (@as(u8, @intFromEnum(LongType.retry)) << 4);
+    try out.append(gpa, first);
+    var ver: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ver, constants.VERSION_1, .big);
+    try out.appendSlice(gpa, &ver);
+    try out.append(gpa, @intCast(dcid.len));
+    try out.appendSlice(gpa, dcid);
+    try out.append(gpa, @intCast(scid.len));
+    try out.appendSlice(gpa, scid);
+    try out.appendSlice(gpa, token);
+
+    var pseudo: std.ArrayListUnmanaged(u8) = .empty;
+    defer pseudo.deinit(gpa);
+    try pseudo.append(gpa, @intCast(original_dcid.len));
+    try pseudo.appendSlice(gpa, original_dcid);
+    try pseudo.appendSlice(gpa, out.items);
+    const tag = crypto.retryIntegrityTag(pseudo.items);
+    try out.appendSlice(gpa, &tag);
+}
+
+/// Write a Version Negotiation packet (RFC 9000 17.2.1). The server swaps the
+/// peer's connection IDs: Destination CID is the client's Source CID, Source CID
+/// is the client's Destination CID from the unsupported-version packet.
+pub fn writeVersionNegotiation(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    dcid: []const u8,
+    scid: []const u8,
+) !void {
+    const first: u8 = constants.HEADER_FORM_LONG | constants.FIXED_BIT;
+    try out.append(gpa, first);
+    try out.appendSlice(gpa, &[_]u8{ 0, 0, 0, 0 });
+    try out.append(gpa, @intCast(dcid.len));
+    try out.appendSlice(gpa, dcid);
+    try out.append(gpa, @intCast(scid.len));
+    try out.appendSlice(gpa, scid);
+    var ver: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ver, constants.VERSION_1, .big);
+    try out.appendSlice(gpa, &ver);
+}
+
 /// Write a short (1-RTT) header through the dcid. Returns the packet-number
 /// offset (right after the dcid); the caller writes the pn and payload next.
 pub fn writeShortHeader(
@@ -195,10 +294,22 @@ pub fn writeShortHeader(
     dcid: []const u8,
     pn_len: usize,
 ) !usize {
+    return writeShortHeaderWithKeyPhase(out, gpa, dcid, pn_len, false);
+}
+
+pub fn writeShortHeaderWithKeyPhase(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    dcid: []const u8,
+    pn_len: usize,
+    key_phase: bool,
+) !usize {
     std.debug.assert(pn_len >= 1 and pn_len <= 4);
     // Short header: the form bit is clear (1-RTT); fixed bit set, pn_len-1 in the
-    // low two bits. The spin and key-phase bits are 0.
-    const first: u8 = constants.FIXED_BIT | @as(u8, @intCast(pn_len - 1));
+    // low two bits. The spin bit is 0; key phase tracks 1-RTT key updates.
+    const first: u8 = constants.FIXED_BIT |
+        (if (key_phase) SHORT_KEY_PHASE else 0) |
+        @as(u8, @intCast(pn_len - 1));
     try out.append(gpa, first);
     try out.appendSlice(gpa, dcid);
     return out.items.len;
@@ -240,6 +351,26 @@ test "parseLong reports an unknown version" {
     try std.testing.expectError(error.UnknownVersion, parseLong(&pkt));
 }
 
+test "parseLongPrefix reads connection ids before version dispatch" {
+    var pkt = [_]u8{ 0xC0, 0xDE, 0xAD, 0xBE, 0xEF, 0x03, 'd', 's', 't', 0x03, 's', 'r', 'c' };
+    const p = try parseLongPrefix(&pkt);
+    try std.testing.expectEqual(@as(u32, 0xDEAD_BEEF), p.version);
+    try std.testing.expectEqualStrings("dst", p.dcid);
+    try std.testing.expectEqualStrings("src", p.scid);
+    try std.testing.expectEqual(@as(usize, pkt.len), p.header_len);
+}
+
+test "parseLong reads a Retry packet and validates its integrity tag" {
+    const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const retry = [_]u8{ 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5, 0x74, 0x6f, 0x6b, 0x65, 0x6e } ++
+        [_]u8{ 0x04, 0xa2, 0x65, 0xba, 0x2e, 0xff, 0x4d, 0x82, 0x90, 0x58, 0xfb, 0x3f, 0x0f, 0x24, 0x96, 0xba };
+    const h = try parseLong(&retry);
+    try std.testing.expectEqual(LongType.retry, h.ltype);
+    try std.testing.expectEqualStrings("token", h.token);
+    try std.testing.expectEqualSlices(u8, retry[retry.len - crypto.TAG_LEN ..], h.retry_tag);
+    try std.testing.expect(try validateRetryIntegrity(std.testing.allocator, &retry, &odcid));
+}
+
 test "parseShort locates the packet number after the dcid" {
     var pkt = [_]u8{ 0x40, 'c', 'i', 'd', 0xAA };
     const h = try parseShort(&pkt, 3);
@@ -278,6 +409,32 @@ test "writeLongHeader round-trips through parseLong" {
     try std.testing.expectEqual(@as(usize, 0), h.scid.len);
     try std.testing.expectEqual(@as(u64, 5), h.length);
     try std.testing.expectEqual(pn_off, h.pn_offset);
+}
+
+test "writeRetry emits a parseable packet with a valid tag" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try writeRetry(&out, gpa, "client", "server", "retry-token", "original");
+    const h = try parseLong(out.items);
+    try std.testing.expectEqual(LongType.retry, h.ltype);
+    try std.testing.expectEqualStrings("client", h.dcid);
+    try std.testing.expectEqualStrings("server", h.scid);
+    try std.testing.expectEqualStrings("retry-token", h.token);
+    try std.testing.expect(try validateRetryIntegrity(gpa, out.items, "original"));
+}
+
+test "writeVersionNegotiation emits version zero and supported v1" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try writeVersionNegotiation(&out, gpa, "client", "server");
+    const p = try parseLongPrefix(out.items);
+    try std.testing.expectEqual(@as(u32, 0), p.version);
+    try std.testing.expectEqualStrings("client", p.dcid);
+    try std.testing.expectEqualStrings("server", p.scid);
+    try std.testing.expectEqual(@as(usize, 4), out.items[p.header_len..].len);
+    try std.testing.expectEqual(constants.VERSION_1, std.mem.readInt(u32, out.items[p.header_len..][0..4], .big));
 }
 
 test "writeLongHeader encodes pn_len into the first byte" {

@@ -67,6 +67,8 @@ pub fn raiseQuic(e: QuicError) py.Object {
         error.ProtocolViolation => "QUIC protocol violation",
         error.FlowControlError => "QUIC flow-control error",
         error.StreamLimitError => "QUIC stream limit exceeded",
+        error.StreamStateError => "QUIC stream-state error",
+        error.StreamBufferExceeded => "QUIC stream buffer exceeded",
         error.FinalSizeError => "QUIC final size error",
         error.CryptoError => "QUIC TLS handshake failed (CRYPTO_ERROR)",
         // A send-side backpressure signal the send paths handle (defer the bytes), so
@@ -83,6 +85,6 @@ pub fn raiseH3(e: H3Error) py.Object {
         error.H3Error => py.raise(RemoteProtocolError, "HTTP/3 protocol error"),
         // A stream-level error is handled inside the pump (it resets one stream), so it
         // never escapes to here; mapped only to keep the switch exhaustive.
-        error.StreamError => py.raise(RemoteProtocolError, "HTTP/3 stream error"),
+        error.StreamError, error.Blocked => py.raise(RemoteProtocolError, "HTTP/3 stream error"),
     };
 }

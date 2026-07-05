@@ -11,18 +11,28 @@ of feeding a byte stream you feed whole datagrams:
 ```python
 import zttp
 
-conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+client = zttp.Connection(
+    zttp.CLIENT,
+    protocol=zttp.HTTP3,
+    server_name=b"example.com",
+)
 ```
 
 As with HTTP/2, the `protocol` argument picks the subtype, so construction
 returns an `H3Connection` and the surface you get matches the wire you chose.
+zttp provides the QUIC transport defaults internally; constructor fields such as
+transport parameters, connection IDs, and handshake entropy are advanced
+overrides for deterministic tests and interoperability work, not the normal user
+API.
 
 !!! warning "Scope"
-    The HTTP/3 **server read path** is implemented end to end: a client Initial
-    datagram is decrypted, its stream bytes are reassembled, and the request
-    comes out as events. The TLS 1.3 handshake driver (only the Initial key
-    space is wired today), the write side, and the client read path are still
-    in progress, and the QPACK dynamic table is intentionally disabled.
+    HTTP/3 support is still experimental. The public surface is intentionally
+    the same event model as HTTP/1.1 and HTTP/2, but the transport underneath is
+    new code: QUIC packet protection, loss recovery, flow control, connection
+    migration, TLS 1.3, and QPACK all live inside zttp's core. The convenience
+    server constructor generates an ephemeral TLS identity for each connection;
+    it is suitable for local experiments, not for production server identity.
 
 ## How HTTP/3 works
 
@@ -141,9 +151,9 @@ Same good ideas - a static table, a dynamic table, Huffman coding - redesigned
 for one specific reason: HPACK assumed a single, totally ordered stream of
 header blocks, and over QUIC's independent streams that assumption breaks. QPACK
 is built so that compressing headers does not quietly reintroduce the very
-head-of-line blocking you came here to escape. And if you want zero risk and
-less complexity, the dynamic table can be turned off entirely (capacity zero),
-leaving just the static table and literals.
+head-of-line blocking you came here to escape. zttp advertises a bounded dynamic
+table and blocked-stream limit, resumes streams that wait for encoder updates,
+and falls back to static/literal encoding when the peer disables dynamic QPACK.
 
 ### Why this changes zttp's job
 

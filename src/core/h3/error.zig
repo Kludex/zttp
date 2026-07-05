@@ -25,6 +25,8 @@ pub const ErrorCode = enum(u64) {
     connect_error = 0x010f,
     version_fallback = 0x0110,
     qpack_decompression_failed = 0x0200,
+    qpack_encoder_stream_error = 0x0201,
+    qpack_decoder_stream_error = 0x0202,
     _,
 };
 
@@ -33,4 +35,6 @@ test "the codes match the RFC 9114 registry" {
     try std.testing.expectEqual(@as(u64, 0x010a), @intFromEnum(ErrorCode.missing_settings));
     try std.testing.expectEqual(@as(u64, 0x0105), @intFromEnum(ErrorCode.frame_unexpected));
     try std.testing.expectEqual(@as(u64, 0x0200), @intFromEnum(ErrorCode.qpack_decompression_failed));
+    try std.testing.expectEqual(@as(u64, 0x0201), @intFromEnum(ErrorCode.qpack_encoder_stream_error));
+    try std.testing.expectEqual(@as(u64, 0x0202), @intFromEnum(ErrorCode.qpack_decoder_stream_error));
 }

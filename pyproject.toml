@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zttp"
-description = "A sans-IO HTTP/1.1 and HTTP/2 parser for Python with a Zig core."
+description = "A sans-IO HTTP/1.1, HTTP/2, and HTTP/3 parser for Python with a Zig core."
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
@@ -124,6 +124,9 @@ addopts = "-rxXs --strict-config --strict-markers"
 xfail_strict = true
 testpaths = ["tests"]
 filterwarnings = ["error"]
+markers = [
+    "http3_interop: optional HTTP/3 interop checks that require external protocol stacks",
+]
 
 [tool.coverage.run]
 source_pkgs = ["zttp", "tests"]

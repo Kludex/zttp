@@ -19,6 +19,24 @@ const finished = @import("finished.zig");
 pub const ClientHelloView = struct {
     legacy_session_id: []const u8,
     client_key_share: [32]u8,
+    selected_psk: ?SelectedPsk = null,
+    accept_early_data: bool = false,
+};
+
+pub const SelectedPsk = struct {
+    index: u16,
+    psk: [schedule.SECRET_LEN]u8,
+    accept_early_data: bool = true,
+};
+
+pub const ResumptionCredential = struct {
+    identity: []const u8,
+    psk: [schedule.SECRET_LEN]u8,
+    ticket_lifetime: ?u32 = null,
+    ticket_age_add: u32 = 0,
+    issued_at_ms: ?u64 = null,
+    max_early_data_size: ?u32 = null,
+    early_data_used: bool = false,
 };
 
 /// Integrator config the crypto core does not supply: the ServerHello randomness,
@@ -33,6 +51,9 @@ pub const Config = struct {
     /// EncryptedExtensions; null skips negotiation - a transport-test affordance.
     alpn: ?[]const u8 = null,
     transport_params: []const u8, // server quic_transport_parameters body
+    resumption: ?ResumptionCredential = null,
+    resumption_store: []ResumptionCredential = &.{},
+    now_ms: u64 = 0,
 };
 
 /// What the driver installs after the flight is built.
@@ -40,6 +61,7 @@ pub const Built = struct {
     handshake_secrets: schedule.Secrets, // Handshake space
     application_secrets: schedule.Secrets, // Application (1-RTT) space
     client_hs_secret: [32]u8, // verifies the client's later Finished
+    key_schedule: schedule.Schedule, // derives the resumption master after client Finished
 };
 
 /// Build the full server flight into `out`, threading `transcript` (which the
@@ -57,9 +79,12 @@ pub fn build(
     try emitFramed(out, w, transcript, 0x02, ServerHello{ .cfg = cfg, .ch = ch, .server_pub = ks.public_key });
     const th_sh = transcript.hash();
     const ecdhe = try ks.shared(ch.client_key_share);
-    const hs = schedule.Schedule.deriveHandshake(ecdhe, th_sh);
+    const hs = if (ch.selected_psk) |selected|
+        schedule.Schedule.deriveHandshakePsk(ecdhe, th_sh, selected.psk)
+    else
+        schedule.Schedule.deriveHandshake(ecdhe, th_sh);
 
-    try emitFramed(out, w, transcript, 0x08, EncryptedExtensions{ .cfg = cfg });
+    try emitFramed(out, w, transcript, 0x08, EncryptedExtensions{ .cfg = cfg, .accept_early_data = ch.accept_early_data });
     try emitFramed(out, w, transcript, 0x0b, Certificate{ .cfg = cfg });
 
     const th_cert = transcript.hash();
@@ -73,6 +98,7 @@ pub fn build(
         .handshake_secrets = hs.secrets,
         .application_secrets = hs.schedule.deriveApplication(th_fin),
         .client_hs_secret = hs.secrets.client,
+        .key_schedule = hs.schedule,
     };
 }
 
@@ -113,12 +139,19 @@ const ServerHello = struct {
         try w.bytes(&self.server_pub);
         try w.close(pt);
         try w.close(ks);
+        if (self.ch.selected_psk) |selected| {
+            try w.u16v(0x0029); // pre_shared_key
+            const psk = try w.open(2);
+            try w.u16v(selected.index);
+            try w.close(psk);
+        }
         try w.close(exts);
     }
 };
 
 const EncryptedExtensions = struct {
     cfg: Config,
+    accept_early_data: bool = false,
 
     fn emit(self: EncryptedExtensions, w: wire.Writer) !void {
         const exts = try w.open(2);
@@ -134,6 +167,11 @@ const EncryptedExtensions = struct {
             try w.bytes(proto);
             try w.close(name);
             try w.close(list);
+            try w.close(ext);
+        }
+        if (self.accept_early_data) {
+            try w.u16v(0x002a); // early_data
+            const ext = try w.open(2);
             try w.close(ext);
         }
         try w.close(exts);

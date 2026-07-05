@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Final, Literal, overload
 
-SERVER: Final[int]
-CLIENT: Final[int]
+SERVER: Final = 1
+CLIENT: Final = 2
 # Literal-typed so Connection(role, HTTP2) selects the H2Connection __new__ overload.
 HTTP1: Final = 1
 HTTP2: Final = 2
@@ -102,15 +102,36 @@ class Connection:
     @overload
     def __new__(
         cls,
-        role: int,
+        role: Literal[1],
         protocol: Literal[3],
         *,
-        certificate: bytes,
-        private_key: bytes,
-        transport_params: bytes,
-        random: bytes,
-        ephemeral_seed: bytes,
+        certificate: bytes | None = ...,
+        private_key: bytes | None = ...,
+        transport_params: bytes | None = ...,
+        random: bytes | None = ...,
+        ephemeral_seed: bytes | None = ...,
         alpn: bytes | None = ...,
+        resumption_identity: bytes | None = ...,
+        resumption_psk: bytes | None = ...,
+    ) -> H3Connection: ...
+    @overload
+    def __new__(
+        cls,
+        role: Literal[2],
+        protocol: Literal[3],
+        *,
+        transport_params: bytes | None = ...,
+        random: bytes | None = ...,
+        ephemeral_seed: bytes | None = ...,
+        connection_id: bytes | None = ...,
+        alpn: bytes | None = ...,
+        server_name: bytes | None = ...,
+        resumption_identity: bytes | None = ...,
+        resumption_psk: bytes | None = ...,
+        obfuscated_ticket_age: int = ...,
+        early_data: bool = ...,
+        remembered_transport_params: bytes | None = ...,
+        validation_token: bytes | None = ...,
     ) -> H3Connection: ...
     @overload
     def __new__(cls, role: int, protocol: Literal[2]) -> H2Connection: ...
@@ -150,18 +171,47 @@ class H2Connection(Connection):
     def has_pending_send(self) -> bool: ...
 
 class H3Connection(Connection):
-    # Fed by UDP datagrams rather than a byte stream. The QUIC handshake is driven
-    # from the server credentials passed at construction; `alpn` defaults to b"h3"
-    # (ALPN is mandatory in QUIC - the parameter overrides the token, e.g. for an
-    # interop draft name, it is not an opt-out). `now` is the integrator's
+    # Fed by UDP datagrams rather than a byte stream. Server credentials default
+    # to an ephemeral local identity; `alpn` defaults to b"h3" (ALPN is mandatory
+    # in QUIC - the parameter overrides the token, e.g. for an interop draft name,
+    # it is not an opt-out). `now` is the integrator's
     # monotonic clock. data_to_send returns one bytes per UDP datagram (QUIC datagram
     # boundaries are semantic), not the byte stream the base returns. Sends go through
     # a Stream handle (conn.stream(req.stream_id)), the same surface HTTP/2 uses; a
     # Stream send packetises against the most recent `now`.
     def data_to_send(self) -> list[bytes]: ...  # type: ignore[override]
-    def receive_datagram(self, datagram: bytes, now: int = ..., /) -> None: ...
+    def receive_datagram(self, datagram: bytes, now: int = ..., peer_address: bytes | None = ..., /) -> None: ...
+    def data_to_send_with_addresses(self) -> list[tuple[bytes, bytes | None]]: ...
+    def challenge_path(self, peer_address: bytes, data: bytes, /) -> None: ...
+    def use_peer_connection_id(self, sequence_number: int, /) -> None: ...
+    def issue_connection_id(
+        self,
+        sequence_number: int,
+        connection_id: bytes,
+        stateless_reset_token: bytes,
+        retire_prior_to: int = ...,
+        /,
+    ) -> None: ...
+    def request_key_update(self) -> None: ...
     def initiate_connection(self) -> None: ...
+    def send_request(
+        self, method: bytes, target: bytes, version: bytes, headers: list[tuple[bytes, bytes]]
+    ) -> Stream: ...
+    def send_session_ticket(
+        self,
+        ticket: bytes,
+        lifetime: int = ...,
+        age_add: int = ...,
+        nonce: bytes = ...,
+        extensions: bytes = ...,
+        max_early_data_size: int | None = ...,
+        /,
+    ) -> bytes | None: ...
+    def send_new_token(self, token: bytes, /) -> None: ...
+    def session_tickets(self) -> list[tuple[int, int, bytes, bytes, bytes, int | None, bytes | None]]: ...
+    def validation_tokens(self) -> list[bytes]: ...
     def shutdown(self, stream_id: int, /) -> None: ...
+    def close(self, app: bool = ..., error_code: int = ..., reason: bytes = ...) -> None: ...
     def stream(self, stream_id: int, /) -> Stream: ...
     def next_timeout(self) -> int | None: ...
     def handle_timeout(self, now: int, /) -> None: ...
@@ -170,4 +220,3 @@ class H3Connection(Connection):
     def close_info(self) -> tuple[int, bytes, bool] | None: ...
     def peer_settings(self) -> dict[str, int] | None: ...
     def goaway_received(self) -> int | None: ...
-    def close(self, error_code: int = ..., reason: bytes = ..., /) -> None: ...

@@ -24,16 +24,49 @@ const stream = @import("stream.zig");
 const crypto_stream = @import("crypto_stream.zig");
 const transport_params = @import("transport_params.zig");
 const ack_ranges = @import("ack_ranges.zig");
-const varint = @import("varint.zig");
 const tls = @import("tls/root.zig");
+const varint = @import("varint.zig");
 
 const Space = constants.Space;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const Role = enum { server, client };
+
+const MAX_SESSION_TICKETS: usize = 8;
+const MAX_NEW_TOKENS: usize = 8;
+
+fn defaultLocalTransportParameters() transport_params.TransportParameters {
+    return .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 1 << 20,
+        .initial_max_stream_data_uni = 1 << 20,
+        .initial_max_streams_bidi = 64,
+        .initial_max_streams_uni = 64,
+    };
+}
 
 /// The earlier of an optional `a` and a `b`.
 fn minOpt(a: ?u64, b: u64) ?u64 {
     return if (a) |x| @min(x, b) else b;
+}
+
+fn addSaturating(a: u64, b: u64) u64 {
+    return if (b > std.math.maxInt(u64) - a) std.math.maxInt(u64) else a + b;
+}
+
+fn msToUsSaturating(ms: u64) u64 {
+    return if (ms > std.math.maxInt(u64) / std.time.us_per_ms)
+        std.math.maxInt(u64)
+    else
+        ms * std.time.us_per_ms;
+}
+
+fn streamSendPriorityLess(_: void, a: u64, b: u64) bool {
+    const a_uni = stream.StreamType.of(a).isUni();
+    const b_uni = stream.StreamType.of(b).isUni();
+    if (a_uni != b_uni) return a_uni;
+    return a < b;
 }
 
 pub const Error = error{
@@ -47,23 +80,18 @@ pub const Error = error{
     /// A flow-control or stream-limit invariant was broken by the peer.
     FlowControlError,
     StreamLimitError,
+    /// A peer sent a stream-scoped control frame for a stream state where that
+    /// frame is not valid, such as STREAM_DATA_BLOCKED on a receive-only stream.
+    StreamStateError,
+    StreamBufferExceeded,
     FinalSizeError,
+    CryptoError,
     /// The send would exceed the 3x anti-amplification budget before the client's
     /// address is validated (RFC 9000 8.1). Not fatal: the send path stops and
     /// resumes once the client's later packets raise the budget.
     AmplificationLimited,
-    /// The TLS handshake failed (RFC 9001 4.8): a CONNECTION_CLOSE carrying
-    /// CRYPTO_ERROR (0x0100 | alert) has been queued, so the peer learns which TLS
-    /// rule broke. Fatal, like ProtocolViolation, but with a specific cause.
-    CryptoError,
     OutOfMemory,
 };
-
-/// The QUIC error code for a TLS alert (RFC 9001 4.8): the CRYPTO_ERROR range is
-/// 0x0100-0x01ff, the low byte being the TLS alert description.
-fn cryptoErrorCode(alert: tls.server.Alert) u64 {
-    return 0x0100 | @as(u64, @intFromEnum(alert));
-}
 
 /// One packet-number space's protection keys, recovery state, and CRYPTO receive
 /// reassembly. Initial keys are derived up front; Handshake/Application keys arrive
@@ -71,6 +99,14 @@ fn cryptoErrorCode(alert: tls.server.Alert) u64 {
 const SpaceState = struct {
     recv_keys: ?crypto.Keys = null,
     send_keys: ?crypto.Keys = null,
+    recv_secret: ?[32]u8 = null,
+    send_secret: ?[32]u8 = null,
+    zero_rtt_recv_keys: ?crypto.Keys = null,
+    zero_rtt_send_keys: ?crypto.Keys = null,
+    prev_recv_keys: ?crypto.Keys = null,
+    prev_recv_key_phase: bool = false,
+    recv_key_phase: bool = false,
+    send_key_phase: bool = false,
     next_pn: u64 = 0,
     largest_recv_pn: ?u64 = null,
     rec: recovery.Space = .{},
@@ -93,6 +129,10 @@ const SpaceState = struct {
     /// The packet numbers received in this space, for accurate ACK frames (RFC 9000
     /// 19.3) - a peer needs every range to detect loss correctly.
     recv_ranges: ack_ranges.AckRanges = .{},
+    /// Latest cumulative ECN counts reported by the peer in ACK_ECN frames for this
+    /// packet-number space. The counters are cumulative; a CE increase feeds the
+    /// congestion controller as an ECN congestion event.
+    peer_ecn_counts: ?frame.EcnCounts = null,
     /// The ack-eliciting send-time anchor a PTO last fired against. A PTO will not
     /// re-fire for the same anchor (which would inflate the backoff without a probe
     /// reaching the wire); it re-arms only once a fresh ack-eliciting send advances
@@ -118,84 +158,61 @@ const StreamSent = struct { id: u64, offset: u64, len: u64, fin: bool };
 /// acked packet number back to the handshake bytes it was responsible for.
 const CryptoSent = struct { offset: u64, len: u64 };
 
+const OpenedPacket = struct {
+    work: []u8,
+    plaintext: []u8,
+    payload: []const u8,
+    pn: u64,
+    key_phase: bool,
+};
+
 /// A STOP_SENDING owed to the peer: the error code, and whether a frame carrying it is
 /// currently in flight (so flushSend does not re-send while one is unacked).
 const StopSending = struct { code: u64, in_flight: bool = false };
 
-/// One peer stream's receive window plus its MAX_STREAM_DATA bookkeeping. `pending`
-/// (the application consumed enough to re-advertise) is a flag, not a map entry, so
-/// marking it is allocation-free; `sent_pn` is the packet number an emitted
-/// MAX_STREAM_DATA rides, so a lost one is re-sent rather than stalling the stream.
-const StreamRecvWindow = struct {
-    window: flow.Window,
-    pending: bool = false,
-    sent_pn: ?u64 = null,
+const PendingBlocked = struct { limit: u64, in_flight: bool = false };
+const StreamDataBlockedSent = struct { id: u64, limit: u64 };
+const StreamsBlockedSent = struct { bidi: bool, limit: u64 };
+
+/// A RETIRE_CONNECTION_ID owed to the peer, re-sent until acknowledged.
+const PendingRetireCid = struct { in_flight: bool = false };
+
+/// A NEW_CONNECTION_ID owed to the peer, re-sent until acknowledged.
+const PendingNewCid = struct { retire_prior_to: u64, in_flight: bool = false };
+
+/// A PATH_CHALLENGE owed to the peer for path validation. The 8-byte challenge data
+/// is the map key; in_flight prevents a tight resend loop while one copy is still
+/// outstanding.
+const PendingPathChallenge = struct { in_flight: bool = false, path_token: ?u64 = null };
+
+/// Address-scoped path state. The address is intentionally opaque to the sans-IO
+/// core: an integrator can pass a serialized socket address, tuple key, or any
+/// stable byte string that identifies the network path it will send datagrams to.
+const PathState = struct {
+    address: []u8,
+    recv_bytes: u64 = 0,
+    sent_bytes: u64 = 0,
+    validated: bool = false,
 };
 
-/// The per-stream-type receive limits a server advertises (RFC 9000 18.2). A
-/// client's request streams are peer-initiated bidirectional, so their limit is
-/// initial_max_stream_data_bidi_remote (the data WE accept on a stream the PEER
-/// opened); its control/QPACK streams are unidirectional. 0 is a real limit.
-const StreamRecvLimits = struct {
-    bidi: u64,
-    uni: u64,
+/// A connection id the peer issued in NEW_CONNECTION_ID, retained for future path
+/// migration / CID rotation. The stateless reset token is copied inline.
+const PeerCid = struct {
+    cid: []u8,
+    token: [16]u8,
 };
 
-/// Tracks which receive streams have completed-and-dropped, so a late frame for one
-/// is ignored rather than resurrecting it - in memory bounded by the number of live
-/// gaps, not the total stream count. Streams of one type carry indices 0, 1, 2, ...
-/// (id = type + index*4). Retired indices are kept as a sorted list of merged
-/// half-open `[lo, hi)` ranges per type: in-order completion grows the first range,
-/// and out-of-order completions above a still-open stream form additional ranges that
-/// merge as the gaps fill. The number of ranges is at most one more than the number
-/// of currently-open streams of that type - which the stream cap bounds - so a peer
-/// that pins a low stream open cannot grow this without bound.
-const RetiredStreams = struct {
-    /// Per StreamType: the sorted, non-overlapping, non-adjacent retired-index ranges.
-    types: [4]std.ArrayListUnmanaged(Range) = .{ .empty, .empty, .empty, .empty },
+/// A connection id we issued to the peer with NEW_CONNECTION_ID. Packets addressed
+/// to an unretired issued CID are accepted in addition to the initial source CID.
+const LocalCid = struct {
+    cid: []u8,
+    token: [16]u8,
+    retired: bool = false,
+};
 
-    const Range = struct { lo: u64, hi: u64 }; // retired indices [lo, hi)
-
-    fn deinit(self: *RetiredStreams, gpa: std.mem.Allocator) void {
-        for (&self.types) |*list| list.deinit(gpa);
-    }
-
-    fn contains(self: *const RetiredStreams, id: u64) bool {
-        const index = id / 4;
-        for (self.types[@intFromEnum(stream.StreamType.of(id))].items) |r| {
-            if (index < r.lo) return false; // ranges are sorted; nothing lower matches
-            if (index < r.hi) return true;
-        }
-        return false;
-    }
-
-    /// Record `id` as retired, merging it into the range list. Returns false only on
-    /// allocator failure (the caller then leaves the stream in place rather than
-    /// dropping it unrecorded).
-    fn put(self: *RetiredStreams, gpa: std.mem.Allocator, id: u64) bool {
-        const list = &self.types[@intFromEnum(stream.StreamType.of(id))];
-        const index = id / 4;
-        // Find the first range starting at or after `index`; `index` belongs just before it.
-        var i: usize = 0;
-        while (i < list.items.len and list.items[i].lo <= index) : (i += 1) {
-            if (index < list.items[i].hi) return true; // already retired
-        }
-        // i is the insertion point. Try to extend the previous range's hi, the next
-        // range's lo, or both (which merges them); otherwise insert a singleton.
-        const touch_prev = i > 0 and list.items[i - 1].hi == index;
-        const touch_next = i < list.items.len and list.items[i].lo == index + 1;
-        if (touch_prev and touch_next) {
-            list.items[i - 1].hi = list.items[i].hi; // bridge the two ranges
-            _ = list.orderedRemove(i);
-        } else if (touch_prev) {
-            list.items[i - 1].hi = index + 1;
-        } else if (touch_next) {
-            list.items[i].lo = index;
-        } else {
-            list.insert(gpa, i, .{ .lo = index, .hi = index + 1 }) catch return false;
-        }
-        return true;
-    }
+const ParsedShortForLocalCid = struct {
+    hdr: packet.ShortHeader,
+    local_cid_seq: u64,
 };
 
 /// A CONNECTION_CLOSE the peer sent (RFC 9000 19.19), retained so the integrator can
@@ -204,7 +221,7 @@ const RetiredStreams = struct {
 pub const PeerClose = struct {
     app: bool,
     error_code: u64,
-    reason: []const u8,
+    reason: []u8,
 
     /// Cap the retained reason so a peer cannot make the server allocate an
     /// arbitrarily long phrase; the prefix is enough to diagnose.
@@ -217,11 +234,20 @@ pub const Connection = struct {
     dcid: []u8, // our peer's chosen dcid for us = the Initial-key material (owned)
     scid: []u8, // our own source connection id, sent in our long headers (owned)
     peer_scid: []u8, // the peer's scid: the dcid of everything we send (owned)
+    retry_scid: ?[]u8 = null, // client only: SCID received in Retry, for TP validation
+    peer_cids: std.AutoHashMapUnmanaged(u64, PeerCid) = .empty,
+    peer_retire_prior_to: u64 = 0,
+    local_cids: std.AutoHashMapUnmanaged(u64, LocalCid) = .empty,
+    local_cid_max_seq: u64 = 0,
+    local_initial_cid_retired: bool = false,
     spaces: [3]SpaceState,
     rtt: recovery.RttEstimator = .{},
     cc: congestion.Controller,
     conn_recv_window: flow.Window,
     conn_send_window: flow.SendWindow,
+    /// The transport parameters we advertised to the peer, parsed into the receive
+    /// limits we must enforce locally.
+    local_tp: transport_params.TransportParameters,
     /// The connection-level flow-control counters (RFC 9000 4.1): the SUM across
     /// all streams of the highest offset received and of the bytes consumed. A
     /// per-stream offset would let a peer evade MAX_DATA by spreading data across
@@ -229,36 +255,29 @@ pub const Connection = struct {
     conn_received_total: u64 = 0,
     conn_consumed_total: u64 = 0,
     streams: std.AutoHashMapUnmanaged(u64, *stream.RecvStream) = .empty,
-    /// Per-stream receive flow control (RFC 9000 19.10): one window per peer stream,
-    /// bounding how much data that single stream may pin independently of the
-    /// connection-wide MAX_DATA - so one stream cannot consume the whole connection
-    /// window. Created lazily alongside the recv stream; dropped with it. Present only
-    /// when `stream_recv_limits` enforces (the server path); the per-entry pending flag
-    /// and in-flight pn make MAX_STREAM_DATA advertisement allocation-free and
-    /// retransmittable.
-    stream_recv_windows: std.AutoHashMapUnmanaged(u64, StreamRecvWindow) = .empty,
-    /// The per-stream receive limits this server advertises and enforces (RFC 9000
-    /// 18.2), or null on the non-server path (no enforcement). A limit of 0 is a real
-    /// value - it forbids all data on that stream type - distinct from "no limit".
-    stream_recv_limits: ?StreamRecvLimits = null,
+    /// Per-stream receive flow-control windows, keyed by stream id.
+    recv_windows: std.AutoHashMapUnmanaged(u64, flow.Window) = .empty,
     send_streams: std.AutoHashMapUnmanaged(u64, *stream.SendStream) = .empty,
-    /// Per-stream SEND flow control (RFC 9000 19.10): how much we may send on each of
-    /// our send streams, bounded by the peer's advertised per-stream limit (raised by
-    /// an inbound MAX_STREAM_DATA), so a response cannot overrun one stream's grant and
-    /// be reset. Created lazily with the send stream from `stream_send_initial`.
-    stream_send_windows: std.AutoHashMapUnmanaged(u64, flow.SendWindow) = .empty,
-    /// The peer's initial per-stream send limits, by the stream we send on (RFC 9000
-    /// 18.2): for a bidi stream the PEER opened (our responses), bidi_local; for one WE
-    /// opened, bidi_remote; for our unidirectional control/QPACK streams, uni. Learned
-    /// at the ClientHello; until then 0. Selected by stream type/initiator on creation.
-    stream_send_initial_peer_bidi: u64 = 0, // bidi the peer opened: bidi_local
-    stream_send_initial_own_bidi: u64 = 0, // bidi we opened: bidi_remote
-    stream_send_initial_uni: u64 = 0,
-    /// A peer MAX_STREAM_DATA for a send stream we have not created yet (it granted
-    /// credit before we opened our half): held by stream id so the higher limit is
-    /// applied when the send window is created, not lost - which would otherwise stall
-    /// the response at the stale initial limit.
-    pending_send_max: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// Per-stream send flow-control windows, keyed by stream id. The peer's
+    /// transport parameters provide the initial limit; MAX_STREAM_DATA raises it.
+    send_windows: std.AutoHashMapUnmanaged(u64, flow.SendWindow) = .empty,
+    /// Latest advisory BLOCKED limits reported by the peer (RFC 9000 19.12-19.14).
+    /// They do not change flow-control grants, but retaining them lets upper layers
+    /// and future schedulers diagnose why a peer is stalled.
+    peer_data_blocked_limit: ?u64 = null,
+    peer_stream_data_blocked: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    peer_streams_blocked_bidi_limit: ?u64 = null,
+    peer_streams_blocked_uni_limit: ?u64 = null,
+    /// BLOCKED frames we owe the peer because its flow-control or stream-count grant
+    /// stalls our send side. They are advisory but ack-eliciting, so keep them until
+    /// acknowledged, lost, or made stale by a larger MAX_* grant.
+    data_blocked: ?PendingBlocked = null,
+    stream_data_blocked: std.AutoHashMapUnmanaged(u64, PendingBlocked) = .empty,
+    streams_blocked_bidi: ?PendingBlocked = null,
+    streams_blocked_uni: ?PendingBlocked = null,
+    data_blocked_inflight: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    stream_data_blocked_inflight: std.AutoHashMapUnmanaged(u64, StreamDataBlockedSent) = .empty,
+    streams_blocked_inflight: std.AutoHashMapUnmanaged(u64, StreamsBlockedSent) = .empty,
     /// STOP_SENDING frames owed to the peer (stream id -> {error code, in_flight}),
     /// queued by stopSending and drained by flushSend; an entry is removed once acked,
     /// and `in_flight` is cleared on loss so it is re-emitted.
@@ -269,48 +288,66 @@ pub const Connection = struct {
     /// A peer STOP_SENDING received before we created the matching send stream (id ->
     /// error code), applied when the stream is lazily created so it is born reset.
     peer_stop_sending: std.AutoHashMapUnmanaged(u64, u64) = .empty,
-    /// Every peer STOP_SENDING received (id -> error code), surfaced to the layer
-    /// above so a response cancellation is observable even when the request side was
-    /// not reset; the layer consumes it via takeStopSending.
-    stop_sending_recv: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// RETIRE_CONNECTION_ID frames owed to the peer (seq -> in-flight state), queued
+    /// when NEW_CONNECTION_ID.retire_prior_to asks us to retire older peer CIDs.
+    pending_retire_cids: std.AutoHashMapUnmanaged(u64, PendingRetireCid) = .empty,
+    /// The retired CID sequence number each in-flight RETIRE_CONNECTION_ID packet
+    /// carried, so ACK/loss can complete or re-arm the pending entry.
+    retire_cid_inflight: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// NEW_CONNECTION_ID frames owed to the peer (seq -> retire_prior_to/in-flight
+    /// state), queued when the integrator issues a replacement local CID.
+    pending_new_cids: std.AutoHashMapUnmanaged(u64, PendingNewCid) = .empty,
+    /// The issued CID sequence number each in-flight NEW_CONNECTION_ID packet
+    /// carried, so ACK/loss can complete or re-arm the pending entry.
+    new_cid_inflight: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// PATH_CHALLENGE frames awaiting a matching PATH_RESPONSE (challenge token ->
+    /// in-flight state), and the sent packet number that carried each token so loss
+    /// recovery can re-arm it.
+    pending_path_challenges: std.AutoHashMapUnmanaged(u64, PendingPathChallenge) = .empty,
+    path_challenge_inflight: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    auto_path_challenge_counter: u64 = 0,
+    /// Address-aware migration state. `current_path_token` is set while processing
+    /// an address-bearing datagram and is used for responses emitted synchronously
+    /// from that receive path, such as PATH_RESPONSE and ACK. `default_path_token`
+    /// retains the most recent peer path so application writes queued after
+    /// receive_datagram still have a routable destination.
+    paths: std.AutoHashMapUnmanaged(u64, PathState) = .empty,
+    current_path_token: ?u64 = null,
+    default_path_token: ?u64 = null,
+    /// Local CID sequence number matched by the short-header packet currently
+    /// being dispatched. RETIRE_CONNECTION_ID is not allowed to retire this CID.
+    current_packet_local_cid_seq: ?u64 = null,
     /// Built datagrams waiting to be drained by `datagramsToSend` (one contiguous
-    /// buffer; `out_lengths` records each datagram's byte length in order).
+    /// buffer; `out_lengths` records each datagram's byte length in order, and
+    /// `out_path_tokens` records the address-aware destination, if known).
     out: std.ArrayListUnmanaged(u8) = .empty,
     out_lengths: std.ArrayListUnmanaged(usize) = .empty,
+    out_path_tokens: std.ArrayListUnmanaged(?u64) = .empty,
     /// The server TLS handshake driver, attached by `initServer`; null on a client
     /// or a connection that does not run the handshake (the recv-pipeline tests).
     tls: ?tls.server.Server = null,
-    /// The full transport-parameter blob this server advertises: the integrator's
-    /// base parameters plus the mandatory per-connection ids initServer appends.
-    /// Connection-owned (the TLS driver borrows it); null outside the server path.
-    own_tp: ?[]u8 = null,
+    /// The client TLS handshake driver, attached by `initClient`; null on a server
+    /// or a connection that does not run the handshake.
+    tls_client: ?tls.client.Client = null,
     /// The client's transport parameters (RFC 9000 18.2), parsed from the
     /// ClientHello; until then the RFC defaults apply. Drives the send window and
     /// the PTO ack-delay.
     peer_tp: transport_params.TransportParameters = .{},
+    remembered_peer_tp: ?transport_params.TransportParameters = null,
     peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
-    /// The Source Connection ID of the Initial packet currently being dispatched,
-    /// borrowed from that datagram for the span of `dispatchFrames`. The ClientHello
-    /// handler validates the client's initial_source_connection_id against THIS - the
-    /// id on the very packet that carried the ClientHello (RFC 9000 7.3) - rather
-    /// than a persistent anchor. Initial keys are derivable from the dcid, so a
-    /// pre-committed anchor could be poisoned by a spoofed PADDING-only Initial that
-    /// still opens under AEAD; binding the check to the ClientHello's own packet
-    /// removes that, since a spoof carrying CRYPTO is already fatal on reassembly.
-    dispatch_initial_scid: ?[]const u8 = null,
     handshake_confirmed: bool = false, // the client Finished verified; HANDSHAKE_DONE sent
     /// The connection-level recv window grew enough to advertise a new MAX_DATA
     /// (RFC 9000 4.1); flushSend emits it so the peer is not stalled at its grant.
     max_data_pending: bool = false,
-    /// Enough request streams completed to advertise a higher bidi cap (RFC 9000 4.6);
-    /// flushSend emits a MAX_STREAMS (carrying `bidi_limit.max`, already granted) so the
-    /// peer is not stuck at the old limit.
-    max_streams_pending: bool = false,
-    /// The packet number an emitted MAX_STREAMS is riding, so a lost one is re-sent (RFC
-    /// 9000 13.3): without this a lost MAX_STREAMS would deadlock the peer, which - being
-    /// out of stream credit - cannot open the streams whose completion would re-trigger
-    /// the advertisement. Cleared when that packet is acked.
-    max_streams_sent: ?u64 = null,
+    /// Per-stream receive windows that grew enough to advertise MAX_STREAM_DATA.
+    max_stream_data_pending: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Whether to emit MAX_STREAMS for peer-initiated streams of either direction.
+    max_streams_bidi_pending: bool = false,
+    max_streams_uni_pending: bool = false,
+    peer_bidi_streams: flow.StreamLimit,
+    peer_uni_streams: flow.StreamLimit,
+    local_bidi_streams: flow.StreamLimit,
+    local_uni_streams: flow.StreamLimit,
     /// Anti-amplification (RFC 9000 8.1): until the client's address is validated, the
     /// server may send at most AMPLIFICATION_FACTOR x the bytes it has received. A
     /// received Handshake packet (only a real client can produce one) validates the
@@ -318,41 +355,33 @@ pub const Connection = struct {
     recv_bytes: u64 = 0,
     sent_bytes: u64 = 0,
     address_validated: bool = false,
-    closed: bool = false,
-    /// Whether the connection was silently closed by the idle timeout (RFC 9000 10.1),
-    /// as opposed to a peer or local CONNECTION_CLOSE. Surfaced so the integrator can
-    /// tell an idle close from an error close.
+    retried: bool = false,
+    initial_token: ?[]u8 = null,
+    /// NEW_TOKEN values the server issued for future address validation. Stored on
+    /// clients only; Retry's token stays separate because it applies to the current
+    /// Initial flight.
+    new_tokens: std.ArrayListUnmanaged([]u8) = .empty,
+    /// TLS NewSessionTicket values received after the client handshake completes.
+    /// Retained for future resumption/0-RTT wiring; capped so a peer cannot grow
+    /// memory indefinitely by sending tickets forever.
+    session_tickets: std.ArrayListUnmanaged(tls.client.SessionTicket) = .empty,
+    /// Absolute monotonic deadline, in microseconds, at which the negotiated QUIC
+    /// idle timeout closes the connection. Null means neither endpoint advertised a
+    /// non-zero max_idle_timeout.
+    idle_deadline: ?u64 = null,
     idle_timed_out: bool = false,
-    /// Our own advertised max_idle_timeout (ms), parsed from our transport parameters;
-    /// 0 means we set no idle timeout. The effective period is the min with the peer's.
-    own_idle_timeout_ms: u64 = 0,
-    /// The monotonic time (us) of the last activity that resets the idle timer (RFC
-    /// 9000 10.1): a received packet that was processed, or the FIRST ack-eliciting
-    /// packet we sent since then. The idle deadline is this plus the effective period.
-    last_activity: u64 = 0,
-    /// Whether we have sent an ack-eliciting packet since the last received packet (RFC
-    /// 9000 10.1): only the first such send restarts the idle timer, so a stream of PTO
-    /// probes to a silent peer cannot extend the connection past the idle timeout.
-    sent_ack_eliciting_since_recv: bool = false,
+    closed: bool = false,
     /// The details of a CONNECTION_CLOSE received from the peer (RFC 9000 19.19),
     /// captured so the integrator can report why the peer closed - not just that it
     /// did. Null until a close arrives. `reason` is an owned copy (the decoded slice
     /// points into the datagram), capped so a hostile reason cannot grow it.
     peer_close: ?PeerClose = null,
-    /// The receive streams that completed and were dropped (see dropStream): a late
-    /// frame for one is ignored rather than resurrecting it. A contiguous per-type
-    /// watermark covers the common in-order completions in O(1) memory; a small sparse
-    /// set holds only the out-of-order gaps and is drained as the watermark catches up,
-    /// so this stays bounded by the reorder window even when MAX_STREAMS replenishment
-    /// lets a connection serve unboundedly many streams.
-    retired_recv: RetiredStreams = .{},
-    /// The cap on client-initiated bidirectional streams (RFC 9000 4.6): exactly the
-    /// initial_max_streams_bidi we advertise, enforced on each newly opened request
-    /// stream so a peer cannot exhaust memory by opening unboundedly many. The wire and
-    /// the enforced value are always identical (a server advertising 0 rejects every
-    /// bidi stream). `null` on the non-server `init` path, which advertises nothing, so
-    /// the recv-pipeline tests open streams unchecked; initServer always sets it.
-    bidi_limit: ?flow.StreamLimit = null,
+    /// The receive-stream ids that completed and were dropped (see dropStream). A late
+    /// frame for one of these is ignored rather than resurrecting the stream. A set,
+    /// not a watermark: stream ids complete out of order, so a watermark would treat a
+    /// legitimate new lower id as retired. One u64 per retired stream is far smaller
+    /// than the RecvStream it replaces, so this still bounds the per-stream memory.
+    retired_recv: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     /// `client_dcid` is the destination connection id on the client's first
     /// Initial: both endpoints derive the Initial keys from it. The server picks
@@ -360,6 +389,7 @@ pub const Connection = struct {
     /// destination of everything it sends; both default to `client_dcid` until the
     /// peer's Initial is parsed (the test path uses a single shared id).
     pub fn init(gpa: std.mem.Allocator, role: Role, client_dcid: []const u8) Error!Connection {
+        const local_tp = defaultLocalTransportParameters();
         const dcid = try gpa.dupe(u8, client_dcid);
         errdefer gpa.free(dcid);
         const scid = try gpa.dupe(u8, client_dcid);
@@ -385,83 +415,227 @@ pub const Connection = struct {
             .peer_scid = peer_scid,
             .spaces = spaces,
             .cc = congestion.Controller.init(constants.MIN_INITIAL_DATAGRAM),
-            .conn_recv_window = flow.Window.init(1 << 20),
+            .conn_recv_window = flow.Window.init(local_tp.initial_max_data),
             .conn_send_window = flow.SendWindow.init(1 << 20),
+            .local_tp = local_tp,
+            .peer_bidi_streams = flow.StreamLimit.init(local_tp.initial_max_streams_bidi),
+            .peer_uni_streams = flow.StreamLimit.init(local_tp.initial_max_streams_uni),
+            .local_bidi_streams = flow.StreamLimit.init(0),
+            .local_uni_streams = flow.StreamLimit.init(0),
         };
     }
 
     /// A server connection with the TLS handshake driver attached: incoming CRYPTO
     /// drives the handshake, which installs per-space keys and emits the server
     /// flight. `tls_config` supplies the ServerHello randomness, ephemeral seed,
-    /// signing key, certificate, and transport parameters. The integrator's
-    /// transport-parameter blob carries only the limits it chooses; the mandatory
-    /// per-connection ids (RFC 9000 7.3) are appended here, since only the
-    /// connection knows them.
+    /// signing key, certificate, and transport parameters.
     pub fn initServer(gpa: std.mem.Allocator, client_dcid: []const u8, tls_config: tls.flight.Config) Error!Connection {
-        // Enforce exactly the bidi cap we advertise (RFC 9000 4.6): parse it from our
-        // own transport parameters so the wire and the enforced value never diverge. A
-        // malformed own blob is a configuration bug, surfaced before anything is built.
-        // The connection-id parameters are appended below, so a base blob already
-        // carrying one would duplicate it on the wire - also a configuration bug.
-        // Only those two ids are rejected: a server may legitimately advertise the
-        // other server-only parameters (stateless_reset_token, preferred_address).
-        const own = transport_params.parse(tls_config.transport_params) catch return error.ProtocolViolation;
-        if (own.has_injected_cid_param) return error.ProtocolViolation;
         var conn = try init(gpa, .server, client_dcid);
         errdefer conn.deinit();
+        const local_tp = transport_params.parse(tls_config.transport_params) catch return error.ProtocolViolation;
+        if (local_tp.original_destination_connection_id != null or
+            local_tp.initial_source_connection_id != null or
+            local_tp.retry_source_connection_id != null)
+        {
+            return error.ProtocolViolation;
+        }
+        conn.setLocalTransportParameters(local_tp);
         conn.tls = tls.server.Server.init(tls_config);
-        conn.bidi_limit = flow.StreamLimit.init(own.initial_max_streams_bidi);
-        // The per-stream recv limits we advertise (RFC 9000 18.2), enforced exactly: a
-        // client's request streams are peer-initiated bidi, so their limit is
-        // bidi_remote; its control/QPACK streams are uni.
-        conn.stream_recv_limits = .{
-            .bidi = own.initial_max_stream_data_bidi_remote,
-            .uni = own.initial_max_stream_data_uni,
-        };
-        // Our advertised idle timeout (RFC 9000 10.1); the effective period is the min
-        // with the peer's, learned at the ClientHello.
-        conn.own_idle_timeout_ms = own.max_idle_timeout_ms;
-        // Advertise the mandatory connection ids (RFC 9000 18.2): the client MUST see
-        // its first Initial's destination id echoed as original_destination_connection_id
-        // and our source id as initial_source_connection_id, or it fails the handshake
-        // with TRANSPORT_PARAMETER_ERROR. The augmented blob is connection-owned.
-        var full: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer full.deinit(gpa);
-        try full.appendSlice(gpa, tls_config.transport_params);
-        try transport_params.appendBytesParam(&full, gpa, 0x00, client_dcid); // original_destination_connection_id
-        try transport_params.appendBytesParam(&full, gpa, 0x0f, conn.scid); // initial_source_connection_id
-        conn.own_tp = try full.toOwnedSlice(gpa);
-        conn.tls.?.config.transport_params = conn.own_tp.?;
         return conn;
+    }
+
+    /// A client connection that has emitted its first Initial carrying a TLS
+    /// ClientHello. The server-flight processing is a follow-up; this starts the
+    /// real QUIC/TLS handshake without relying on preinstalled test application keys.
+    pub fn initClient(gpa: std.mem.Allocator, client_dcid: []const u8, tls_config: tls.client.Config, now: u64) Error!Connection {
+        var conn = try init(gpa, .client, client_dcid);
+        errdefer conn.deinit();
+        const local_tp = transport_params.parse(tls_config.transport_params) catch return error.ProtocolViolation;
+        if (local_tp.original_destination_connection_id != null or
+            local_tp.initial_source_connection_id != null or
+            local_tp.retry_source_connection_id != null)
+        {
+            return error.ProtocolViolation;
+        }
+        conn.setLocalTransportParameters(local_tp);
+
+        var client_tp: std.ArrayListUnmanaged(u8) = .empty;
+        defer client_tp.deinit(gpa);
+        try conn.buildClientTransportParameters(&client_tp, tls_config.transport_params);
+        var cfg = tls_config;
+        cfg.transport_params = client_tp.items;
+
+        var ch: std.ArrayListUnmanaged(u8) = .empty;
+        defer ch.deinit(gpa);
+        var client = tls.client.Client.init();
+        client.start(&ch, gpa, cfg) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ProtocolViolation,
+        };
+        if (client.early_traffic_secret) |secret| conn.installZeroRttSendSecret(secret);
+        if (tls_config.validation_token) |token| {
+            if (token.len == 0) return error.ProtocolViolation;
+            conn.initial_token = gpa.dupe(u8, token) catch return error.OutOfMemory;
+        }
+        conn.tls_client = client;
+        try conn.sendInitialCrypto(ch.items, now);
+        return conn;
+    }
+
+    fn setLocalTransportParameters(self: *Connection, tp: transport_params.TransportParameters) void {
+        self.local_tp = tp;
+        self.conn_recv_window = flow.Window.init(tp.initial_max_data);
+        self.peer_bidi_streams = flow.StreamLimit.init(tp.initial_max_streams_bidi);
+        self.peer_uni_streams = flow.StreamLimit.init(tp.initial_max_streams_uni);
+    }
+
+    fn setPeerTransportParameters(self: *Connection, tp: transport_params.TransportParameters) Error!void {
+        // RFC 9000 18.2: stateless_reset_token is server-only. A client that sends
+        // one in its transport parameters is a transport-parameter error.
+        if (self.role == .server and tp.stateless_reset_token != null) return error.ProtocolViolation;
+        if (self.role == .server) {
+            if (tp.original_destination_connection_id != null) return error.ProtocolViolation;
+            if (tp.retry_source_connection_id != null) return error.ProtocolViolation;
+            if (tp.initial_source_connection_id) |cid| {
+                if (!std.mem.eql(u8, cid.slice(), self.peer_scid)) return error.ProtocolViolation;
+            }
+        } else {
+            const odcid = tp.original_destination_connection_id orelse return error.ProtocolViolation;
+            if (!std.mem.eql(u8, odcid.slice(), self.dcid)) return error.ProtocolViolation;
+            const initial_scid = tp.initial_source_connection_id orelse return error.ProtocolViolation;
+            if (!std.mem.eql(u8, initial_scid.slice(), self.peer_scid)) return error.ProtocolViolation;
+            if (tp.retry_source_connection_id) |cid| {
+                if (!self.retried) return error.ProtocolViolation;
+                const retry_scid = self.retry_scid orelse return error.ProtocolViolation;
+                if (!std.mem.eql(u8, cid.slice(), retry_scid)) return error.ProtocolViolation;
+            } else if (self.retried) return error.ProtocolViolation;
+        }
+        self.peer_tp = tp;
+        self.conn_send_window.setInitial(tp.initial_max_data);
+        self.local_bidi_streams = flow.StreamLimit.init(tp.initial_max_streams_bidi);
+        self.local_uni_streams = flow.StreamLimit.init(tp.initial_max_streams_uni);
+    }
+
+    /// Seed the peer limits remembered from the connection that issued a resumption
+    /// ticket, so a client can enforce flow control and stream limits for 0-RTT
+    /// before the new handshake receives fresh server transport parameters.
+    pub fn applyRememberedPeerTransportParameters(self: *Connection, raw: []const u8) Error!void {
+        if (self.role != .client or self.spaces[@intFromEnum(Space.handshake)].recv_keys != null) {
+            return error.ProtocolViolation;
+        }
+        const tp = transport_params.parse(raw) catch return error.ProtocolViolation;
+        self.remembered_peer_tp = tp;
+        self.peer_tp = tp;
+        self.conn_send_window.setInitial(tp.initial_max_data);
+        self.local_bidi_streams = flow.StreamLimit.init(tp.initial_max_streams_bidi);
+        self.local_uni_streams = flow.StreamLimit.init(tp.initial_max_streams_uni);
+    }
+
+    fn validateFreshParametersForAcceptedZeroRtt(self: *const Connection, fresh: transport_params.TransportParameters) Error!void {
+        const remembered = self.remembered_peer_tp orelse return;
+        // RFC 9000 7.4.1: if 0-RTT is accepted, these limits cannot be reduced
+        // below the remembered values because the client might already have relied
+        // on them when sending early STREAM frames.
+        if (fresh.active_connection_id_limit < remembered.active_connection_id_limit or
+            fresh.initial_max_data < remembered.initial_max_data or
+            fresh.initial_max_stream_data_bidi_local < remembered.initial_max_stream_data_bidi_local or
+            fresh.initial_max_stream_data_bidi_remote < remembered.initial_max_stream_data_bidi_remote or
+            fresh.initial_max_stream_data_uni < remembered.initial_max_stream_data_uni or
+            fresh.initial_max_streams_bidi < remembered.initial_max_streams_bidi or
+            fresh.initial_max_streams_uni < remembered.initial_max_streams_uni)
+        {
+            return error.ProtocolViolation;
+        }
+    }
+
+    fn buildServerTransportParameters(self: *Connection, out: *std.ArrayListUnmanaged(u8), base: []const u8) Error!void {
+        out.appendSlice(self.gpa, base) catch return error.OutOfMemory;
+        transport_params.appendOriginalDestinationConnectionId(out, self.gpa, self.dcid) catch return error.OutOfMemory;
+        transport_params.appendInitialSourceConnectionId(out, self.gpa, self.scid) catch return error.OutOfMemory;
+        if (self.retried) {
+            const retry_scid = self.retry_scid orelse return error.ProtocolViolation;
+            transport_params.appendRetrySourceConnectionId(out, self.gpa, retry_scid) catch return error.OutOfMemory;
+        }
+    }
+
+    fn buildClientTransportParameters(self: *Connection, out: *std.ArrayListUnmanaged(u8), base: []const u8) Error!void {
+        out.appendSlice(self.gpa, base) catch return error.OutOfMemory;
+        transport_params.appendInitialSourceConnectionId(out, self.gpa, self.scid) catch return error.OutOfMemory;
+    }
+
+    fn effectiveIdleTimeoutUs(self: *const Connection) ?u64 {
+        const local = self.local_tp.max_idle_timeout_ms;
+        const peer = self.peer_tp.max_idle_timeout_ms;
+        const ms = if (local == 0 and peer == 0)
+            return null
+        else if (local == 0)
+            peer
+        else if (peer == 0)
+            local
+        else
+            @min(local, peer);
+        return msToUsSaturating(ms);
+    }
+
+    fn resetIdleTimer(self: *Connection, now: u64) void {
+        self.idle_deadline = if (self.effectiveIdleTimeoutUs()) |timeout|
+            addSaturating(now, timeout)
+        else
+            null;
     }
 
     pub fn deinit(self: *Connection) void {
         self.gpa.free(self.dcid);
         self.gpa.free(self.scid);
         self.gpa.free(self.peer_scid);
-        if (self.own_tp) |tp| self.gpa.free(tp);
+        if (self.retry_scid) |cid| self.gpa.free(cid);
+        var cid_it = self.peer_cids.valueIterator();
+        while (cid_it.next()) |entry| self.gpa.free(entry.cid);
+        self.peer_cids.deinit(self.gpa);
+        var local_cid_it = self.local_cids.valueIterator();
+        while (local_cid_it.next()) |entry| self.gpa.free(entry.cid);
+        self.local_cids.deinit(self.gpa);
         var it = self.streams.valueIterator();
         while (it.next()) |s| {
             s.*.deinit();
             self.gpa.destroy(s.*);
         }
         self.streams.deinit(self.gpa);
-        self.stream_recv_windows.deinit(self.gpa);
+        self.recv_windows.deinit(self.gpa);
         var sit = self.send_streams.valueIterator();
         while (sit.next()) |s| {
             s.*.deinit();
             self.gpa.destroy(s.*);
         }
         self.send_streams.deinit(self.gpa);
-        self.stream_send_windows.deinit(self.gpa);
-        self.pending_send_max.deinit(self.gpa);
+        self.send_windows.deinit(self.gpa);
+        self.peer_stream_data_blocked.deinit(self.gpa);
+        self.stream_data_blocked.deinit(self.gpa);
+        self.data_blocked_inflight.deinit(self.gpa);
+        self.stream_data_blocked_inflight.deinit(self.gpa);
+        self.streams_blocked_inflight.deinit(self.gpa);
         self.stop_sending.deinit(self.gpa);
         self.stop_sending_inflight.deinit(self.gpa);
         self.peer_stop_sending.deinit(self.gpa);
-        self.stop_sending_recv.deinit(self.gpa);
+        self.pending_retire_cids.deinit(self.gpa);
+        self.retire_cid_inflight.deinit(self.gpa);
+        self.pending_new_cids.deinit(self.gpa);
+        self.new_cid_inflight.deinit(self.gpa);
+        self.pending_path_challenges.deinit(self.gpa);
+        self.path_challenge_inflight.deinit(self.gpa);
+        var path_it = self.paths.valueIterator();
+        while (path_it.next()) |p| self.gpa.free(p.address);
+        self.paths.deinit(self.gpa);
+        if (self.initial_token) |t| self.gpa.free(t);
+        for (self.new_tokens.items) |t| self.gpa.free(t);
+        self.new_tokens.deinit(self.gpa);
+        for (self.session_tickets.items) |*ticket| ticket.deinit(self.gpa);
+        self.session_tickets.deinit(self.gpa);
+        self.max_stream_data_pending.deinit(self.gpa);
         self.retired_recv.deinit(self.gpa);
         self.out.deinit(self.gpa);
         self.out_lengths.deinit(self.gpa);
+        self.out_path_tokens.deinit(self.gpa);
         if (self.peer_close) |pc| self.gpa.free(pc.reason);
         for (&self.spaces) |*s| s.deinit(self.gpa);
     }
@@ -475,6 +649,40 @@ pub const Connection = struct {
         s.send_keys = send_keys;
     }
 
+    fn installApplicationSecrets(self: *Connection, recv_secret: [32]u8, send_secret: [32]u8) void {
+        const s = &self.spaces[@intFromEnum(Space.application)];
+        s.recv_secret = recv_secret;
+        s.send_secret = send_secret;
+        s.recv_keys = crypto.Keys.fromSecret(recv_secret);
+        s.send_keys = crypto.Keys.fromSecret(send_secret);
+        s.zero_rtt_send_keys = null;
+        s.prev_recv_keys = null;
+        s.recv_key_phase = false;
+        s.send_key_phase = false;
+    }
+
+    fn installZeroRttSendSecret(self: *Connection, secret: [32]u8) void {
+        self.spaces[@intFromEnum(Space.application)].zero_rtt_send_keys = crypto.Keys.fromSecret(secret);
+    }
+
+    fn installZeroRttRecvSecret(self: *Connection, secret: [32]u8) void {
+        self.spaces[@intFromEnum(Space.application)].zero_rtt_recv_keys = crypto.Keys.fromSecret(secret);
+    }
+
+    /// Initiate a QUIC 1-RTT key update for packets we send (RFC 9001 6). The
+    /// peer learns the new phase from the short-header Key Phase bit on the next
+    /// Application packet. Receive keys advance independently when a peer's
+    /// next-phase packet authenticates.
+    pub fn updateApplicationSendKeys(self: *Connection) Error!void {
+        const s = &self.spaces[@intFromEnum(Space.application)];
+        const old = s.send_secret orelse return error.ProtocolViolation;
+        const current = s.send_keys orelse return error.ProtocolViolation;
+        const next = crypto.nextTrafficSecret(old);
+        s.send_secret = next;
+        s.send_keys = crypto.Keys.fromUpdatedSecret(next, current.hp);
+        s.send_key_phase = !s.send_key_phase;
+    }
+
     // ---- send core -------------------------------------------------------------
 
     /// Build one packet in `space` carrying `frames` (already-encoded frame bytes),
@@ -485,10 +693,11 @@ pub const Connection = struct {
     /// fit one datagram. A long header (Initial/Handshake) carries our scid + a
     /// length field; a short header (Application) runs to the datagram end.
     fn buildPacket(self: *Connection, space: Space, frames: []const u8, ack_eliciting: bool, now: u64) Error!u64 {
-        assertFramesAllowedIn(space, frames); // no STREAM in Initial/Handshake, by construction
         const st = &self.spaces[@intFromEnum(space)];
-        const keys = st.send_keys orelse return error.ProtocolViolation; // driver installs first
-        const long = space != .application;
+        const use_zero_rtt = space == .application and st.send_keys == null and st.zero_rtt_send_keys != null;
+        assertFramesAllowedIn(space, use_zero_rtt, frames); // no illegal frames for the packet type
+        const keys = if (use_zero_rtt) st.zero_rtt_send_keys.? else st.send_keys orelse return error.ProtocolViolation; // driver installs first
+        const long = space != .application or use_zero_rtt;
         const pn = st.next_pn;
         const pn_len = packet.packetNumberLen(pn, st.rec.largest_acked);
 
@@ -496,11 +705,12 @@ pub const Connection = struct {
         defer hdr.deinit(self.gpa);
         const pn_offset = blk: {
             if (long) {
-                const ltype: constants.LongType = if (space == .initial) .initial else .handshake;
+                const ltype: constants.LongType = if (space == .initial) .initial else if (space == .handshake) .handshake else .zero_rtt;
+                const token = if (space == .initial) self.initial_token orelse &.{} else &.{};
                 const length = pn_len + frames.len + crypto.TAG_LEN;
-                break :blk packet.writeLongHeader(&hdr, self.gpa, ltype, constants.VERSION_1, self.peer_scid, self.scid, &.{}, length, pn_len) catch return error.OutOfMemory;
+                break :blk packet.writeLongHeader(&hdr, self.gpa, ltype, constants.VERSION_1, self.peer_scid, self.scid, token, length, pn_len) catch return error.OutOfMemory;
             } else {
-                break :blk packet.writeShortHeader(&hdr, self.gpa, self.peer_scid, pn_len) catch return error.OutOfMemory;
+                break :blk packet.writeShortHeaderWithKeyPhase(&hdr, self.gpa, self.peer_scid, pn_len, st.send_key_phase) catch return error.OutOfMemory;
             }
         };
         packet.writePacketNumber(&hdr, self.gpa, pn, pn_len) catch return error.OutOfMemory;
@@ -512,7 +722,8 @@ pub const Connection = struct {
         // address. The flight stalls here and resumes as the client's later packets
         // raise the budget; the caller treats AmplificationLimited as "stop", not fatal.
         const datagram_len = hdr.items.len + frames.len + crypto.TAG_LEN;
-        if (long and !self.address_validated and self.sent_bytes + datagram_len > constants.AMPLIFICATION_FACTOR * self.recv_bytes) {
+        if (datagram_len > self.peer_tp.max_udp_payload_size) return error.ProtocolViolation;
+        if (!self.canSendDatagram(datagram_len, long)) {
             return error.AmplificationLimited;
         }
 
@@ -522,7 +733,9 @@ pub const Connection = struct {
         _ = crypto.seal(keys, pn, hdr.items, frames, ct);
         crypto.protectHeader(keys.hp, self.out.items[start..], pn_offset, long) catch return error.ProtocolViolation;
         self.sent_bytes += datagram_len;
+        self.recordPathSent(datagram_len);
         self.out_lengths.append(self.gpa, datagram_len) catch return error.OutOfMemory;
+        self.out_path_tokens.append(self.gpa, self.sendPathToken()) catch return error.OutOfMemory;
         // A pure-ACK packet is not ack-eliciting, so it is not in flight: not
         // congestion-controlled or retransmitted (RFC 9002 2, 7). Only in-flight
         // packets count toward bytes_in_flight - charging a pure ACK would inflate it
@@ -530,13 +743,7 @@ pub const Connection = struct {
         st.rec.onSent(self.gpa, .{ .pn = pn, .sent_time = now, .size = datagram_len, .ack_eliciting = ack_eliciting, .in_flight = ack_eliciting }) catch return error.OutOfMemory;
         if (ack_eliciting) {
             self.cc.onSent(datagram_len);
-            // Restart the idle timer only on the FIRST ack-eliciting send since the last
-            // received packet (RFC 9000 10.1); later probes to a silent peer must not
-            // keep pushing the deadline out, or the connection never times out.
-            if (!self.sent_ack_eliciting_since_recv) {
-                self.last_activity = now;
-                self.sent_ack_eliciting_since_recv = true;
-            }
+            self.resetIdleTimer(now);
         }
         st.next_pn += 1;
         return pn;
@@ -583,33 +790,68 @@ pub const Connection = struct {
         return self.out_lengths.items;
     }
 
+    /// The address-aware path token for each queued datagram. A null token means
+    /// the datagram was queued through the legacy no-address API.
+    pub fn datagramPathTokens(self: *Connection) []const ?u64 {
+        return self.out_path_tokens.items;
+    }
+
+    /// Resolve an address-aware path token to the opaque peer address supplied by
+    /// the integrator.
+    pub fn pathAddress(self: *const Connection, token: u64) ?[]const u8 {
+        const p = self.paths.get(token) orelse return null;
+        return p.address;
+    }
+
+    /// Switch subsequent packets to a peer-issued connection id (RFC 9000 5.1).
+    /// The id must have arrived in NEW_CONNECTION_ID and must not have been retired.
+    pub fn usePeerConnectionId(self: *Connection, seq: u64) Error!void {
+        if (seq < self.peer_retire_prior_to) return error.ProtocolViolation;
+        const peer_cid = self.peer_cids.get(seq) orelse return error.ProtocolViolation;
+        if (peer_cid.cid.len == 0 or peer_cid.cid.len > constants.MAX_CID_LEN) return error.ProtocolViolation;
+        const owned = self.gpa.dupe(u8, peer_cid.cid) catch return error.OutOfMemory;
+        self.gpa.free(self.peer_scid);
+        self.peer_scid = owned;
+    }
+
+    /// Issue a replacement local connection id to the peer (RFC 9000 5.1/19.15).
+    /// The caller owns CID entropy and the stateless reset token derivation; the
+    /// core stores the CID for short-header routing and re-sends the frame until
+    /// ACKed. `retire_prior_to` asks the peer to stop using older local CID
+    /// sequences while preserving the peer's active_connection_id_limit.
+    pub fn issueLocalConnectionId(self: *Connection, seq: u64, retire_prior_to: u64, cid: []const u8, token: [16]u8) Error!void {
+        if (seq == 0 or retire_prior_to > seq) return error.ProtocolViolation;
+        if (seq <= self.local_cid_max_seq or self.local_cids.contains(seq)) return error.ProtocolViolation;
+        if (cid.len == 0 or cid.len > constants.MAX_CID_LEN) return error.ProtocolViolation;
+        if (std.mem.eql(u8, cid, self.scid) or self.localCidValueExists(cid)) return error.ProtocolViolation;
+        if (self.localActiveCidCountAfter(retire_prior_to) + 1 > self.peer_tp.active_connection_id_limit) return error.ProtocolViolation;
+
+        const owned = self.gpa.dupe(u8, cid) catch return error.OutOfMemory;
+        errdefer self.gpa.free(owned);
+        self.local_cids.put(self.gpa, seq, .{ .cid = owned, .token = token }) catch return error.OutOfMemory;
+        errdefer {
+            if (self.local_cids.fetchRemove(seq)) |entry| self.gpa.free(entry.value.cid);
+        }
+        const gop = self.pending_new_cids.getOrPut(self.gpa, seq) catch return error.OutOfMemory;
+        gop.value_ptr.* = .{ .retire_prior_to = retire_prior_to };
+        self.local_cid_max_seq = seq;
+    }
+
     /// Drop the drained datagrams (the integrator has sent them).
     pub fn clearSend(self: *Connection) void {
         self.out.clearRetainingCapacity();
         self.out_lengths.clearRetainingCapacity();
+        self.out_path_tokens.clearRetainingCapacity();
     }
 
     // ---- STREAM send -----------------------------------------------------------
 
     fn sendStream(self: *Connection, id: u64) Error!*stream.SendStream {
         if (self.send_streams.get(id)) |s| return s;
+        try self.checkLocalStreamLimit(id);
         const s = try self.gpa.create(stream.SendStream);
         s.* = stream.SendStream.init(self.gpa);
         self.send_streams.put(self.gpa, id, s) catch {
-            s.deinit();
-            self.gpa.destroy(s);
-            return error.OutOfMemory;
-        };
-        // This send stream's flow-control window (RFC 9000 19.10), the peer's advertised
-        // per-stream limit selected by the stream we send on; an inbound MAX_STREAM_DATA
-        // raises it later.
-        const send_limit = self.peerSendInitial(id);
-        var win = flow.SendWindow.init(send_limit);
-        // A MAX_STREAM_DATA that arrived before this send half existed granted a higher
-        // limit; apply it now so the grant is not lost (a limit only grows).
-        if (self.pending_send_max.fetchRemove(id)) |e| win.onMaxData(e.value);
-        self.stream_send_windows.put(self.gpa, id, win) catch {
-            _ = self.send_streams.remove(id);
             s.deinit();
             self.gpa.destroy(s);
             return error.OutOfMemory;
@@ -625,14 +867,15 @@ pub const Connection = struct {
     /// the queue once the Application keys exist. Writing after a FIN is rejected.
     ///
     /// This is application queueing: it buffers everything written. Only `flushSend`
-    /// applies the connection send window, so the in-flight bytes on the wire are
-    /// bounded by the peer's MAX_DATA grant, but the queued-but-unsent buffer is
-    /// bounded only by what the application writes; there is no write-side
-    /// backpressure cap.
+    /// applies the connection and per-stream send windows, so the in-flight bytes on
+    /// the wire are bounded by the peer's MAX_DATA/MAX_STREAM_DATA grants, but the
+    /// queued-but-unsent buffer is bounded only by what the application writes; there
+    /// is no write-side backpressure cap.
     pub fn sendStreamData(self: *Connection, id: u64, data: []const u8, fin: bool) Error!void {
         const s = try self.sendStream(id);
         s.write(data, fin) catch |e| switch (e) {
             error.FinalSizeError => return error.FinalSizeError,
+            error.StreamBufferExceeded => unreachable,
             error.OutOfMemory => return error.OutOfMemory,
         };
     }
@@ -652,13 +895,314 @@ pub const Connection = struct {
         if (!gop.found_existing) gop.value_ptr.* = .{ .code = error_code };
     }
 
+    /// Start path validation by sending a PATH_CHALLENGE with caller-supplied
+    /// unpredictable 8-byte data (RFC 9000 8.2). The core is sans-IO and has no RNG,
+    /// so the integrator owns entropy; the transport owns retransmission state and
+    /// matching the peer's PATH_RESPONSE.
+    pub fn challengePath(self: *Connection, data: [8]u8) Error!void {
+        try self.queuePathChallenge(data, null);
+    }
+
+    /// Start path validation for an address-scoped path. The address is an opaque,
+    /// stable byte key chosen by the integrator; outbound datagrams queued by the
+    /// subsequent flush are accounted against that path's amplification budget.
+    pub fn challengePathOn(self: *Connection, data: [8]u8, peer_address: []const u8) Error!void {
+        const pt = try self.pathTokenForAddress(peer_address);
+        try self.queuePathChallenge(data, pt);
+    }
+
+    fn queuePathChallenge(self: *Connection, data: [8]u8, pt: ?u64) Error!void {
+        const gop = self.pending_path_challenges.getOrPut(self.gpa, pathToken(data)) catch return error.OutOfMemory;
+        if (gop.found_existing and gop.value_ptr.path_token != pt) return error.ProtocolViolation;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.path_token = pt;
+    }
+
+    fn queueAutomaticPathChallenge(self: *Connection, pt: u64, now: u64) Error!void {
+        if (self.pathHasPendingChallenge(pt)) return;
+        const data = self.automaticPathChallengeData(pt, now);
+        try self.queuePathChallenge(data, pt);
+    }
+
+    fn pathHasPendingChallenge(self: *const Connection, pt: u64) bool {
+        var it = self.pending_path_challenges.valueIterator();
+        while (it.next()) |pending| {
+            if (pending.path_token != null and pending.path_token.? == pt) return true;
+        }
+        return false;
+    }
+
+    fn automaticPathChallengeData(self: *Connection, pt: u64, now: u64) [8]u8 {
+        const secret = self.spaces[@intFromEnum(Space.application)].send_secret orelse self.spaces[@intFromEnum(Space.application)].recv_secret orelse [_]u8{0} ** 32;
+        var msg: [40]u8 = undefined;
+        std.mem.copyForwards(u8, msg[0..8], "zttp-h3p");
+        std.mem.writeInt(u64, msg[8..16], pt, .big);
+        std.mem.writeInt(u64, msg[16..24], now, .big);
+        std.mem.writeInt(u64, msg[24..32], self.auto_path_challenge_counter, .big);
+        std.mem.writeInt(u64, msg[32..40], std.hash.Wyhash.hash(0, self.scid), .big);
+        self.auto_path_challenge_counter +%= 1;
+
+        var mac: [32]u8 = undefined;
+        HmacSha256.create(&mac, &msg, &secret);
+        return mac[0..8].*;
+    }
+
     /// Whether any stream has bytes (or a FIN) still to send, or a RESET_STREAM /
     /// STOP_SENDING is owed.
     pub fn hasPendingSend(self: *Connection) bool {
+        if (self.data_blocked != null) return true;
+        if (self.stream_data_blocked.count() > 0) return true;
+        if (self.streams_blocked_bidi != null or self.streams_blocked_uni != null) return true;
         if (self.stop_sending.count() > 0) return true;
+        if (self.pending_new_cids.count() > 0) return true;
+        if (self.pending_retire_cids.count() > 0) return true;
+        if (self.pending_path_challenges.count() > 0) return true;
         var it = self.send_streams.valueIterator();
         while (it.next()) |s| if (s.*.pending() or s.*.resetOwed()) return true;
         return false;
+    }
+
+    fn sendWindow(self: *Connection, id: u64) Error!*flow.SendWindow {
+        const gop = self.send_windows.getOrPut(self.gpa, id) catch return error.OutOfMemory;
+        if (!gop.found_existing) gop.value_ptr.* = flow.SendWindow.init(self.initialStreamSendLimit(id));
+        return gop.value_ptr;
+    }
+
+    /// The remaining peer-granted stream-level send credit for a live send stream,
+    /// or null if the stream has no send state.
+    pub fn streamSendWindow(self: *const Connection, id: u64) ?u64 {
+        if (!self.send_streams.contains(id)) return null;
+        if (self.send_windows.get(id)) |w| return w.available();
+        return self.initialStreamSendLimit(id);
+    }
+
+    /// New bytes queued on `id` that have not yet been admitted into STREAM frames,
+    /// or null if the stream has no send state.
+    pub fn streamPendingBytes(self: *const Connection, id: u64) ?usize {
+        const s = self.send_streams.get(id) orelse return null;
+        return s.pendingNewBytes();
+    }
+
+    /// The peer's transport parameters define the initial stream-data limit for
+    /// bytes we send. For bidirectional streams, the "local"/"remote" names are from
+    /// the peer's perspective: a peer-initiated stream uses bidi_local, a stream we
+    /// initiate uses bidi_remote. Unidirectional streams use the single uni limit.
+    fn initialStreamSendLimit(self: *const Connection, id: u64) u64 {
+        return switch (stream.StreamType.of(id)) {
+            .client_bidi, .server_bidi => blk: {
+                break :blk if (self.isPeerInitiated(id))
+                    self.peer_tp.initial_max_stream_data_bidi_local
+                else
+                    self.peer_tp.initial_max_stream_data_bidi_remote;
+            },
+            .client_uni, .server_uni => self.peer_tp.initial_max_stream_data_uni,
+        };
+    }
+
+    fn recvWindow(self: *Connection, id: u64) Error!*flow.Window {
+        const gop = self.recv_windows.getOrPut(self.gpa, id) catch return error.OutOfMemory;
+        if (!gop.found_existing) gop.value_ptr.* = flow.Window.init(self.initialStreamRecvLimit(id));
+        return gop.value_ptr;
+    }
+
+    /// The transport parameters we advertise define the initial stream-data limit
+    /// for bytes we receive. For bidirectional streams, local/remote are from our
+    /// perspective: peer-initiated streams use bidi_remote; local-initiated streams
+    /// use bidi_local.
+    fn initialStreamRecvLimit(self: *const Connection, id: u64) u64 {
+        return switch (stream.StreamType.of(id)) {
+            .client_bidi, .server_bidi => if (self.isPeerInitiated(id))
+                self.local_tp.initial_max_stream_data_bidi_remote
+            else
+                self.local_tp.initial_max_stream_data_bidi_local,
+            .client_uni, .server_uni => self.local_tp.initial_max_stream_data_uni,
+        };
+    }
+
+    fn isPeerInitiated(self: *const Connection, id: u64) bool {
+        const local_is_client = self.role == .client;
+        return stream.StreamType.of(id).isClientInitiated() != local_is_client;
+    }
+
+    fn peerCanSendOn(self: *const Connection, id: u64) bool {
+        const st = stream.StreamType.of(id);
+        return !st.isUni() or self.isPeerInitiated(id);
+    }
+
+    fn localCanSendOn(self: *const Connection, id: u64) bool {
+        const st = stream.StreamType.of(id);
+        return !st.isUni() or !self.isPeerInitiated(id);
+    }
+
+    fn checkPeerStreamLimit(self: *Connection, id: u64) Error!void {
+        if (!self.isPeerInitiated(id)) return;
+        const st = stream.StreamType.of(id);
+        const idx = id >> 2;
+        if (st.isUni()) {
+            self.peer_uni_streams.onOpened(idx) catch return error.StreamLimitError;
+            if (self.peer_uni_streams.shouldUpdate()) self.max_streams_uni_pending = true;
+        } else {
+            self.peer_bidi_streams.onOpened(idx) catch return error.StreamLimitError;
+            if (self.peer_bidi_streams.shouldUpdate()) self.max_streams_bidi_pending = true;
+        }
+    }
+
+    fn checkLocalStreamLimit(self: *Connection, id: u64) Error!void {
+        if (self.isPeerInitiated(id)) return;
+        const st = stream.StreamType.of(id);
+        const idx = id >> 2;
+        if (st.isUni()) {
+            self.local_uni_streams.onOpened(idx) catch {
+                self.queueStreamsBlocked(false, self.local_uni_streams.max);
+                return error.StreamLimitError;
+            };
+        } else {
+            self.local_bidi_streams.onOpened(idx) catch {
+                self.queueStreamsBlocked(true, self.local_bidi_streams.max);
+                return error.StreamLimitError;
+            };
+        }
+    }
+
+    fn onMaxStreams(self: *Connection, bidi: bool, max: u64) Error!void {
+        if (max > transport_params.MAX_STREAM_COUNT) return error.ProtocolViolation;
+        if (bidi) self.local_bidi_streams.onMaxStreams(max) else self.local_uni_streams.onMaxStreams(max);
+        const pending = if (bidi) &self.streams_blocked_bidi else &self.streams_blocked_uni;
+        if (pending.*) |p| {
+            if (max > p.limit) pending.* = null;
+        }
+    }
+
+    fn onMaxData(self: *Connection, max: u64) void {
+        self.conn_send_window.onMaxData(max);
+        if (self.data_blocked) |p| {
+            if (max > p.limit) self.data_blocked = null;
+        }
+    }
+
+    fn onMaxStreamData(self: *Connection, id: u64, max: u64) Error!void {
+        if (!self.localCanSendOn(id)) return error.StreamStateError;
+        const sw = try self.sendWindow(id);
+        sw.onMaxData(max);
+        if (self.stream_data_blocked.get(id)) |p| {
+            if (max > p.limit) _ = self.stream_data_blocked.remove(id);
+        }
+    }
+
+    fn onDataBlocked(self: *Connection, limit: u64) void {
+        self.peer_data_blocked_limit = if (self.peer_data_blocked_limit) |old| @max(old, limit) else limit;
+    }
+
+    fn onStreamDataBlocked(self: *Connection, id: u64, limit: u64) Error!void {
+        if (!self.peerCanSendOn(id)) return error.StreamStateError;
+        const gop = self.peer_stream_data_blocked.getOrPut(self.gpa, id) catch return error.OutOfMemory;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = limit;
+        } else {
+            gop.value_ptr.* = @max(gop.value_ptr.*, limit);
+        }
+    }
+
+    fn onStreamsBlocked(self: *Connection, bidi: bool, limit: u64) Error!void {
+        if (limit > transport_params.MAX_STREAM_COUNT) return error.StreamLimitError;
+        if (bidi) {
+            self.peer_streams_blocked_bidi_limit = if (self.peer_streams_blocked_bidi_limit) |old| @max(old, limit) else limit;
+        } else {
+            self.peer_streams_blocked_uni_limit = if (self.peer_streams_blocked_uni_limit) |old| @max(old, limit) else limit;
+        }
+    }
+
+    fn queueDataBlocked(self: *Connection, limit: u64) void {
+        if (self.data_blocked) |p| {
+            if (limit <= p.limit) return;
+        }
+        self.data_blocked = .{ .limit = limit };
+    }
+
+    fn queueStreamDataBlocked(self: *Connection, id: u64, limit: u64) Error!void {
+        const gop = self.stream_data_blocked.getOrPut(self.gpa, id) catch return error.OutOfMemory;
+        if (!gop.found_existing or limit > gop.value_ptr.limit) gop.value_ptr.* = .{ .limit = limit };
+    }
+
+    fn queueStreamsBlocked(self: *Connection, bidi: bool, limit: u64) void {
+        const pending = if (bidi) &self.streams_blocked_bidi else &self.streams_blocked_uni;
+        if (pending.*) |p| {
+            if (limit <= p.limit) return;
+        }
+        pending.* = .{ .limit = limit };
+    }
+
+    fn emitPendingBlockedFrames(self: *Connection, space: Space, now: u64) Error!void {
+        if (self.data_blocked) |*p| {
+            if (!p.in_flight) {
+                var bf: std.ArrayListUnmanaged(u8) = .empty;
+                defer bf.deinit(self.gpa);
+                frame.encodeDataBlocked(&bf, self.gpa, p.limit) catch return error.OutOfMemory;
+                while (bf.items.len < 20) bf.append(self.gpa, 0x00) catch return error.OutOfMemory;
+                self.data_blocked_inflight.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+                const pn = try self.buildPacket(space, bf.items, true, now);
+                self.data_blocked_inflight.putAssumeCapacity(pn, p.limit);
+                p.in_flight = true;
+            }
+        }
+
+        if (self.stream_data_blocked.count() > 0) {
+            var ids: std.ArrayListUnmanaged(u64) = .empty;
+            defer ids.deinit(self.gpa);
+            var it = self.stream_data_blocked.keyIterator();
+            while (it.next()) |id| ids.append(self.gpa, id.*) catch return error.OutOfMemory;
+            for (ids.items) |id| {
+                const p = self.stream_data_blocked.getPtr(id) orelse continue;
+                if (p.in_flight) continue;
+                var bf: std.ArrayListUnmanaged(u8) = .empty;
+                defer bf.deinit(self.gpa);
+                frame.encodeStreamDataBlocked(&bf, self.gpa, id, p.limit) catch return error.OutOfMemory;
+                while (bf.items.len < 20) bf.append(self.gpa, 0x00) catch return error.OutOfMemory;
+                self.stream_data_blocked_inflight.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+                const pn = try self.buildPacket(space, bf.items, true, now);
+                self.stream_data_blocked_inflight.putAssumeCapacity(pn, .{ .id = id, .limit = p.limit });
+                p.in_flight = true;
+            }
+        }
+
+        try self.emitStreamsBlocked(space, now, true);
+        try self.emitStreamsBlocked(space, now, false);
+    }
+
+    fn emitStreamsBlocked(self: *Connection, space: Space, now: u64, bidi: bool) Error!void {
+        const pending = if (bidi) &self.streams_blocked_bidi else &self.streams_blocked_uni;
+        if (pending.*) |*p| {
+            if (p.in_flight) return;
+            var bf: std.ArrayListUnmanaged(u8) = .empty;
+            defer bf.deinit(self.gpa);
+            frame.encodeStreamsBlocked(&bf, self.gpa, bidi, p.limit) catch return error.OutOfMemory;
+            while (bf.items.len < 20) bf.append(self.gpa, 0x00) catch return error.OutOfMemory;
+            self.streams_blocked_inflight.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+            const pn = try self.buildPacket(space, bf.items, true, now);
+            self.streams_blocked_inflight.putAssumeCapacity(pn, .{ .bidi = bidi, .limit = p.limit });
+            p.in_flight = true;
+        }
+    }
+
+    fn flushPathChallenges(self: *Connection, space: Space, now: u64) Error!void {
+        var pc = self.pending_path_challenges.iterator();
+        while (pc.next()) |entry| {
+            if (entry.value_ptr.in_flight) continue;
+            const token = entry.key_ptr.*;
+            var data: [8]u8 = undefined;
+            std.mem.writeInt(u64, &data, token, .big);
+            var pf: std.ArrayListUnmanaged(u8) = .empty;
+            defer pf.deinit(self.gpa);
+            frame.encodePathChallenge(&pf, self.gpa, data) catch return error.OutOfMemory;
+            while (pf.items.len < 20) pf.append(self.gpa, 0x00) catch return error.OutOfMemory;
+            self.path_challenge_inflight.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+            const previous_path = self.current_path_token;
+            if (entry.value_ptr.path_token) |pt| self.current_path_token = pt;
+            defer self.current_path_token = previous_path;
+            const pn = try self.buildPacket(space, pf.items, true, now);
+            self.path_challenge_inflight.putAssumeCapacity(pn, token);
+            entry.value_ptr.in_flight = true;
+        }
     }
 
     /// Packetize queued stream data into Application (1-RTT) datagrams, one STREAM
@@ -667,13 +1211,16 @@ pub const Connection = struct {
     /// the structural fix for shipping STREAM data in Initial packets.
     ///
     /// Each sent range is recorded per packet (stream_sent) and retained in the
-    /// SendStream until acked, so a lost packet is retransmitted (the ACK arm routes
-    /// lost pns back into SendStream.onLost). Loss is detected on ACK only; a tail
-    /// packet with no later ACK to trigger detection is not yet covered by a PTO timer.
+    /// SendStream until acked, so a lost packet is retransmitted. ACK-based loss
+    /// detection routes lost pns back into SendStream.onLost, and the PTO timer
+    /// probes tail packets that have no later ACK to trigger threshold loss.
     pub fn flushSend(self: *Connection, now: u64) Error!void {
+        if (self.closed) return;
         const space = Space.application;
         const st = &self.spaces[@intFromEnum(space)];
-        if (st.send_keys == null) return; // no 1-RTT keys yet: nothing can be sent
+        if (st.send_keys == null and st.zero_rtt_send_keys == null) return; // no application keys yet
+        if (st.ack_pending and st.send_keys != null) try self.sendAck(space, now);
+        try self.emitPendingBlockedFrames(space, now);
         // Advertise a raised connection flow-control limit if one is pending, so the
         // peer is not stalled at its old MAX_DATA grant (RFC 9000 4.1).
         if (self.max_data_pending) {
@@ -685,48 +1232,66 @@ pub const Connection = struct {
             self.max_data_pending = false;
         }
 
-        // Advertise each per-stream window that slid (RFC 9000 19.10), one
-        // MAX_STREAM_DATA per stream, so a long upload is not stalled at its limit. The
-        // value is granted here; the packet number is recorded so a lost frame is
-        // re-sent (the limit only grows, so a duplicate is harmless).
-        var sit = self.stream_recv_windows.iterator();
-        while (sit.next()) |entry| {
-            const sw = entry.value_ptr;
-            if (!sw.pending) continue;
-            // Build with the candidate limit but commit the window only after the send
-            // succeeds: an OOM must not raise the local limit past what was advertised.
-            const next = sw.window.nextLimit();
-            var sf: std.ArrayListUnmanaged(u8) = .empty;
-            defer sf.deinit(self.gpa);
-            frame.encodeMaxStreamData(&sf, self.gpa, entry.key_ptr.*, next) catch return error.OutOfMemory;
-            while (sf.items.len < 20) sf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
-            const pn = try self.buildPacket(space, sf.items, true, now);
-            _ = sw.window.grant(); // commit the advertised limit now the frame is on the wire
-            sw.sent_pn = pn;
-            sw.pending = false;
+        if (self.max_streams_bidi_pending) {
+            var mf: std.ArrayListUnmanaged(u8) = .empty;
+            defer mf.deinit(self.gpa);
+            frame.encodeMaxStreams(&mf, self.gpa, true, self.peer_bidi_streams.grant()) catch return error.OutOfMemory;
+            while (mf.items.len < 20) mf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+            _ = try self.buildPacket(space, mf.items, true, now);
+            self.max_streams_bidi_pending = false;
+        }
+        if (self.max_streams_uni_pending) {
+            var mf: std.ArrayListUnmanaged(u8) = .empty;
+            defer mf.deinit(self.gpa);
+            frame.encodeMaxStreams(&mf, self.gpa, false, self.peer_uni_streams.grant()) catch return error.OutOfMemory;
+            while (mf.items.len < 20) mf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+            _ = try self.buildPacket(space, mf.items, true, now);
+            self.max_streams_uni_pending = false;
         }
 
-        // Advertise a raised bidi-stream cap if one is pending, so a peer serving a long
-        // run of requests is not stuck at the old MAX_STREAMS limit (RFC 9000 4.6). The
-        // value was granted in dropStream; emit it and record the pn so a lost frame is
-        // re-sent (the cap only grows, so a duplicate is harmless).
-        if (self.max_streams_pending) {
-            if (self.bidi_limit) |*limit| {
-                var msf: std.ArrayListUnmanaged(u8) = .empty;
-                defer msf.deinit(self.gpa);
-                frame.encodeMaxStreams(&msf, self.gpa, true, limit.max) catch return error.OutOfMemory;
-                while (msf.items.len < 20) msf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
-                self.max_streams_sent = try self.buildPacket(space, msf.items, true, now);
+        if (self.max_stream_data_pending.count() > 0) {
+            var ids: std.ArrayListUnmanaged(u64) = .empty;
+            defer ids.deinit(self.gpa);
+            var pit = self.max_stream_data_pending.keyIterator();
+            while (pit.next()) |id| ids.append(self.gpa, id.*) catch return error.OutOfMemory;
+            for (ids.items) |id| {
+                const rw = self.recv_windows.getPtr(id) orelse {
+                    _ = self.max_stream_data_pending.remove(id);
+                    continue;
+                };
+                var mf: std.ArrayListUnmanaged(u8) = .empty;
+                defer mf.deinit(self.gpa);
+                frame.encodeMaxStreamData(&mf, self.gpa, id, rw.grant()) catch return error.OutOfMemory;
+                while (mf.items.len < 20) mf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+                _ = try self.buildPacket(space, mf.items, true, now);
+                _ = self.max_stream_data_pending.remove(id);
             }
-            self.max_streams_pending = false;
         }
+
+        // PATH_CHALLENGE frames owed for path validation (RFC 9000 8.2), retained
+        // until the peer returns the exact data in PATH_RESPONSE. An ACK only proves
+        // delivery, not validation, so it clears the packet-number bookkeeping but
+        // does not remove the pending challenge.
+        try self.flushPathChallenges(space, now);
 
         // A conservative single-packet budget: one STREAM frame per packet.
-        const packet_room = constants.MIN_INITIAL_DATAGRAM - 64;
-        var it = self.send_streams.iterator();
-        while (it.next()) |entry| {
-            const id = entry.key_ptr.*;
-            const s = entry.value_ptr.*;
+        const packet_room = self.framePayloadRoom(space);
+        var stack_stream_ids: [64]u64 = undefined;
+        const stream_count = self.send_streams.count();
+        const stream_ids = if (stream_count <= stack_stream_ids.len)
+            stack_stream_ids[0..stream_count]
+        else
+            self.gpa.alloc(u64, stream_count) catch return error.OutOfMemory;
+        defer if (stream_count > stack_stream_ids.len) self.gpa.free(stream_ids);
+        var stream_id_it = self.send_streams.keyIterator();
+        var stream_id_count: usize = 0;
+        while (stream_id_it.next()) |id| {
+            stream_ids[stream_id_count] = id.*;
+            stream_id_count += 1;
+        }
+        std.mem.sort(u64, stream_ids[0..stream_id_count], {}, streamSendPriorityLess);
+        for (stream_ids[0..stream_id_count]) |id| {
+            const s = self.send_streams.get(id) orelse continue;
             // A reset stream sends a RESET_STREAM instead of any further data (RFC
             // 9000 19.4): the final size is the bytes already written. It rides until
             // acked; loss re-arms resetOwed via onResetLost.
@@ -750,15 +1315,19 @@ pub const Connection = struct {
                 var chunk = s.peek(packet_room) orelse break;
                 const is_new = chunk.offset >= s.sent;
                 if (is_new and chunk.data.len > 0) {
-                    // New bytes are bounded by the peer's connection grant (MAX_DATA),
-                    // this stream's own grant (MAX_STREAM_DATA, RFC 9000 4.1 / 19.10),
-                    // and the congestion window (RFC 9002 7). A retransmit or a pure FIN
-                    // below is exempt, since neither presents fresh offsets. cwnd limits
-                    // bytes in flight; gate the new stream bytes against the smallest of
-                    // the remaining budgets.
-                    const stream_credit = if (self.stream_send_windows.getPtr(id)) |w| w.available() else std.math.maxInt(u64);
-                    const credit = @min(@min(self.conn_send_window.available(), stream_credit), self.cc.available());
-                    if (credit == 0) break; // out of a window or out of cwnd: keep new bytes queued
+                    // New bytes are bounded by BOTH the peer's flow-control grant
+                    // (MAX_DATA + MAX_STREAM_DATA, RFC 9000 4.1) and the congestion
+                    // window (RFC 9002 7): a retransmit or a pure FIN below is exempt,
+                    // since neither presents fresh offsets. cwnd limits bytes in
+                    // flight, so a packet already counts its header+tag; gate the new
+                    // stream bytes against the smallest remaining budget.
+                    const sw = try self.sendWindow(id);
+                    const conn_credit = self.conn_send_window.available();
+                    const stream_credit = sw.available();
+                    if (conn_credit == 0) self.queueDataBlocked(self.conn_send_window.limit);
+                    if (stream_credit == 0) try self.queueStreamDataBlocked(id, sw.limit);
+                    const credit = @min(@min(conn_credit, stream_credit), self.cc.available());
+                    if (credit == 0) break; // out of window or out of cwnd: keep new bytes queued
                     if (chunk.data.len > credit) chunk = s.peek(@intCast(credit)).?; // shrink to fit
                 }
                 if (chunk.data.len == 0 and !chunk.fin) break;
@@ -773,11 +1342,12 @@ pub const Connection = struct {
                 st.stream_sent.putAssumeCapacity(pn, .{ .id = id, .offset = chunk.offset, .len = chunk.data.len, .fin = chunk.fin });
                 if (is_new) {
                     self.conn_send_window.onSent(chunk.data.len); // monotonic: only new offsets
-                    if (self.stream_send_windows.getPtr(id)) |w| w.onSent(chunk.data.len);
+                    (try self.sendWindow(id)).onSent(chunk.data.len);
                 }
                 s.commit(chunk.offset, chunk.data.len, chunk.fin);
             }
         }
+        try self.emitPendingBlockedFrames(space, now);
 
         // STOP_SENDING frames owed to peers (RFC 9000 19.5): one per packet, recorded
         // so a lost one is re-sent. Only those not already in flight are emitted.
@@ -794,6 +1364,42 @@ pub const Connection = struct {
             self.stop_sending_inflight.putAssumeCapacity(pn, id);
             entry.value_ptr.in_flight = true;
         }
+
+        // NEW_CONNECTION_ID frames owed to peers (RFC 9000 19.15), re-sent until
+        // acked so the peer reliably learns replacement CIDs for migration.
+        var nc = self.pending_new_cids.iterator();
+        while (nc.next()) |entry| {
+            if (entry.value_ptr.in_flight) continue;
+            const seq = entry.key_ptr.*;
+            const local = self.local_cids.get(seq) orelse {
+                _ = self.pending_new_cids.remove(seq);
+                continue;
+            };
+            var nf: std.ArrayListUnmanaged(u8) = .empty;
+            defer nf.deinit(self.gpa);
+            frame.encodeNewConnectionId(&nf, self.gpa, seq, entry.value_ptr.retire_prior_to, local.cid, local.token) catch return error.OutOfMemory;
+            while (nf.items.len < 20) nf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+            self.new_cid_inflight.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+            const pn = try self.buildPacket(space, nf.items, true, now);
+            self.new_cid_inflight.putAssumeCapacity(pn, seq);
+            entry.value_ptr.in_flight = true;
+        }
+
+        // RETIRE_CONNECTION_ID frames owed to peers (RFC 9000 19.16), re-sent until
+        // acked so retire_prior_to requests are reliably reported back.
+        var rc = self.pending_retire_cids.iterator();
+        while (rc.next()) |entry| {
+            if (entry.value_ptr.in_flight) continue;
+            const seq = entry.key_ptr.*;
+            var rf: std.ArrayListUnmanaged(u8) = .empty;
+            defer rf.deinit(self.gpa);
+            frame.encodeRetireConnectionId(&rf, self.gpa, seq) catch return error.OutOfMemory;
+            while (rf.items.len < 20) rf.append(self.gpa, 0x00) catch return error.OutOfMemory; // PADDING for HP
+            self.retire_cid_inflight.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+            const pn = try self.buildPacket(space, rf.items, true, now);
+            self.retire_cid_inflight.putAssumeCapacity(pn, seq);
+            entry.value_ptr.in_flight = true;
+        }
     }
 
     /// Process an incoming ACK for `space`: fold it into recovery, free the STREAM
@@ -803,14 +1409,19 @@ pub const Connection = struct {
     /// the SendStream exactly once (fetchRemove), defending double-free / resurrect.
     fn onAckFrame(self: *Connection, space: Space, a: anytype, now: u64) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
+        try validateAckFrame(st, a);
         var acked_pns: std.ArrayListUnmanaged(u64) = .empty;
         defer acked_pns.deinit(self.gpa);
         var it = frame.ackRanges(a.ranges);
         // onAck's only failure is the acked_pns append, i.e. OutOfMemory - a
         // malformed range just stops the walk, it never errors. So surface allocator
         // pressure as OutOfMemory, not a peer protocol error.
-        _ = st.rec.onAck(&self.rtt, &self.cc, now, a.largest, a.delay, a.first_range, &it, &acked_pns, self.gpa) catch
+        const ack_delay = try self.decodeAckDelay(space, a.delay);
+        _ = st.rec.onAck(&self.rtt, &self.cc, now, a.largest, ack_delay, a.first_range, &it, &acked_pns, self.gpa) catch
             return error.OutOfMemory;
+        if (a.ecn) |ecn| {
+            if (try recordPeerEcnCounts(st, ecn)) self.cc.onEcnCe(a.largest);
+        }
         for (acked_pns.items) |pn| {
             if (st.stream_sent.fetchRemove(pn)) |e| {
                 if (self.send_streams.get(e.value.id)) |s| {
@@ -820,7 +1431,7 @@ pub const Connection = struct {
                     // does not linger (dropStream could not free it while in flight).
                     if (s.fullyAcked()) {
                         _ = self.send_streams.remove(e.value.id);
-                        _ = self.stream_send_windows.remove(e.value.id);
+                        _ = self.send_windows.remove(e.value.id);
                         s.deinit();
                         self.gpa.destroy(s);
                     }
@@ -832,19 +1443,31 @@ pub const Connection = struct {
                     s.onResetAck();
                     if (s.fullyAcked()) {
                         _ = self.send_streams.remove(e.value);
-                        _ = self.stream_send_windows.remove(e.value);
+                        _ = self.send_windows.remove(e.value);
                         s.deinit();
                         self.gpa.destroy(s);
                     }
                 }
             }
-            // These frames ride only the Application space, so their connection-wide
-            // pn records must be matched only against Application pns - an Initial or
-            // Handshake pn N must not be mistaken for Application pn N.
-            if (space == .application) {
-                if (self.stop_sending_inflight.fetchRemove(pn)) |e| _ = self.stop_sending.remove(e.value); // acked: done
-                if (self.max_streams_sent == pn) self.max_streams_sent = null; // the advertised cap is confirmed
-                _ = self.onMaxStreamDataPn(pn, false); // a confirmed MAX_STREAM_DATA
+            if (self.stop_sending_inflight.fetchRemove(pn)) |e| _ = self.stop_sending.remove(e.value); // acked: done
+            if (self.new_cid_inflight.fetchRemove(pn)) |e| _ = self.pending_new_cids.remove(e.value); // acked: done
+            if (self.retire_cid_inflight.fetchRemove(pn)) |e| _ = self.pending_retire_cids.remove(e.value); // acked: done
+            if (self.path_challenge_inflight.fetchRemove(pn)) |_| {} // acked delivery is not path validation
+            if (self.data_blocked_inflight.fetchRemove(pn)) |e| {
+                if (self.data_blocked) |p| {
+                    if (p.limit == e.value) self.data_blocked = null;
+                }
+            }
+            if (self.stream_data_blocked_inflight.fetchRemove(pn)) |e| {
+                if (self.stream_data_blocked.get(e.value.id)) |p| {
+                    if (p.limit == e.value.limit) _ = self.stream_data_blocked.remove(e.value.id);
+                }
+            }
+            if (self.streams_blocked_inflight.fetchRemove(pn)) |e| {
+                const pending = if (e.value.bidi) &self.streams_blocked_bidi else &self.streams_blocked_uni;
+                if (pending.*) |p| {
+                    if (p.limit == e.value.limit) pending.* = null;
+                }
             }
         }
         // ACK progress resets the PTO backoff (in recovery), so release the fire-once
@@ -852,6 +1475,43 @@ pub const Connection = struct {
         // anchor is still in flight.
         if (acked_pns.items.len > 0) st.pto_fired_anchor = null;
         try self.detectLostAndRequeue(space, now);
+    }
+
+    fn validateAckFrame(st: *const SpaceState, a: anytype) Error!void {
+        if (a.first_range > a.largest) return error.ProtocolViolation;
+        if (a.largest >= st.next_pn) return error.ProtocolViolation;
+
+        var smallest = a.largest - a.first_range;
+        var ranges = frame.ackRanges(a.ranges);
+        while (ranges.next()) |r| {
+            const gap_span = std.math.add(u64, r.gap, 2) catch return error.ProtocolViolation;
+            if (smallest < gap_span) return error.ProtocolViolation;
+            const next_largest = smallest - gap_span;
+            if (next_largest < r.len) return error.ProtocolViolation;
+            smallest = next_largest - r.len;
+        }
+    }
+
+    fn decodeAckDelay(self: *const Connection, space: Space, raw: u64) Error!u64 {
+        if (space != .application) return 0;
+        if (self.peer_tp.ack_delay_exponent > 20) return error.ProtocolViolation;
+        const exponent: u6 = @intCast(self.peer_tp.ack_delay_exponent);
+        if (raw > (@as(u64, std.math.maxInt(u64)) >> exponent)) return error.ProtocolViolation;
+        const decoded = raw << exponent;
+        const max_ack_delay_us = self.peer_tp.max_ack_delay_ms * std.time.us_per_ms;
+        return @min(decoded, max_ack_delay_us);
+    }
+
+    fn recordPeerEcnCounts(st: *SpaceState, ecn: frame.EcnCounts) Error!bool {
+        var ce_increased = ecn.ce > 0;
+        if (st.peer_ecn_counts) |old| {
+            if (ecn.ect0 < old.ect0 or ecn.ect1 < old.ect1 or ecn.ce < old.ce) {
+                return error.ProtocolViolation;
+            }
+            ce_increased = ecn.ce > old.ce;
+        }
+        st.peer_ecn_counts = ecn;
+        return ce_increased;
     }
 
     /// Run loss detection for one space and re-queue every newly-lost packet's
@@ -862,7 +1522,7 @@ pub const Connection = struct {
         const st = &self.spaces[@intFromEnum(space)];
         var lost_pns: std.ArrayListUnmanaged(u64) = .empty;
         defer lost_pns.deinit(self.gpa);
-        _ = st.rec.detectLost(&self.rtt, &self.cc, now, &lost_pns, self.gpa) catch return error.OutOfMemory;
+        _ = st.rec.detectLost(&self.rtt, &self.cc, now, self.ackDelayFor(space), &lost_pns, self.gpa) catch return error.OutOfMemory;
         var crypto_lost = false;
         for (lost_pns.items) |pn| {
             if (st.stream_sent.fetchRemove(pn)) |e| {
@@ -877,19 +1537,40 @@ pub const Connection = struct {
             if (st.reset_sent.fetchRemove(pn)) |e| {
                 if (self.send_streams.get(e.value)) |s| s.onResetLost();
             }
-            // The connection-wide control frames below ride only the Application space,
-            // so a lost Initial/Handshake pn N must not re-arm an Application frame.
-            if (space == .application) {
-                // A lost STOP_SENDING: clear in_flight so the next flushSend re-emits it.
-                if (self.stop_sending_inflight.fetchRemove(pn)) |e| {
-                    if (self.stop_sending.getPtr(e.value)) |ss| ss.in_flight = false;
+            // A lost STOP_SENDING: clear in_flight so the next flushSend re-emits it.
+            if (self.stop_sending_inflight.fetchRemove(pn)) |e| {
+                if (self.stop_sending.getPtr(e.value)) |ss| ss.in_flight = false;
+            }
+            // A lost NEW_CONNECTION_ID: clear in_flight so the next flushSend
+            // re-emits it.
+            if (self.new_cid_inflight.fetchRemove(pn)) |e| {
+                if (self.pending_new_cids.getPtr(e.value)) |nc| nc.in_flight = false;
+            }
+            // A lost RETIRE_CONNECTION_ID: clear in_flight so the next flushSend
+            // re-emits it.
+            if (self.retire_cid_inflight.fetchRemove(pn)) |e| {
+                if (self.pending_retire_cids.getPtr(e.value)) |rc| rc.in_flight = false;
+            }
+            // A lost PATH_CHALLENGE must be re-sent until a matching PATH_RESPONSE
+            // validates the path.
+            if (self.path_challenge_inflight.fetchRemove(pn)) |e| {
+                if (self.pending_path_challenges.getPtr(e.value)) |pc| pc.in_flight = false;
+            }
+            if (self.data_blocked_inflight.fetchRemove(pn)) |e| {
+                if (self.data_blocked) |*p| {
+                    if (p.limit == e.value) p.in_flight = false;
                 }
-                // A lost MAX_STREAMS: re-arm so the next flushSend re-advertises the cap.
-                if (self.max_streams_sent == pn) {
-                    self.max_streams_sent = null;
-                    self.max_streams_pending = true;
+            }
+            if (self.stream_data_blocked_inflight.fetchRemove(pn)) |e| {
+                if (self.stream_data_blocked.getPtr(e.value.id)) |p| {
+                    if (p.limit == e.value.limit) p.in_flight = false;
                 }
-                _ = self.onMaxStreamDataPn(pn, true); // a lost MAX_STREAM_DATA: re-advertise
+            }
+            if (self.streams_blocked_inflight.fetchRemove(pn)) |e| {
+                const pending = if (e.value.bidi) &self.streams_blocked_bidi else &self.streams_blocked_uni;
+                if (pending.*) |*p| {
+                    if (p.limit == e.value.limit) p.in_flight = false;
+                }
             }
         }
         if (crypto_lost) try self.flushCrypto(space, now); // resend the lost handshake bytes now
@@ -897,11 +1578,10 @@ pub const Connection = struct {
 
     // ---- loss-recovery timer (sans-IO: the integrator owns the OS timer) --------
 
-    /// The absolute time (us) of the earliest armed deadline across all spaces - the
-    /// earlier of any time-threshold loss deadline and any PTO deadline - or null if
-    /// nothing is armed. The integrator sets an OS timer for this and calls
-    /// `onTimeout` at or after it. Null also when the PTO backoff has saturated (a
-    /// black-holed peer): the integrator's own idle timeout then closes the connection.
+    /// The absolute time (us) of the earliest armed deadline across all spaces: the
+    /// negotiated idle timeout, any time-threshold loss deadline, or any PTO
+    /// deadline. The integrator sets an OS timer for this and calls `onTimeout` at
+    /// or after it.
     /// The PTO ack-delay term per space (RFC 9002 6.2.1): the peer's negotiated
     /// max_ack_delay applies only to the Application space; the long-header spaces
     /// use 0 (the handshake has no ack-delay budget).
@@ -910,36 +1590,14 @@ pub const Connection = struct {
     }
 
     pub fn nextTimeout(self: *Connection) ?u64 {
+        if (self.closed) return null;
         var earliest: ?u64 = null;
+        if (self.idle_deadline) |t| earliest = minOpt(earliest, t);
         for (&self.spaces, 0..) |*st, i| {
             if (st.rec.loss_time) |t| earliest = minOpt(earliest, t);
             if (st.rec.ptoDeadline(&self.rtt, self.ackDelayFor(@enumFromInt(i)))) |t| earliest = minOpt(earliest, t);
         }
-        if (self.idleDeadline()) |t| earliest = minOpt(earliest, t);
         return earliest;
-    }
-
-    /// The absolute time (us) the connection is silently closed for inactivity (RFC
-    /// 9000 10.1), or null when neither endpoint set an idle timeout. The period is the
-    /// smaller of the two advertised max_idle_timeout values (a zero on one side means
-    /// no limit there, so the other governs), floored at three PTOs so loss recovery
-    /// cannot trip it. Measured from the last activity that resets the timer.
-    fn idleDeadline(self: *const Connection) ?u64 {
-        const own = self.own_idle_timeout_ms;
-        const peer = self.peer_tp.max_idle_timeout_ms;
-        const effective_ms = if (own == 0) peer else if (peer == 0) own else @min(own, peer);
-        if (effective_ms == 0) return null;
-        const period = @max(effective_ms * std.time.us_per_ms, 3 * self.ptoPeriod());
-        return self.last_activity + period;
-    }
-
-    /// One PTO interval (RFC 9002 6.2.1) for the idle-timeout floor, WITHOUT the
-    /// per-space ack-delay term: that term is the peer's advertised max_ack_delay, and
-    /// folding it into a 3x floor would let a peer inflate the effective idle timeout.
-    /// The floor only guards against closing during loss recovery, so the bare PTO is
-    /// the right conservative basis.
-    fn ptoPeriod(self: *const Connection) u64 {
-        return self.rtt.pto();
     }
 
     /// Drive the loss-recovery timers at time `now`. First handle any space whose
@@ -949,16 +1607,10 @@ pub const Connection = struct {
     /// I/O happens here - the next flushSend emits whatever was queued.
     pub fn onTimeout(self: *Connection, now: u64) Error!void {
         if (self.closed) return error.ProtocolViolation;
-
-        // (0) Idle timeout (RFC 9000 10.1): if the inactivity period elapsed, the
-        // connection is silently closed - no CONNECTION_CLOSE is sent, the state is
-        // simply discarded. Checked first so a black-holed peer (no loss/PTO progress)
-        // is eventually reclaimed.
-        if (self.idleDeadline()) |deadline| {
+        if (self.idle_deadline) |deadline| {
             if (now >= deadline) {
                 self.closed = true;
                 self.idle_timed_out = true;
-                self.clearSend(); // 10.1 discards the state: do not emit stale queued packets
                 return;
             }
         }
@@ -982,6 +1634,10 @@ pub const Connection = struct {
             st.pto_fired_anchor = st.rec.last_ack_eliciting_sent_time;
             if (st.rec.onPtoExpired()) |pn| try self.sendProbe(@enumFromInt(i), pn, now);
         }
+    }
+
+    pub fn idleTimedOut(self: *const Connection) bool {
+        return self.idle_timed_out;
     }
 
     /// Send a PTO probe for `space`: re-queue the oldest unacked STREAM range so the
@@ -1019,44 +1675,64 @@ pub const Connection = struct {
                 if (s.resetOwed()) return; // the next flushSend re-sends the reset
             }
         }
-        // The connection-wide control frames ride only the Application space, so an
-        // Initial/Handshake probe pn must not match one (its pn is in another space).
-        if (space == .application) {
-            // ... or the STOP_SENDING the probed packet carried: clear in_flight to re-emit.
-            if (self.stop_sending_inflight.get(pn)) |id| {
-                if (self.stop_sending.getPtr(id)) |ss| {
-                    ss.in_flight = false;
-                    return; // the next flushSend re-sends it
-                }
-            }
-            // ... or the MAX_STREAMS the probed packet carried: re-arm it to re-advertise.
-            if (self.max_streams_sent == pn) {
-                self.max_streams_sent = null;
-                self.max_streams_pending = true;
+        // ... or the STOP_SENDING the probed packet carried: clear in_flight to re-emit.
+        if (self.stop_sending_inflight.get(pn)) |id| {
+            if (self.stop_sending.getPtr(id)) |ss| {
+                ss.in_flight = false;
                 return; // the next flushSend re-sends it
             }
-            // ... or a MAX_STREAM_DATA the probed packet carried: re-arm it.
-            if (self.onMaxStreamDataPn(pn, true)) return; // the next flushSend re-sends it
+        }
+        // ... or the NEW_CONNECTION_ID it carried: clear in_flight to re-emit.
+        if (self.new_cid_inflight.get(pn)) |seq| {
+            if (self.pending_new_cids.getPtr(seq)) |nc| {
+                nc.in_flight = false;
+                return; // the next flushSend re-sends it
+            }
+        }
+        // ... or the RETIRE_CONNECTION_ID it carried: clear in_flight to re-emit.
+        if (self.retire_cid_inflight.get(pn)) |seq| {
+            if (self.pending_retire_cids.getPtr(seq)) |rc| {
+                rc.in_flight = false;
+                return; // the next flushSend re-sends it
+            }
+        }
+        // ... or the PATH_CHALLENGE it carried: re-arm the challenge so the next
+        // flushSend validates the path instead of sending an unrelated PING.
+        if (self.path_challenge_inflight.get(pn)) |token| {
+            if (self.pending_path_challenges.getPtr(token)) |pc| {
+                pc.in_flight = false;
+                return;
+            }
+        }
+        // ... or one of the BLOCKED advisories it carried.
+        if (self.data_blocked_inflight.get(pn)) |limit| {
+            if (self.data_blocked) |*p| {
+                if (p.limit == limit) {
+                    p.in_flight = false;
+                    return;
+                }
+            }
+        }
+        if (self.stream_data_blocked_inflight.get(pn)) |sent| {
+            if (self.stream_data_blocked.getPtr(sent.id)) |p| {
+                if (p.limit == sent.limit) {
+                    p.in_flight = false;
+                    return;
+                }
+            }
+        }
+        if (self.streams_blocked_inflight.get(pn)) |sent| {
+            const pending = if (sent.bidi) &self.streams_blocked_bidi else &self.streams_blocked_uni;
+            if (pending.*) |*p| {
+                if (p.limit == sent.limit) {
+                    p.in_flight = false;
+                    return;
+                }
+            }
         }
         // No data to resend (the range was already acked, or a PING-only packet): a
         // PING is a valid probe that elicits an ACK and keeps the recovery loop alive.
         try self.sendPing(space, now);
-    }
-
-    /// Route an acked/lost packet number to the per-stream MAX_STREAM_DATA it carried,
-    /// if any: clear the in-flight pn on ack, or re-arm the advertisement on loss so
-    /// the next flushSend re-sends it (a lost grant would otherwise stall the stream).
-    /// Returns whether a stream owned this pn (so the PTO probe knows it re-sent).
-    fn onMaxStreamDataPn(self: *Connection, pn: u64, lost: bool) bool {
-        var it = self.stream_recv_windows.valueIterator();
-        while (it.next()) |sw| {
-            if (sw.sent_pn == pn) {
-                sw.sent_pn = null;
-                if (lost) sw.pending = true;
-                return true;
-            }
-        }
-        return false;
     }
 
     fn sendPing(self: *Connection, space: Space, now: u64) Error!void {
@@ -1081,80 +1757,41 @@ pub const Connection = struct {
         try self.driveTls(space, now);
     }
 
-    /// Queue a CONNECTION_CLOSE carrying CRYPTO_ERROR for a failed TLS handshake
-    /// (RFC 9001 4.8) and return the fatal error. The close rides whatever space
-    /// has keys. A pre-validation amplification stall is swallowed (the error is
-    /// still fatal, the integrator tears the connection down regardless), but an
-    /// allocation failure propagates so the caller sees a MemoryError, not a
-    /// misattributed protocol error.
-    fn failHandshake(self: *Connection, alert: tls.server.Alert) Error {
-        try self.queueFatalClose(false, cryptoErrorCode(alert));
-        return error.CryptoError;
-    }
-
-    /// Map a TLS server error to its CRYPTO_ERROR close, but let an allocation
-    /// failure surface as OutOfMemory (a local resource fault, not a peer protocol
-    /// error) rather than a misattributed CryptoError.
-    fn failHandshakeErr(self: *Connection, e: tls.server.Error) Error {
-        if (e == error.OutOfMemory) return error.OutOfMemory;
-        return self.failHandshake(tls.server.alertFor(e));
-    }
-
-    /// Queue a CONNECTION_CLOSE carrying a QUIC TRANSPORT_PARAMETER_ERROR for a
-    /// malformed/forbidden/spoofed transport parameter (RFC 9000 7.3/7.4/18.2), so
-    /// a peer with bad parameters learns why rather than seeing a silent drop.
-    fn failTransportParams(self: *Connection) Error {
-        try self.queueFatalClose(false, @intFromEnum(constants.TransportError.transport_parameter_error));
-        return error.ProtocolViolation;
-    }
-
-    /// Queue a fatal CONNECTION_CLOSE, swallowing only the amplification stall (the
-    /// caller's error is fatal regardless); OutOfMemory propagates.
-    fn queueFatalClose(self: *Connection, app: bool, code: u64) Error!void {
-        self.close(app, code, "") catch |e| switch (e) {
-            error.AmplificationLimited => {},
-            else => return e,
-        };
-    }
-
     fn driveTls(self: *Connection, space: Space, now: u64) Error!void {
-        const server = if (self.tls) |*s| s else return; // only the server drives the handshake here
+        if (self.tls) |*server| return self.driveServerTls(server, space, now);
+        if (self.tls_client) |*client| return self.driveClientTls(client, space, now);
+        if (space == .application) return error.ProtocolViolation;
+    }
+
+    fn driveServerTls(self: *Connection, server: *tls.server.Server, space: Space, now: u64) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
         while (true) {
             const buf = st.crypto.readable();
             const msg = tls.handshake.peek(buf) orelse break; // need more CRYPTO bytes
             switch (msg.msg_type) {
                 .client_hello => {
-                    const decoded = tls.client_hello.parse(buf[0..msg.len]) catch return self.failHandshake(.decode_error);
+                    const decoded = tls.client_hello.parse(buf[0..msg.len]) catch return error.ProtocolViolation;
 
                     // Honour the client's transport parameters (RFC 9000 7.4): its
                     // initial_max_data is the send-window ceiling, max_ack_delay feeds
                     // the PTO. Applied before the flight is built/sent.
-                    self.peer_tp = transport_params.parse(decoded.value.quic_transport_parameters) catch
-                        return self.failTransportParams();
-                    // RFC 9000 7.3/18.2: a client must not send server-only parameters,
-                    // must send initial_source_connection_id, and that id must equal the
-                    // Source Connection ID of the Initial carrying this ClientHello -
-                    // the handshake-time authentication that defeats id spoofing.
-                    if (self.peer_tp.has_server_only_param) return self.failTransportParams();
-                    const iscid = self.peer_tp.initial_scid orelse return self.failTransportParams();
-                    const carrier_scid = self.dispatch_initial_scid orelse return self.failTransportParams();
-                    if (!std.mem.eql(u8, iscid.slice(), carrier_scid)) return self.failTransportParams();
-                    self.conn_send_window.setInitial(self.peer_tp.initial_max_data);
-                    // Our responses ride bidi streams the client opens, bounded by its
-                    // bidi_local; a bidi stream we open is bounded by its bidi_remote;
-                    // our control/QPACK uni streams by its uni limit (RFC 9000 18.2).
-                    self.stream_send_initial_peer_bidi = self.peer_tp.initial_max_stream_data_bidi_local;
-                    self.stream_send_initial_own_bidi = self.peer_tp.initial_max_stream_data_bidi_remote;
-                    self.stream_send_initial_uni = self.peer_tp.initial_max_stream_data_uni;
+                    try self.setPeerTransportParameters(transport_params.parse(decoded.value.quic_transport_parameters) catch
+                        return error.ProtocolViolation);
 
                     var flight_buf: std.ArrayListUnmanaged(u8) = .empty;
                     defer flight_buf.deinit(self.gpa);
-                    const outcome = server.onClientHello(&flight_buf, self.gpa, decoded.value) catch |e| return self.failHandshakeErr(e);
+                    var server_tp: std.ArrayListUnmanaged(u8) = .empty;
+                    defer server_tp.deinit(self.gpa);
+                    const base_tp = server.config.transport_params;
+                    try self.buildServerTransportParameters(&server_tp, base_tp);
+                    server.config.transport_params = server_tp.items;
+                    defer server.config.transport_params = base_tp;
+                    const outcome = server.onClientHello(&flight_buf, self.gpa, decoded.value) catch return error.ProtocolViolation;
+                    if (outcome.early_traffic_secret) |secret| self.installZeroRttRecvSecret(secret);
 
                     // A server RECVs with the client traffic secret, SENDs with the server one.
                     self.installKeys(.handshake, outcome.built.handshake_secrets.clientKeys(), outcome.built.handshake_secrets.serverKeys());
-                    self.installKeys(.application, outcome.built.application_secrets.clientKeys(), outcome.built.application_secrets.serverKeys());
+                    self.installApplicationSecrets(outcome.built.application_secrets.client, outcome.built.application_secrets.server);
 
                     // Consume the ClientHello from the reassembler BEFORE emitting the
                     // flight, so nothing borrows from `ready` across a send (which may
@@ -1164,14 +1801,129 @@ pub const Connection = struct {
                     continue;
                 },
                 .finished => {
-                    const body = tls.handshake.finishedBody(msg.body) catch return self.failHandshake(.decode_error);
-                    server.onClientFinished(body) catch |e| return self.failHandshakeErr(e);
+                    const body = tls.handshake.finishedBody(msg.body) catch return error.ProtocolViolation;
+                    server.onClientFinished(body) catch return error.ProtocolViolation;
                     st.crypto.advance(msg.len);
                     try self.confirmHandshake(now);
                 },
-                else => return self.failHandshake(.unexpected_message), // unexpected message at the server
+                else => return error.ProtocolViolation, // unexpected message at the server
             }
         }
+    }
+
+    fn driveClientTls(self: *Connection, client: *tls.client.Client, space: Space, now: u64) Error!void {
+        const st = &self.spaces[@intFromEnum(space)];
+        while (true) {
+            const buf = st.crypto.readable();
+            const msg = tls.handshake.peek(buf) orelse break;
+            switch (client.state) {
+                .wait_server_hello => {
+                    if (space != .initial or msg.msg_type != .server_hello) return error.ProtocolViolation;
+                    const outcome = client.onServerHello(buf[0..msg.len]) catch return error.ProtocolViolation;
+                    // A client RECVs Handshake with the server traffic secret, SENDs
+                    // with the client one.
+                    self.installKeys(.handshake, outcome.handshake_secrets.serverKeys(), outcome.handshake_secrets.clientKeys());
+                    st.crypto.advance(msg.len);
+                    continue;
+                },
+                .wait_server_flight => {
+                    if (space != .handshake) break;
+                    var fin: std.ArrayListUnmanaged(u8) = .empty;
+                    defer fin.deinit(self.gpa);
+                    const outcome = (client.onServerFlight(&fin, self.gpa, buf) catch |e| switch (e) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.ProtocolViolation,
+                    }) orelse break;
+                    const fresh_tp = transport_params.parse(outcome.peer_transport_params) catch return error.ProtocolViolation;
+                    if (outcome.early_data_accepted) try self.validateFreshParametersForAcceptedZeroRtt(fresh_tp);
+                    try self.setPeerTransportParameters(fresh_tp);
+                    // A client RECVs 1-RTT with the server traffic secret, SENDs
+                    // with the client one.
+                    self.installApplicationSecrets(outcome.application_secrets.server, outcome.application_secrets.client);
+                    st.crypto.advance(outcome.consumed);
+                    self.spaces[@intFromEnum(Space.handshake)].crypto_send.write(fin.items, false) catch return error.OutOfMemory;
+                    try self.flushCrypto(.handshake, now);
+                    continue;
+                },
+                .complete => {
+                    if (space != .application) return error.ProtocolViolation;
+                    if (msg.msg_type != .new_session_ticket) return error.ProtocolViolation;
+                    var ticket = tls.client.parseNewSessionTicket(self.gpa, msg.body) catch |e| switch (e) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.ProtocolViolation,
+                    };
+                    const rms = client.resumption_master_secret orelse {
+                        ticket.deinit(self.gpa);
+                        return error.ProtocolViolation;
+                    };
+                    tls.client.deriveTicketPsk(&ticket, rms);
+                    try self.storeSessionTicket(ticket);
+                    st.crypto.advance(msg.len);
+                    continue;
+                },
+                else => return error.ProtocolViolation,
+            }
+        }
+    }
+
+    fn storeSessionTicket(self: *Connection, ticket: tls.client.SessionTicket) Error!void {
+        var owned = ticket;
+        errdefer owned.deinit(self.gpa);
+        if (self.session_tickets.items.len == MAX_SESSION_TICKETS) {
+            var oldest = self.session_tickets.orderedRemove(0);
+            oldest.deinit(self.gpa);
+        }
+        self.session_tickets.append(self.gpa, owned) catch return error.OutOfMemory;
+    }
+
+    pub fn sessionTickets(self: *const Connection) []const tls.client.SessionTicket {
+        return self.session_tickets.items;
+    }
+
+    pub fn validationTokens(self: *const Connection) []const []u8 {
+        return self.new_tokens.items;
+    }
+
+    pub fn sendNewToken(self: *Connection, token: []const u8, now: u64) Error!void {
+        if (self.role != .server or !self.handshake_confirmed or token.len == 0) return error.ProtocolViolation;
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(self.gpa);
+        frame.encodeNewToken(&frames, self.gpa, token) catch return error.OutOfMemory;
+        while (frames.items.len < 20) frames.append(self.gpa, 0x00) catch return error.OutOfMemory;
+        _ = try self.buildPacket(.application, frames.items, true, now);
+    }
+
+    pub fn sendSessionTicket(
+        self: *Connection,
+        ticket_lifetime: u32,
+        ticket_age_add: u32,
+        nonce: []const u8,
+        ticket: []const u8,
+        extensions: []const u8,
+        max_early_data_size: ?u32,
+        now: u64,
+    ) Error!?[tls.schedule.SECRET_LEN]u8 {
+        if (self.role != .server or !self.handshake_confirmed) return error.ProtocolViolation;
+        var msg: std.ArrayListUnmanaged(u8) = .empty;
+        defer msg.deinit(self.gpa);
+        tls.server.buildNewSessionTicket(&msg, self.gpa, .{
+            .ticket_lifetime = ticket_lifetime,
+            .ticket_age_add = ticket_age_add,
+            .nonce = nonce,
+            .ticket = ticket,
+            .extensions = extensions,
+            .max_early_data_size = max_early_data_size,
+        }) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ProtocolViolation,
+        };
+        const psk = if (self.tls) |server|
+            if (server.resumption_master_secret) |rms| tls.schedule.resumptionPsk(rms, nonce) else null
+        else
+            null;
+        self.spaces[@intFromEnum(Space.application)].crypto_send.write(msg.items, false) catch return error.OutOfMemory;
+        try self.flushCrypto(.application, now);
+        return psk;
     }
 
     /// Queue the server flight: ServerHello into the Initial space's CRYPTO send
@@ -1185,6 +1937,23 @@ pub const Connection = struct {
         try self.flushCrypto(.handshake, now);
     }
 
+    fn sendInitialCrypto(self: *Connection, bytes: []const u8, now: u64) Error!void {
+        const space = Space.initial;
+        const st = &self.spaces[@intFromEnum(space)];
+        st.crypto_send.write(bytes, false) catch return error.OutOfMemory;
+        const chunk = st.crypto_send.peek(constants.MIN_INITIAL_DATAGRAM) orelse return;
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(self.gpa);
+        frame.encodeCrypto(&frames, self.gpa, chunk.offset, chunk.data) catch return error.OutOfMemory;
+        while (frames.items.len < constants.MIN_INITIAL_DATAGRAM) {
+            frames.append(self.gpa, 0x00) catch return error.OutOfMemory;
+        }
+        st.crypto_sent.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+        const pn = try self.buildPacket(space, frames.items, true, now);
+        st.crypto_sent.putAssumeCapacity(pn, .{ .offset = chunk.offset, .len = chunk.data.len });
+        st.crypto_send.commit(chunk.offset, chunk.data.len, false);
+    }
+
     /// Packetize a space's pending CRYPTO into packets, recording each sent range so
     /// ack/loss can free or re-send it. Stops cleanly on the anti-amplification limit
     /// (RFC 9000 8.1) - the unsent bytes stay retained and flush on a later call once
@@ -1192,7 +1961,8 @@ pub const Connection = struct {
     fn flushCrypto(self: *Connection, space: Space, now: u64) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
         if (st.send_keys == null) return;
-        const room = constants.MIN_INITIAL_DATAGRAM - 64;
+        const room = self.framePayloadRoom(space);
+        if (room == 0) return error.ProtocolViolation;
         while (st.crypto_send.pending()) {
             const chunk = st.crypto_send.peek(room) orelse break;
             if (chunk.data.len == 0) break; // CRYPTO has no FIN; an empty chunk is nothing to send
@@ -1242,6 +2012,7 @@ pub const Connection = struct {
     fn sendAck(self: *Connection, space: Space, now: u64) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
         if (st.send_keys == null) {
+            if (space == .application) return; // 0-RTT is acked with later 1-RTT keys.
             st.ack_pending = false; // space discarded (e.g. handshake confirmed): nothing to ack with
             return;
         }
@@ -1260,18 +2031,84 @@ pub const Connection = struct {
         st.ack_pending = false;
     }
 
+    fn framePayloadRoom(self: *const Connection, space: Space) usize {
+        const target: u64 = constants.MIN_INITIAL_DATAGRAM - 64;
+        const token_len: u64 = if (space == .initial) if (self.initial_token) |t| t.len else 0 else 0;
+        const app_zero_rtt = if (space == .application) blk: {
+            const st = &self.spaces[@intFromEnum(Space.application)];
+            break :blk st.send_keys == null and st.zero_rtt_send_keys != null;
+        } else false;
+        const overhead: u64 = if (space == .application and !app_zero_rtt)
+            1 + self.peer_scid.len + 4 + crypto.TAG_LEN
+        else
+            1 + 4 + 1 + self.peer_scid.len + 1 + self.scid.len + token_len + 8 + 4 + crypto.TAG_LEN;
+        if (self.peer_tp.max_udp_payload_size <= overhead) return 0;
+        return @intCast(@min(target, self.peer_tp.max_udp_payload_size - overhead));
+    }
+
     /// Process one received UDP datagram: walk the coalesced packets, decrypt and
     /// dispatch each. `now` is a monotonic microsecond timestamp. A packet that
     /// fails authentication is skipped (not fatal); a protocol violation poisons
     /// the connection.
     pub fn receiveDatagram(self: *Connection, datagram: []const u8, now: u64) Error!void {
+        self.receiveDatagramOn(datagram, now, null) catch |err| return self.closeForReceiveError(err);
+    }
+
+    /// Address-aware variant of receiveDatagram. `peer_address` is opaque and only
+    /// needs to be stable for a network path; callers that pass it get per-path
+    /// amplification and PATH_CHALLENGE/PATH_RESPONSE validation state.
+    pub fn receiveDatagramFrom(self: *Connection, datagram: []const u8, now: u64, peer_address: []const u8) Error!void {
+        self.receiveDatagramOn(datagram, now, peer_address) catch |err| return self.closeForReceiveError(err);
+    }
+
+    fn closeForReceiveError(self: *Connection, err: Error) Error!void {
+        const close_code: ?constants.TransportError = switch (err) {
+            error.ProtocolViolation => .protocol_violation,
+            error.FlowControlError => .flow_control_error,
+            error.StreamLimitError => .stream_limit_error,
+            error.StreamStateError => .stream_state_error,
+            error.FinalSizeError => .final_size_error,
+            error.StreamBufferExceeded => .internal_error,
+            else => null,
+        };
+        if (close_code) |code| {
+            self.close(false, @intFromEnum(code), @errorName(err)) catch |close_err| switch (close_err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {},
+            };
+        }
+        return err;
+    }
+
+    fn receiveDatagramOn(self: *Connection, datagram: []const u8, now: u64, peer_address: ?[]const u8) Error!void {
         if (self.closed) return error.ProtocolViolation;
         // Anti-amplification credit (RFC 9000 8.1): every received byte raises the
         // budget for what the server may send before the address is validated.
         self.recv_bytes += datagram.len;
+        const previous_path = self.current_path_token;
+        defer self.current_path_token = previous_path;
+        var auto_path_challenge_queued = false;
+        if (peer_address) |addr| {
+            const pt = try self.pathTokenForAddress(addr);
+            if (self.local_tp.disable_active_migration and self.handshake_confirmed) {
+                if (self.default_path_token) |current| {
+                    if (current != pt) return error.ProtocolViolation;
+                }
+            }
+            const new_peer_path = self.default_path_token != null and self.default_path_token.? != pt;
+            self.current_path_token = pt;
+            if (self.default_path_token == null) self.default_path_token = pt;
+            if (self.paths.getPtr(pt)) |p| {
+                p.recv_bytes += datagram.len;
+                if (self.handshake_confirmed and new_peer_path and !p.validated) {
+                    try self.queueAutomaticPathChallenge(pt, now);
+                    auto_path_challenge_queued = true;
+                }
+            }
+        }
         var rest = datagram;
         while (rest.len > 0) {
-            const consumed = self.receivePacket(rest, now) catch |e| switch (e) {
+            const consumed = self.receivePacket(rest, now, datagram.len) catch |e| switch (e) {
                 // A short-header packet has no length field, so an undecryptable one
                 // ends the walk (its boundary is the datagram end). A long-header
                 // packet whose boundary IS known returns its length from receiveLong
@@ -1286,159 +2123,559 @@ pub const Connection = struct {
         // CRYPTO that stalled on the limit (RFC 9000 8.1).
         try self.flushCrypto(.initial, now);
         try self.flushCrypto(.handshake, now);
+        if (auto_path_challenge_queued) {
+            self.flushPathChallenges(.application, now) catch |e| switch (e) {
+                error.AmplificationLimited => {},
+                else => return e,
+            };
+        }
     }
 
-    fn receivePacket(self: *Connection, buf: []const u8, now: u64) Error!usize {
-        if (packet.isLong(buf[0])) return self.receiveLong(buf, now);
+    fn receivePacket(self: *Connection, buf: []const u8, now: u64, datagram_len: usize) Error!usize {
+        if (packet.isLong(buf[0])) return self.receiveLong(buf, now, datagram_len);
         return self.receiveShort(buf, now);
     }
 
-    fn receiveLong(self: *Connection, buf: []const u8, now: u64) Error!usize {
+    fn receiveLong(self: *Connection, buf: []const u8, now: u64, datagram_len: usize) Error!usize {
+        const prefix = packet.parseLongPrefix(buf) catch return error.Dropped;
+        if (prefix.version == 0) return self.receiveVersionNegotiation(prefix, buf);
+        if (prefix.version != constants.VERSION_1) {
+            if (self.role == .server) try self.sendVersionNegotiation(prefix);
+            return buf.len;
+        }
         const hdr = packet.parseLong(buf) catch return error.Dropped;
+        if (hdr.ltype == .retry) return self.receiveRetry(hdr, buf, now);
         const space: Space = switch (hdr.ltype) {
             .initial => .initial,
             .handshake => .handshake,
-            // 0-RTT uses its own keys, which this server never installs (0-RTT is out
-            // of scope); drop it rather than risk decrypting it with 1-RTT keys.
-            .zero_rtt => return error.Dropped,
-            .retry => return error.Dropped, // retry handling is the connection-setup path
+            .zero_rtt => .application,
+            .retry => unreachable,
         };
         const total = hdr.pn_offset + @as(usize, @intCast(hdr.length));
         if (total > buf.len) return error.Dropped;
+        if (self.role == .server and hdr.ltype == .initial and datagram_len < constants.MIN_INITIAL_DATAGRAM) {
+            return error.Dropped;
+        }
+        // Adopt the peer's source connection id (from its first long header) as the
+        // destination of everything we send (RFC 9000 7.2). Until this, peer_scid
+        // defaults to the client dcid - fine for tests that use one shared id.
+        if (!self.peer_scid_set and hdr.scid.len > 0) {
+            const sc = self.gpa.dupe(u8, hdr.scid) catch return error.OutOfMemory;
+            self.gpa.free(self.peer_scid);
+            self.peer_scid = sc;
+            self.peer_scid_set = true;
+        }
         // A long header's length is known, so a packet we cannot decrypt (no keys
         // for the space yet, or a bad tag) is SKIPPED, not fatal: we return its
         // length so the caller keeps walking any coalesced packets behind it
-        // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2. The
-        // header's scid rides along so it is adopted only AFTER the packet
-        // authenticates: a spoofed Initial racing the client's must not steer
-        // where replies go or poison the id its transport parameters are checked
-        // against (that would let an off-path attacker kill the handshake).
-        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, now, hdr.scid) catch |e| switch (e) {
+        // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2.
+        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, now) catch |e| switch (e) {
             error.Dropped => return total,
             else => return e,
         };
         return total;
     }
 
-    fn receiveShort(self: *Connection, buf: []const u8, now: u64) Error!usize {
-        const hdr = packet.parseShort(buf, self.dcid.len) catch return error.Dropped;
-        // A short-header packet is the rest of the datagram (no length field).
-        try self.decryptAndDispatch(buf, hdr.pn_offset, .application, false, now, null);
+    fn sendVersionNegotiation(self: *Connection, prefix: packet.LongPrefix) Error!void {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.gpa);
+        packet.writeVersionNegotiation(&out, self.gpa, prefix.scid, prefix.dcid) catch return error.OutOfMemory;
+        if (!self.canSendDatagram(out.items.len, true)) {
+            return;
+        }
+        self.out.appendSlice(self.gpa, out.items) catch return error.OutOfMemory;
+        self.out_lengths.append(self.gpa, out.items.len) catch return error.OutOfMemory;
+        self.out_path_tokens.append(self.gpa, self.sendPathToken()) catch return error.OutOfMemory;
+        self.sent_bytes += out.items.len;
+        self.recordPathSent(out.items.len);
+    }
+
+    fn receiveVersionNegotiation(self: *Connection, prefix: packet.LongPrefix, buf: []const u8) Error!usize {
+        if (self.role != .client) return error.Dropped;
+        // VN is only valid if it is addressed to our source CID and names the peer's
+        // CID as its source. Otherwise it is not for this connection.
+        if (!std.mem.eql(u8, prefix.dcid, self.scid)) return error.Dropped;
+        if (!std.mem.eql(u8, prefix.scid, self.peer_scid)) return error.Dropped;
+        const versions = buf[prefix.header_len..];
+        if (versions.len == 0 or versions.len % 4 != 0) return error.Dropped;
+
+        var pos: usize = 0;
+        while (pos < versions.len) : (pos += 4) {
+            const v = std.mem.readInt(u32, versions[pos..][0..4], .big);
+            // A VN packet that includes the version we attempted is invalid and is
+            // ignored (RFC 9000 17.2.1).
+            if (v == constants.VERSION_1) return error.Dropped;
+        }
+        self.closed = true;
+        return error.ProtocolViolation;
+    }
+
+    fn receiveRetry(self: *Connection, hdr: packet.LongHeader, buf: []const u8, now: u64) Error!usize {
+        if (self.role != .client) return error.Dropped;
+        if (self.retried or self.spaces[@intFromEnum(Space.handshake)].recv_keys != null) return error.Dropped;
+        if (!std.mem.eql(u8, hdr.dcid, self.scid)) return error.Dropped;
+        if (hdr.scid.len == 0 or hdr.token.len == 0) return error.Dropped;
+        if (!(packet.validateRetryIntegrity(self.gpa, buf, self.peer_scid) catch return error.OutOfMemory)) return error.Dropped;
+
+        const token = self.gpa.dupe(u8, hdr.token) catch return error.OutOfMemory;
+        errdefer self.gpa.free(token);
+        const sc = self.gpa.dupe(u8, hdr.scid) catch return error.OutOfMemory;
+        errdefer self.gpa.free(sc);
+        const retry_scid = self.gpa.dupe(u8, hdr.scid) catch return error.OutOfMemory;
+        errdefer self.gpa.free(retry_scid);
+
+        if (self.initial_token) |old| self.gpa.free(old);
+        self.initial_token = token;
+        self.gpa.free(self.peer_scid);
+        self.peer_scid = sc;
+        if (self.retry_scid) |old| self.gpa.free(old);
+        self.retry_scid = retry_scid;
+        self.peer_scid_set = false;
+        self.retried = true;
+
+        const initial = crypto.InitialKeys.derive(hdr.scid);
+        const st = &self.spaces[@intFromEnum(Space.initial)];
+        st.recv_keys = initial.server;
+        st.send_keys = initial.client;
+        if (st.crypto_send.end() > 0) try st.crypto_send.onLost(0, st.crypto_send.end(), false);
+        st.crypto_sent.clearRetainingCapacity();
+        try self.flushCrypto(.initial, now);
         return buf.len;
     }
 
-    fn decryptAndDispatch(self: *Connection, pkt: []const u8, pn_offset: usize, space: Space, long: bool, now: u64, peer_scid_hdr: ?[]const u8) Error!void {
-        const st = &self.spaces[@intFromEnum(space)];
-        const keys = st.recv_keys orelse return error.Dropped; // no keys for this space yet
-        // Work on a mutable copy: header protection removal and decryption mutate.
-        const work = self.gpa.dupe(u8, pkt) catch return error.OutOfMemory;
-        defer self.gpa.free(work);
+    fn receiveShort(self: *Connection, buf: []const u8, now: u64) Error!usize {
+        const parsed = self.parseShortForLocalCid(buf) catch {
+            if (self.detectStatelessReset(buf)) return buf.len;
+            return error.Dropped;
+        };
+        const previous_cid_seq = self.current_packet_local_cid_seq;
+        self.current_packet_local_cid_seq = parsed.local_cid_seq;
+        defer self.current_packet_local_cid_seq = previous_cid_seq;
+        // A short-header packet is the rest of the datagram (no length field).
+        self.decryptAndDispatch(buf, parsed.hdr.pn_offset, .application, false, now) catch |e| switch (e) {
+            error.Dropped => {
+                if (self.detectStatelessReset(buf)) return buf.len;
+                return error.Dropped;
+            },
+            else => return e,
+        };
+        return buf.len;
+    }
 
-        const pn_len = crypto.unprotectHeader(keys.hp, work, pn_offset, long) catch return error.Dropped;
-        var truncated: u64 = 0;
-        for (work[pn_offset .. pn_offset + pn_len]) |b| truncated = (truncated << 8) | b;
-        const pn = packet.decodePacketNumber(st.largest_recv_pn orelse 0, truncated, pn_len);
+    fn parseShortForLocalCid(self: *const Connection, buf: []const u8) packet.Error!ParsedShortForLocalCid {
+        if ((buf[0] & constants.FIXED_BIT) == 0) return error.Malformed;
+        if (!self.local_initial_cid_retired) {
+            const hdr = try packet.parseShort(buf, self.scid.len);
+            if (std.mem.eql(u8, hdr.dcid, self.scid)) return .{ .hdr = hdr, .local_cid_seq = 0 };
+        }
+        var it = self.local_cids.iterator();
+        while (it.next()) |cid| {
+            if (cid.value_ptr.retired) continue;
+            const hdr = packet.parseShort(buf, cid.value_ptr.cid.len) catch |e| switch (e) {
+                error.Truncated => continue,
+                else => return e,
+            };
+            if (std.mem.eql(u8, hdr.dcid, cid.value_ptr.cid)) return .{ .hdr = hdr, .local_cid_seq = cid.key_ptr.* };
+        }
+        return error.Malformed;
+    }
 
-        const header = work[0 .. pn_offset + pn_len];
-        const ciphertext = work[pn_offset + pn_len ..];
-        const plaintext = self.gpa.alloc(u8, ciphertext.len) catch return error.OutOfMemory;
-        defer self.gpa.free(plaintext);
-        const payload = crypto.open(keys, pn, header, ciphertext, plaintext) catch return error.Dropped;
-
-        // The packet authenticated: NOW the peer's source connection id can be
-        // trusted. Adopt it as the destination of everything we send (RFC 9000 7.2).
-        if (peer_scid_hdr) |scid| {
-            if (!self.peer_scid_set and scid.len > 0) {
-                const sc = self.gpa.dupe(u8, scid) catch return error.OutOfMemory;
-                self.gpa.free(self.peer_scid);
-                self.peer_scid = sc;
-                self.peer_scid_set = true;
+    fn detectStatelessReset(self: *Connection, buf: []const u8) bool {
+        if (buf.len < 21) return false;
+        const token = buf[buf.len - 16 ..];
+        if (self.peer_tp.stateless_reset_token) |t| {
+            if (std.mem.eql(u8, token, &t)) {
+                self.closed = true;
+                return true;
             }
         }
+        var it = self.peer_cids.valueIterator();
+        while (it.next()) |cid| {
+            if (std.mem.eql(u8, token, &cid.token)) {
+                self.closed = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn acceptsLocalCid(self: *const Connection, dcid: []const u8) bool {
+        if (self.local_initial_cid_retired) return false;
+        return std.mem.eql(u8, dcid, self.scid);
+    }
+
+    fn localCidValueExists(self: *const Connection, cid: []const u8) bool {
+        var it = self.local_cids.valueIterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.cid, cid)) return true;
+        }
+        return false;
+    }
+
+    fn peerCidValueExists(self: *const Connection, cid: []const u8) bool {
+        var it = self.peer_cids.valueIterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.cid, cid)) return true;
+        }
+        return false;
+    }
+
+    fn localActiveCidCountAfter(self: *const Connection, retire_prior_to: u64) u64 {
+        var count: u64 = 0;
+        if (!self.local_initial_cid_retired and retire_prior_to == 0) count += 1;
+        var it = self.local_cids.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.retired and entry.key_ptr.* >= retire_prior_to) count += 1;
+        }
+        return count;
+    }
+
+    fn decryptAndDispatch(self: *Connection, pkt: []const u8, pn_offset: usize, space: Space, long: bool, now: u64) Error!void {
+        const st = &self.spaces[@intFromEnum(space)];
+        const opened = if (space == .application and !long)
+            try self.openApplicationPacket(pkt, pn_offset)
+        else if (space == .application)
+            try self.openPacket(pkt, pn_offset, space, long, st.zero_rtt_recv_keys orelse return error.Dropped, null)
+        else
+            try self.openPacket(pkt, pn_offset, space, long, st.recv_keys orelse return error.Dropped, null);
+        defer self.gpa.free(opened.work);
+        defer self.gpa.free(opened.plaintext);
 
         // A decryptable Handshake packet proves the peer received our Initial/
         // handshake keys, so its address is validated and the 3x send limit lifts
         // (RFC 9000 8.1).
-        if (space == .handshake) self.address_validated = true;
+        if (space == .handshake) self.validateCurrentPath();
 
-        // The packet authenticated and is being processed: reset the idle timer (RFC
-        // 9000 10.1). A dropped/undecryptable packet never reaches here, so spoofed
-        // traffic cannot keep the connection alive. Receiving also re-arms the "first
-        // ack-eliciting send restarts the timer" rule, so the next probe counts again.
-        self.last_activity = now;
-        self.sent_ack_eliciting_since_recv = false;
-
-        st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, pn) else pn;
-        st.recv_ranges.add(self.gpa, pn) catch return error.OutOfMemory; // for accurate ACKs
-        // Expose this Initial's scid to the ClientHello handler so it can check the
-        // client's initial_source_connection_id against the carrier packet's id
-        // (RFC 9000 7.3); borrowed for the dispatch only, then cleared.
-        self.dispatch_initial_scid = if (space == .initial) peer_scid_hdr else null;
-        defer self.dispatch_initial_scid = null;
-        try self.dispatchFrames(payload, space, now);
+        st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, opened.pn) else opened.pn;
+        st.recv_ranges.add(self.gpa, opened.pn) catch return error.OutOfMemory; // for accurate ACKs
+        try self.dispatchFrames(opened.payload, space, long, now);
+        self.resetIdleTimer(now);
 
         // Acknowledge the space if it carried an ack-eliciting frame this packet.
         if (st.ack_pending) try self.sendAck(space, now);
     }
 
-    fn dispatchFrames(self: *Connection, payload: []const u8, space: Space, now: u64) Error!void {
+    fn openApplicationPacket(self: *Connection, pkt: []const u8, pn_offset: usize) Error!OpenedPacket {
+        const st = &self.spaces[@intFromEnum(Space.application)];
+        const current = st.recv_keys orelse return error.Dropped;
+
+        if (self.openPacket(pkt, pn_offset, .application, false, current, st.recv_key_phase)) |opened| {
+            return opened;
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Dropped => {},
+            else => return err,
+        }
+
+        if (st.recv_secret) |secret| {
+            const next_secret = crypto.nextTrafficSecret(secret);
+            const next_keys = crypto.Keys.fromUpdatedSecret(next_secret, current.hp);
+            const next_phase = !st.recv_key_phase;
+            if (self.openPacket(pkt, pn_offset, .application, false, next_keys, next_phase)) |opened| {
+                st.prev_recv_keys = current;
+                st.prev_recv_key_phase = st.recv_key_phase;
+                st.recv_secret = next_secret;
+                st.recv_keys = next_keys;
+                st.recv_key_phase = next_phase;
+                return opened;
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Dropped => {},
+                else => return err,
+            }
+        }
+
+        if (st.prev_recv_keys) |prev| {
+            return self.openPacket(pkt, pn_offset, .application, false, prev, st.prev_recv_key_phase) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.Dropped,
+            };
+        }
+
+        return error.Dropped;
+    }
+
+    fn openPacket(self: *Connection, pkt: []const u8, pn_offset: usize, space: Space, long: bool, keys: crypto.Keys, expected_key_phase: ?bool) Error!OpenedPacket {
+        // Work on a mutable copy: header protection removal and decryption mutate.
+        const work = self.gpa.dupe(u8, pkt) catch return error.OutOfMemory;
+        errdefer self.gpa.free(work);
+
+        const pn_len = crypto.unprotectHeader(keys.hp, work, pn_offset, long) catch return error.Dropped;
+        if (pn_offset + pn_len > work.len) return error.Dropped;
+        const key_phase = !long and (work[0] & packet.SHORT_KEY_PHASE) != 0;
+        if (expected_key_phase) |expected| {
+            if (key_phase != expected) return error.Dropped;
+        }
+
+        var truncated: u64 = 0;
+        for (work[pn_offset .. pn_offset + pn_len]) |b| truncated = (truncated << 8) | b;
+        const st = &self.spaces[@intFromEnum(space)];
+        const pn = packet.decodePacketNumber(st.largest_recv_pn orelse 0, truncated, pn_len);
+
+        const header = work[0 .. pn_offset + pn_len];
+        const ciphertext = work[pn_offset + pn_len ..];
+        const plaintext = self.gpa.alloc(u8, ciphertext.len) catch return error.OutOfMemory;
+        errdefer self.gpa.free(plaintext);
+        const payload = crypto.open(keys, pn, header, ciphertext, plaintext) catch return error.Dropped;
+        return .{
+            .work = work,
+            .plaintext = plaintext,
+            .payload = payload,
+            .pn = pn,
+            .key_phase = key_phase,
+        };
+    }
+
+    fn dispatchFrames(self: *Connection, payload: []const u8, space: Space, long: bool, now: u64) Error!void {
         var rest = payload;
         while (rest.len > 0) {
             const d = frame.decode(rest) catch return error.ProtocolViolation;
-            try self.handleFrame(d.frame, space, now);
+            try self.handleFrame(d.frame, space, long, now);
             if (d.len == 0) break;
             rest = rest[d.len..];
         }
     }
 
-    fn handleFrame(self: *Connection, f: frame.Frame, space: Space, now: u64) Error!void {
+    fn handleFrame(self: *Connection, f: frame.Frame, space: Space, long: bool, now: u64) Error!void {
         // RFC 9000 12.4: only PADDING, PING, ACK, CRYPTO, and CONNECTION_CLOSE are
         // permitted in the Initial and Handshake spaces. STREAM and the other
         // 1-RTT frames in those spaces are a PROTOCOL_VIOLATION - the recv mirror of
         // keeping STREAM out of Initial on the send side.
-        if (!frameAllowedIn(space, f)) return error.ProtocolViolation;
+        if (!frameAllowedIn(space, long, f)) return error.ProtocolViolation;
 
         const st = &self.spaces[@intFromEnum(space)];
+        if (frameAckEliciting(f)) st.ack_pending = true;
         switch (f) {
             .padding => {},
-            .ping => st.ack_pending = true,
+            .ping => {},
             .ack => |a| try self.onAckFrame(space, a, now),
             .crypto => |c| {
-                st.ack_pending = true;
                 try self.onCrypto(space, c.offset, c.data, now);
             },
             .stream => |s| {
-                st.ack_pending = true;
                 try self.onStreamFrame(s.stream_id, s.offset, s.data, s.fin);
             },
-            .max_data => |m| self.conn_send_window.onMaxData(m),
+            .max_data => |m| self.onMaxData(m),
             .max_stream_data => |m| try self.onMaxStreamData(m.stream_id, m.max),
+            .max_streams => |m| try self.onMaxStreams(m.bidi, m.max),
+            .data_blocked => |limit| self.onDataBlocked(limit),
+            .stream_data_blocked => |b| try self.onStreamDataBlocked(b.stream_id, b.limit),
+            .streams_blocked => |b| try self.onStreamsBlocked(b.bidi, b.limit),
             .reset_stream => |r| try self.onReset(r.stream_id, r.error_code, r.final_size),
             .stop_sending => |s| try self.onStopSending(s.stream_id, s.error_code),
+            .new_token => |t| {
+                if (self.role != .client) return error.ProtocolViolation;
+                try self.onNewToken(t.token);
+            },
+            .new_connection_id => |cid| try self.onNewConnectionId(cid.seq, cid.retire_prior_to, cid.cid, cid.token),
+            .retire_connection_id => |seq| try self.onRetireConnectionId(seq),
+            .path_challenge => |data| {
+                try self.sendPathResponse(data, now);
+            },
+            .path_response => |data| try self.onPathResponse(data),
             .connection_close => |cc| {
                 // Retain the peer's close details (RFC 9000 19.19); the reason slice
                 // points into the datagram, so copy a length-capped prefix. The first
                 // close wins - a later frame in the same (closing) packet cannot
-                // overwrite it. A copy failure still records the close, sans reason.
+                // overwrite it.
                 if (self.peer_close == null) {
                     const n = @min(cc.reason.len, PeerClose.MAX_REASON);
-                    const reason = self.gpa.dupe(u8, cc.reason[0..n]) catch &.{};
+                    const reason = self.gpa.dupe(u8, cc.reason[0..n]) catch return error.OutOfMemory;
                     self.peer_close = .{ .app = cc.app, .error_code = cc.error_code, .reason = reason };
                 }
                 self.closed = true;
             },
-            .handshake_done => {},
-            else => {}, // the remaining control frames affect state the send path owns
+            .handshake_done => {
+                if (self.role != .client) return error.ProtocolViolation;
+                if (self.role == .client and !self.handshake_confirmed) {
+                    self.handshake_confirmed = true;
+                    self.discardSpace(.initial);
+                    self.discardSpace(.handshake);
+                }
+            },
         }
     }
 
-    /// RFC 9000 12.4 / table 3: which frame types each space permits. Initial and
-    /// Handshake carry only the handshake-control frames; everything else is a 1-RTT
-    /// frame and illegal there.
-    fn frameAllowedIn(space: Space, f: frame.Frame) bool {
-        if (space == .application) return true;
+    fn onNewToken(self: *Connection, token: []const u8) Error!void {
+        if (self.new_tokens.items.len == MAX_NEW_TOKENS) {
+            const oldest = self.new_tokens.orderedRemove(0);
+            self.gpa.free(oldest);
+        }
+        const owned = self.gpa.dupe(u8, token) catch return error.OutOfMemory;
+        errdefer self.gpa.free(owned);
+        self.new_tokens.append(self.gpa, owned) catch return error.OutOfMemory;
+    }
+
+    fn onRetireConnectionId(self: *Connection, seq: u64) Error!void {
+        if (self.current_packet_local_cid_seq) |current| {
+            if (current == seq) return error.ProtocolViolation;
+        }
+        if (seq > self.local_cid_max_seq) return error.ProtocolViolation;
+        if (seq == 0) {
+            self.local_initial_cid_retired = true;
+            return;
+        }
+        const local = self.local_cids.getPtr(seq) orelse return error.ProtocolViolation;
+        local.retired = true;
+    }
+
+    fn onNewConnectionId(self: *Connection, seq: u64, retire_prior_to: u64, cid: []const u8, token: []const u8) Error!void {
+        if (token.len != 16) return error.ProtocolViolation;
+        if (retire_prior_to > self.peer_retire_prior_to) {
+            self.peer_retire_prior_to = retire_prior_to;
+            var retire: std.ArrayListUnmanaged(u64) = .empty;
+            defer retire.deinit(self.gpa);
+            var it = self.peer_cids.keyIterator();
+            while (it.next()) |existing_seq| {
+                if (existing_seq.* < retire_prior_to) retire.append(self.gpa, existing_seq.*) catch return error.OutOfMemory;
+            }
+            for (retire.items) |old_seq| {
+                if (self.peer_cids.fetchRemove(old_seq)) |entry| {
+                    self.gpa.free(entry.value.cid);
+                    const gop = self.pending_retire_cids.getOrPut(self.gpa, old_seq) catch return error.OutOfMemory;
+                    if (!gop.found_existing) gop.value_ptr.* = .{};
+                }
+            }
+        }
+        if (seq < self.peer_retire_prior_to) return;
+
+        const token_array = token[0..16].*;
+        if (self.peer_cids.get(seq)) |existing| {
+            if (!std.mem.eql(u8, existing.cid, cid) or !std.mem.eql(u8, &existing.token, &token_array)) return error.ProtocolViolation;
+            return;
+        }
+        if (std.mem.eql(u8, cid, self.peer_scid) or self.peerCidValueExists(cid)) return error.ProtocolViolation;
+
+        if (self.peer_cids.count() + 2 > self.local_tp.active_connection_id_limit) return error.ProtocolViolation;
+        const owned = self.gpa.dupe(u8, cid) catch return error.OutOfMemory;
+        errdefer self.gpa.free(owned);
+        self.peer_cids.put(self.gpa, seq, .{ .cid = owned, .token = token_array }) catch return error.OutOfMemory;
+    }
+
+    /// RFC 9002 2: every frame except ACK, PADDING, and CONNECTION_CLOSE makes its
+    /// packet ack-eliciting. Keep this independent of the frame-specific switch so
+    /// passive control frames like MAX_DATA and NEW_TOKEN still get acknowledged.
+    fn frameAckEliciting(f: frame.Frame) bool {
         return switch (f) {
-            .padding, .ping, .ack, .crypto, .connection_close => true,
+            .padding, .ack, .connection_close => false,
+            else => true,
+        };
+    }
+
+    fn sendPathResponse(self: *Connection, data: [8]u8, now: u64) Error!void {
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(self.gpa);
+        frame.encodePathResponse(&frames, self.gpa, data) catch return error.OutOfMemory;
+        _ = try self.buildPacket(.application, frames.items, true, now);
+    }
+
+    fn onPathResponse(self: *Connection, data: [8]u8) Error!void {
+        const token = pathToken(data);
+        const pending = self.pending_path_challenges.get(token) orelse return error.ProtocolViolation;
+        if (pending.path_token) |pt| {
+            if (self.current_path_token == null or self.current_path_token.? != pt) return error.ProtocolViolation;
+        }
+        _ = self.pending_path_challenges.remove(token);
+        if (self.pathChallengeInflightPn(token)) |pn| _ = self.path_challenge_inflight.remove(pn);
+        self.validateCurrentPath();
+        if (pending.path_token) |pt| self.removePendingPathChallengesFor(pt);
+    }
+
+    fn pathChallengeInflightPn(self: *Connection, token: u64) ?u64 {
+        var it = self.path_challenge_inflight.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == token) return entry.key_ptr.*;
+        }
+        return null;
+    }
+
+    fn removePendingPathChallengesFor(self: *Connection, pt: u64) void {
+        while (true) {
+            var removed = false;
+            var it = self.pending_path_challenges.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.path_token != null and entry.value_ptr.path_token.? == pt) {
+                    const token = entry.key_ptr.*;
+                    _ = self.pending_path_challenges.remove(token);
+                    if (self.pathChallengeInflightPn(token)) |pn| _ = self.path_challenge_inflight.remove(pn);
+                    removed = true;
+                    break;
+                }
+            }
+            if (!removed) break;
+        }
+    }
+
+    fn canSendDatagram(self: *Connection, datagram_len: usize, long: bool) bool {
+        if (self.role != .server) return true;
+        if (self.sendPathToken()) |pt| {
+            const p = self.paths.get(pt) orelse return false;
+            if (p.validated) return true;
+            return withinAmplificationBudget(p.sent_bytes, p.recv_bytes, datagram_len);
+        }
+        if (!long or self.address_validated) return true;
+        return withinAmplificationBudget(self.sent_bytes, self.recv_bytes, datagram_len);
+    }
+
+    fn recordPathSent(self: *Connection, datagram_len: usize) void {
+        if (self.sendPathToken()) |pt| {
+            if (self.paths.getPtr(pt)) |p| p.sent_bytes += datagram_len;
+        }
+    }
+
+    fn sendPathToken(self: *const Connection) ?u64 {
+        return self.current_path_token orelse self.default_path_token;
+    }
+
+    fn validateCurrentPath(self: *Connection) void {
+        if (self.current_path_token) |pt| {
+            if (self.paths.getPtr(pt)) |p| p.validated = true;
+            self.default_path_token = pt;
+        }
+        self.address_validated = true;
+    }
+
+    fn pathTokenForAddress(self: *Connection, peer_address: []const u8) Error!u64 {
+        const token = std.hash.Wyhash.hash(0, peer_address);
+        const gop = self.paths.getOrPut(self.gpa, token) catch return error.OutOfMemory;
+        if (gop.found_existing) {
+            if (!std.mem.eql(u8, gop.value_ptr.address, peer_address)) return error.ProtocolViolation;
+        } else {
+            const owned = self.gpa.dupe(u8, peer_address) catch {
+                _ = self.paths.remove(token);
+                return error.OutOfMemory;
+            };
+            gop.value_ptr.* = .{ .address = owned };
+        }
+        return token;
+    }
+
+    fn pathToken(data: [8]u8) u64 {
+        return std.mem.readInt(u64, &data, .big);
+    }
+
+    fn withinAmplificationBudget(sent: u64, received: u64, datagram_len: usize) bool {
+        const budget = if (received > std.math.maxInt(u64) / constants.AMPLIFICATION_FACTOR)
+            std.math.maxInt(u64)
+        else
+            received * constants.AMPLIFICATION_FACTOR;
+        if (sent > budget) return false;
+        return datagram_len <= budget - sent;
+    }
+
+    /// RFC 9000 12.4 / table 3: which frame types each space permits.
+    fn frameAllowedIn(space: Space, long: bool, f: frame.Frame) bool {
+        if (space == .application and long) return switch (f) {
+            .padding, .ping, .stream, .reset_stream, .stop_sending, .max_data, .max_stream_data, .max_streams, .data_blocked, .stream_data_blocked, .streams_blocked, .new_connection_id, .retire_connection_id, .path_challenge => true,
+            .connection_close => |cc| !cc.app,
+            else => false,
+        };
+        if (space == .application) return switch (f) {
+            else => true,
+        };
+        return switch (f) {
+            .padding, .ping, .ack, .crypto => true,
+            .connection_close => |cc| !cc.app,
             else => false,
         };
     }
@@ -1448,12 +2685,12 @@ pub const Connection = struct {
     /// packet, even through the shared buildPacket primitive). A debug
     /// check - it decodes the payload, so it compiles out in release builds, where
     /// the single STREAM caller is already pinned to the Application space.
-    fn assertFramesAllowedIn(space: Space, frames: []const u8) void {
+    fn assertFramesAllowedIn(space: Space, long: bool, frames: []const u8) void {
         if (!std.debug.runtime_safety) return;
         var rest = frames;
         while (rest.len > 0) {
             const d = frame.decode(rest) catch return;
-            std.debug.assert(frameAllowedIn(space, d.frame));
+            std.debug.assert(frameAllowedIn(space, long, d.frame));
             if (d.len == 0) break;
             rest = rest[d.len..];
         }
@@ -1461,146 +2698,64 @@ pub const Connection = struct {
 
     fn onStreamFrame(self: *Connection, id: u64, offset: u64, data: []const u8, fin: bool) Error!void {
         if (self.isRetired(id)) return; // a late frame for a completed-and-dropped stream
-        // A client may only send on streams it initiated (RFC 9000 19.8); a STREAM
-        // frame on a server-initiated id - or on a send-only unidirectional stream we
-        // own - is a STREAM_STATE_ERROR. Reject before any per-stream state is created.
-        if (!self.peerMaySendOn(id)) return error.ProtocolViolation;
-        // A stream offset past the 62-bit maximum is a FRAME_ENCODING_ERROR (RFC 9000
-        // 4.5); reject it before the arithmetic below could wrap.
-        if (offset > varint.MAX or data.len > varint.MAX - offset) return error.ProtocolViolation;
-        try self.noteClientStream(id);
-        const s = try self.recvStream(id);
-        // Reject data past this stream's window BEFORE push buffers it (RFC 9000 4.1 /
-        // 19.10), so a single huge over-limit STREAM frame cannot make us allocate it.
-        // The check is on this frame's end offset, not just the high-water mark.
-        if (self.stream_recv_windows.getPtr(id)) |sw| {
-            sw.window.onReceived(offset + data.len) catch return error.FlowControlError;
-        }
+        if (!self.peerCanSendOn(id)) return error.StreamStateError;
+        const existing = self.streams.get(id);
+        const end = std.math.add(u64, offset, data.len) catch return error.FlowControlError;
+        const old_high = if (existing) |s| s.highest_received else 0;
+        const new_high = @max(old_high, end);
+        const expected_delta = new_high - old_high;
+        const recv_limit = if (self.recv_windows.get(id)) |rw| rw.limit else self.initialStreamRecvLimit(id);
+        if (new_high > recv_limit) return error.FlowControlError;
+        const new_total = std.math.add(u64, self.conn_received_total, expected_delta) catch return error.FlowControlError;
+        if (new_total > self.conn_recv_window.limit) return error.FlowControlError;
+        const s = existing orelse try self.recvStream(id);
+        const rw = try self.recvWindow(id);
         const delta = s.push(offset, data, fin) catch |e| switch (e) {
             error.FinalSizeError => return error.FinalSizeError,
+            error.StreamBufferExceeded => return error.StreamBufferExceeded,
             error.OutOfMemory => return error.OutOfMemory,
         };
+        std.debug.assert(s.highest_received == new_high);
+        std.debug.assert(delta == expected_delta);
+        rw.onReceived(s.highest_received) catch return error.FlowControlError;
         // Charge the new bytes against the connection-wide window (the sum across
         // every stream), not just this stream's offset.
-        self.conn_received_total += delta;
+        self.conn_received_total = new_total;
         self.conn_recv_window.onReceived(self.conn_received_total) catch return error.FlowControlError;
     }
 
     fn onReset(self: *Connection, id: u64, error_code: u64, final_size: u64) Error!void {
         if (self.isRetired(id)) return; // a reset for an already-completed-and-dropped stream
-        // RESET_STREAM is only valid on a stream the peer initiated (RFC 9000 19.4).
-        if (!self.peerMaySendOn(id)) return error.ProtocolViolation;
-        try self.noteClientStream(id);
+        if (!self.peerCanSendOn(id)) return error.StreamStateError;
         const s = try self.recvStream(id);
-        // A RESET_STREAM's final size counts as data received up to that offset (RFC
-        // 9000 4.5): it consumes flow-control credit, so it must stay within both this
-        // stream's window and the connection window, exactly like STREAM data - else a
-        // peer could declare an over-limit final size and bypass the per-stream bound.
-        if (self.stream_recv_windows.getPtr(id)) |sw| {
-            sw.window.onReceived(final_size) catch return error.FlowControlError;
-        }
-        const conn_delta = if (final_size > s.highest_received) final_size - s.highest_received else 0;
-        s.onReset(error_code, final_size) catch return error.FinalSizeError; // validate before charging
-        if (conn_delta > 0) {
-            self.conn_received_total += conn_delta;
-            self.conn_recv_window.onReceived(self.conn_received_total) catch return error.FlowControlError;
-        }
-    }
-
-    /// Charge a peer-initiated bidirectional stream against the advertised cap (RFC
-    /// 9000 4.6): a STREAM_LIMIT_ERROR if `id` is beyond it. Idempotent - the limit
-    /// records the high-water count, so re-noting an already-open stream is a no-op.
-    /// Only client-bidi request streams are gated here; enforcement is off (null) on
-    /// the non-server path, and uni control streams are bounded by their own logic.
-    fn noteClientStream(self: *Connection, id: u64) Error!void {
-        const limit = if (self.bidi_limit) |*l| l else return; // unenforced (non-server) path
-        if (stream.StreamType.of(id) != .client_bidi) return;
-        limit.onOpened(id / 4) catch return error.StreamLimitError;
-    }
-
-    /// Whether the peer is permitted to send STREAM/RESET on `id` (RFC 9000 3.2,
-    /// 19.8). A bidirectional stream carries data both ways, so either endpoint may
-    /// send on it; a unidirectional stream is send-only for its initiator, so the
-    /// peer may send on it only if the peer initiated it. Sending on OUR own
-    /// unidirectional stream is a STREAM_STATE_ERROR.
-    fn peerMaySendOn(self: *const Connection, id: u64) bool {
-        const t = stream.StreamType.of(id);
-        if (!t.isUni()) return true; // bidirectional: both endpoints send
-        const peer_is_client = self.role == .server;
-        return t.isClientInitiated() == peer_is_client; // a uni stream: only its initiator sends
-    }
-
-    /// The peer's advertised per-stream send limit for a stream WE send on `id`
-    /// (RFC 9000 18.2): uni for our unidirectional streams, bidi_local when the bidi
-    /// stream was opened by the peer (our responses), bidi_remote when we opened it.
-    fn peerSendInitial(self: *const Connection, id: u64) u64 {
-        const t = stream.StreamType.of(id);
-        if (t.isUni()) return self.stream_send_initial_uni;
-        const we_opened = t.isClientInitiated() != (self.role == .server);
-        return if (we_opened) self.stream_send_initial_own_bidi else self.stream_send_initial_peer_bidi;
-    }
-
-    /// The peer raised our send limit on `id` (RFC 9000 19.10). A MAX_STREAM_DATA may
-    /// only target a stream we send on - a bidirectional stream, or one we initiated;
-    /// for the server that is a bidi or a server-uni id. One for a receive-only stream
-    /// is a STREAM_STATE_ERROR. The grant is applied to the window, or held for a send
-    /// stream not opened yet so a pre-emptive grant is not lost (a limit only grows).
-    fn onMaxStreamData(self: *Connection, id: u64, max: u64) Error!void {
-        const t = stream.StreamType.of(id);
-        const we_send_on = !t.isUni() or (t.isClientInitiated() != (self.role == .server));
-        if (!we_send_on) return error.ProtocolViolation;
-        if (self.stream_send_windows.getPtr(id)) |w| {
-            w.onMaxData(max);
-            return;
-        }
-        // The send window does not exist yet. We open our own streams before sending on
-        // them, so a pre-emptive grant is only meaningful for a PEER-initiated bidi
-        // stream we have not responded on yet. A grant for a stream that already
-        // completed (its window was reclaimed) must NOT be held: the id is never
-        // reused, so the entry would never be consumed and a peer could grow the map
-        // for every retired stream. A grant for any other not-yet-open stream is
-        // dropped (it re-grants from the initial when we open it).
-        if (t == .client_bidi and self.role == .server and !self.isRetired(id)) {
-            try self.noteClientStream(id); // STREAM_LIMIT_ERROR if past the cap; bounds the map
-            const gop = self.pending_send_max.getOrPut(self.gpa, id) catch return error.OutOfMemory;
-            gop.value_ptr.* = if (gop.found_existing) @max(gop.value_ptr.*, max) else max;
-        }
+        const new_high = @max(s.highest_received, final_size);
+        const delta = new_high - s.highest_received;
+        const rw = try self.recvWindow(id);
+        if (new_high > rw.limit) return error.FlowControlError;
+        const new_total = std.math.add(u64, self.conn_received_total, delta) catch return error.FlowControlError;
+        if (new_total > self.conn_recv_window.limit) return error.FlowControlError;
+        const charged = s.onReset(error_code, final_size) catch return error.FinalSizeError;
+        std.debug.assert(charged == delta);
+        rw.onReceived(s.highest_received) catch return error.FlowControlError;
+        self.conn_received_total = new_total;
+        self.conn_recv_window.onReceived(self.conn_received_total) catch return error.FlowControlError;
     }
 
     /// A peer STOP_SENDING (RFC 9000 19.5) asks us to stop sending on `id`. Reset that
-    /// send stream so we stop producing; if it does not exist yet (the peer cancelled
-    /// before we started the response), remember the request so the stream is born
-    /// already reset. Only the bidirectional request/response streams are auto-reset -
-    /// a STOP_SENDING aimed at the server's own control/QPACK streams is left to the
+    /// send stream so we stop producing; if the stream does not exist yet (the peer
+    /// cancelled before we started the response), remember the request so the stream
+    /// is born already reset rather than sending data the peer rejected. Only the
+    /// bidirectional request/response streams are auto-reset - a STOP_SENDING aimed at
+    /// the server's own unidirectional infrastructure (control/QPACK) is left to the
     /// layer above, so it never resets the critical control stream.
     fn onStopSending(self: *Connection, id: u64, error_code: u64) Error!void {
+        if (!self.localCanSendOn(id)) return error.StreamStateError;
         if (stream.StreamType.of(id) != .client_bidi) return;
-        // Charge the stream against the bidi cap before stashing any state for it (RFC
-        // 9000 4.6): a STOP_SENDING for a never-seen high id is otherwise an unchecked
-        // way to grow peer_stop_sending / stop_sending_recv unbounded.
-        try self.noteClientStream(id);
-        // Record the cancellation so the layer above can surface it (takeStopSending),
-        // even when the request side is never reset - the integrator would otherwise
-        // only discover it as a late error when it tries to send the response.
-        self.stop_sending_recv.put(self.gpa, id, error_code) catch return error.OutOfMemory;
         if (self.send_streams.get(id)) |s| {
             s.reset(error_code);
         } else {
             self.peer_stop_sending.put(self.gpa, id, error_code) catch return error.OutOfMemory;
         }
-    }
-
-    /// The error code of a peer STOP_SENDING received for `id`, or null, WITHOUT
-    /// consuming it (so the caller can retry if surfacing the event fails).
-    pub fn peekStopSending(self: *Connection, id: u64) ?u64 {
-        return self.stop_sending_recv.get(id);
-    }
-
-    /// Take (and clear) the error code of a peer STOP_SENDING received for `id`, or
-    /// null. The layer above surfaces the response cancellation once and consumes it.
-    pub fn takeStopSending(self: *Connection, id: u64) ?u64 {
-        if (self.stop_sending_recv.fetchRemove(id)) |e| return e.value;
-        return null;
     }
 
     /// Whether `id` names a recv stream that already completed and was dropped, so a
@@ -1612,6 +2767,7 @@ pub const Connection = struct {
 
     fn recvStream(self: *Connection, id: u64) Error!*stream.RecvStream {
         if (self.streams.get(id)) |s| return s;
+        try self.checkPeerStreamLimit(id);
         const s = try self.gpa.create(stream.RecvStream);
         s.* = stream.RecvStream.init(self.gpa);
         self.streams.put(self.gpa, id, s) catch {
@@ -1619,19 +2775,6 @@ pub const Connection = struct {
             self.gpa.destroy(s);
             return error.OutOfMemory;
         };
-        // Give the new stream its own receive window (RFC 9000 19.10) so it cannot pin
-        // more than the advertised per-stream limit. The uni limit applies to a
-        // unidirectional peer stream, the bidi limit to a request stream; a 0 limit is
-        // real (it forbids data). Only the non-server path (null) skips enforcement.
-        if (self.stream_recv_limits) |limits| {
-            const limit = if (stream.StreamType.of(id).isUni()) limits.uni else limits.bidi;
-            self.stream_recv_windows.put(self.gpa, id, .{ .window = flow.Window.init(limit) }) catch {
-                _ = self.streams.remove(id);
-                s.deinit();
-                self.gpa.destroy(s);
-                return error.OutOfMemory;
-            };
-        }
         return s;
     }
 
@@ -1644,7 +2787,7 @@ pub const Connection = struct {
         if (self.send_streams.get(id)) |ss| {
             if (ss.fullyAcked()) {
                 _ = self.send_streams.remove(id);
-                _ = self.stream_send_windows.remove(id);
+                _ = self.send_windows.remove(id);
                 ss.deinit();
                 self.gpa.destroy(ss);
             }
@@ -1653,22 +2796,12 @@ pub const Connection = struct {
         if (!s.isTerminal()) return false;
         // Remember the id as retired BEFORE freeing, so a failure to record it leaves
         // the stream in place rather than dropped-but-resurrectable.
-        if (!self.retired_recv.put(self.gpa, id)) return false;
+        self.retired_recv.put(self.gpa, id, {}) catch return false;
         _ = self.streams.remove(id);
-        _ = self.stream_recv_windows.remove(id);
+        _ = self.recv_windows.remove(id);
+        _ = self.max_stream_data_pending.remove(id);
         s.deinit();
         self.gpa.destroy(s);
-        // A finished request frees a bidi slot: re-advertise a higher cap once the
-        // headroom ahead of the highest opened stream runs low (RFC 9000 4.6), so a
-        // long-lived connection serving many requests is not stranded at the limit. The
-        // grant happens here (once per slide); flushSend just emits the new max, so a
-        // retransmit re-sends the same value rather than ratcheting it up each time.
-        if (self.bidi_limit) |*limit| {
-            if (stream.StreamType.of(id) == .client_bidi and limit.shouldUpdate()) {
-                _ = limit.grant();
-                self.max_streams_pending = true;
-            }
-        }
         return true;
     }
 
@@ -1689,12 +2822,9 @@ pub const Connection = struct {
             self.conn_recv_window.onConsumed(self.conn_consumed_total);
             // Enough has been consumed to advertise a higher limit; flushSend emits it.
             if (self.conn_recv_window.shouldUpdate()) self.max_data_pending = true;
-            // Slide this stream's own window too (RFC 9000 19.10), so a long upload on
-            // one stream is not throttled by its per-stream limit. The pending flag
-            // lives on the entry, so marking it never allocates and cannot be lost.
-            if (self.stream_recv_windows.getPtr(id)) |sw| {
-                sw.window.onConsumed(s.read_offset);
-                if (sw.window.shouldUpdate()) sw.pending = true;
+            if (self.recv_windows.getPtr(id)) |rw| {
+                rw.onConsumed(s.read_offset);
+                if (rw.shouldUpdate()) self.max_stream_data_pending.put(self.gpa, id, {}) catch {};
             }
         }
     }
@@ -1724,23 +2854,6 @@ pub const Connection = struct {
         return self.streams.contains(id);
     }
 
-    /// How many unidirectional streams the peer's transport parameters let us open
-    /// (RFC 9000 4.6, initial_max_streams_uni). The HTTP/3 layer checks this before
-    /// opening its mandatory control + QPACK streams. Zero until a ClientHello is
-    /// parsed (the RFC default), so the no-handshake test path reports zero - those
-    /// tests set it directly. (A peer MAX_STREAMS would raise it; the send side does
-    /// not yet track that - see the outbound uni-limit follow-up.)
-    pub fn peerMaxStreamsUni(self: *const Connection) u64 {
-        return self.peer_tp.initial_max_streams_uni;
-    }
-
-    /// Whether the connection was silently closed by the idle timeout (RFC 9000 10.1)
-    /// rather than by a peer or local CONNECTION_CLOSE, so the integrator can tell an
-    /// inactivity close from an error close.
-    pub fn idleTimedOut(self: *const Connection) bool {
-        return self.idle_timed_out;
-    }
-
     /// Snapshot the ids of every stream the transport currently knows about, into
     /// `out`, returning how many were written (capped at `out.len`). The HTTP/3
     /// layer iterates these to advance each request stream's parse.
@@ -1755,18 +2868,8 @@ pub const Connection = struct {
         return n;
     }
 
-    /// Snapshot the ids with an unconsumed peer STOP_SENDING (RFC 9000 19.5), so the
-    /// HTTP/3 layer can surface a response cancellation even for a request whose recv
-    /// stream has already completed and is gone from `streamIds`.
-    pub fn stopSendingIds(self: *Connection, out: []u64) usize {
-        var n: usize = 0;
-        var it = self.stop_sending_recv.keyIterator();
-        while (it.next()) |k| {
-            if (n >= out.len) break;
-            out[n] = k.*;
-            n += 1;
-        }
-        return n;
+    pub fn streamCount(self: *Connection) usize {
+        return @intCast(self.streams.count());
     }
 };
 
@@ -1777,16 +2880,27 @@ const testing = std.testing;
 // protection. Returns an owned datagram the caller frees. Exposed (test-only) so
 // the HTTP/3 layer's tests can drive a request through the real transport.
 pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
-    return testBuildInitialScid(gpa, dcid, &.{}, sender, pn, frames);
+    return testBuildInitialWithPadding(gpa, dcid, sender, pn, frames, sender == .client);
 }
 
-// testBuildInitial with a caller-chosen source connection id, so a test can forge an
-// Initial whose scid differs from the legitimate client's (RFC 9000 7.3 spoofing).
-pub fn testBuildInitialScid(gpa: std.mem.Allocator, dcid: []const u8, scid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
+fn initialDatagramLen(dcid_len: usize, payload_len: usize) !usize {
+    const protected_len = 1 + payload_len + crypto.TAG_LEN;
+    return 1 + 4 + 1 + dcid_len + 1 + 1 + try varint.len(protected_len) + protected_len;
+}
+
+fn testBuildInitialWithPadding(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, pn: u64, frames: []const u8, pad_to_min: bool) ![]u8 {
     const keys = blk: {
         const ik = crypto.InitialKeys.derive(dcid);
         break :blk if (sender == .client) ik.client else ik.server;
     };
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    defer payload.deinit(gpa);
+    try payload.appendSlice(gpa, frames);
+    if (pad_to_min) {
+        while (try initialDatagramLen(dcid.len, payload.items.len) < constants.MIN_INITIAL_DATAGRAM) {
+            try payload.append(gpa, 0x00);
+        }
+    }
     // first byte: long(0x80)|fixed(0x40)|initial(type 0)| pn_len-1 (=0 -> 1-byte pn)
     var hdr_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer hdr_buf.deinit(gpa);
@@ -1794,21 +2908,20 @@ pub fn testBuildInitialScid(gpa: std.mem.Allocator, dcid: []const u8, scid: []co
     try hdr_buf.appendSlice(gpa, &[_]u8{ 0, 0, 0, 1 }); // version 1
     try hdr_buf.append(gpa, @intCast(dcid.len));
     try hdr_buf.appendSlice(gpa, dcid);
-    try hdr_buf.append(gpa, @intCast(scid.len));
-    try hdr_buf.appendSlice(gpa, scid);
+    try hdr_buf.append(gpa, 0); // scid len 0
     try hdr_buf.append(gpa, 0); // token len 0 (varint)
     // length = pn(1) + ciphertext(frames + tag)
-    const length = 1 + frames.len + crypto.TAG_LEN;
+    const length = 1 + payload.items.len + crypto.TAG_LEN;
     var lbuf: [8]u8 = undefined;
     try hdr_buf.appendSlice(gpa, try varint.encode(&lbuf, @intCast(length)));
     const pn_offset = hdr_buf.items.len;
     try hdr_buf.append(gpa, @intCast(pn & 0xff)); // 1-byte pn
 
     const header = hdr_buf.items;
-    const out = try gpa.alloc(u8, header.len + frames.len + crypto.TAG_LEN);
+    const out = try gpa.alloc(u8, header.len + payload.items.len + crypto.TAG_LEN);
     errdefer gpa.free(out);
     @memcpy(out[0..header.len], header);
-    _ = crypto.seal(keys, pn, header, frames, out[header.len..]);
+    _ = crypto.seal(keys, pn, header, payload.items, out[header.len..]);
     try crypto.protectHeader(keys.hp, out, pn_offset, true);
     return out;
 }
@@ -1839,6 +2952,39 @@ fn testBuildHandshake(gpa: std.mem.Allocator, dcid: []const u8, keys: crypto.Key
     return out;
 }
 
+fn testBuildZeroRtt(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8, secret: [32]u8) ![]u8 {
+    const keys = crypto.Keys.fromSecret(secret);
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    defer payload.deinit(gpa);
+    try payload.appendSlice(gpa, frames);
+    while (payload.items.len < 20) try payload.append(gpa, 0x00);
+
+    var hdr: std.ArrayListUnmanaged(u8) = .empty;
+    defer hdr.deinit(gpa);
+    const pn_len: usize = 1;
+    const length = pn_len + payload.items.len + crypto.TAG_LEN;
+    const pn_offset = packet.writeLongHeader(&hdr, gpa, .zero_rtt, constants.VERSION_1, dcid, &.{}, &.{}, length, pn_len) catch return error.OutOfMemory;
+    try packet.writePacketNumber(&hdr, gpa, pn, pn_len);
+
+    const out = try gpa.alloc(u8, hdr.items.len + payload.items.len + crypto.TAG_LEN);
+    errdefer gpa.free(out);
+    @memcpy(out[0..hdr.items.len], hdr.items);
+    _ = crypto.seal(keys, pn, hdr.items, payload.items, out[hdr.items.len..]);
+    try crypto.protectHeader(keys.hp, out, pn_offset, true);
+    return out;
+}
+
+fn expectZeroRttProtocolViolation(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8, secret: [32]u8) !void {
+    var server = try Connection.init(gpa, .server, dcid);
+    defer server.deinit();
+    server.installZeroRttRecvSecret(secret);
+
+    const dgram = try testBuildZeroRtt(gpa, dcid, pn, frames, secret);
+    defer gpa.free(dgram);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(dgram, 1000 + pn));
+    try testing.expect(server.closed);
+}
+
 // Application-space test keys, deterministic so a test builder and the connection
 // agree. STREAM frames are illegal in Initial (RFC 9000 12.4); these helpers let
 // the recv-pipeline tests deliver stream data in the Application space, the way a
@@ -1852,30 +2998,52 @@ fn testAppKeys() crypto.Keys {
 // Install Application-space keys on `conn` (both directions the same fixed keys,
 // which is all the recv path needs) so it can decrypt a testBuildApp datagram.
 pub fn testInstallAppKeys(conn: *Connection) void {
-    conn.installKeys(.application, testAppKeys(), testAppKeys());
-    // The no-handshake test path skips parsing a client's transport parameters, which
-    // would grant stream credit; stand in for a normal H3 client so the H3 layer can
-    // open its mandatory control + QPACK streams and send a response of real size.
-    conn.peer_tp.initial_max_streams_uni = 16;
-    conn.peer_tp.initial_max_stream_data_bidi_local = 1 << 16;
-    conn.peer_tp.initial_max_stream_data_uni = 1 << 16;
-    conn.stream_send_initial_peer_bidi = 1 << 16;
-    conn.stream_send_initial_own_bidi = 1 << 16;
-    conn.stream_send_initial_uni = 1 << 16;
-    // A real connection learns the per-stream send grant at the ClientHello, before any
-    // send stream exists; a test may queue data first, so raise any existing windows.
-    var it = conn.stream_send_windows.valueIterator();
-    while (it.next()) |w| w.onMaxData(1 << 16);
+    conn.installApplicationSecrets(TEST_APP_SECRET, TEST_APP_SECRET);
+    conn.peer_tp.initial_max_stream_data_bidi_local = 1 << 20;
+    conn.peer_tp.initial_max_stream_data_bidi_remote = 1 << 20;
+    conn.peer_tp.initial_max_stream_data_uni = 1 << 20;
+    conn.peer_tp.initial_max_streams_bidi = 1 << 20;
+    conn.peer_tp.initial_max_streams_uni = 1 << 20;
+    conn.local_bidi_streams = flow.StreamLimit.init(conn.peer_tp.initial_max_streams_bidi);
+    conn.local_uni_streams = flow.StreamLimit.init(conn.peer_tp.initial_max_streams_uni);
+    conn.local_tp.initial_max_streams_bidi = 1 << 60;
+    conn.local_tp.initial_max_streams_uni = 1 << 60;
+    conn.peer_bidi_streams = flow.StreamLimit.init(conn.local_tp.initial_max_streams_bidi);
+    conn.peer_uni_streams = flow.StreamLimit.init(conn.local_tp.initial_max_streams_uni);
+}
+
+pub fn testSetAppNextPn(conn: *Connection, next_pn: u64) void {
+    conn.spaces[@intFromEnum(Space.application)].next_pn = next_pn;
+}
+
+fn testRequiredServerTransportParameters(conn: *const Connection) !transport_params.TransportParameters {
+    return .{
+        .original_destination_connection_id = try transport_params.ConnectionId.init(conn.dcid),
+        .initial_source_connection_id = try transport_params.ConnectionId.init(conn.peer_scid),
+    };
 }
 
 // Build a 1-RTT (short-header) Application packet carrying `frames`, sealed with
 // the test Application keys. The mirror of testBuildInitial for the post-handshake
 // space, so stream-reassembly tests use the space STREAM is actually legal in.
 pub fn testBuildApp(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8) ![]u8 {
-    const keys = testAppKeys();
+    return testBuildAppWithSecret(gpa, dcid, pn, frames, TEST_APP_SECRET, false);
+}
+
+fn testBuildAppWithSecret(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8, secret: [32]u8, key_phase: bool) ![]u8 {
+    const keys = crypto.Keys.fromSecret(secret);
+    return testBuildAppWithKeys(gpa, dcid, pn, frames, keys, key_phase);
+}
+
+fn testBuildAppWithUpdatedSecret(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8, secret: [32]u8, current_hp: [crypto.HP_LEN]u8, key_phase: bool) ![]u8 {
+    const keys = crypto.Keys.fromUpdatedSecret(secret, current_hp);
+    return testBuildAppWithKeys(gpa, dcid, pn, frames, keys, key_phase);
+}
+
+fn testBuildAppWithKeys(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8, keys: crypto.Keys, key_phase: bool) ![]u8 {
     var hdr: std.ArrayListUnmanaged(u8) = .empty;
     defer hdr.deinit(gpa);
-    const pn_offset = try packet.writeShortHeader(&hdr, gpa, dcid, 1);
+    const pn_offset = try packet.writeShortHeaderWithKeyPhase(&hdr, gpa, dcid, 1, key_phase);
     try packet.writePacketNumber(&hdr, gpa, pn, 1);
 
     const out = try gpa.alloc(u8, hdr.items.len + frames.len + crypto.TAG_LEN);
@@ -1884,6 +3052,46 @@ pub fn testBuildApp(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: [
     _ = crypto.seal(keys, pn, hdr.items, frames, out[hdr.items.len..]);
     try crypto.protectHeader(keys.hp, out, pn_offset, false);
     return out;
+}
+
+fn expectFirstQueuedAppFrameTag(conn: *Connection, want: std.meta.Tag(frame.Frame)) !void {
+    try expectQueuedAppFrameTag(conn, 0, want);
+}
+
+fn expectQueuedAppFrameTag(conn: *Connection, index: usize, want: std.meta.Tag(frame.Frame)) !void {
+    const decoded = try decodeQueuedAppFrame(conn, index);
+    defer testing.allocator.free(decoded.work);
+    defer testing.allocator.free(decoded.plaintext);
+    try testing.expectEqual(want, std.meta.activeTag(decoded.frame));
+}
+
+const DecodedQueuedAppFrame = struct {
+    work: []u8,
+    plaintext: []u8,
+    frame: frame.Frame,
+};
+
+fn decodeQueuedAppFrame(conn: *Connection, index: usize) !DecodedQueuedAppFrame {
+    const gpa = testing.allocator;
+    try testing.expect(conn.datagramLengths().len > index);
+    var start: usize = 0;
+    for (conn.datagramLengths()[0..index]) |len| start += len;
+    const dgram = conn.datagramsToSend()[start .. start + conn.datagramLengths()[index]];
+    var work = try gpa.dupe(u8, dgram);
+    errdefer gpa.free(work);
+
+    const hdr = try packet.parseShort(work, conn.peer_scid.len);
+    const pn_len = try crypto.unprotectHeader(testAppKeys().hp, work, hdr.pn_offset, false);
+    var truncated: u64 = 0;
+    for (work[hdr.pn_offset .. hdr.pn_offset + pn_len]) |b| truncated = (truncated << 8) | b;
+    const pn = packet.decodePacketNumber(0, truncated, pn_len);
+    const header = work[0 .. hdr.pn_offset + pn_len];
+    const ciphertext = work[hdr.pn_offset + pn_len ..];
+    const plaintext = try gpa.alloc(u8, ciphertext.len);
+    errdefer gpa.free(plaintext);
+    const payload = try crypto.open(testAppKeys(), pn, header, ciphertext, plaintext);
+    const decoded = try frame.decode(payload);
+    return .{ .work = work, .plaintext = plaintext, .frame = decoded.frame };
 }
 
 test "server decrypts a 1-RTT packet and reassembles a stream" {
@@ -1902,6 +3110,1492 @@ test "server decrypts a 1-RTT packet and reassembles a stream" {
     try conn.receiveDatagram(dgram, 1000);
     try testing.expectEqualStrings("hi", conn.streamData(0));
     try testing.expect(conn.streamFinished(0));
+}
+
+test "client sends queued STREAM data in a 0-RTT long-header packet" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const psk = [_]u8{0x7b} ** tls.schedule.SECRET_LEN;
+    var client = try Connection.initClient(gpa, &dcid, .{
+        .random = [_]u8{0x11} ** 32,
+        .ephemeral_seed = [_]u8{0x22} ** 32,
+        .transport_params = &.{ 0x04, 0x01, 0x3f },
+        .alpn = "h3",
+        .resumption = .{
+            .identity = "ticket-identity",
+            .obfuscated_ticket_age = 0x01020304,
+            .psk = psk,
+            .early_data = true,
+        },
+    }, 0);
+    defer client.deinit();
+    try testing.expect(client.tls_client.?.early_traffic_secret != null);
+    try testing.expect(client.spaces[@intFromEnum(Space.application)].zero_rtt_send_keys != null);
+
+    var remembered = try testRequiredServerTransportParameters(&client);
+    remembered.initial_max_data = 1024;
+    remembered.initial_max_stream_data_bidi_remote = 1024;
+    remembered.initial_max_streams_bidi = 1;
+    try client.setPeerTransportParameters(remembered);
+    client.clearSend(); // discard the Initial ClientHello; this test inspects only 0-RTT.
+
+    try client.sendStreamData(0, "early", true);
+    try client.flushSend(1000);
+    try testing.expectEqual(@as(usize, 1), client.datagramLengths().len);
+    const dgram = client.datagramsToSend()[0..client.datagramLengths()[0]];
+    const hdr = try packet.parseLong(dgram);
+    try testing.expectEqual(constants.LongType.zero_rtt, hdr.ltype);
+}
+
+test "server decrypts accepted 0-RTT STREAM data with the early traffic secret" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const psk = [_]u8{0x7b} ** tls.schedule.SECRET_LEN;
+    var client = try Connection.initClient(gpa, &dcid, .{
+        .random = [_]u8{0x11} ** 32,
+        .ephemeral_seed = [_]u8{0x22} ** 32,
+        .transport_params = &.{ 0x04, 0x01, 0x3f },
+        .alpn = "h3",
+        .resumption = .{
+            .identity = "ticket-identity",
+            .obfuscated_ticket_age = 0x01020304,
+            .psk = psk,
+            .early_data = true,
+        },
+    }, 0);
+    defer client.deinit();
+    const early_secret = client.tls_client.?.early_traffic_secret.?;
+
+    var remembered = try testRequiredServerTransportParameters(&client);
+    remembered.initial_max_data = 1024;
+    remembered.initial_max_stream_data_bidi_remote = 1024;
+    remembered.initial_max_streams_bidi = 1;
+    try client.setPeerTransportParameters(remembered);
+    client.clearSend();
+
+    try client.sendStreamData(0, "early", true);
+    try client.flushSend(1000);
+    const dgram = client.datagramsToSend()[0..client.datagramLengths()[0]];
+
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    server.installZeroRttRecvSecret(early_secret);
+    try server.receiveDatagram(dgram, 1000);
+    try testing.expectEqualStrings("early", server.streamData(0));
+    try testing.expect(server.streamFinished(0));
+    try testing.expect(server.spaces[@intFromEnum(Space.application)].ack_pending);
+}
+
+test "pending 0-RTT ACK is sent once 1-RTT send keys are available" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x19 };
+    const early_secret = [_]u8{0x7d} ** tls.schedule.SECRET_LEN;
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    server.installZeroRttRecvSecret(early_secret);
+
+    const dgram = try testBuildZeroRtt(gpa, &dcid, 0, &.{ 0x0a, 0x00, 0x05, 'e', 'a', 'r', 'l', 'y' }, early_secret);
+    defer gpa.free(dgram);
+    try server.receiveDatagram(dgram, 1000);
+    try testing.expect(server.spaces[@intFromEnum(Space.application)].ack_pending);
+    try testing.expectEqual(@as(usize, 0), server.datagramLengths().len);
+
+    server.installApplicationSecrets(TEST_APP_SECRET, TEST_APP_SECRET);
+    try server.flushSend(2000);
+    try testing.expect(!server.spaces[@intFromEnum(Space.application)].ack_pending);
+    try expectFirstQueuedAppFrameTag(&server, .ack);
+}
+
+test "server rejects frame types that are not allowed in 0-RTT packets" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x18 };
+    const early_secret = [_]u8{0x7c} ** tls.schedule.SECRET_LEN;
+
+    try expectZeroRttProtocolViolation(gpa, &dcid, 0, &.{ 0x02, 0x00, 0x00, 0x00, 0x00 }, early_secret); // ACK
+
+    var crypto_frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer crypto_frames.deinit(gpa);
+    try frame.encodeCrypto(&crypto_frames, gpa, 0, "late");
+    try expectZeroRttProtocolViolation(gpa, &dcid, 1, crypto_frames.items, early_secret);
+
+    var token_frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer token_frames.deinit(gpa);
+    try frame.encodeNewToken(&token_frames, gpa, "token");
+    try expectZeroRttProtocolViolation(gpa, &dcid, 2, token_frames.items, early_secret);
+
+    var path_response_frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer path_response_frames.deinit(gpa);
+    try frame.encodePathResponse(&path_response_frames, gpa, [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try expectZeroRttProtocolViolation(gpa, &dcid, 3, path_response_frames.items, early_secret);
+
+    var app_close_frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer app_close_frames.deinit(gpa);
+    try frame.encodeConnectionClose(&app_close_frames, gpa, true, 0x0100, 0, "app close");
+    try expectZeroRttProtocolViolation(gpa, &dcid, 4, app_close_frames.items, early_secret);
+
+    var done_frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer done_frames.deinit(gpa);
+    try varint.append(&done_frames, gpa, @intFromEnum(constants.FrameType.handshake_done));
+    try expectZeroRttProtocolViolation(gpa, &dcid, 5, done_frames.items, early_secret);
+}
+
+test "client rejects accepted 0-RTT when fresh server transport limits shrink" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+
+    try client.applyRememberedPeerTransportParameters(&.{
+        0x04, 0x04, 0x80, 0x10, 0x00, 0x00, // initial_max_data = 1048576
+        0x08, 0x01, 0x08, // initial_max_streams_bidi = 8
+        0x09, 0x01, 0x08, // initial_max_streams_uni = 8
+        0x06, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_bidi_remote = 262144
+        0x07, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_uni = 262144
+    });
+
+    var fresh = client.remembered_peer_tp.?;
+    fresh.initial_max_streams_bidi = 7;
+    try testing.expectError(error.ProtocolViolation, client.validateFreshParametersForAcceptedZeroRtt(fresh));
+
+    fresh.initial_max_streams_bidi = 8;
+    fresh.initial_max_data = 1 << 20;
+    try client.validateFreshParametersForAcceptedZeroRtt(fresh);
+}
+
+test "a received next-phase 1-RTT packet updates application receive keys" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const next_secret = crypto.nextTrafficSecret(TEST_APP_SECRET);
+    const current_hp = conn.spaces[@intFromEnum(Space.application)].recv_keys.?.hp;
+    const frames = [_]u8{ 0x0b, 0x00, 0x02, 'k', 'u' };
+    const dgram = try testBuildAppWithUpdatedSecret(gpa, &dcid, 0, &frames, next_secret, current_hp, true);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    const app = &conn.spaces[@intFromEnum(Space.application)];
+    try testing.expect(app.recv_key_phase);
+    try testing.expectEqualSlices(u8, &next_secret, &app.recv_secret.?);
+    try testing.expect(app.prev_recv_keys != null);
+    try testing.expectEqualSlices(u8, &current_hp, &app.recv_keys.?.hp);
+    try testing.expectEqualStrings("ku", conn.streamData(0));
+    try testing.expect(conn.streamFinished(0));
+}
+
+test "a local application key update sets the short-header key phase bit" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const next_secret = crypto.nextTrafficSecret(TEST_APP_SECRET);
+    const current_hp = conn.spaces[@intFromEnum(Space.application)].send_keys.?.hp;
+    try conn.updateApplicationSendKeys();
+    try testing.expectEqualSlices(u8, &current_hp, &conn.spaces[@intFromEnum(Space.application)].send_keys.?.hp);
+    try conn.sendStreamData(1, "x", true);
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len);
+
+    const dgram = conn.datagramsToSend()[0..conn.datagramLengths()[0]];
+    var work = try gpa.dupe(u8, dgram);
+    defer gpa.free(work);
+    const keys = crypto.Keys.fromUpdatedSecret(next_secret, current_hp);
+    const hdr = try packet.parseShort(work, dcid.len);
+    const pn_len = try crypto.unprotectHeader(keys.hp, work, hdr.pn_offset, false);
+    try testing.expect((work[0] & packet.SHORT_KEY_PHASE) != 0);
+    var truncated: u64 = 0;
+    for (work[hdr.pn_offset .. hdr.pn_offset + pn_len]) |b| truncated = (truncated << 8) | b;
+    const pn = packet.decodePacketNumber(0, truncated, pn_len);
+    const header = work[0 .. hdr.pn_offset + pn_len];
+    const ciphertext = work[hdr.pn_offset + pn_len ..];
+    const plaintext = try gpa.alloc(u8, ciphertext.len);
+    defer gpa.free(plaintext);
+    const payload = try crypto.open(keys, pn, header, ciphertext, plaintext);
+    const decoded = try frame.decode(payload);
+    try testing.expectEqual(@as(std.meta.Tag(frame.Frame), .stream), std.meta.activeTag(decoded.frame));
+}
+
+test "negotiated idle timeout is armed by packet activity and silently closes" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.local_tp.max_idle_timeout_ms = 50;
+    try conn.setPeerTransportParameters(.{ .max_idle_timeout_ms = 5 });
+
+    const frames = [_]u8{ 0x01, 0x00, 0x00 }; // PING plus enough PADDING for HP sample
+    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(dgram);
+    try conn.receiveDatagram(dgram, 1000);
+
+    try testing.expectEqual(@as(?u64, 6000), conn.nextTimeout());
+    try conn.onTimeout(5999);
+    try testing.expect(!conn.closed);
+    try conn.onTimeout(6000);
+    try testing.expect(conn.closed);
+    try testing.expect(conn.nextTimeout() == null);
+}
+
+test "PATH_CHALLENGE elicits a matching PATH_RESPONSE" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const data = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodePathChallenge(&frames, gpa, data);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expect(conn.datagramLengths().len >= 1);
+
+    const response = conn.datagramsToSend()[0..conn.datagramLengths()[0]];
+    var work = try gpa.dupe(u8, response);
+    defer gpa.free(work);
+
+    const hdr = try packet.parseShort(work, dcid.len);
+    const pn_len = try crypto.unprotectHeader(testAppKeys().hp, work, hdr.pn_offset, false);
+    var truncated: u64 = 0;
+    for (work[hdr.pn_offset .. hdr.pn_offset + pn_len]) |b| truncated = (truncated << 8) | b;
+    const pn = packet.decodePacketNumber(0, truncated, pn_len);
+    const header = work[0 .. hdr.pn_offset + pn_len];
+    const ciphertext = work[hdr.pn_offset + pn_len ..];
+    const plaintext = try gpa.alloc(u8, ciphertext.len);
+    defer gpa.free(plaintext);
+    const payload = try crypto.open(testAppKeys(), pn, header, ciphertext, plaintext);
+    const decoded = try frame.decode(payload);
+    switch (decoded.frame) {
+        .path_response => |got| try testing.expectEqualSlices(u8, &data, &got),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "challengePath emits PATH_CHALLENGE and matching PATH_RESPONSE validates the path" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const data = [_]u8{ 1, 3, 3, 7, 9, 2, 4, 6 };
+    try conn.challengePath(data);
+    try testing.expect(conn.hasPendingSend());
+
+    try conn.flushSend(1000);
+    try testing.expectEqual(@as(usize, 1), conn.pending_path_challenges.count());
+    try expectFirstQueuedAppFrameTag(&conn, .path_challenge);
+    conn.clearSend();
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodePathResponse(&frames, gpa, data);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 2000);
+    try testing.expect(conn.address_validated);
+    try testing.expectEqual(@as(usize, 0), conn.pending_path_challenges.count());
+    try testing.expectEqual(@as(usize, 0), conn.path_challenge_inflight.count());
+    try expectFirstQueuedAppFrameTag(&conn, .ack);
+}
+
+test "address-aware PATH_RESPONSE validates only the challenged path" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x18 };
+    const addr_a = "203.0.113.1:4433";
+    const addr_b = "203.0.113.2:4433";
+    const data = [_]u8{ 1, 3, 3, 7, 9, 2, 4, 7 };
+
+    {
+        var conn = try Connection.init(gpa, .client, &dcid);
+        defer conn.deinit();
+        testInstallAppKeys(&conn);
+
+        try conn.challengePathOn(data, addr_a);
+        try conn.flushSend(1000);
+        conn.clearSend();
+
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(gpa);
+        try frame.encodePathResponse(&frames, gpa, data);
+        const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+        defer gpa.free(dgram);
+
+        try testing.expectError(error.ProtocolViolation, conn.receiveDatagramFrom(dgram, 2000, addr_b));
+        try testing.expectEqual(@as(usize, 1), conn.pending_path_challenges.count());
+        const pt_a = std.hash.Wyhash.hash(0, addr_a);
+        try testing.expect(!conn.paths.get(pt_a).?.validated);
+    }
+    {
+        var conn = try Connection.init(gpa, .client, &dcid);
+        defer conn.deinit();
+        testInstallAppKeys(&conn);
+
+        try conn.challengePathOn(data, addr_a);
+        try conn.flushSend(1000);
+        conn.clearSend();
+
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(gpa);
+        try frame.encodePathResponse(&frames, gpa, data);
+        const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+        defer gpa.free(dgram);
+
+        try conn.receiveDatagramFrom(dgram, 2000, addr_a);
+        const pt_a = std.hash.Wyhash.hash(0, addr_a);
+        try testing.expect(conn.paths.get(pt_a).?.validated);
+        try testing.expect(conn.address_validated);
+        try testing.expectEqual(@as(usize, 0), conn.pending_path_challenges.count());
+    }
+}
+
+test "PATH_CHALLENGE response is accounted to the receiving path" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x19 };
+    const addr = "198.51.100.9:4433";
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const data = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 3 };
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodePathChallenge(&frames, gpa, data);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagramFrom(dgram, 1000, addr);
+    try testing.expect(conn.datagramLengths().len >= 1);
+
+    const pt = std.hash.Wyhash.hash(0, addr);
+    const path = conn.paths.get(pt).?;
+    var sent_sum: u64 = 0;
+    for (conn.datagramLengths()) |len| sent_sum += len;
+    try testing.expectEqual(conn.datagramLengths().len, conn.datagramPathTokens().len);
+    for (conn.datagramPathTokens()) |tok| try testing.expectEqual(pt, tok.?);
+    try testing.expectEqual(@as(u64, @intCast(dgram.len)), path.recv_bytes);
+    try testing.expectEqual(sent_sum, path.sent_bytes);
+    try testing.expect(!path.validated);
+    try expectFirstQueuedAppFrameTag(&conn, .path_response);
+    conn.clearSend();
+    try testing.expectEqual(@as(usize, 0), conn.datagramPathTokens().len);
+}
+
+test "application sends after address-aware receive inherit the peer path" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x1a };
+    const addr = "198.51.100.10:4433";
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.ping));
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagramFrom(dgram, 1000, addr);
+    conn.clearSend(); // discard ACK from the received PING
+
+    try conn.sendStreamData(1, "hello", false);
+    try conn.flushSend(2000);
+    try testing.expect(conn.datagramLengths().len >= 1);
+    const pt = std.hash.Wyhash.hash(0, addr);
+    try testing.expectEqual(conn.datagramLengths().len, conn.datagramPathTokens().len);
+    for (conn.datagramPathTokens()) |tok| try testing.expectEqual(pt, tok.?);
+}
+
+test "application sends stay on the default path until a migrated path validates" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x1c };
+    const addr_a = "198.51.100.10:4433";
+    const addr_b = "198.51.100.11:4433";
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.ping));
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+
+    const d1 = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(d1);
+    try conn.receiveDatagramFrom(d1, 1000, addr_a);
+    conn.clearSend();
+    const pt_a = std.hash.Wyhash.hash(0, addr_a);
+    const pt_b = std.hash.Wyhash.hash(0, addr_b);
+    try testing.expectEqual(pt_a, conn.default_path_token.?);
+
+    const d2 = try testBuildApp(gpa, &dcid, 1, frames.items);
+    defer gpa.free(d2);
+    try conn.receiveDatagramFrom(d2, 2000, addr_b);
+    try testing.expectEqual(pt_a, conn.default_path_token.?);
+    try testing.expect(conn.datagramLengths().len >= 1);
+    for (conn.datagramPathTokens()) |tok| try testing.expectEqual(pt_b, tok.?);
+    conn.clearSend();
+
+    try conn.sendStreamData(1, "hello", false);
+    try conn.flushSend(3000);
+    try testing.expect(conn.datagramLengths().len >= 1);
+    for (conn.datagramPathTokens()) |tok| try testing.expectEqual(pt_a, tok.?);
+}
+
+test "disable_active_migration rejects a new peer path after handshake" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x1b };
+    const addr_a = "198.51.100.10:4433";
+    const addr_b = "198.51.100.11:4433";
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.local_tp.disable_active_migration = true;
+    conn.handshake_confirmed = true;
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.ping));
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+
+    const d1 = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(d1);
+    try conn.receiveDatagramFrom(d1, 1000, addr_a);
+    try testing.expect(conn.default_path_token != null);
+
+    const d2 = try testBuildApp(gpa, &dcid, 1, frames.items);
+    defer gpa.free(d2);
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagramFrom(d2, 2000, addr_b));
+    try testing.expectEqual(std.hash.Wyhash.hash(0, addr_a), conn.default_path_token.?);
+}
+
+test "passive MAX_DATA is ack-eliciting" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeMaxData(&frames, gpa, 1234);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try expectFirstQueuedAppFrameTag(&conn, .ack);
+}
+
+test "BLOCKED frames are retained and ack-eliciting" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x09 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.data_blocked));
+    try varint.append(&frames, gpa, 10);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.data_blocked));
+    try varint.append(&frames, gpa, 7);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.stream_data_blocked));
+    try varint.append(&frames, gpa, 0);
+    try varint.append(&frames, gpa, 5);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.stream_data_blocked));
+    try varint.append(&frames, gpa, 0);
+    try varint.append(&frames, gpa, 12);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.streams_blocked_bidi));
+    try varint.append(&frames, gpa, 2);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.streams_blocked_uni));
+    try varint.append(&frames, gpa, 3);
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expectEqual(@as(?u64, 10), conn.peer_data_blocked_limit);
+    try testing.expectEqual(@as(u64, 12), conn.peer_stream_data_blocked.get(0).?);
+    try testing.expectEqual(@as(?u64, 2), conn.peer_streams_blocked_bidi_limit);
+    try testing.expectEqual(@as(?u64, 3), conn.peer_streams_blocked_uni_limit);
+    try expectFirstQueuedAppFrameTag(&conn, .ack);
+}
+
+test "oversized stream-count frames are rejected" {
+    const gpa = testing.allocator;
+    const over_limit = transport_params.MAX_STREAM_COUNT + 1;
+
+    {
+        const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x8a };
+        var conn = try Connection.init(gpa, .server, &dcid);
+        defer conn.deinit();
+        testInstallAppKeys(&conn);
+
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(gpa);
+        try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.max_streams_bidi));
+        try varint.append(&frames, gpa, over_limit);
+        const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+        defer gpa.free(dgram);
+
+        try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+    }
+
+    {
+        const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x8b };
+        var conn = try Connection.init(gpa, .server, &dcid);
+        defer conn.deinit();
+        testInstallAppKeys(&conn);
+
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(gpa);
+        try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.streams_blocked_uni));
+        try varint.append(&frames, gpa, over_limit);
+        const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+        defer gpa.free(dgram);
+
+        try testing.expectError(error.StreamLimitError, conn.receiveDatagram(dgram, 1000));
+    }
+}
+
+test "PATH_RESPONSE is ack-eliciting" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const data = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
+    try conn.challengePath(data);
+    try conn.flushSend(1000);
+    conn.clearSend();
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodePathResponse(&frames, gpa, data);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try expectFirstQueuedAppFrameTag(&conn, .ack);
+}
+
+test "unmatched PATH_RESPONSE is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodePathResponse(&frames, gpa, .{ 9, 8, 7, 6, 5, 4, 3, 2 });
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+}
+
+test "NEW_TOKEN received by a server is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeNewToken(&frames, gpa, "tok");
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+}
+
+test "NEW_TOKEN received by a client is retained for future validation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeNewToken(&frames, gpa, "token-one");
+    try frame.encodeNewToken(&frames, gpa, "token-two");
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expectEqual(@as(usize, 2), conn.new_tokens.items.len);
+    try testing.expectEqualStrings("token-one", conn.new_tokens.items[0]);
+    try testing.expectEqualStrings("token-two", conn.new_tokens.items[1]);
+    try testing.expectEqual(@as(usize, 2), conn.validationTokens().len);
+}
+
+test "NEW_TOKEN storage is bounded" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x09 };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    var i: usize = 0;
+    while (i < MAX_NEW_TOKENS + 1) : (i += 1) {
+        var token = [_]u8{ 't', 'o', 'k', '0' };
+        token[3] = @intCast('0' + i);
+        try frame.encodeNewToken(&frames, gpa, &token);
+    }
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expectEqual(@as(usize, MAX_NEW_TOKENS), conn.validationTokens().len);
+    try testing.expectEqualStrings("tok1", conn.validationTokens()[0]);
+    try testing.expectEqualStrings("tok8", conn.validationTokens()[MAX_NEW_TOKENS - 1]);
+}
+
+test "a client stateless_reset_token transport parameter is rejected by a server" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+
+    try testing.expectError(error.ProtocolViolation, conn.setPeerTransportParameters(.{
+        .stateless_reset_token = [_]u8{0x5a} ** 16,
+    }));
+}
+
+test "a server stateless_reset_token transport parameter is stored by a client" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf1 };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+
+    const token = [_]u8{0xa5} ** 16;
+    var tp = try testRequiredServerTransportParameters(&conn);
+    tp.stateless_reset_token = token;
+    try conn.setPeerTransportParameters(tp);
+    try testing.expectEqualSlices(u8, &token, &conn.peer_tp.stateless_reset_token.?);
+}
+
+test "a matching stateless reset token closes the connection" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf2 };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const token = [_]u8{0x5e} ** 16;
+    var tp = try testRequiredServerTransportParameters(&conn);
+    tp.stateless_reset_token = token;
+    try conn.setPeerTransportParameters(tp);
+    const reset = [_]u8{0x40} ++ [_]u8{0xaa} ** 8 ++ token;
+    try conn.receiveDatagram(&reset, 1000);
+    try testing.expect(conn.closed);
+}
+
+test "an unmatched stateless-reset-shaped packet is dropped without closing" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf3 };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const token = [_]u8{0x5e} ** 16;
+    var tp = try testRequiredServerTransportParameters(&conn);
+    tp.stateless_reset_token = token;
+    try conn.setPeerTransportParameters(tp);
+    const random = [_]u8{0x40} ++ [_]u8{0xaa} ** 8 ++ [_]u8{0x99} ** 16;
+    try conn.receiveDatagram(&random, 1000);
+    try testing.expect(!conn.closed);
+}
+
+test "stateless reset tokens learned from NEW_CONNECTION_ID are recognized" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf4 };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const cid = [_]u8{ 1, 2, 3, 4 };
+    const token = [_]u8{0xa7} ** 16;
+    try conn.onNewConnectionId(1, 0, &cid, &token);
+    const reset = [_]u8{0x40} ++ [_]u8{0xaa} ** 8 ++ token;
+    try conn.receiveDatagram(&reset, 1000);
+    try testing.expect(conn.closed);
+}
+
+test "client-only transport parameters reject server CID parameters" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+
+    try testing.expectError(error.ProtocolViolation, conn.setPeerTransportParameters(.{
+        .original_destination_connection_id = try transport_params.ConnectionId.init("odcid"),
+    }));
+    try testing.expectError(error.ProtocolViolation, conn.setPeerTransportParameters(.{
+        .retry_source_connection_id = try transport_params.ConnectionId.init("retry"),
+    }));
+}
+
+test "client initial_source_connection_id must match the peer initial SCID" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xc5, 0xc6, 0xc7, 0xc8 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+
+    try conn.setPeerTransportParameters(.{
+        .initial_source_connection_id = try transport_params.ConnectionId.init(&dcid),
+    });
+    try testing.expectError(error.ProtocolViolation, conn.setPeerTransportParameters(.{
+        .initial_source_connection_id = try transport_params.ConnectionId.init("bad"),
+    }));
+}
+
+test "server original_destination_connection_id must match the client's original dcid" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xc9, 0xca, 0xcb, 0xcc };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+
+    try testing.expectError(error.ProtocolViolation, conn.setPeerTransportParameters(.{
+        .initial_source_connection_id = try transport_params.ConnectionId.init(&dcid),
+    }));
+    try testing.expectError(error.ProtocolViolation, conn.setPeerTransportParameters(.{
+        .original_destination_connection_id = try transport_params.ConnectionId.init(&dcid),
+    }));
+    try conn.setPeerTransportParameters(try testRequiredServerTransportParameters(&conn));
+    try testing.expectError(error.ProtocolViolation, conn.setPeerTransportParameters(.{
+        .original_destination_connection_id = try transport_params.ConnectionId.init("nope"),
+        .initial_source_connection_id = try transport_params.ConnectionId.init(&dcid),
+    }));
+}
+
+test "server retry_source_connection_id is required only after Retry and must match" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xcd, 0xce, 0xcf, 0xd0 };
+    const retry = [_]u8{ 0xd1, 0xd2, 0xd3, 0xd4 };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+
+    try testing.expectError(error.ProtocolViolation, conn.setPeerTransportParameters(.{
+        .retry_source_connection_id = try transport_params.ConnectionId.init(&retry),
+    }));
+
+    conn.retry_scid = try gpa.dupe(u8, &retry);
+    conn.gpa.free(conn.peer_scid);
+    conn.peer_scid = try gpa.dupe(u8, &retry);
+    conn.retried = true;
+    try testing.expectError(error.ProtocolViolation, conn.setPeerTransportParameters(.{}));
+    try testing.expectError(error.ProtocolViolation, conn.setPeerTransportParameters(.{
+        .original_destination_connection_id = try transport_params.ConnectionId.init(&dcid),
+        .initial_source_connection_id = try transport_params.ConnectionId.init(&retry),
+        .retry_source_connection_id = try transport_params.ConnectionId.init("bad"),
+    }));
+    try conn.setPeerTransportParameters(.{
+        .original_destination_connection_id = try transport_params.ConnectionId.init(&dcid),
+        .initial_source_connection_id = try transport_params.ConnectionId.init(&retry),
+        .retry_source_connection_id = try transport_params.ConnectionId.init(&retry),
+    });
+}
+
+test "HANDSHAKE_DONE received by a server is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.handshake_done));
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+}
+
+test "RESET_STREAM on a peer receive-only unidirectional stream is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeResetStream(&frames, gpa, 3, 0x010c, 0); // server-initiated uni: client cannot send
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.StreamStateError, conn.receiveDatagram(dgram, 1000));
+}
+
+test "STREAM on a peer receive-only unidirectional stream is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x0b };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const frames = [_]u8{ 0x0a, 0x03, 0x01, 'x' }; // server-initiated uni: client cannot send
+    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.StreamStateError, conn.receiveDatagram(dgram, 1000));
+}
+
+test "MAX_STREAM_DATA on a local receive-only unidirectional stream is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeMaxStreamData(&frames, gpa, 2, 1024); // client-initiated uni: server cannot send
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.StreamStateError, conn.receiveDatagram(dgram, 1000));
+}
+
+test "STOP_SENDING on a local receive-only unidirectional stream is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeStopSending(&frames, gpa, 2, 0x010c); // client-initiated uni: server cannot send
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.StreamStateError, conn.receiveDatagram(dgram, 1000));
+}
+
+test "STREAM_DATA_BLOCKED on a peer receive-only unidirectional stream is a stream state error" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x0a };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeStreamDataBlocked(&frames, gpa, 3, 1024); // server-initiated uni: client cannot send
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.StreamStateError, conn.receiveDatagram(dgram, 1000));
+    try testing.expect(conn.closed);
+    const decoded = try decodeQueuedAppFrame(&conn, 0);
+    defer gpa.free(decoded.work);
+    defer gpa.free(decoded.plaintext);
+    switch (decoded.frame) {
+        .connection_close => |cc| {
+            try testing.expect(!cc.app);
+            try testing.expectEqual(@intFromEnum(constants.TransportError.stream_state_error), cc.error_code);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "short-header packet for a different local cid is dropped" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const other = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x09 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frames.append(gpa, 0x01); // PING
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+    const dgram = try testBuildApp(gpa, &other, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expectEqual(@as(?u64, null), conn.spaces[@intFromEnum(Space.application)].largest_recv_pn);
+    try testing.expectEqual(@as(usize, 0), conn.datagramLengths().len);
+}
+
+test "short-header packet for a retired local cid is dropped" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.local_initial_cid_retired = true;
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frames.append(gpa, 0x01); // PING
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expectEqual(@as(?u64, null), conn.spaces[@intFromEnum(Space.application)].largest_recv_pn);
+    try testing.expectEqual(@as(usize, 0), conn.datagramLengths().len);
+}
+
+test "CRYPTO in an Application packet without a TLS driver is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeCrypto(&frames, gpa, 0, "late handshake bytes");
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+}
+
+test "a completed client stores post-handshake NewSessionTicket" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x1c };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.tls_client = tls.client.Client.init();
+    conn.tls_client.?.state = .complete;
+    const rms = [_]u8{0x44} ** 32;
+    conn.tls_client.?.resumption_master_secret = rms;
+
+    const ticket_body = [_]u8{
+        0x00, 0x00, 0x0e, 0x10, // ticket_lifetime
+        0xaa, 0xbb, 0xcc, 0xdd, // ticket_age_add
+        0x02, 0x01, 0x02, // ticket_nonce
+        0x00, 0x03, 0x41, 0x42, 0x43, // ticket
+        0x00, 0x08, 0x00, 0x2a, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, // early_data max=65536
+    };
+    var ticket = [_]u8{ @intFromEnum(tls.handshake.MsgType.new_session_ticket), 0x00, 0x00, ticket_body.len } ++ ticket_body;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeCrypto(&frames, gpa, 0, &ticket);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expectEqual(@as(usize, 0), conn.spaces[@intFromEnum(Space.application)].crypto.readable().len);
+    const tickets = conn.sessionTickets();
+    try testing.expectEqual(@as(usize, 1), tickets.len);
+    try testing.expectEqual(@as(u32, 3600), tickets[0].ticket_lifetime);
+    try testing.expectEqual(@as(u32, 0xaabbccdd), tickets[0].ticket_age_add);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, tickets[0].nonce);
+    try testing.expectEqualSlices(u8, "ABC", tickets[0].ticket);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x2a, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00 }, tickets[0].extensions);
+    try testing.expectEqual(@as(u32, 65536), tickets[0].max_early_data_size.?);
+    const expected_psk = tls.schedule.resumptionPsk(rms, tickets[0].nonce);
+    try testing.expectEqualSlices(u8, &expected_psk, &tickets[0].psk.?);
+}
+
+test "a completed client rejects unexpected post-handshake CRYPTO messages" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x1d };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.tls_client = tls.client.Client.init();
+    conn.tls_client.?.state = .complete;
+
+    const unexpected = [_]u8{ @intFromEnum(tls.handshake.MsgType.finished), 0x00, 0x00, 0x00 };
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeCrypto(&frames, gpa, 0, &unexpected);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+}
+
+test "a completed client rejects malformed NewSessionTicket" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x1e };
+    var conn = try Connection.init(gpa, .client, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.tls_client = tls.client.Client.init();
+    conn.tls_client.?.state = .complete;
+
+    const ticket_body = [_]u8{
+        0x00, 0x00, 0x00, 0x00, // ticket_lifetime
+        0x00, 0x00, 0x00, 0x00, // ticket_age_add
+        0x00, // ticket_nonce
+        0x00, 0x00, // empty ticket
+        0x00, 0x00, // extensions
+    };
+    var ticket = [_]u8{ @intFromEnum(tls.handshake.MsgType.new_session_ticket), 0x00, 0x00, ticket_body.len } ++ ticket_body;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeCrypto(&frames, gpa, 0, &ticket);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+    try testing.expectEqual(@as(usize, 0), conn.sessionTickets().len);
+}
+
+test "a confirmed server sends a NewSessionTicket to a completed client" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x1f };
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    testInstallAppKeys(&server);
+    server.handshake_confirmed = true;
+
+    try testing.expectEqual(@as(?[tls.schedule.SECRET_LEN]u8, null), try server.sendSessionTicket(7200, 0x01020304, &.{ 0xaa, 0xbb }, "ticket-bytes", &.{ 0xfa, 0xce, 0x00, 0x00 }, 4096, 1000));
+    try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+    testInstallAppKeys(&client);
+    client.tls_client = tls.client.Client.init();
+    client.tls_client.?.state = .complete;
+    const rms = [_]u8{0x55} ** 32;
+    client.tls_client.?.resumption_master_secret = rms;
+
+    try client.receiveDatagram(server.datagramsToSend()[0..server.datagramLengths()[0]], 2000);
+    const tickets = client.sessionTickets();
+    try testing.expectEqual(@as(usize, 1), tickets.len);
+    try testing.expectEqual(@as(u32, 7200), tickets[0].ticket_lifetime);
+    try testing.expectEqual(@as(u32, 0x01020304), tickets[0].ticket_age_add);
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, tickets[0].nonce);
+    try testing.expectEqualSlices(u8, "ticket-bytes", tickets[0].ticket);
+    try testing.expectEqualSlices(u8, &.{ 0xfa, 0xce, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x04, 0x00, 0x00, 0x10, 0x00 }, tickets[0].extensions);
+    try testing.expectEqual(@as(u32, 4096), tickets[0].max_early_data_size.?);
+    const expected_psk = tls.schedule.resumptionPsk(rms, tickets[0].nonce);
+    try testing.expectEqualSlices(u8, &expected_psk, &tickets[0].psk.?);
+}
+
+test "a server cannot send a NewSessionTicket before handshake confirmation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x20 };
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    testInstallAppKeys(&server);
+
+    try testing.expectError(error.ProtocolViolation, server.sendSessionTicket(1, 0, &.{}, "ticket", &.{}, null, 1000));
+    try testing.expectEqual(@as(usize, 0), server.datagramLengths().len);
+}
+
+test "a confirmed server sends NEW_TOKEN to a client" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x2f };
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    testInstallAppKeys(&server);
+    server.handshake_confirmed = true;
+
+    try server.sendNewToken("validation-token", 1000);
+    try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+    testInstallAppKeys(&client);
+
+    try client.receiveDatagram(server.datagramsToSend()[0..server.datagramLengths()[0]], 2000);
+    try testing.expectEqual(@as(usize, 1), client.validationTokens().len);
+    try testing.expectEqualStrings("validation-token", client.validationTokens()[0]);
+}
+
+test "NEW_TOKEN send requires a confirmed server and non-empty token" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x3f };
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    testInstallAppKeys(&server);
+
+    try testing.expectError(error.ProtocolViolation, server.sendNewToken("validation-token", 1000));
+    server.handshake_confirmed = true;
+    try testing.expectError(error.ProtocolViolation, server.sendNewToken("", 1000));
+
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+    testInstallAppKeys(&client);
+    client.handshake_confirmed = true;
+    try testing.expectError(error.ProtocolViolation, client.sendNewToken("client-token", 1000));
+}
+
+test "NEW_CONNECTION_ID stores a peer connection id" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const cid = [_]u8{ 1, 2, 3, 4 };
+    const token = [_]u8{0xa5} ** 16;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeNewConnectionId(&frames, gpa, 1, 0, &cid, token);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    const stored = conn.peer_cids.get(1).?;
+    try testing.expectEqualSlices(u8, &cid, stored.cid);
+    try testing.expectEqualSlices(u8, &token, &stored.token);
+}
+
+test "a stored peer connection id can be used for later packets" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x0a };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const cid = [_]u8{ 9, 8, 7, 6, 5 };
+    const reset_token = [_]u8{0xa6} ** 16;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeNewConnectionId(&frames, gpa, 1, 0, &cid, reset_token);
+    const in = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(in);
+
+    try conn.receiveDatagram(in, 1000);
+    conn.clearSend();
+    try conn.usePeerConnectionId(1);
+    try conn.challengePath([_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try conn.flushSend(2000);
+
+    const out = conn.datagramsToSend()[0..conn.datagramLengths()[0]];
+    const hdr = try packet.parseShort(out, cid.len);
+    try testing.expectEqualSlices(u8, &cid, hdr.dcid);
+}
+
+test "an unknown peer connection id sequence cannot be selected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x0b };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+
+    try testing.expectError(error.ProtocolViolation, conn.usePeerConnectionId(1));
+}
+
+test "issueLocalConnectionId emits NEW_CONNECTION_ID and accepts packets for it" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const cid = [_]u8{ 9, 8, 7, 6, 5, 4 };
+    const reset_token = [_]u8{0xb7} ** 16;
+    try conn.issueLocalConnectionId(1, 0, &cid, reset_token);
+    try testing.expect(conn.pending_new_cids.contains(1));
+    try conn.flushSend(1000);
+
+    const dgram = conn.datagramsToSend()[0..conn.datagramLengths()[0]];
+    var work = try gpa.dupe(u8, dgram);
+    defer gpa.free(work);
+    const hdr = try packet.parseShort(work, conn.peer_scid.len);
+    const pn_len = try crypto.unprotectHeader(testAppKeys().hp, work, hdr.pn_offset, false);
+    var truncated: u64 = 0;
+    for (work[hdr.pn_offset .. hdr.pn_offset + pn_len]) |b| truncated = (truncated << 8) | b;
+    const header = work[0 .. hdr.pn_offset + pn_len];
+    const ciphertext = work[hdr.pn_offset + pn_len ..];
+    const plaintext = try gpa.alloc(u8, ciphertext.len);
+    defer gpa.free(plaintext);
+    const payload = try crypto.open(testAppKeys(), truncated, header, ciphertext, plaintext);
+    const decoded = try frame.decode(payload);
+    try testing.expectEqual(@as(u64, 1), decoded.frame.new_connection_id.seq);
+    try testing.expectEqual(@as(u64, 0), decoded.frame.new_connection_id.retire_prior_to);
+    try testing.expectEqualSlices(u8, &cid, decoded.frame.new_connection_id.cid);
+    try testing.expectEqualSlices(u8, &reset_token, decoded.frame.new_connection_id.token);
+
+    conn.clearSend();
+    const ping = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
+    const addressed_to_new_cid = try testBuildApp(gpa, &cid, 0, &ping);
+    defer gpa.free(addressed_to_new_cid);
+    try conn.receiveDatagram(addressed_to_new_cid, 2000);
+    try expectFirstQueuedAppFrameTag(&conn, .ack);
+}
+
+test "retired issued local connection ids stop accepting packets" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc9 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const cid = [_]u8{ 1, 3, 5, 7, 9 };
+    try conn.issueLocalConnectionId(1, 0, &cid, [_]u8{0xc1} ** 16);
+    conn.clearSend();
+
+    var retire: std.ArrayListUnmanaged(u8) = .empty;
+    defer retire.deinit(gpa);
+    try frame.encodeRetireConnectionId(&retire, gpa, 1);
+    while (retire.items.len < 20) try retire.append(gpa, 0x00);
+    const retire_dgram = try testBuildApp(gpa, &dcid, 0, retire.items);
+    defer gpa.free(retire_dgram);
+    try conn.receiveDatagram(retire_dgram, 1000);
+    try testing.expect(conn.local_cids.get(1).?.retired);
+    conn.clearSend();
+
+    const ping = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
+    const addressed_to_retired = try testBuildApp(gpa, &cid, 1, &ping);
+    defer gpa.free(addressed_to_retired);
+    try conn.receiveDatagram(addressed_to_retired, 2000);
+    try testing.expectEqual(@as(usize, 0), conn.datagramLengths().len);
+}
+
+test "issuing local connection ids accounts retire_prior_to against the active limit" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xca };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.peer_tp.active_connection_id_limit = 2;
+
+    try conn.issueLocalConnectionId(1, 0, &[_]u8{ 1, 1, 1 }, [_]u8{0xd1} ** 16);
+    try testing.expectError(error.ProtocolViolation, conn.issueLocalConnectionId(2, 0, &[_]u8{ 2, 2, 2 }, [_]u8{0xd2} ** 16));
+    try conn.issueLocalConnectionId(2, 1, &[_]u8{ 2, 2, 2 }, [_]u8{0xd2} ** 16);
+}
+
+test "NEW_CONNECTION_ID duplicate sequence with different cid is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const token = [_]u8{0xa5} ** 16;
+    var first: std.ArrayListUnmanaged(u8) = .empty;
+    defer first.deinit(gpa);
+    try frame.encodeNewConnectionId(&first, gpa, 1, 0, &[_]u8{ 1, 2, 3, 4 }, token);
+    const d1 = try testBuildApp(gpa, &dcid, 0, first.items);
+    defer gpa.free(d1);
+    try conn.receiveDatagram(d1, 1000);
+    conn.clearSend();
+
+    var second: std.ArrayListUnmanaged(u8) = .empty;
+    defer second.deinit(gpa);
+    try frame.encodeNewConnectionId(&second, gpa, 1, 0, &[_]u8{ 4, 3, 2, 1 }, token);
+    const d2 = try testBuildApp(gpa, &dcid, 1, second.items);
+    defer gpa.free(d2);
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(d2, 2000));
+}
+
+test "NEW_CONNECTION_ID cannot reissue the current peer connection id" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x0c };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const token = [_]u8{0xa5} ** 16;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeNewConnectionId(&frames, gpa, 1, 0, &dcid, token);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+}
+
+test "NEW_CONNECTION_ID cannot reuse a connection id with a different sequence" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x0d };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.local_tp.active_connection_id_limit = 3;
+
+    const cid = [_]u8{ 1, 2, 3, 4 };
+    const token = [_]u8{0xa5} ** 16;
+    var first: std.ArrayListUnmanaged(u8) = .empty;
+    defer first.deinit(gpa);
+    try frame.encodeNewConnectionId(&first, gpa, 1, 0, &cid, token);
+    const d1 = try testBuildApp(gpa, &dcid, 0, first.items);
+    defer gpa.free(d1);
+    try conn.receiveDatagram(d1, 1000);
+    conn.clearSend();
+
+    var second: std.ArrayListUnmanaged(u8) = .empty;
+    defer second.deinit(gpa);
+    try frame.encodeNewConnectionId(&second, gpa, 2, 0, &cid, token);
+    const d2 = try testBuildApp(gpa, &dcid, 1, second.items);
+    defer gpa.free(d2);
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(d2, 2000));
+}
+
+test "NEW_CONNECTION_ID enforces the active connection id limit" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.local_tp.active_connection_id_limit = 2;
+
+    const token = [_]u8{0xa5} ** 16;
+    var first: std.ArrayListUnmanaged(u8) = .empty;
+    defer first.deinit(gpa);
+    try frame.encodeNewConnectionId(&first, gpa, 1, 0, &[_]u8{ 1, 2, 3, 4 }, token);
+    const d1 = try testBuildApp(gpa, &dcid, 0, first.items);
+    defer gpa.free(d1);
+    try conn.receiveDatagram(d1, 1000);
+    conn.clearSend();
+
+    var second: std.ArrayListUnmanaged(u8) = .empty;
+    defer second.deinit(gpa);
+    try frame.encodeNewConnectionId(&second, gpa, 2, 0, &[_]u8{ 5, 6, 7, 8 }, token);
+    const d2 = try testBuildApp(gpa, &dcid, 1, second.items);
+    defer gpa.free(d2);
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(d2, 2000));
+}
+
+test "NEW_CONNECTION_ID retire_prior_to removes older peer ids" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const token = [_]u8{0xa5} ** 16;
+    var first: std.ArrayListUnmanaged(u8) = .empty;
+    defer first.deinit(gpa);
+    try frame.encodeNewConnectionId(&first, gpa, 1, 0, &[_]u8{ 1, 2, 3, 4 }, token);
+    const d1 = try testBuildApp(gpa, &dcid, 0, first.items);
+    defer gpa.free(d1);
+    try conn.receiveDatagram(d1, 1000);
+    conn.clearSend();
+
+    var second: std.ArrayListUnmanaged(u8) = .empty;
+    defer second.deinit(gpa);
+    try frame.encodeNewConnectionId(&second, gpa, 2, 2, &[_]u8{ 5, 6, 7, 8 }, token);
+    const d2 = try testBuildApp(gpa, &dcid, 1, second.items);
+    defer gpa.free(d2);
+    try conn.receiveDatagram(d2, 2000);
+    try testing.expect(!conn.peer_cids.contains(1));
+    try testing.expect(conn.peer_cids.contains(2));
+}
+
+test "NEW_CONNECTION_ID retire_prior_to queues RETIRE_CONNECTION_ID" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x09 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const token = [_]u8{0xa5} ** 16;
+    var first: std.ArrayListUnmanaged(u8) = .empty;
+    defer first.deinit(gpa);
+    try frame.encodeNewConnectionId(&first, gpa, 1, 0, &[_]u8{ 1, 2, 3, 4 }, token);
+    const d1 = try testBuildApp(gpa, &dcid, 0, first.items);
+    defer gpa.free(d1);
+    try conn.receiveDatagram(d1, 1000);
+    conn.clearSend();
+
+    var second: std.ArrayListUnmanaged(u8) = .empty;
+    defer second.deinit(gpa);
+    try frame.encodeNewConnectionId(&second, gpa, 2, 2, &[_]u8{ 5, 6, 7, 8 }, token);
+    const d2 = try testBuildApp(gpa, &dcid, 1, second.items);
+    defer gpa.free(d2);
+    try conn.receiveDatagram(d2, 2000);
+    try testing.expect(conn.pending_retire_cids.contains(1));
+
+    conn.clearSend();
+    try conn.flushSend(3000);
+
+    const dgram = conn.datagramsToSend()[0..conn.datagramLengths()[0]];
+    const keys = testAppKeys();
+    const hdr = try packet.parseShort(dgram, dcid.len);
+    const work = try gpa.dupe(u8, dgram);
+    defer gpa.free(work);
+    const pn_len = try crypto.unprotectHeader(keys.hp, work, hdr.pn_offset, false);
+    var truncated: u64 = 0;
+    for (work[hdr.pn_offset .. hdr.pn_offset + pn_len]) |b| truncated = (truncated << 8) | b;
+    const header = work[0 .. hdr.pn_offset + pn_len];
+    const ciphertext = work[hdr.pn_offset + pn_len ..];
+    const plaintext = try gpa.alloc(u8, ciphertext.len);
+    defer gpa.free(plaintext);
+    const payload = try crypto.open(keys, truncated, header, ciphertext, plaintext);
+    const decoded = try frame.decode(payload);
+    try testing.expectEqual(frame.Frame{ .retire_connection_id = 1 }, decoded.frame);
+}
+
+test "RETIRE_CONNECTION_ID can retire the initial local cid" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const cid = [_]u8{ 4, 6, 8, 10 };
+    try conn.issueLocalConnectionId(1, 0, &cid, [_]u8{0xb4} ** 16);
+    conn.clearSend();
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeRetireConnectionId(&frames, gpa, 0);
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+    const dgram = try testBuildApp(gpa, &cid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expect(conn.local_initial_cid_retired);
+}
+
+test "RETIRE_CONNECTION_ID cannot retire the cid used by the same packet" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x09 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const cid = [_]u8{ 7, 7, 7, 7 };
+    try conn.issueLocalConnectionId(1, 0, &cid, [_]u8{0xb5} ** 16);
+    conn.clearSend();
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeRetireConnectionId(&frames, gpa, 1);
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+    const dgram = try testBuildApp(gpa, &cid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+}
+
+test "RETIRE_CONNECTION_ID for an unissued sequence is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeRetireConnectionId(&frames, gpa, 1);
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
 }
 
 test "a tampered Initial is dropped, not fatal" {
@@ -1933,101 +4627,6 @@ test "consume re-grants connection flow-control credit" {
     try testing.expectEqualStrings("", conn.streamData(0));
 }
 
-test "a bidi stream past the advertised cap is a stream-limit error" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x51, 0x52, 0x53, 0x54 };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    conn.bidi_limit = flow.StreamLimit.init(2); // allow client-bidi 0 and 4, reject 8
-
-    // Two request streams open within the cap (ids 0 and 4); a STREAM frame each.
-    const s0 = [_]u8{ 0x0b, 0x00, 0x01, 'a' }; // STREAM|LEN|FIN id 0
-    const d0 = try testBuildApp(gpa, &dcid, 0, &s0);
-    defer gpa.free(d0);
-    try conn.receiveDatagram(d0, 1000);
-    const s4 = [_]u8{ 0x0b, 0x04, 0x01, 'b' }; // id 4
-    const d4 = try testBuildApp(gpa, &dcid, 1, &s4);
-    defer gpa.free(d4);
-    try conn.receiveDatagram(d4, 1000);
-
-    // The third (id 8) is one beyond the cap of 2: STREAM_LIMIT_ERROR.
-    const s8 = [_]u8{ 0x0b, 0x08, 0x01, 'c' }; // id 8
-    const d8 = try testBuildApp(gpa, &dcid, 2, &s8);
-    defer gpa.free(d8);
-    try testing.expectError(error.StreamLimitError, conn.receiveDatagram(d8, 1000));
-}
-
-test "initServer enforces exactly the bidi cap it advertises" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x60, 0x61, 0x62, 0x63 };
-
-    // The cap enforced is the initial_max_streams_bidi the config advertises (8 here).
-    var conn = try Connection.initServer(gpa, &dcid, testServerConfig());
-    defer conn.deinit();
-    try testing.expectEqual(@as(u64, 8), conn.bidi_limit.?.max);
-
-    // A config advertising no initial_max_streams_bidi enforces 0: a conformant client
-    // opens no request stream, and the server rejects any it does open.
-    var noneCfg = testServerConfig();
-    noneCfg.transport_params = &.{};
-    var none = try Connection.initServer(gpa, &dcid, noneCfg);
-    defer none.deinit();
-    try testing.expectEqual(@as(u64, 0), none.bidi_limit.?.max);
-
-    // A malformed own transport-parameter blob is a configuration bug, not silently
-    // defaulted: initServer surfaces it.
-    var badCfg = testServerConfig();
-    badCfg.transport_params = &[_]u8{ 0x08, 0x08, 0x00 }; // len 8, only 1 byte follows
-    try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, badCfg));
-}
-
-test "initServer takes the per-stream recv limit from its transport parameters" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x64, 0x65, 0x66, 0x67 };
-    var cfg = testServerConfig();
-    // initial_max_stream_data_bidi_remote (id 0x06) = 0x4000 (varint 0x80,0x00,0x40,0x00):
-    // the limit a client request stream (peer-initiated bidi) gets.
-    cfg.transport_params = &[_]u8{ 0x06, 0x04, 0x80, 0x00, 0x40, 0x00 };
-    var conn = try Connection.initServer(gpa, &dcid, cfg);
-    defer conn.deinit();
-    try testing.expectEqual(@as(u64, 0x4000), conn.stream_recv_limits.?.bidi);
-}
-
-test "initServer advertises the mandatory connection ids" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x70, 0x71, 0x72, 0x73 };
-    var conn = try Connection.initServer(gpa, &dcid, testServerConfig());
-    defer conn.deinit();
-
-    // The advertised blob is the integrator base plus original_destination_connection_id
-    // (the client's first dcid) and initial_source_connection_id (our scid) - the two
-    // a conformant client validates before completing the handshake (RFC 9000 7.3).
-    var expected: std.ArrayListUnmanaged(u8) = .empty;
-    defer expected.deinit(gpa);
-    try expected.appendSlice(gpa, testServerConfig().transport_params);
-    try transport_params.appendBytesParam(&expected, gpa, 0x00, &dcid);
-    try transport_params.appendBytesParam(&expected, gpa, 0x0f, conn.scid);
-    try testing.expectEqualSlices(u8, expected.items, conn.own_tp.?);
-    // The TLS driver ships exactly this blob in EncryptedExtensions.
-    try testing.expectEqualSlices(u8, conn.own_tp.?, conn.tls.?.config.transport_params);
-
-    // A base blob already carrying one of the two ids initServer injects would
-    // duplicate it on the wire: a configuration bug, rejected up front.
-    var dupCfg = testServerConfig();
-    dupCfg.transport_params = &[_]u8{ 0x0f, 0x00 }; // initial_source_connection_id
-    try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, dupCfg));
-
-    // But a base blob carrying a server-only parameter the server itself does NOT
-    // inject (stateless_reset_token, 0x02) is legitimate and rides through verbatim.
-    var srtCfg = testServerConfig();
-    const srt = [_]u8{0x02} ++ [_]u8{0x10} ++ [_]u8{0xcc} ** 16; // 16-byte token
-    srtCfg.transport_params = &srt;
-    var srtConn = try Connection.initServer(gpa, &dcid, srtCfg);
-    defer srtConn.deinit();
-    try testing.expect(std.mem.indexOf(u8, srtConn.own_tp.?, &srt) != null);
-}
-
 test "connection flow control sums across streams" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x0a, 0x0b, 0x0c, 0x0d };
@@ -2046,124 +4645,202 @@ test "connection flow control sums across streams" {
     const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
     defer gpa.free(dgram);
     try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
+    try testing.expectEqual(@as(u64, 4), conn.conn_received_total);
+    try testing.expectEqualStrings("aaaa", conn.streamData(0));
+    try testing.expectEqualStrings("", conn.streamData(4));
+    try testing.expect(!conn.hasStream(4));
+    try testing.expect(!conn.recv_windows.contains(4));
 }
 
-test "retired streams merge into ranges bounded by live gaps" {
+test "per-stream receive flow control rejects data past the stream limit" {
     const gpa = testing.allocator;
-    var r = RetiredStreams{};
-    defer r.deinit(gpa);
+    const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x11 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.local_tp.initial_max_stream_data_bidi_remote = 3; // client-bidi stream 0
 
-    // In-order client-bidi retirements (0, 4, 8) merge into ONE range [0,3): memory
-    // stays O(1) however many complete in order.
-    try testing.expect(r.put(gpa, 0));
-    try testing.expect(r.put(gpa, 4));
-    try testing.expect(r.put(gpa, 8));
-    try testing.expectEqual(@as(usize, 1), r.types[0].items.len);
-    try testing.expectEqual(RetiredStreams.Range{ .lo = 0, .hi = 3 }, r.types[0].items[0]);
-    try testing.expect(r.contains(0) and r.contains(8) and !r.contains(12));
-
-    // Stream 12 (index 3) stays OPEN; completions above it (16, 20) form a SECOND
-    // range that grows but does not multiply - two ranges, not one-per-stream.
-    try testing.expect(r.put(gpa, 16));
-    try testing.expect(r.put(gpa, 20));
-    try testing.expectEqual(@as(usize, 2), r.types[0].items.len);
-    try testing.expectEqual(RetiredStreams.Range{ .lo = 4, .hi = 6 }, r.types[0].items[1]);
-
-    // When 12 finally completes, the gap fills and the two ranges bridge into one.
-    try testing.expect(r.put(gpa, 12));
-    try testing.expectEqual(@as(usize, 1), r.types[0].items.len);
-    try testing.expectEqual(RetiredStreams.Range{ .lo = 0, .hi = 6 }, r.types[0].items[0]);
-    try testing.expect(r.contains(20));
-
-    // A re-put is a no-op, and stream types are independent (server-uni id 3).
-    try testing.expect(r.put(gpa, 4)); // already retired
-    try testing.expectEqual(@as(usize, 1), r.types[0].items.len);
-    try testing.expect(r.put(gpa, 3));
-    try testing.expect(r.contains(3) and !r.contains(7));
+    const frames = [_]u8{ 0x0a, 0x00, 0x04, 'a', 'b', 'c', 'd' };
+    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(dgram);
+    try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
+    try testing.expectEqual(@as(u64, 0), conn.conn_received_total);
+    try testing.expectEqualStrings("", conn.streamData(0));
+    try testing.expect(!conn.hasStream(0));
+    try testing.expect(!conn.recv_windows.contains(0));
 }
 
-test "a single stream over its per-stream window is a flow-control error" {
+test "receive stream fragment count is bounded" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x15 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    var i: usize = 0;
+    while (i <= stream.MAX_RECV_FRAGMENTS) : (i += 1) {
+        const offset: u64 = @intCast((i + 1) * 2);
+        try frame.encodeStream(&frames, gpa, 0, offset, "x", false);
+    }
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.StreamBufferExceeded, conn.receiveDatagram(dgram, 1000));
+    const s = conn.streams.get(0).?;
+    try testing.expectEqual(stream.MAX_RECV_FRAGMENTS, s.pending.items.len);
+    try testing.expectEqualStrings("", conn.streamData(0));
+}
+
+test "RESET_STREAM final size is charged to receive flow control" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x12 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeResetStream(&frames, gpa, 0, 0x010c, 5);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expect(conn.streamReset(0));
+    try testing.expectEqual(@as(u64, 5), conn.conn_received_total);
+    try testing.expectEqual(@as(u64, 5), conn.recv_windows.get(0).?.received);
+}
+
+test "RESET_STREAM final size past the stream receive limit is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x13 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.local_tp.initial_max_stream_data_bidi_remote = 3; // client-bidi stream 0
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeResetStream(&frames, gpa, 0, 0x010c, 4);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
+    try testing.expect(!conn.streamReset(0));
+    try testing.expectEqual(@as(u64, 0), conn.conn_received_total);
+}
+
+test "RESET_STREAM final size past the connection receive limit is rejected" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x14 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.conn_recv_window.limit = 3;
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeResetStream(&frames, gpa, 0, 0x010c, 4);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
+    try testing.expect(!conn.streamReset(0));
+    try testing.expectEqual(@as(u64, 0), conn.conn_received_total);
+}
+
+test "peer stream limits reject streams past the advertised count" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x12, 0x13, 0x14, 0x15 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.peer_bidi_streams = flow.StreamLimit.init(1); // only client-bidi stream index 0
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeStream(&frames, gpa, 4, 0, "x", false); // client-bidi index 1
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+    try testing.expectError(error.StreamLimitError, conn.receiveDatagram(dgram, 1000));
+}
+
+test "opening enough peer streams advertises a raised MAX_STREAMS" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x16, 0x17, 0x18, 0x19 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.peer_bidi_streams = flow.StreamLimit.init(2);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeStream(&frames, gpa, 4, 0, "x", false); // opens index 1 of 2
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expect(conn.max_streams_bidi_pending);
+
+    conn.clearSend(); // discard ACK bytes from receiving the STREAM
+    try conn.flushSend(2000);
+    try testing.expect(!conn.max_streams_bidi_pending);
+    try testing.expect(conn.datagramLengths().len >= 1);
+}
+
+test "local stream creation is limited by peer initial_max_streams" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x1a, 0x1b, 0x1c, 0x1d };
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
     testInstallAppKeys(&conn);
-    conn.stream_recv_limits = .{ .bidi = 4, .uni = 0 }; // each bidi stream may send at most 4 bytes, even though
-    conn.conn_recv_window.limit = 1000; // the connection has ample room
+    conn.peer_tp.initial_max_streams_bidi = 0;
+    conn.local_bidi_streams = flow.StreamLimit.init(0);
 
-    // 5 bytes on a single stream exceeds its 4-byte per-stream window (RFC 9000 19.10),
-    // the evasion the connection-wide check alone would miss.
-    const frames = [_]u8{ 0x0a, 0x00, 0x05, 'a', 'a', 'a', 'a', 'a' };
-    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
-    defer gpa.free(dgram);
-    try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
+    try testing.expectError(error.StreamLimitError, conn.sendStreamData(1, "blocked", false));
+    try testing.expect(conn.hasPendingSend());
+    try conn.flushSend(1000);
+    try expectFirstQueuedAppFrameTag(&conn, .streams_blocked);
 }
 
-test "a client sending on a server-initiated uni stream is a protocol violation" {
+test "MAX_STREAMS raises the local stream creation limit" {
     const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x4a, 0x4b, 0x4c, 0x4d };
+    const dcid = [_]u8{ 0x1e, 0x1f, 0x20, 0x21 };
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
     testInstallAppKeys(&conn);
-    // Stream 3 is server-initiated unidirectional (our control stream); a client must
-    // not send STREAM data on it (RFC 9000 19.8: STREAM_STATE_ERROR). A client-bidi
-    // (stream 0) or a server-bidi (stream 1, both-ways) would be accepted.
-    const frames = [_]u8{ 0x0a, 0x03, 0x01, 'x' }; // STREAM on stream 3
-    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
-    defer gpa.free(dgram);
-    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
-}
+    conn.peer_tp.initial_max_streams_bidi = 0;
+    conn.local_bidi_streams = flow.StreamLimit.init(0);
 
-test "a unidirectional peer stream uses the uni per-stream limit" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x3a, 0x3b, 0x3c, 0x3d };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    conn.stream_recv_limits = .{ .bidi = 4, .uni = 100 }; // uni streams get their own, larger limit
-    conn.conn_recv_window.limit = 1000;
-
-    // 10 bytes on client-uni stream 2: within the uni limit (100), though over the
-    // bidi limit (4) - so the right parameter must be selected by stream type.
-    const frames = [_]u8{ 0x0a, 0x02, 0x0a } ++ [_]u8{0x7a} ** 10;
-    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
-    defer gpa.free(dgram);
-    try conn.receiveDatagram(dgram, 1000); // no FlowControlError
-    try testing.expectEqualStrings(&[_]u8{0x7a} ** 10, conn.streamData(2));
-}
-
-test "consuming a stream advertises a raised MAX_STREAM_DATA" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x2a, 0x2b, 0x2c, 0x2d };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    conn.stream_recv_limits = .{ .bidi = 100, .uni = 100 };
-
-    // Receive 60 bytes on stream 0, then consume them: that crosses the per-stream
-    // auto-tune threshold and queues a MAX_STREAM_DATA, which flushSend emits.
-    var sframe: std.ArrayListUnmanaged(u8) = .empty;
-    defer sframe.deinit(gpa);
-    try frame.encodeStream(&sframe, gpa, 0, 0, &[_]u8{0x7a} ** 60, false);
-    const dgram = try testBuildApp(gpa, &dcid, 0, sframe.items);
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeMaxStreams(&frames, gpa, true, 1);
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
     defer gpa.free(dgram);
     try conn.receiveDatagram(dgram, 1000);
-    conn.clearSend();
 
-    conn.consumeStream(0, 60);
-    try testing.expect(conn.stream_recv_windows.getPtr(0).?.pending);
-    try conn.flushSend(2000);
-    try testing.expect(!conn.stream_recv_windows.getPtr(0).?.pending); // emitted
-    try testing.expect(conn.stream_recv_windows.getPtr(0).?.sent_pn != null); // recorded for loss recovery
-    try testing.expect(conn.datagramLengths().len >= 1);
-    conn.clearSend();
+    try conn.sendStreamData(1, "allowed", false);
+    try testing.expect(conn.send_streams.contains(1));
+}
 
-    // A lost MAX_STREAM_DATA is re-sent (RFC 9000 13.3): otherwise the peer, blocked at
-    // the old limit, never sends more, so no consume re-triggers the advertisement.
-    const d = conn.nextTimeout().?;
-    try conn.onTimeout(d + 1);
-    try conn.flushSend(d + 2);
-    try testing.expect(conn.datagramsToSend().len > 0); // the raised limit rode again
+test "MAX_STREAMS lower than the existing local limit is ignored" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x22, 0x23, 0x24, 0x25 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.local_bidi_streams = flow.StreamLimit.init(2);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeMaxStreams(&frames, gpa, true, 1);
+    while (frames.items.len < 20) try frames.append(gpa, 0x00);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+    try conn.receiveDatagram(dgram, 1000);
+
+    try testing.expectEqual(@as(u64, 2), conn.local_bidi_streams.max);
 }
 
 test "an ACK carries every received range, not just the largest" {
@@ -2223,13 +4900,15 @@ test "a received CONNECTION_CLOSE is captured with its code and reason" {
     try testing.expectEqualStrings("bye", pc.reason);
 }
 
-test "consuming stream data advertises a raised MAX_DATA" {
+test "consuming stream data advertises raised MAX_DATA and MAX_STREAM_DATA" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x51, 0x52, 0x53, 0x54 };
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
     testInstallAppKeys(&conn);
     conn.conn_recv_window.limit = 100; // a small window so consuming half trips the update
+    conn.conn_recv_window.initial = 100;
+    conn.local_tp.initial_max_stream_data_bidi_local = 100; // stream 1 is server-bidi
 
     // Receive 60 bytes on stream 1, then consume them: that crosses the auto-tune
     // threshold and queues a MAX_DATA, which flushSend emits.
@@ -2243,84 +4922,11 @@ test "consuming stream data advertises a raised MAX_DATA" {
 
     conn.consumeStream(1, 60);
     try testing.expect(conn.max_data_pending);
+    try testing.expect(conn.max_stream_data_pending.contains(1));
     try conn.flushSend(2000);
     try testing.expect(!conn.max_data_pending); // emitted
-    try testing.expect(conn.datagramLengths().len >= 1);
-}
-
-test "completing request streams advertises a raised MAX_STREAMS" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x55, 0x56, 0x57, 0x58 };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    conn.bidi_limit = flow.StreamLimit.init(4); // window 4: opening 3 trips the auto-tune
-
-    // Open, drain and drop three request streams (ids 0, 4, 8). Each is one byte with
-    // FIN, consumed to terminal so dropStream reclaims it and frees a bidi slot.
-    var pn: u64 = 0;
-    for ([_]u64{ 0, 4, 8 }) |id| {
-        var sframe: std.ArrayListUnmanaged(u8) = .empty;
-        defer sframe.deinit(gpa);
-        try frame.encodeStream(&sframe, gpa, id, 0, &[_]u8{0x7a}, true);
-        const dgram = try testBuildApp(gpa, &dcid, pn, sframe.items);
-        defer gpa.free(dgram);
-        try conn.receiveDatagram(dgram, 1000);
-        conn.consumeStream(id, 1);
-        try testing.expect(conn.dropStream(id));
-        pn += 1;
-    }
-    conn.clearSend();
-
-    // Three of four opened crossed the auto-tune threshold: the cap slid to opened (3)
-    // + window (4) and a MAX_STREAMS is queued, which flushSend emits.
-    try testing.expect(conn.max_streams_pending);
-    try testing.expectEqual(@as(u64, 7), conn.bidi_limit.?.max);
-    try conn.flushSend(2000);
-    try testing.expect(!conn.max_streams_pending); // emitted
-    try testing.expect(conn.datagramLengths().len >= 1);
-    try testing.expect(conn.max_streams_sent != null); // recorded for loss recovery
-    conn.clearSend();
-
-    // A lost MAX_STREAMS must be re-sent, or the peer - out of stream credit - can never
-    // open the streams whose completion would re-trigger the advertisement (RFC 9000 13.3).
-    const d = conn.nextTimeout().?;
-    try conn.onTimeout(d + 1);
-    try conn.flushSend(d + 2);
-    try testing.expect(conn.datagramsToSend().len > 0); // the cap rode again
-}
-
-test "a cap of one request still slides after the request completes" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x59, 0x5a, 0x5b, 0x5c };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    conn.bidi_limit = flow.StreamLimit.init(1); // one request at a time
-
-    // The one allowed request (stream 0): a single byte with FIN, drained to terminal.
-    var s0: std.ArrayListUnmanaged(u8) = .empty;
-    defer s0.deinit(gpa);
-    try frame.encodeStream(&s0, gpa, 0, 0, &[_]u8{0x7a}, true);
-    const d0 = try testBuildApp(gpa, &dcid, 0, s0.items);
-    defer gpa.free(d0);
-    try conn.receiveDatagram(d0, 1000);
-    conn.consumeStream(0, 1);
-    try testing.expect(conn.dropStream(0));
-
-    // Completing it slides the cap to 2 and queues a MAX_STREAMS (the window-of-1 edge).
-    try testing.expect(conn.max_streams_pending);
-    try testing.expectEqual(@as(u64, 2), conn.bidi_limit.?.max);
-    try conn.flushSend(2000);
-
-    // The next request (stream 4) is now within the raised cap.
-    var s4: std.ArrayListUnmanaged(u8) = .empty;
-    defer s4.deinit(gpa);
-    try frame.encodeStream(&s4, gpa, 4, 0, &[_]u8{0x7a}, true);
-    const d4 = try testBuildApp(gpa, &dcid, 1, s4.items);
-    defer gpa.free(d4);
-    try conn.receiveDatagram(d4, 2100); // no StreamLimitError
-    try testing.expectEqualStrings("z", conn.streamData(4));
+    try testing.expect(!conn.max_stream_data_pending.contains(1)); // emitted
+    try testing.expect(conn.datagramLengths().len >= 2);
 }
 
 // ---- TLS handshake seam tests ----------------------------------------------
@@ -2332,14 +4938,6 @@ const RFC_CLIENT_PUBKEY = "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d54136
 // Build a QUIC-valid ClientHello carrying `pubkey` as its x25519 key_share, framed
 // as a handshake message (type 0x01 || u24 len || body) ready to ride a CRYPTO frame.
 fn buildClientHello(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pubkey: [32]u8) !void {
-    // max_idle_timeout, plus the mandatory initial_source_connection_id (RFC 9000
-    // 7.3) - empty, matching the zero-length scid testBuildInitial writes.
-    return buildClientHelloTp(out, gpa, pubkey, &[_]u8{ 0x01, 0x02, 0x40, 0x01, 0x0f, 0x00 });
-}
-
-// buildClientHello with a caller-chosen transport-parameter body, for the tests
-// that probe how the server validates a client's parameters.
-fn buildClientHelloTp(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, pubkey: [32]u8, tp: []const u8) !void {
     const w = tls.wire.Writer{ .out = out, .gpa = gpa };
     try w.u8v(0x01);
     const msg = try w.open(3);
@@ -2382,7 +4980,14 @@ fn buildClientHelloTp(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, 
     try w.close(ks);
     try w.u16v(0x0039); // quic_transport_parameters
     const qtp = try w.open(2);
-    try w.bytes(tp);
+    try w.bytes(&[_]u8{
+        0x04, 0x04, 0x80, 0x01, 0x00, 0x00, // initial_max_data = 65536
+        0x05, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_bidi_local = 262144
+        0x06, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_bidi_remote = 262144
+        0x07, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_uni = 262144
+        0x08, 0x01, 0x10, // initial_max_streams_bidi = 16
+        0x09, 0x01, 0x10, // initial_max_streams_uni = 16
+    });
     try w.close(qtp);
     try w.close(exts);
     try w.close(msg);
@@ -2399,34 +5004,49 @@ fn buildClientHelloInitial(gpa: std.mem.Allocator, dcid: []const u8, pubkey: [32
     return testBuildInitial(gpa, dcid, .client, 0, frames.items);
 }
 
-// buildClientHelloInitial with a caller-chosen client transport-parameter body.
-fn buildClientHelloInitialTp(gpa: std.mem.Allocator, dcid: []const u8, pubkey: [32]u8, tp: []const u8) ![]u8 {
-    var ch: std.ArrayListUnmanaged(u8) = .empty;
-    defer ch.deinit(gpa);
-    try buildClientHelloTp(&ch, gpa, pubkey, tp);
-    var frames: std.ArrayListUnmanaged(u8) = .empty;
-    defer frames.deinit(gpa);
-    try frame.encodeCrypto(&frames, gpa, 0, ch.items);
-    return testBuildInitial(gpa, dcid, .client, 0, frames.items);
-}
-
 fn testServerConfig() tls.flight.Config {
     return .{
         .random = [_]u8{0xAB} ** 32,
         .ephemeral_seed = [_]u8{0x33} ** 32,
         .signer = tls.sign.Signer.fromSeed([_]u8{0x42} ** 32) catch unreachable,
         .cert_chain = &[_]u8{0xCC} ** 48,
-        // initial_max_streams_bidi = 8; per-stream recv limits bidi_remote (0x06) and
-        // uni (0x07) = 262144 (varint 0x80,0x04,0x00,0x00), so a request and the
-        // client's control/QPACK streams have room.
         .transport_params = &[_]u8{
-            0x08, 0x01, 0x08,
-            0x06, 0x04, 0x80,
-            0x04, 0x00, 0x00,
-            0x07, 0x04, 0x80,
-            0x04, 0x00, 0x00,
+            0x04, 0x04, 0x80, 0x10, 0x00, 0x00, // initial_max_data = 1048576
+            0x08, 0x01, 0x08, // initial_max_streams_bidi = 8
+            0x09, 0x01, 0x08, // initial_max_streams_uni = 8
+            0x06, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_bidi_remote = 262144
+            0x07, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_uni = 262144
         },
     };
+}
+
+test "server config cannot carry static CID transport parameters" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xd0, 0xd1, 0xd2, 0xd3 };
+    var cfg = testServerConfig();
+    cfg.transport_params = &[_]u8{
+        0x00, 0x04, 0xd0, 0xd1, 0xd2, 0xd3, // original_destination_connection_id
+    };
+    try testing.expectError(error.ProtocolViolation, Connection.initServer(gpa, &dcid, cfg));
+}
+
+test "server drops Initial packets from UDP datagrams under 1200 bytes" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xd4, 0xd5, 0xd6, 0xd7 };
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeCrypto(&frames, gpa, 0, "partial ClientHello");
+    const dgram = try testBuildInitialWithPadding(gpa, &dcid, .client, 0, frames.items, false);
+    defer gpa.free(dgram);
+    try testing.expect(dgram.len < constants.MIN_INITIAL_DATAGRAM);
+
+    try server.receiveDatagram(dgram, 1000);
+    try testing.expectEqual(@as(usize, 0), server.spaces[@intFromEnum(Space.initial)].crypto.readable().len);
+    try testing.expect(server.spaces[@intFromEnum(Space.initial)].recv_ranges.isEmpty());
+    try testing.expectEqual(@as(usize, 0), server.datagramLengths().len);
 }
 
 test "a server drives the handshake from a ClientHello and installs 1-RTT keys" {
@@ -2457,6 +5077,229 @@ test "a server drives the handshake from a ClientHello and installs 1-RTT keys" 
     const server_ks = try tls.keyshare.KeyShare.ephemeral([_]u8{0x33} ** 32);
     const ecdhe = try server_ks.shared(pubkey);
     try testing.expectEqual(@as(usize, 32), ecdhe.len); // both sides reach the same ECDHE input
+}
+
+test "a client Initial carries a ClientHello the server can answer" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xd1, 0xd2, 0xd3, 0xd4 };
+    const client_tp = [_]u8{
+        0x04, 0x04, 0x80, 0x01, 0x00, 0x00, // initial_max_data = 65536
+        0x05, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_bidi_local = 262144
+        0x06, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_bidi_remote = 262144
+        0x07, 0x04, 0x80, 0x04, 0x00, 0x00, // initial_max_stream_data_uni = 262144
+        0x08, 0x01, 0x10, // initial_max_streams_bidi = 16
+        0x09, 0x01, 0x10, // initial_max_streams_uni = 16
+    };
+    var client = try Connection.initClient(gpa, &dcid, .{
+        .random = [_]u8{0x44} ** 32,
+        .ephemeral_seed = [_]u8{0x55} ** 32,
+        .transport_params = &client_tp,
+        .alpn = "h3",
+        .server_name = "example.test",
+    }, 1000);
+    defer client.deinit();
+
+    try testing.expect(client.datagramLengths().len >= 1);
+    try testing.expect(client.datagramLengths()[0] >= constants.MIN_INITIAL_DATAGRAM);
+
+    var server_cfg = testServerConfig();
+    server_cfg.alpn = "h3";
+    const signer = tls.sign.Signer.fromSeed([_]u8{0x42} ** 32) catch unreachable;
+    const cert_pub = signer.publicKeySec1();
+    server_cfg.cert_chain = &cert_pub;
+    var server = try Connection.initServer(gpa, &dcid, server_cfg);
+    defer server.deinit();
+    const buf = client.datagramsToSend();
+    var off: usize = 0;
+    for (client.datagramLengths()) |len| {
+        try server.receiveDatagram(buf[off .. off + len], 2000);
+        off += len;
+    }
+
+    try testing.expectEqual(@as(u64, 65536), server.peer_tp.initial_max_data);
+    try testing.expectEqual(@as(u64, 262144), server.peer_tp.initial_max_stream_data_bidi_local);
+    try testing.expectEqualStrings(&dcid, server.peer_tp.initial_source_connection_id.?.slice());
+    try testing.expect(server.datagramLengths().len >= 1);
+    try testing.expect(server.spaces[@intFromEnum(Space.handshake)].send_keys != null);
+
+    const server_buf = server.datagramsToSend();
+    off = 0;
+    for (server.datagramLengths()) |len| {
+        try client.receiveDatagram(server_buf[off .. off + len], 3000);
+        off += len;
+    }
+    try testing.expect(client.spaces[@intFromEnum(Space.handshake)].recv_keys != null);
+    try testing.expect(client.spaces[@intFromEnum(Space.handshake)].send_keys != null);
+    try testing.expect(client.spaces[@intFromEnum(Space.application)].recv_keys != null);
+    try testing.expect(client.spaces[@intFromEnum(Space.application)].send_keys != null);
+    try testing.expectEqualStrings(&dcid, client.peer_tp.original_destination_connection_id.?.slice());
+    try testing.expectEqualStrings(&dcid, client.peer_tp.initial_source_connection_id.?.slice());
+    try testing.expectEqual(tls.client.State.complete, client.tls_client.?.state);
+    try testing.expect(client.datagramLengths().len >= 1); // client Finished
+
+    const client_finished = client.datagramsToSend();
+    off = 0;
+    for (client.datagramLengths()) |len| {
+        try server.receiveDatagram(client_finished[off .. off + len], 4000);
+        off += len;
+    }
+    try testing.expect(server.handshake_confirmed);
+
+    const confirmed = server.datagramsToSend();
+    off = 0;
+    for (server.datagramLengths()) |len| {
+        try client.receiveDatagram(confirmed[off .. off + len], 5000);
+        off += len;
+    }
+    try testing.expect(client.handshake_confirmed);
+    try testing.expect(client.spaces[@intFromEnum(Space.initial)].recv_keys == null);
+    try testing.expect(client.spaces[@intFromEnum(Space.handshake)].recv_keys == null);
+}
+
+test "client config cannot carry static CID transport parameters" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xd1, 0xd2, 0xd3, 0xd5 };
+    const bad_tp = [_]u8{
+        0x0f, 0x04, 0xd1, 0xd2, 0xd3, 0xd5, // initial_source_connection_id
+    };
+    try testing.expectError(error.ProtocolViolation, Connection.initClient(gpa, &dcid, .{
+        .random = [_]u8{0x44} ** 32,
+        .ephemeral_seed = [_]u8{0x55} ** 32,
+        .transport_params = &bad_tp,
+        .alpn = "h3",
+        .server_name = "example.test",
+    }, 1000));
+}
+
+test "client Initial can carry a NEW_TOKEN validation token" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xd1, 0xd2, 0xd3, 0xd6 };
+    const client_tp = [_]u8{
+        0x04, 0x04, 0x80, 0x01, 0x00, 0x00,
+        0x05, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x06, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x07, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x08, 0x01, 0x10, 0x09, 0x01, 0x10,
+    };
+    var client = try Connection.initClient(gpa, &dcid, .{
+        .random = [_]u8{0x44} ** 32,
+        .ephemeral_seed = [_]u8{0x55} ** 32,
+        .transport_params = &client_tp,
+        .alpn = "h3",
+        .server_name = "example.test",
+        .validation_token = "validated-earlier",
+    }, 1000);
+    defer client.deinit();
+
+    const h = try packet.parseLong(client.datagramsToSend());
+    try testing.expectEqual(constants.LongType.initial, h.ltype);
+    try testing.expectEqualStrings("validated-earlier", h.token);
+}
+
+test "client validation token must be non-empty when provided" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xd1, 0xd2, 0xd3, 0xd7 };
+    const client_tp = [_]u8{
+        0x04, 0x04, 0x80, 0x01, 0x00, 0x00,
+    };
+    try testing.expectError(error.ProtocolViolation, Connection.initClient(gpa, &dcid, .{
+        .random = [_]u8{0x44} ** 32,
+        .ephemeral_seed = [_]u8{0x55} ** 32,
+        .transport_params = &client_tp,
+        .validation_token = "",
+    }, 1000));
+}
+
+test "client processes Retry and resends Initial with token and new dcid" {
+    const gpa = testing.allocator;
+    const original_dcid = [_]u8{ 0xd5, 0xd6, 0xd7, 0xd8 };
+    const client_tp = [_]u8{
+        0x04, 0x04, 0x80, 0x01, 0x00, 0x00,
+        0x05, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x06, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x07, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x08, 0x01, 0x10, 0x09, 0x01, 0x10,
+    };
+    var client = try Connection.initClient(gpa, &original_dcid, .{
+        .transport_params = &client_tp,
+        .random = [_]u8{0x44} ** 32,
+        .ephemeral_seed = [_]u8{0x55} ** 32,
+        .alpn = "h3",
+        .server_name = "example.test",
+    }, 1000);
+    defer client.deinit();
+    client.clearSend();
+
+    const retry_scid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3 };
+    var retry: std.ArrayListUnmanaged(u8) = .empty;
+    defer retry.deinit(gpa);
+    try packet.writeRetry(&retry, gpa, client.scid, &retry_scid, "retry-token", &original_dcid);
+
+    try client.receiveDatagram(retry.items, 2000);
+    try testing.expect(client.retried);
+    try testing.expectEqualStrings("retry-token", client.initial_token.?);
+    try testing.expectEqualSlices(u8, &retry_scid, client.peer_scid);
+    try testing.expect(client.datagramLengths().len >= 1);
+
+    const h = try packet.parseLong(client.datagramsToSend());
+    try testing.expectEqual(constants.LongType.initial, h.ltype);
+    try testing.expectEqualSlices(u8, &retry_scid, h.dcid);
+    try testing.expectEqualStrings("retry-token", h.token);
+}
+
+test "server answers an unsupported long-header version with Version Negotiation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4 };
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    var bad: std.ArrayListUnmanaged(u8) = .empty;
+    defer bad.deinit(gpa);
+    _ = try packet.writeLongHeader(&bad, gpa, .initial, 0x0a0a_0a0a, &dcid, "cli", "", 1, 1);
+    try bad.append(gpa, 0x00);
+    try server.receiveDatagram(bad.items, 1000);
+
+    try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+    const vn = server.datagramsToSend()[0..server.datagramLengths()[0]];
+    const p = try packet.parseLongPrefix(vn);
+    try testing.expectEqual(@as(u32, 0), p.version);
+    try testing.expectEqualStrings("cli", p.dcid);
+    try testing.expectEqualSlices(u8, &dcid, p.scid);
+    try testing.expectEqual(@as(usize, 4), vn[p.header_len..].len);
+    try testing.expectEqual(constants.VERSION_1, std.mem.readInt(u32, vn[p.header_len..][0..4], .big));
+}
+
+test "client ignores Version Negotiation that still advertises QUIC v1" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe5, 0xe6, 0xe7, 0xe8 };
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+
+    var vn: std.ArrayListUnmanaged(u8) = .empty;
+    defer vn.deinit(gpa);
+    try packet.writeVersionNegotiation(&vn, gpa, client.scid, client.peer_scid);
+    try client.receiveDatagram(vn.items, 1000);
+    try testing.expect(!client.closed);
+}
+
+test "client fails when Version Negotiation offers no supported version" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe9, 0xea, 0xeb, 0xec };
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+
+    var vn: std.ArrayListUnmanaged(u8) = .empty;
+    defer vn.deinit(gpa);
+    try vn.append(gpa, constants.HEADER_FORM_LONG | constants.FIXED_BIT);
+    try vn.appendSlice(gpa, &.{ 0, 0, 0, 0 });
+    try vn.append(gpa, @intCast(client.scid.len));
+    try vn.appendSlice(gpa, client.scid);
+    try vn.append(gpa, @intCast(client.peer_scid.len));
+    try vn.appendSlice(gpa, client.peer_scid);
+    try vn.appendSlice(gpa, &.{ 0x0a, 0x0a, 0x0a, 0x0a });
+
+    try testing.expectError(error.ProtocolViolation, client.receiveDatagram(vn.items, 1000));
+    try testing.expect(client.closed);
 }
 
 test "the client Finished confirms the handshake and discards the early spaces" {
@@ -2507,88 +5350,14 @@ test "the client's transport parameters set the connection send window" {
     _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
     var server = try Connection.initServer(gpa, &dcid, testServerConfig());
     defer server.deinit();
-    // The test ClientHello's transport parameters carry max_idle_timeout and the
-    // mandatory empty initial_source_connection_id - initial_max_data is absent, so
-    // the send window becomes 0 (the client granted no data yet).
+    // The test ClientHello grants connection-level and per-stream send credit, so
+    // the server can later send H3 response bytes on client request streams.
     const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
     defer gpa.free(ch);
     try server.receiveDatagram(ch, 1000);
-    try testing.expectEqual(@as(u64, 0), server.peer_tp.initial_max_data);
-    try testing.expectEqual(@as(u64, 0), server.conn_send_window.limit); // set from the (absent) grant
-}
-
-test "a client without initial_source_connection_id is rejected" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
-    var pubkey: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
-    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
-    defer server.deinit();
-    // RFC 9000 7.3: absence of initial_source_connection_id from either peer is a
-    // TRANSPORT_PARAMETER_ERROR. Only max_idle_timeout here.
-    const ch = try buildClientHelloInitialTp(gpa, &dcid, pubkey, &[_]u8{ 0x01, 0x02, 0x40, 0x01 });
-    defer gpa.free(ch);
-    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
-
-    // The rejection rode out as a CONNECTION_CLOSE carrying TRANSPORT_PARAMETER_ERROR.
-    try testing.expect(server.closed);
-    var peer = try Connection.init(gpa, .client, &dcid);
-    defer peer.deinit();
-    try peer.receiveDatagram(server.datagramsToSend(), 2000);
-    try testing.expectEqual(@intFromEnum(constants.TransportError.transport_parameter_error), peer.peer_close.?.error_code);
-}
-
-test "a client whose initial_source_connection_id mismatches its Initial is rejected" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
-    var pubkey: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
-    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
-    defer server.deinit();
-    // The Initial's scid is empty, but the parameter claims aa bb (RFC 9000 7.3:
-    // the values are authenticated against the header to defeat id spoofing).
-    const ch = try buildClientHelloInitialTp(gpa, &dcid, pubkey, &[_]u8{ 0x0f, 0x02, 0xaa, 0xbb });
-    defer gpa.free(ch);
-    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
-}
-
-test "a client sending a server-only transport parameter is rejected" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
-    var pubkey: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
-    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
-    defer server.deinit();
-    // A valid (empty) initial_source_connection_id plus an ODCID, which only a
-    // server may send (RFC 9000 18.2).
-    const ch = try buildClientHelloInitialTp(gpa, &dcid, pubkey, &[_]u8{ 0x0f, 0x00, 0x00, 0x01, 0xcc });
-    defer gpa.free(ch);
-    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(ch, 1000));
-}
-
-test "a spoofed Initial with a different scid does not break the real handshake" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
-    var pubkey: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&pubkey, RFC_CLIENT_PUBKEY);
-    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
-    defer server.deinit();
-
-    // Initial keys are derivable from the dcid, so an off-path attacker who saw it can
-    // forge a Initial that opens under AEAD with a DIFFERENT scid (aa bb) carrying only
-    // a PING. The connection-id check is bound to the ClientHello's own packet, not a
-    // persistent anchor, so this must not make the real client's check fail later.
-    const spoof = try testBuildInitialScid(gpa, &dcid, &[_]u8{ 0xaa, 0xbb }, .client, 0, &[_]u8{0x01} ** 20);
-    defer gpa.free(spoof);
-    try server.receiveDatagram(spoof, 900); // accepted (a valid PING), but does not poison
-
-    // The authentic ClientHello (zero-length scid, matching its empty initial_scid
-    // parameter) still validates and the server flight goes out.
-    const ch = try buildClientHelloInitial(gpa, &dcid, pubkey);
-    defer gpa.free(ch);
-    try server.receiveDatagram(ch, 1000);
-    try testing.expect(server.datagramLengths().len >= 1); // the server flight went out
-    try testing.expect(server.tls.?.state == .flight_sent);
+    try testing.expectEqual(@as(u64, 65536), server.peer_tp.initial_max_data);
+    try testing.expectEqual(@as(u64, 262144), server.peer_tp.initial_max_stream_data_bidi_local);
+    try testing.expectEqual(@as(u64, 65536), server.conn_send_window.limit);
 }
 
 test "a lost handshake CRYPTO packet is retransmitted on loss" {
@@ -2607,12 +5376,14 @@ test "a lost handshake CRYPTO packet is retransmitted on loss" {
     const hs = &server.spaces[@intFromEnum(Space.handshake)];
     try testing.expect(hs.crypto_sent.count() >= 1);
     try testing.expect(!hs.crypto_send.pending());
+    server.discardSpace(.initial);
+    server.clearSend();
 
     // A PTO re-queues the oldest unacked CRYPTO range for retransmission - the
     // handshake recovers from a lost flight rather than deadlocking.
     const deadline = server.nextTimeout().?;
     try server.onTimeout(deadline + 1);
-    try testing.expect(hs.crypto_send.pending()); // the lost flight bytes are queued to resend
+    try testing.expect(server.datagramLengths().len >= 1);
 }
 
 test "a fragmented ClientHello across CRYPTO frames still drives the handshake" {
@@ -2685,7 +5456,21 @@ test "a STREAM frame in an Initial packet is a protocol violation" {
     try testing.expectError(error.ProtocolViolation, server.receiveDatagram(dgram, 1000));
 }
 
-test "a malformed ClientHello closes with CRYPTO_ERROR (decode_error)" {
+test "an application CONNECTION_CLOSE in an Initial packet is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x21, 0x22, 0x23, 0x24 };
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeConnectionClose(&frames, gpa, true, 0x0100, 0, "bad space");
+    const dgram = try testBuildInitial(gpa, &dcid, .client, 0, frames.items);
+    defer gpa.free(dgram);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(dgram, 1000));
+}
+
+test "a malformed ClientHello (no supported_versions) poisons the connection" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x31, 0x32, 0x33, 0x34 };
     var pubkey: [32]u8 = undefined;
@@ -2705,18 +5490,7 @@ test "a malformed ClientHello closes with CRYPTO_ERROR (decode_error)" {
     try frame.encodeCrypto(&frames, gpa, 0, ch.items);
     const dgram = try testBuildInitial(gpa, &dcid, .client, 0, frames.items);
     defer gpa.free(dgram);
-    try testing.expectError(error.CryptoError, server.receiveDatagram(dgram, 1000));
-
-    // RFC 9001 4.8: the failure rode out as a CONNECTION_CLOSE carrying
-    // CRYPTO_ERROR (0x0100 | decode_error). A peer deriving the same Initial keys
-    // from the dcid reads it back.
-    try testing.expect(server.closed);
-    var peer = try Connection.init(gpa, .client, &dcid);
-    defer peer.deinit();
-    try peer.receiveDatagram(server.datagramsToSend(), 2000);
-    const pc = peer.peer_close.?;
-    try testing.expect(!pc.app);
-    try testing.expectEqual(cryptoErrorCode(.decode_error), pc.error_code);
+    try testing.expectError(error.ProtocolViolation, server.receiveDatagram(dgram, 1000));
 }
 
 // ---- STREAM send tests -----------------------------------------------------
@@ -2860,12 +5634,13 @@ test "a STOP_SENDING before the send stream exists still resets it" {
     // the server cannot send a response the peer already cancelled.
     try testing.expectError(error.FinalSizeError, server.sendStreamData(0, "ignored body", false));
 
-    // Flushing sends only the RESET_STREAM, which the peer sees.
+    // Flushing sends the RESET_STREAM after the ACK owed for STOP_SENDING; the peer
+    // sees the reset once all queued UDP datagrams are delivered.
     try server.flushSend(2000);
     var peer = try Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
     testInstallAppKeys(&peer);
-    try peer.receiveDatagram(server.datagramsToSend(), 3000);
+    try deliverAllExcept(&server, &peer, null, 3000);
     try testing.expect(peer.streamReset(0));
     try testing.expectEqualStrings("", peer.streamData(0)); // no data, just the reset
 }
@@ -2892,6 +5667,7 @@ test "flushSend is a no-op until the Application keys are installed" {
     const dcid = [_]u8{ 0x51, 0x52, 0x53, 0x54 };
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
+    conn.local_bidi_streams = flow.StreamLimit.init(1);
     // No app keys yet (no handshake): queued data cannot leave.
     try conn.sendStreamData(1, "held", false);
     try conn.flushSend(1000);
@@ -2917,6 +5693,7 @@ test "flushSend never sends past the connection send window, and resumes on MAX_
     // Only the 4 granted bytes left; the rest stays queued.
     try testing.expectEqual(@as(u64, 4), conn.conn_send_window.sent);
     try testing.expect(conn.hasPendingSend());
+    try expectQueuedAppFrameTag(&conn, 1, .data_blocked);
 
     // A flush with no further credit sends nothing more.
     conn.clearSend();
@@ -2924,216 +5701,51 @@ test "flushSend never sends past the connection send window, and resumes on MAX_
     try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len);
 
     // The peer raises MAX_DATA; the remaining bytes can now flow.
-    conn.conn_send_window.onMaxData(10);
+    conn.onMaxData(10);
+    conn.clearSend(); // discard the advisory DATA_BLOCKED frame
     try conn.flushSend(1000);
     try testing.expectEqual(@as(u64, 10), conn.conn_send_window.sent);
     try testing.expect(!conn.hasPendingSend());
 }
 
-test "flushSend never sends past a stream's send window, and resumes on MAX_STREAM_DATA" {
+test "flushSend never sends past a stream send window, and resumes on MAX_STREAM_DATA" {
     const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x9a, 0x9b, 0x9c, 0x9d };
+    const dcid = [_]u8{ 0x95, 0x96, 0x97, 0x98 };
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
     testInstallAppKeys(&conn);
-    try conn.sendStreamData(1, "abcdefghij", false); // 10 bytes queued (creates the send stream)
-    // Ample connection window, but this stream is granted only 4 bytes (RFC 9000 19.10),
-    // so the per-stream limit - not the connection one - bounds the response.
-    conn.stream_send_windows.getPtr(1).?.* = flow.SendWindow.init(4);
+    conn.conn_send_window.limit = 1000; // connection credit is not the bound here
+    conn.peer_tp.initial_max_stream_data_bidi_remote = 4; // stream 1 is server-initiated
 
+    try conn.sendStreamData(1, "abcdefghij", false); // 10 bytes queued
     try conn.flushSend(1000);
-    try testing.expectEqual(@as(u64, 4), conn.stream_send_windows.getPtr(1).?.sent);
+
+    // Only the stream's 4-byte grant left; the rest stays queued.
+    try testing.expectEqual(@as(u64, 4), conn.conn_send_window.sent);
+    try testing.expectEqual(@as(u64, 4), conn.send_windows.get(1).?.sent);
     try testing.expect(conn.hasPendingSend());
+    try expectQueuedAppFrameTag(&conn, 1, .stream_data_blocked);
 
-    // A peer MAX_STREAM_DATA for stream 1 raises the limit; the rest can flow.
-    conn.stream_send_windows.getPtr(1).?.onMaxData(10);
+    // A flush with no further per-stream credit sends nothing more.
     conn.clearSend();
     try conn.flushSend(1000);
-    try testing.expectEqual(@as(u64, 10), conn.stream_send_windows.getPtr(1).?.sent);
+    try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len);
+
+    // The peer raises MAX_STREAM_DATA for stream 1; the remaining bytes can flow.
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.max_stream_data));
+    try varint.append(&frames, gpa, 1);
+    try varint.append(&frames, gpa, 10);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+    try conn.receiveDatagram(dgram, 2000);
+    conn.clearSend(); // discard any ACK/control bytes from receiving the peer update
+
+    try conn.flushSend(3000);
+    try testing.expectEqual(@as(u64, 10), conn.conn_send_window.sent);
+    try testing.expectEqual(@as(u64, 10), conn.send_windows.get(1).?.sent);
     try testing.expect(!conn.hasPendingSend());
-}
-
-test "a MAX_STREAM_DATA before the send stream exists is applied when it opens" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0xb1, 0xb2, 0xb3, 0xb4 };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    conn.stream_send_initial_peer_bidi = 4; // a small initial bidi send limit
-
-    // The peer grants a higher limit on stream 0 BEFORE we open our send half.
-    const mf = [_]u8{ 0x11, 0x00, 0x40, 0x64 }; // MAX_STREAM_DATA stream 0, max 100
-    const dgram = try testBuildApp(gpa, &dcid, 0, (mf ++ [_]u8{0} ** 16)[0..]);
-    defer gpa.free(dgram);
-    try conn.receiveDatagram(dgram, 1000);
-    try testing.expect(conn.pending_send_max.contains(0)); // held until the stream opens
-
-    // Opening the send stream applies the held grant, not the stale initial 4.
-    try conn.sendStreamData(0, "x", false);
-    try testing.expectEqual(@as(u64, 100), conn.stream_send_windows.getPtr(0).?.limit);
-    try testing.expect(!conn.pending_send_max.contains(0)); // consumed
-}
-
-test "a RESET_STREAM final size past the per-stream window is a flow-control error" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4 };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    conn.stream_recv_limits = .{ .bidi = 4, .uni = 0 }; // a 4-byte per-stream recv window
-    conn.conn_recv_window.limit = 1000;
-
-    // RESET_STREAM (0x04) on stream 0, error 0, final_size 5 - past the 4-byte grant.
-    // The final size counts as received data (RFC 9000 4.5), so it must be rejected.
-    var rf: std.ArrayListUnmanaged(u8) = .empty;
-    defer rf.deinit(gpa);
-    try rf.append(gpa, 0x04);
-    try varint.append(&rf, gpa, 0); // stream id 0
-    try varint.append(&rf, gpa, 0); // error code
-    try varint.append(&rf, gpa, 5); // final size 5
-    const dgram = try testBuildApp(gpa, &dcid, 0, rf.items);
-    defer gpa.free(dgram);
-    try testing.expectError(error.FlowControlError, conn.receiveDatagram(dgram, 1000));
-}
-
-test "a MAX_STREAM_DATA for a retired stream is not stashed" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0xc5, 0xc6, 0xc7, 0xc8 };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-
-    // Open, complete and drop a request stream (id 0): a 1-byte body with FIN, consumed.
-    var sf: std.ArrayListUnmanaged(u8) = .empty;
-    defer sf.deinit(gpa);
-    try frame.encodeStream(&sf, gpa, 0, 0, &[_]u8{0x7a}, true);
-    const d0 = try testBuildApp(gpa, &dcid, 0, sf.items);
-    defer gpa.free(d0);
-    try conn.receiveDatagram(d0, 1000);
-    conn.consumeStream(0, 1);
-    try testing.expect(conn.dropStream(0));
-    try testing.expect(conn.isRetired(0));
-
-    // A MAX_STREAM_DATA for the now-retired stream must NOT be held: the id is never
-    // reused, so the entry would never be consumed and a peer could grow the map.
-    const mf = [_]u8{ 0x11, 0x00, 0x40, 0x64 }; // MAX_STREAM_DATA stream 0, max 100
-    const d1 = try testBuildApp(gpa, &dcid, 1, (mf ++ [_]u8{0} ** 16)[0..]);
-    defer gpa.free(d1);
-    try conn.receiveDatagram(d1, 1100);
-    try testing.expect(!conn.pending_send_max.contains(0)); // dropped, not stashed
-}
-
-test "a MAX_STREAM_DATA for a receive-only stream is a protocol violation" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0xb5, 0xb6, 0xb7, 0xb8 };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    // Stream 2 is client-initiated unidirectional - the server only receives on it, so
-    // a MAX_STREAM_DATA flow-controlling our (non-existent) send half is invalid.
-    const mf = [_]u8{ 0x11, 0x02, 0x40, 0x64 }; // MAX_STREAM_DATA stream 2, max 100
-    const dgram = try testBuildApp(gpa, &dcid, 0, (mf ++ [_]u8{0} ** 16)[0..]);
-    defer gpa.free(dgram);
-    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
-}
-
-test "resetting a flow-blocked stream declares only the bytes actually sent" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0x9e, 0x9f, 0xa0, 0xa1 };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    // Write 10 bytes but the stream is granted only 4: 4 ride a frame, 6 stay queued.
-    try conn.sendStreamData(1, "abcdefghij", false);
-    conn.stream_send_windows.getPtr(1).?.* = flow.SendWindow.init(4);
-    try conn.flushSend(1000);
-    try testing.expectEqual(@as(u64, 4), conn.stream_send_windows.getPtr(1).?.sent);
-    conn.clearSend();
-
-    // Reset abandons the unsent 6 bytes; the RESET_STREAM's final size is 4 (the bytes
-    // that actually consumed credit), not 10 - which would exceed the peer's grant and
-    // draw a FLOW_CONTROL_ERROR (RFC 9000 19.4).
-    try conn.resetStream(1, 0x010c);
-    try conn.flushSend(2000);
-    try testing.expectEqual(@as(u64, 4), conn.send_streams.get(1).?.reset_final_size);
-}
-
-test "the idle timeout silently closes an inactive connection" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4 };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    conn.own_idle_timeout_ms = 30_000; // we advertise 30s
-    conn.peer_tp.max_idle_timeout_ms = 10_000; // the peer 10s; the smaller governs
-
-    // Activity at t=1s arms the timer; the effective period is 10s (well above 3*PTO),
-    // so the idle deadline is 11s. (nextTimeout also folds in the PTO, which is sooner;
-    // the idle deadline is checked directly here.)
-    const ping = [_]u8{0x01} ** 20;
-    const d0 = try testBuildApp(gpa, &dcid, 0, &ping);
-    defer gpa.free(d0);
-    try conn.receiveDatagram(d0, 1_000_000);
-    try testing.expectEqual(@as(u64, 1_000_000 + 10_000_000), conn.idleDeadline().?);
-    try testing.expect(conn.nextTimeout().? <= conn.idleDeadline().?); // the idle bound is included
-
-    // The received PING already queued an ACK into the outbound buffer (not yet
-    // drained). A timeout just before the deadline does not idle-close.
-    try testing.expect(conn.datagramsToSend().len > 0); // the ACK is queued
-    try conn.onTimeout(11_000_000 - 1);
-    try testing.expect(!conn.closed);
-
-    // At the deadline it idle-closes, and the still-queued packets are discarded too
-    // (RFC 9000 10.1: the state is silently discarded - no stale packets leak out, no
-    // CONNECTION_CLOSE is sent).
-    try conn.onTimeout(11_000_000);
-    try testing.expect(conn.closed and conn.idleTimedOut());
-    try testing.expectEqual(@as(usize, 0), conn.datagramsToSend().len); // discarded
-}
-
-test "no idle timeout when neither endpoint advertises one" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0xe5, 0xe6, 0xe7, 0xe8 };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    // Both max_idle_timeout default to 0: no idle deadline, so a long-quiet connection
-    // is not closed by onTimeout (only the integrator's own policy would).
-    const ping = [_]u8{0x01} ** 20;
-    const d0 = try testBuildApp(gpa, &dcid, 0, &ping);
-    defer gpa.free(d0);
-    try conn.receiveDatagram(d0, 1_000_000);
-    try conn.onTimeout(1_000_000_000_000); // a very late tick
-    try testing.expect(!conn.closed);
-}
-
-test "probes to a silent peer do not extend the idle timeout" {
-    const gpa = testing.allocator;
-    const dcid = [_]u8{ 0xe9, 0xea, 0xeb, 0xec };
-    var conn = try Connection.init(gpa, .server, &dcid);
-    defer conn.deinit();
-    testInstallAppKeys(&conn);
-    conn.peer_tp.max_idle_timeout_ms = 10_000; // 10s idle timeout
-
-    // The peer sends once at t=1s; we then respond (an ack-eliciting send), which is the
-    // FIRST since the receive, so it restarts the timer to ~t=1s.
-    const ping = [_]u8{0x01} ** 20;
-    const d0 = try testBuildApp(gpa, &dcid, 0, &ping);
-    defer gpa.free(d0);
-    try conn.receiveDatagram(d0, 1_000_000);
-    try conn.sendStreamData(1, "hi", false);
-    try conn.flushSend(1_500_000);
-    const deadline = conn.idleDeadline().?;
-
-    // The peer then goes silent. We keep probing (more ack-eliciting sends) over the
-    // next several seconds - but these must NOT push the deadline out, since none is
-    // the first since a receive. So the connection still idle-closes at the deadline.
-    try conn.sendStreamData(1, "more", false);
-    try conn.flushSend(5_000_000);
-    try conn.flushSend(9_000_000);
-    try testing.expectEqual(deadline, conn.idleDeadline().?); // unchanged by the probes
-    try conn.onTimeout(deadline);
-    try testing.expect(conn.closed and conn.idleTimedOut());
 }
 
 test "flushSend never sends past the congestion window, and resumes as it opens" {
@@ -3190,11 +5802,30 @@ test "a large stream send is chunked across multiple packets" {
     try testing.expect(peer.streamFinished(1));
 }
 
+test "stream packetization respects peer max_udp_payload_size" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0, 0xc1, 0xc2, 0xc3, 0xc4 };
+    var sender = try Connection.init(gpa, .server, &dcid);
+    defer sender.deinit();
+    testInstallAppKeys(&sender);
+    sender.peer_tp.max_udp_payload_size = 1200;
+
+    const big = [_]u8{'m'} ** 4096;
+    try sender.sendStreamData(1, &big, true);
+    try sender.flushSend(1000);
+
+    try testing.expect(sender.datagramLengths().len > 1);
+    for (sender.datagramLengths()) |len| {
+        try testing.expect(len <= sender.peer_tp.max_udp_payload_size);
+    }
+}
+
 test "writing after a FIN is a final-size error" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x71, 0x72, 0x73, 0x74 };
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
+    conn.local_bidi_streams = flow.StreamLimit.init(1);
     try conn.sendStreamData(1, "done", true);
     try testing.expectError(error.FinalSizeError, conn.sendStreamData(1, "more", false));
 }
@@ -3204,15 +5835,190 @@ test "writing after a FIN is a final-size error" {
 // An Application (1-RTT) datagram carrying one ACK frame, sealed with the test app
 // keys so a sender installed via testInstallAppKeys decrypts it.
 fn buildAppAck(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, largest: u64, first_range: u64) ![]u8 {
+    return buildAppAckWithDelay(gpa, dcid, pn, largest, 0, first_range);
+}
+
+fn buildAppAckWithDelay(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, largest: u64, delay: u64, first_range: u64) ![]u8 {
     var frames: std.ArrayListUnmanaged(u8) = .empty;
     defer frames.deinit(gpa);
-    try frame.encodeAck(&frames, gpa, largest, 0, first_range);
+    try frame.encodeAck(&frames, gpa, largest, delay, first_range);
     return testBuildApp(gpa, dcid, pn, frames.items);
+}
+
+fn buildAppAckEcn(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, largest: u64, ecn: frame.EcnCounts) ![]u8 {
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.ack_ecn));
+    try varint.append(&frames, gpa, largest);
+    try varint.append(&frames, gpa, 0); // ACK Delay
+    try varint.append(&frames, gpa, 0); // ACK Range Count
+    try varint.append(&frames, gpa, 0); // First ACK Range
+    try varint.append(&frames, gpa, ecn.ect0);
+    try varint.append(&frames, gpa, ecn.ect1);
+    try varint.append(&frames, gpa, ecn.ce);
+    return testBuildApp(gpa, dcid, pn, frames.items);
+}
+
+test "ACK delay uses the peer ack_delay_exponent" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xA1, 0xA2, 0xA3, 0xA4 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.peer_tp.ack_delay_exponent = 4;
+    conn.peer_tp.max_ack_delay_ms = 25;
+
+    try conn.sendPing(.application, 1000);
+    const first_ack = try buildAppAck(gpa, &dcid, 0, 0, 0);
+    defer gpa.free(first_ack);
+    try conn.receiveDatagram(first_ack, 11_000);
+    try testing.expectEqual(@as(u64, 10_000), conn.rtt.smoothed);
+
+    try conn.sendPing(.application, 20_000);
+    const second_ack = try buildAppAckWithDelay(gpa, &dcid, 1, 1, 1000, 0);
+    defer gpa.free(second_ack);
+    try conn.receiveDatagram(second_ack, 50_000);
+
+    try testing.expectEqual(@as(u64, 30_000), conn.rtt.latest);
+    try testing.expectEqual(@as(u64, 10_500), conn.rtt.smoothed);
+}
+
+test "ACK_ECN counts are retained per packet number space" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xA5, 0xA6, 0xA7, 0xA8 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    try conn.sendPing(.application, 1000); // pn 0
+    try conn.sendPing(.application, 2000); // pn 1
+
+    const first = try buildAppAckEcn(gpa, &dcid, 0, 0, .{ .ect0 = 4, .ect1 = 1, .ce = 2 });
+    defer gpa.free(first);
+    try conn.receiveDatagram(first, 3000);
+    try testing.expectEqual(frame.EcnCounts{ .ect0 = 4, .ect1 = 1, .ce = 2 }, conn.spaces[@intFromEnum(Space.application)].peer_ecn_counts.?);
+
+    const second = try buildAppAckEcn(gpa, &dcid, 1, 1, .{ .ect0 = 4, .ect1 = 5, .ce = 2 });
+    defer gpa.free(second);
+    try conn.receiveDatagram(second, 4000);
+    try testing.expectEqual(frame.EcnCounts{ .ect0 = 4, .ect1 = 5, .ce = 2 }, conn.spaces[@intFromEnum(Space.application)].peer_ecn_counts.?);
+}
+
+test "ACK_ECN counts cannot decrease" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xA5, 0xA6, 0xA7, 0xA9 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    try conn.sendPing(.application, 1000); // pn 0
+    try conn.sendPing(.application, 2000); // pn 1
+
+    const first = try buildAppAckEcn(gpa, &dcid, 0, 0, .{ .ect0 = 4, .ect1 = 1, .ce = 2 });
+    defer gpa.free(first);
+    try conn.receiveDatagram(first, 3000);
+
+    const second = try buildAppAckEcn(gpa, &dcid, 1, 1, .{ .ect0 = 3, .ect1 = 1, .ce = 2 });
+    defer gpa.free(second);
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(second, 4000));
+    try testing.expectEqual(frame.EcnCounts{ .ect0 = 4, .ect1 = 1, .ce = 2 }, conn.spaces[@intFromEnum(Space.application)].peer_ecn_counts.?);
+}
+
+test "ACK_ECN CE increase reduces the congestion window" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xA5, 0xA6, 0xA7, 0xAA };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    try conn.sendPing(.application, 1000); // pn 0, ack-eliciting and in flight
+    const before = conn.cc.congestion_window;
+
+    const ack = try buildAppAckEcn(gpa, &dcid, 0, 0, .{ .ect0 = 0, .ect1 = 0, .ce = 1 });
+    defer gpa.free(ack);
+    try conn.receiveDatagram(ack, 2000);
+
+    try testing.expect(conn.cc.congestion_window < before);
+    try testing.expect(conn.cc.recovery_start != null);
+}
+
+test "persistent congestion collapses the QUIC congestion window" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xA5, 0xA6, 0xA7, 0xAB };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    conn.rtt.update(100_000, 0); // PTO = 300ms; persistent period = 900ms.
+    for ([_]u64{ 0, 300_000, 600_000, 900_000 }, 0..) |sent_time, pn| {
+        conn.cc.onSent(1200);
+        try conn.spaces[@intFromEnum(Space.application)].rec.onSent(gpa, .{
+            .pn = @intCast(pn),
+            .sent_time = sent_time,
+            .size = 1200,
+            .ack_eliciting = true,
+            .in_flight = true,
+        });
+    }
+    try conn.spaces[@intFromEnum(Space.application)].rec.onSent(gpa, .{
+        .pn = 4,
+        .sent_time = 1_000_000,
+        .size = 0,
+        .ack_eliciting = true,
+        .in_flight = false,
+    });
+    testSetAppNextPn(&conn, 5);
+
+    const ack = try buildAppAck(gpa, &dcid, 0, 4, 0);
+    defer gpa.free(ack);
+    try conn.receiveDatagram(ack, 1_100_000);
+
+    try testing.expectEqual(@as(u64, 2 * constants.MIN_INITIAL_DATAGRAM), conn.cc.congestion_window);
+    try testing.expectEqual(@as(u64, 0), conn.cc.bytes_in_flight);
+}
+
+test "ACK for an unsent packet is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xA9, 0xAA, 0xAB, 0xAC };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const ack = try buildAppAck(gpa, &dcid, 0, 0, 0);
+    defer gpa.free(ack);
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(ack, 1000));
+    try testing.expect(conn.closed);
+    try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len);
+}
+
+test "ACK with an underflowing range is a protocol violation" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xAD, 0xAE, 0xAF, 0xB0 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    try conn.sendStreamData(1, "x", false);
+    try conn.flushSend(1000); // pn 0 exists; pn 1 is still unsent
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try varint.append(&frames, gpa, @intFromEnum(constants.FrameType.ack));
+    try varint.append(&frames, gpa, 0); // largest
+    try varint.append(&frames, gpa, 0); // delay
+    try varint.append(&frames, gpa, 1); // one extra range
+    try varint.append(&frames, gpa, 0); // first_range: [0,0]
+    try varint.append(&frames, gpa, 0); // gap underflows below packet 0
+    try varint.append(&frames, gpa, 0); // range length
+    const ack = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(ack);
+
+    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(ack, 2000));
 }
 
 // Deliver every queued datagram in `sender`'s send buffer to `peer`, sliced by the
 // per-datagram lengths (each is its own UDP datagram). Optionally skip index `drop`.
 fn deliverAllExcept(sender: *Connection, peer: *Connection, drop: ?usize, now: u64) !void {
+    if (peer.spaces[@intFromEnum(Space.application)].next_pn == 0) testSetAppNextPn(peer, 1);
     const buf = sender.datagramsToSend();
     var off: usize = 0;
     var idx: usize = 0;
