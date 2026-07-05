@@ -2346,15 +2346,22 @@ fn h2_has_pending_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.
 // Connection is the factory: constructing it picks H1Connection / H2Connection by
 // protocol (new_base), so the runtime type is truthful while isinstance(obj,
 // Connection) still holds.
+// Only `next_event()` is common to every transport. The read/write *byte* surface
+// is transport-specific: HTTP/1.1 and HTTP/2 are byte streams (receive_data +
+// data_to_send()->bytes); HTTP/3 rides UDP datagrams (receive_datagram +
+// data_to_send()->list[bytes]). Keeping the byte surface off the base means
+// H3Connection does not inherit an incompatible receive_data / data_to_send - the
+// type hierarchy states exactly what each transport supports (see issue #113).
 var base_methods = [_]py.MethodDef{
-    .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
     .{ .ml_name = "next_event", .ml_meth = next_event, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the next parse event, or NEED_DATA." },
-    .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
-// HTTP/1.1: the message-scoped send API plus keep-alive / upgrade signals.
+// HTTP/1.1: the byte-stream read/write surface plus the message-scoped send API and
+// keep-alive / upgrade signals.
 var h1_methods = [_]py.MethodDef{
+    .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
+    .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
     .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
     .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(status, headers=None). The reason phrase is derived from the status; the version is 1.1. Bodyless framing (HEAD / 204 / 304) is derived automatically." },
@@ -2370,6 +2377,8 @@ var h1_methods = [_]py.MethodDef{
 // a request (returns a Stream); the server reaches one with stream(id). There is
 // no connection-level body send - that is what the Stream handle is for.
 var h2_methods = [_]py.MethodDef{
+    .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
+    .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
     .{ .ml_name = "initiate_connection", .ml_meth = h2_initiate, .ml_flags = c.METH_NOARGS, .ml_doc = "Emit the connection preface (client preface + SETTINGS, or the server's SETTINGS) now, rather than lazily on the first send. Idempotent." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
     .{ .ml_name = "initiate_upgrade_connection", .ml_meth = @ptrCast(&initiate_upgrade_connection), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Initialise an h2c-upgraded connection: initiate_upgrade_connection(method, target, headers, settings_header=None). Seeds the already-parsed HTTP/1.1 request as stream 1 and applies the client's base64url HTTP2-Settings, returning the stream's Stream. Call on a fresh server connection before feeding the client's HTTP/2 preface; next_event() then yields the request." },
@@ -2393,6 +2402,7 @@ var h2_getset = [_]c.PyGetSetDef{
 // feeds handle_timeout; a Stream send uses the most recent `now` the caller gave.
 var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "receive_datagram", .ml_meth = receive_datagram, .ml_flags = c.METH_VARARGS, .ml_doc = "Feed one received UDP datagram: receive_datagram(datagram, now=0, peer_address=None). peer_address is an optional opaque bytes key for QUIC path validation and migration." },
+    .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing UDP datagrams as a list of bytes (one per datagram - QUIC datagram boundaries are semantic)." },
     .{ .ml_name = "data_to_send_with_addresses", .ml_meth = h3_data_to_send_with_addresses, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams as (datagram, peer_address) pairs. peer_address is None when no address key is known." },
     .{ .ml_name = "challenge_path", .ml_meth = h3_challenge_path, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC PATH_CHALLENGE for a peer address: challenge_path(peer_address, data). data must be 8 unpredictable bytes. Drain with data_to_send_with_addresses." },
     .{ .ml_name = "use_peer_connection_id", .ml_meth = h3_use_peer_connection_id, .ml_flags = c.METH_O, .ml_doc = "Switch future QUIC packets to a peer-issued NEW_CONNECTION_ID sequence: use_peer_connection_id(sequence_number)." },
