@@ -98,10 +98,13 @@ class Stream:
     def reset(self, error_code: int = ..., /) -> None: ...
 
 class Connection:
-    # The read API, shared by every protocol. Constructing a Connection returns the
-    # protocol-specific subtype (H1Connection / H2Connection / H3Connection): the
-    # send surface differs, so each is its own type rather than methods that raise
-    # at runtime.
+    # A factory base: constructing a Connection returns the protocol-specific subtype
+    # (H1Connection / H2Connection / H3Connection). Only next_event() is common to
+    # every transport. The read/write *byte* surface is transport-specific and lives
+    # on the subtypes - HTTP/1.1 and HTTP/2 are byte streams (receive_data +
+    # data_to_send() -> bytes), HTTP/3 rides UDP datagrams (receive_datagram +
+    # data_to_send() -> list[bytes]) - so the base does not promise a surface a given
+    # transport cannot honour.
     @overload
     def __new__(
         cls,
@@ -140,11 +143,11 @@ class Connection:
     def __new__(cls, role: int, protocol: Literal[2]) -> H2Connection: ...
     @overload
     def __new__(cls, role: int, protocol: Literal[1] = ...) -> H1Connection: ...
-    def receive_data(self, data: bytes) -> None: ...
     def next_event(self) -> Event: ...
-    def data_to_send(self) -> bytes: ...
 
 class H1Connection(Connection):
+    def receive_data(self, data: bytes, /) -> None: ...
+    def data_to_send(self) -> bytes: ...
     def start_next_cycle(self) -> None: ...
     def send_request(
         self, method: bytes, target: bytes, version: bytes, headers: list[tuple[bytes, bytes]]
@@ -159,6 +162,8 @@ class H1Connection(Connection):
 
 class H2Connection(Connection):
     send_window: int
+    def receive_data(self, data: bytes, /) -> None: ...
+    def data_to_send(self) -> bytes: ...
     def initiate_connection(self) -> None: ...
     def send_request(
         self, method: bytes, target: bytes, version: bytes, headers: list[tuple[bytes, bytes]]
@@ -180,10 +185,11 @@ class H3Connection(Connection):
     # in QUIC - the parameter overrides the token, e.g. for an interop draft name,
     # it is not an opt-out). `now` is the integrator's
     # monotonic clock. data_to_send returns one bytes per UDP datagram (QUIC datagram
-    # boundaries are semantic), not the byte stream the base returns. Sends go through
+    # boundaries are semantic), rather than the single byte string the H1/H2 stream
+    # transports return. Sends go through
     # a Stream handle (conn.stream(req.stream_id)), the same surface HTTP/2 uses; a
     # Stream send packetises against the most recent `now`.
-    def data_to_send(self) -> list[bytes]: ...  # type: ignore[override]
+    def data_to_send(self) -> list[bytes]: ...
     def receive_datagram(self, datagram: bytes, now: int = ..., peer_address: bytes | None = ..., /) -> None: ...
     def data_to_send_with_addresses(self) -> list[tuple[bytes, bytes | None]]: ...
     def challenge_path(self, peer_address: bytes, data: bytes, /) -> None: ...
