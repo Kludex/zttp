@@ -192,6 +192,31 @@ You get the same `Request` / `Data` / `EndOfMessage` events, now tagged with the
 QUIC `stream_id`. An HTTP/3 request collapses its pseudo-headers into the same
 shape the other protocols use, and `http_version` is `b"3"`.
 
+## Typed construction
+
+The raw `Connection(role, HTTP3, ...)` constructor takes a dozen `bytes` keyword
+arguments; because every value is `bytes`, nothing stops a certificate and a
+private key from being swapped. The `h3_server` / `h3_client` factories take named
+value objects instead, so a swap is a type error:
+
+```python
+import zttp
+
+server = zttp.h3_server(
+    zttp.TlsCredentials(certificate=cert_bytes, private_key=key_bytes),
+)
+
+client = zttp.h3_client(
+    server_name=b"example.com",
+    resumption=zttp.SessionResumption(identity=ticket_id, psk=ticket_psk),
+    early_data=True,
+)
+```
+
+`h3_server()` with no credentials creates an ephemeral local identity for
+development. The 0-RTT knobs (`early_data`, `obfuscated_ticket_age`,
+`remembered_transport_params`) require a `resumption` and raise otherwise.
+
 ## The transport is inside
 
 For HTTP/1.1 and HTTP/2, the kernel's TCP gives zttp an ordered, reliable byte
