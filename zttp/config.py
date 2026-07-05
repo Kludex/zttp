@@ -111,9 +111,7 @@ def h3_client(
     """
     if resumption is None:
         if early_data or obfuscated_ticket_age or remembered_transport_params is not None:
-            raise ValueError(
-                "early_data, obfuscated_ticket_age and remembered_transport_params require `resumption`"
-            )
+            raise ValueError("early_data, obfuscated_ticket_age and remembered_transport_params require `resumption`")
         return Connection(
             CLIENT,
             HTTP3,
