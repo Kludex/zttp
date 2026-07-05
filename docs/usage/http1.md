@@ -313,6 +313,31 @@ conn.send_response(200, [(b"X-Evil", b"a\r\nInjected: yes")])
     Malformed bytes from the peer raise `RemoteProtocolError`. See
     [Errors](errors.md).
 
+## One write surface across protocols
+
+HTTP/2 and HTTP/3 send on a `Stream` handle (`conn.stream(stream_id)`). HTTP/1.1
+exposes its single in-flight message as **stream 0** - the `stream_id` its
+`Request` / `Response` events carry - so the same handle drives every protocol
+and an integrator can share one write path:
+
+```python
+import zttp
+
+conn = zttp.Connection(zttp.SERVER)
+conn.receive_data(b"GET /p HTTP/1.1\r\nHost: x\r\n\r\n")
+request = conn.next_event()
+
+stream = conn.stream(request.stream_id)   # stream_id == 0 on HTTP/1.1
+stream.send_response(200, [(b"Content-Length", b"5")])
+stream.send_data(b"hello")
+stream.end_message()
+```
+
+This is exactly equivalent to calling `send_response` / `send_data` /
+`end_message` on the connection. HTTP/1.1 has no per-stream flow control, so
+`send_window` and `pending_bytes` are `None`, and `reset()` raises - there is no
+way to cancel one message mid-connection without closing it.
+
 ## Where to go next
 
 * [HTTP/2](http2.md): the same four building blocks, multiplexed across streams.

@@ -1034,6 +1034,7 @@ var stream_type: py.Object = null;
 // per-stream state; the handle is a borrowed, re-validated command surface over
 // whichever the connection runs.
 const StreamEngine = union(enum) {
+    h1: *H1Engine,
     h2: *H2Engine,
     h3: *H3Engine,
 };
@@ -1043,9 +1044,10 @@ const StreamObject = extern struct {
     conn: ?*c.PyObject, // owned reference to the ConnectionObject
     stream_id: u64, // 62-bit for QUIC; 31-bit for HTTP/2
 
-    /// The multiplexed engine behind the handle, or a Python error if the connection
-    /// was torn down or is single-stream (HTTP/1.1). The connection object can outlive
-    /// its engine, so this re-validates on every call.
+    /// The engine behind the handle, or a Python error if the connection was torn
+    /// down. HTTP/1.1 exposes its single in-flight message as stream 0 so integrators
+    /// can drive one write surface across every protocol. The connection object can
+    /// outlive its engine, so this re-validates on every call.
     fn engine(self: *StreamObject) ?StreamEngine {
         const conn_obj: *ConnectionObject = @ptrCast(self.conn orelse {
             _ = py.raiseRuntime("connection is closed");
@@ -1056,12 +1058,9 @@ const StreamObject = extern struct {
             return null;
         };
         return switch (eng.*) {
+            .h1 => |*h| .{ .h1 = h },
             .h2 => |*h| .{ .h2 = h },
             .h3 => |*h| .{ .h3 = h },
-            .h1 => {
-                _ = py.raiseRuntime("streams exist only on a multiplexed (HTTP/2 or HTTP/3) connection");
-                return null;
-            },
         };
     }
 };
@@ -1103,6 +1102,13 @@ fn stream_send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwds: ?*c.Py
     }
     var h = hdrs orelse BorrowedHeaders{ .headers = &.{}, .refs = &.{} };
     return switch (e) {
+        .h1 => |x| blk: {
+            const rb = core.h1.writer.reasonPhrase(@intCast(status));
+            const w = x.ensureWriter() orelse break :blk null;
+            w.sendResponse("1.1", @intCast(status), rb, h.headers, x.method()) catch |err| break :blk raiseWrite(err);
+            if (end_stream != 0) w.endMessage(&.{}) catch |err| break :blk raiseWrite(err);
+            break :blk py.none();
+        },
         .h2 => |x| x.sendResponse(@intCast(self.stream_id), @intCast(status), &h, end_stream != 0),
         .h3 => |x| blk: {
             const r = x.sendResponse(self.stream_id, @intCast(status), h.headers);
@@ -1120,8 +1126,9 @@ fn stream_send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callcon
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
     if (status < 100 or status > 199) return py.raiseValue("informational status code must be in 100..199");
-    // 101 Switching Protocols is an HTTP/1.1 mechanism; neither HTTP/2 nor HTTP/3 use it.
-    if (status == 101) return py.raiseValue("HTTP/2 and HTTP/3 have no 101 Switching Protocols");
+    // 101 Switching Protocols is a terminal upgrade response, not an interim 1xx:
+    // neither HTTP/2 nor HTTP/3 use it, and HTTP/1.1 does not send it via this path.
+    if (status == 101) return py.raiseValue("101 Switching Protocols is a terminal upgrade response, not interim");
     var hdrs: ?BorrowedHeaders = null;
     defer if (hdrs) |*h| h.deinit();
     if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
@@ -1129,6 +1136,11 @@ fn stream_send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callcon
     }
     var h = hdrs orelse BorrowedHeaders{ .headers = &.{}, .refs = &.{} };
     return switch (e) {
+        .h1 => |x| blk: {
+            const w = x.ensureWriter() orelse break :blk null;
+            w.sendInformational(@intCast(status), h.headers) catch |err| break :blk raiseWrite(err);
+            break :blk py.none();
+        },
         .h2 => |x| x.sendInformational(@intCast(self.stream_id), @intCast(status), &h),
         .h3 => |x| x.sendInformational(self.stream_id, @intCast(status), h.headers),
     };
@@ -1138,6 +1150,7 @@ fn stream_send_window_get(self_obj: ?*c.PyObject, _: ?*anyopaque) callconv(.c) p
     const self: *StreamObject = @ptrCast(self_obj.?);
     const e = self.engine() orelse return null;
     return switch (e) {
+        .h1 => py.none(), // HTTP/1.1 has no per-stream flow control
         .h2 => |h2| {
             const w = h2.conn.streamSendWindow(@intCast(self.stream_id)) orelse return py.none();
             return c.PyLong_FromLong(w);
@@ -1154,6 +1167,7 @@ fn stream_pending_bytes_get(self_obj: ?*c.PyObject, _: ?*anyopaque) callconv(.c)
     const self: *StreamObject = @ptrCast(self_obj.?);
     const e = self.engine() orelse return null;
     return switch (e) {
+        .h1 => py.none(), // HTTP/1.1 has no per-stream send queue
         .h2 => |h2| {
             const n = h2.conn.streamPendingBytes(@intCast(self.stream_id)) orelse return py.none();
             return c.PyLong_FromUnsignedLongLong(n);
@@ -1171,6 +1185,11 @@ fn stream_send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.O
     const e = self.engine() orelse return null;
     const data = py.asBytes(arg) orelse return null;
     return switch (e) {
+        .h1 => |x| blk: {
+            const w = x.ensureWriter() orelse break :blk null;
+            w.sendData(data) catch |err| break :blk raiseWrite(err);
+            break :blk py.none();
+        },
         .h2 => |x| x.sendData(@intCast(self.stream_id), data),
         .h3 => |x| x.sendData(self.stream_id, data),
     };
@@ -1187,6 +1206,12 @@ fn stream_end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
         hdrs = borrowHeaders(hdrs_seq) orelse return null;
     }
     switch (e) {
+        .h1 => |x| {
+            const w = x.ensureWriter() orelse return null;
+            const t = if (hdrs) |h| h.headers else &[_]events.Header{};
+            w.endMessage(t) catch |err| return raiseWrite(err);
+            return py.none();
+        },
         // HTTP/2 send-side trailers are still a follow-up; an empty/absent list is the
         // ordinary END_STREAM.
         .h2 => |x| {
@@ -1207,6 +1232,7 @@ fn stream_reset(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
     const self: *StreamObject = @ptrCast(self_obj.?);
     const e = self.engine() orelse return null;
     switch (e) {
+        .h1 => return py.raise(exceptions.LocalProtocolError, "HTTP/1.1 has no per-stream reset; close the connection to abort"),
         .h2 => |h2| {
             var code: c_ulong = @intFromEnum(core.h2.constants.ErrorCode.cancel);
             if (c.PyArg_ParseTuple(args, "|k", &code) == 0) return null;
@@ -2165,10 +2191,13 @@ fn stream(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
     // HTTP/2 ids are 31-bit and stream 0 is the connection (RFC 9113 5.1.1); QUIC
     // (HTTP/3) ids are 62-bit and stream 0 is the first client bidi stream.
+    // HTTP/1.1 is single-message: its one in-flight message is exposed as stream 0
+    // (the stream_id its Request/Response events carry) so integrators can drive the
+    // same Stream write surface across every protocol.
     const max_id: i128, const min_id: i128 = switch (engine.*) {
+        .h1 => .{ 0, 0 },
         .h2 => .{ 0x7FFF_FFFF, 1 },
         .h3 => .{ (1 << 62) - 1, 0 },
-        .h1 => return py.raiseRuntime("streams exist only on a multiplexed (HTTP/2 or HTTP/3) connection"),
     };
     // Parse as long long (64-bit on every platform; c_long is only 32-bit on
     // Windows, where a large id would otherwise raise OverflowError from PyLong_AsLong
@@ -2361,6 +2390,7 @@ var h1_methods = [_]py.MethodDef{
     .{ .ml_name = "send_informational", .ml_meth = send_informational, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response: send_informational(status, headers=None). The real response still follows on the same cycle." },
     .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
     .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
+    .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for the single in-flight message: stream(0) (the stream_id its events carry). The one write surface shared with HTTP/2 and HTTP/3: send_response / send_data / end_message." },
     .{ .ml_name = "should_close", .ml_meth = should_close, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request (Connection: close / HTTP/1.0)." },
     .{ .ml_name = "upgrade", .ml_meth = upgrade, .ml_flags = c.METH_NOARGS, .ml_doc = "The last request's Upgrade value if it asked to upgrade (Connection: upgrade), else None." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },

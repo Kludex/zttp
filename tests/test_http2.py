@@ -346,9 +346,10 @@ def test_message_scoped_send_is_absent_on_http2() -> None:
     assert not hasattr(conn, "send_response")
     assert not hasattr(conn, "send_data")
     assert not hasattr(conn, "end_message")
-    # Conversely, stream-scoped sending is absent on HTTP/1.1.
+    # HTTP/1.1 keeps its message-scoped connection API, and also exposes the same
+    # stream(0) write surface as HTTP/2 and HTTP/3 so integrators can share one path.
     h1 = zttp.Connection(zttp.SERVER)
-    assert not hasattr(h1, "stream")
+    assert hasattr(h1, "stream")
 
 
 def test_protocol_defaults_to_http1() -> None:

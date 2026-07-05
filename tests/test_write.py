@@ -295,3 +295,62 @@ def test_send_response_version_1_1_even_for_http_1_0_request() -> None:
     assert isinstance(conn.next_event(), zttp.Request)
     conn.send_response(200, [(b"Content-Length", b"0")])
     assert conn.data_to_send() == b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+
+
+def test_h1_stream_write_surface_matches_connection_api() -> None:
+    # HTTP/1.1 exposes its single in-flight message as stream(0), the same write
+    # surface HTTP/2 and HTTP/3 use, so an integrator can share one code path.
+    def serve(via_stream: bool) -> bytes:
+        conn = zttp.Connection(zttp.SERVER)
+        conn.receive_data(b"GET /p HTTP/1.1\r\nHost: x\r\n\r\n")
+        request = conn.next_event()
+        assert isinstance(request, zttp.Request)
+        assert request.stream_id == 0
+        conn.next_event()  # EndOfMessage
+        if via_stream:
+            stream = conn.stream(request.stream_id)
+            assert stream.stream_id == 0
+            stream.send_response(200, [(b"Content-Length", b"5")])
+            stream.send_data(b"hello")
+            stream.end_message()
+        else:
+            conn.send_response(200, [(b"Content-Length", b"5")])
+            conn.send_data(b"hello")
+            conn.end_message()
+        return conn.data_to_send()
+
+    assert serve(via_stream=True) == serve(via_stream=False)
+
+
+def test_h1_stream_end_stream_shortcut() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    conn.next_event()
+    conn.next_event()
+    conn.stream(0).send_response(204, end_stream=True)
+    assert conn.data_to_send() == b"HTTP/1.1 204 No Content\r\n\r\n"
+
+
+def test_h1_stream_has_no_flow_control() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    conn.next_event()
+    conn.next_event()
+    stream = conn.stream(0)
+    assert stream.send_window is None
+    assert stream.pending_bytes is None
+
+
+def test_h1_stream_reset_is_rejected() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    conn.next_event()
+    conn.next_event()
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.stream(0).reset()
+
+
+def test_h1_stream_id_must_be_zero() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(ValueError):
+        conn.stream(1)
