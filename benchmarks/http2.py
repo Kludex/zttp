@@ -13,9 +13,9 @@ or status, headers, body), verified equal before timing.
 
 Methodology mirrors http1.py: many short batches interleaved round-robin so
 thermal drift hits both parsers equally, GC disabled while a batch is timed, and
-the median batch reported with its spread so noise is visible. msg/s counts
-HTTP/2 *messages* (requests or responses), so a 16-stream workload that decodes
-in one pass still counts as 16.
+the median batch reported with its p25-p75 quartiles and stdev so noise is
+visible. msg/s counts HTTP/2 *messages* (requests or responses), so a 16-stream
+workload that decodes in one pass still counts as 16.
 """
 
 from __future__ import annotations
@@ -408,6 +408,19 @@ def timed(fn: Runner, n: int) -> float:
         gc.enable()
 
 
+# The ratio's p25-p75 per workload, filled by bench() and shown in the summary.
+dispersion: dict[str, tuple[float, float]] = {}
+
+
+def _quartiles(values: list[float]) -> tuple[float, float, float]:
+    """Return (p25, median, p75). statistics.quantiles needs at least two points."""
+    if len(values) < 2:
+        v = values[0]
+        return (v, v, v)
+    q1, median, q3 = statistics.quantiles(values, n=4)
+    return (q1, median, q3)
+
+
 def bench(w: Workload, batch: int, repeats: int) -> dict[str, float]:
     verify(w)
     batch = max(1, int(batch * w.scale))
@@ -422,15 +435,23 @@ def bench(w: Workload, batch: int, repeats: int) -> dict[str, float]:
         for label, fn in parsers:
             samples[label].append(timed(fn, batch))
 
+    per_batch = {label: [batch * w.messages / dt for dt in batches] for label, batches in samples.items()}
     rates: dict[str, float] = {}
-    for label, batches in samples.items():
-        per_batch = [batch * w.messages / dt for dt in batches]
-        median = statistics.median(per_batch)
-        spread = (max(per_batch) - min(per_batch)) / median * 100
+    for label, values in per_batch.items():
+        p25, median, p75 = _quartiles(values)
+        stdev = statistics.stdev(values)
         rates[label] = median
-        print(f"  {label:>10}: {median:14,.0f} msg/s  (median of {repeats}, spread {spread:4.1f}%)")
+        print(
+            f"  {label:>10}: {median:14,.0f} msg/s  "
+            f"(median of {repeats}, p25-p75 {p25:,.0f}-{p75:,.0f}, stdev {stdev / median * 100:4.1f}%)"
+        )
 
-    print(f"  -> zttp is {rates['zttp'] / rates['h2']:.2f}x h2")
+    # The ratio's own dispersion: pair the interleaved zttp/h2 batches and take
+    # each batch's ratio, so the headline number comes with error bars.
+    ratios = [z / h for z, h in zip(per_batch["zttp"], per_batch["h2"], strict=True)]
+    r25, rmed, r75 = _quartiles(ratios)
+    dispersion[w.name] = (r25, r75)
+    print(f"  -> zttp is {rmed:.2f}x h2 (p25-p75 {r25:.2f}-{r75:.2f})")
     return rates
 
 
@@ -446,10 +467,11 @@ def main() -> None:
     workloads = [Workload(w.name, w.streams, w.kind, w.scale, wire=_encode(w)) for w in selected]
     results = {w.name: bench(w, args.batch, args.repeats) for w in workloads}
 
-    print(f"\n{'workload':<36} {'zttp':>14} {'h2':>14} {'ratio':>7}")
+    print(f"\n{'workload':<36} {'zttp':>14} {'h2':>14} {'ratio':>7} {'p25-p75':>13}")
     for name, rates in results.items():
         ratio = rates["zttp"] / rates["h2"]
-        print(f"{name:<36} {rates['zttp']:>14,.0f} {rates['h2']:>14,.0f} {ratio:>6.2f}x")
+        r25, r75 = dispersion[name]
+        print(f"{name:<36} {rates['zttp']:>14,.0f} {rates['h2']:>14,.0f} {ratio:>6.2f}x {f'{r25:.2f}-{r75:.2f}':>13}")
 
 
 if __name__ == "__main__":
