@@ -1,0 +1,7 @@
+# Intentional, reviewed discrepancies between zttp/_zttp.pyi and the compiled
+# extension. Everything else is a hard error, so the stub cannot silently drift.
+#
+# `Event` is a stub-only type alias (the union of the event classes) used for the
+# next_event() return annotation. It is defined for real in zttp/__init__.py; the
+# extension module has no runtime `Event` attribute, so stubtest sees it as absent.
+zttp._zttp.Event
