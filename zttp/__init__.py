@@ -8,6 +8,7 @@ from zttp._zttp import (
     HTTP3,
     NEED_DATA,
     SERVER,
+    CloseInfo,
     Connection,
     ConnectionClosed,
     Data,
@@ -24,10 +25,12 @@ from zttp._zttp import (
     Request,
     Response,
     RstStream,
+    SessionTicket,
     Settings,
     Stream,
     WindowUpdate,
 )
+from zttp.settings import H2Settings
 
 Event = (
     Request
@@ -51,12 +54,14 @@ __all__ = [
     "HTTP2",
     "HTTP3",
     "NEED_DATA",
+    "CloseInfo",
     "Connection",
     "ConnectionClosed",
     "Data",
     "EndOfMessage",
     "Event",
     "Goaway",
+    "H2Settings",
     "H1Connection",
     "H2Connection",
     "H3Connection",
@@ -68,6 +73,7 @@ __all__ = [
     "Request",
     "Response",
     "RstStream",
+    "SessionTicket",
     "Settings",
     "Stream",
     "WindowUpdate",

@@ -768,7 +768,13 @@ const H3Engine = struct {
             py.tupleSet(tuple, 4, extensions);
             py.tupleSet(tuple, 5, max_early_data_size);
             py.tupleSet(tuple, 6, psk);
-            py.listSet(list, @intCast(i), tuple);
+            const row = c.PyObject_CallObject(session_ticket_type, tuple);
+            py.decref(tuple);
+            if (row == null) {
+                py.decref(list);
+                return null;
+            }
+            py.listSet(list, @intCast(i), row);
         }
         return list;
     }
@@ -879,7 +885,9 @@ const H3Engine = struct {
         py.tupleSet(tuple, 0, code);
         py.tupleSet(tuple, 1, reason);
         py.tupleSet(tuple, 2, app);
-        return tuple;
+        const row = c.PyObject_CallObject(close_info_type, tuple);
+        py.decref(tuple);
+        return row;
     }
 
     /// The peer's HTTP/3 SETTINGS as a dict of the named values, or None until its
@@ -1022,6 +1030,11 @@ var h1_connection_type: py.Object = null;
 var h2_connection_type: py.Object = null;
 var h3_connection_type: py.Object = null;
 var stream_type: py.Object = null;
+// collections.namedtuple types for the H3 result rows, so the fields are named
+// (SessionTicket.psk, CloseInfo.is_application) instead of positional. A namedtuple
+// is a tuple, so unpacking and indexing still work - the change is purely additive.
+var session_ticket_type: py.Object = null;
+var close_info_type: py.Object = null;
 
 /// A handle to one HTTP/2 stream on a Connection. It is a borrowed view: the
 /// Connection owns the stream state (the core's stream map); the handle holds the
@@ -2496,11 +2509,19 @@ pub fn register(module: py.Object) bool {
     if (h3_connection_type == null) return false;
     stream_type = py.typeFromSpec(&stream_spec);
     if (stream_type == null) return false;
+    const namedtuple = py.importFrom("collections", "namedtuple") orelse return false;
+    defer py.decref(namedtuple);
+    session_ticket_type = c.PyObject_CallFunction(namedtuple, "ss", "SessionTicket", "lifetime age_add nonce ticket extensions max_early_data_size psk");
+    if (session_ticket_type == null) return false;
+    close_info_type = c.PyObject_CallFunction(namedtuple, "ss", "CloseInfo", "error_code reason is_application");
+    if (close_info_type == null) return false;
     _ = c.PyModule_AddObjectRef(module, "Connection", connection_type);
     _ = c.PyModule_AddObjectRef(module, "H1Connection", h1_connection_type);
     _ = c.PyModule_AddObjectRef(module, "H2Connection", h2_connection_type);
     _ = c.PyModule_AddObjectRef(module, "H3Connection", h3_connection_type);
     _ = c.PyModule_AddObjectRef(module, "Stream", stream_type);
+    _ = c.PyModule_AddObjectRef(module, "SessionTicket", session_ticket_type);
+    _ = c.PyModule_AddObjectRef(module, "CloseInfo", close_info_type);
     _ = c.PyModule_AddIntConstant(module, "SERVER", SERVER);
     _ = c.PyModule_AddIntConstant(module, "CLIENT", CLIENT);
     _ = c.PyModule_AddIntConstant(module, "HTTP1", HTTP1);

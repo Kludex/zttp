@@ -1415,3 +1415,35 @@ def test_idle_timeout_closes_http3_connection() -> None:
     assert conn.is_closed() is False
     conn.handle_timeout(6000)
     assert conn.is_closed() is True
+
+
+def test_close_info_exposes_named_fields() -> None:
+    client, server = handshake_pair()
+    client.close(error_code=0x0100, reason=b"done")
+    transfer(client, server, 4000)
+
+    info = server.close_info()
+    assert info is not None
+    # Named access, and still a plain tuple for unpacking / equality.
+    assert info.error_code == 0x0100
+    assert info.reason == b"done"
+    assert info.is_application is True
+    assert isinstance(info, zttp.CloseInfo)
+    assert isinstance(info, tuple)
+    assert info == (0x0100, b"done", True)
+
+
+def test_session_ticket_type_is_a_named_tuple() -> None:
+    assert zttp.SessionTicket._fields == (
+        "lifetime",
+        "age_add",
+        "nonce",
+        "ticket",
+        "extensions",
+        "max_early_data_size",
+        "psk",
+    )
+    row = zttp.SessionTicket(1, 2, b"n", b"t", b"e", None, None)
+    assert row.lifetime == 1
+    assert row.max_early_data_size is None
+    assert isinstance(row, tuple)
