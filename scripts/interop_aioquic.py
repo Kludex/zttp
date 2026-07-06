@@ -166,15 +166,15 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
     if (
         len(issued_tickets) != 1
         or len(tickets) != 1
-        or tickets[0][3] != issued_tickets[0].ticket
-        or tickets[0][5] != MAX_EARLY_DATA
+        or tickets[0].ticket != issued_tickets[0].ticket
+        or tickets[0].max_early_data_size != MAX_EARLY_DATA
     ):
         raise SystemExit(
             "zttp did not receive aioquic's NewSessionTicket: "
             f"issued={issued_tickets!r} stored={tickets!r}"
         )
     ticket = tickets[0]
-    if ticket[6] != issued_tickets[0].resumption_secret:
+    if ticket.psk != issued_tickets[0].resumption_secret:
         raise SystemExit("zttp derived a different PSK for aioquic's NewSessionTicket")
 
     resumed = zttp.Connection(
@@ -186,9 +186,8 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
         connection_id=b"\x11\x22\x33\x45",
         alpn=b"h3",
         server_name=b"localhost",
-        resumption_identity=ticket[3],
-        resumption_psk=ticket[6],
-        obfuscated_ticket_age=obfuscated_ticket_age(ticket[1], 3_000, 10_000),
+        resumption=zttp.SessionResumption(identity=ticket.ticket, psk=ticket.psk),
+        obfuscated_ticket_age=obfuscated_ticket_age(ticket.age_add, 3_000, 10_000),
         early_data=True,
         remembered_transport_params=ZTTP_SERVER_TP,
     )
@@ -207,7 +206,7 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
     resumed_server = QuicConnection(
         configuration=server_config,
         original_destination_connection_id=resumed_header.destination_cid,
-        session_ticket_fetcher=lambda identity: issued_tickets[0] if identity == ticket[3] else None,
+        session_ticket_fetcher=lambda identity: issued_tickets[0] if identity == ticket.ticket else None,
     )
     resumed_h3 = H3Connection(resumed_server)
     early_events: list[object] = []
@@ -359,8 +358,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
     server = zttp.Connection(
         zttp.SERVER,
         protocol=zttp.HTTP3,
-        certificate=make_zttp_server_cert_der(),
-        private_key=b"\x42" * 32,
+        credentials=zttp.TlsCredentials(certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32),
         transport_params=ZTTP_SERVER_TP,
         random=b"\xab" * 32,
         ephemeral_seed=b"\x33" * 32,
@@ -514,8 +512,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
     resumed_server = zttp.Connection(
         zttp.SERVER,
         protocol=zttp.HTTP3,
-        certificate=make_zttp_server_cert_der(),
-        private_key=b"\x42" * 32,
+        credentials=zttp.TlsCredentials(certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32),
         transport_params=ZTTP_SERVER_TP,
         random=b"\xac" * 32,
         ephemeral_seed=b"\x34" * 32,
@@ -613,7 +610,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
     client.close(error_code=0x0100, reason_phrase="aioquic-close")
     for datagram, _addr in client.datagrams_to_send(0.04):
         server.receive_datagram(datagram, 40_000, migrated_client)
-    if server.close_info() != (0x0100, b"aioquic-close", True):
+    if server.close_info() != zttp.CloseInfo(0x0100, b"aioquic-close", True):
         raise SystemExit(f"zttp did not receive aioquic's CONNECTION_CLOSE: {server.close_info()!r}")
     if server.next_event() is not zttp.CONNECTION_CLOSED:
         raise SystemExit("zttp did not surface CONNECTION_CLOSED after aioquic close")
@@ -766,8 +763,7 @@ def assert_udp_loopback_aioquic_client_to_zttp_server(drop_first_server_datagram
     server = zttp.Connection(
         zttp.SERVER,
         protocol=zttp.HTTP3,
-        certificate=make_zttp_server_cert_der(),
-        private_key=b"\x42" * 32,
+        credentials=zttp.TlsCredentials(certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32),
         transport_params=ZTTP_SERVER_TP,
         random=b"\xad" * 32,
         ephemeral_seed=b"\x35" * 32,
