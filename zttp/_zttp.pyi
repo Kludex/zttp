@@ -6,6 +6,8 @@ from typing import Final, Literal, final, overload
 
 from typing_extensions import disjoint_base
 
+from zttp.config import SessionResumption, TlsCredentials
+
 SERVER: Final = 1
 CLIENT: Final = 2
 # Literal-typed so Connection(role, HTTP2) selects the H2Connection __new__ overload.
@@ -124,14 +126,12 @@ class Connection:
         role: Literal[1],
         protocol: Literal[3],
         *,
-        certificate: bytes | None = ...,
-        private_key: bytes | None = ...,
+        credentials: TlsCredentials | None = ...,
         transport_params: bytes | None = ...,
         random: bytes | None = ...,
         ephemeral_seed: bytes | None = ...,
         alpn: bytes | None = ...,
-        resumption_identity: bytes | None = ...,
-        resumption_psk: bytes | None = ...,
+        resumption: SessionResumption | None = ...,
     ) -> H3Connection: ...
     @overload
     def __new__(
@@ -145,8 +145,7 @@ class Connection:
         connection_id: bytes | None = ...,
         alpn: bytes | None = ...,
         server_name: bytes | None = ...,
-        resumption_identity: bytes | None = ...,
-        resumption_psk: bytes | None = ...,
+        resumption: SessionResumption | None = ...,
         obfuscated_ticket_age: int = ...,
         early_data: bool = ...,
         remembered_transport_params: bytes | None = ...,

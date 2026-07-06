@@ -28,6 +28,7 @@ from zttp._zttp import (
     Stream,
     WindowUpdate,
 )
+from zttp.config import SessionResumption, TlsCredentials
 
 Event = (
     Request
@@ -68,7 +69,9 @@ __all__ = [
     "Request",
     "Response",
     "RstStream",
+    "SessionResumption",
     "Settings",
     "Stream",
+    "TlsCredentials",
     "WindowUpdate",
 ]

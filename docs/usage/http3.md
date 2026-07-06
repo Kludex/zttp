@@ -26,6 +26,25 @@ transport parameters, connection IDs, and handshake entropy are advanced
 overrides for deterministic tests and interoperability work, not the normal user
 API.
 
+The handshake's two same-typed `bytes` pairs - a server's certificate and key,
+and a resumption ticket's identity and PSK - are passed as **value objects** so
+they cannot be transposed. A swap is a type error, not a handshake failure:
+
+```python
+server = zttp.Connection(
+    zttp.SERVER, zttp.HTTP3,
+    credentials=zttp.TlsCredentials(certificate=cert, private_key=key),
+)
+client = zttp.Connection(
+    zttp.CLIENT, zttp.HTTP3,
+    server_name=b"example.com",
+    resumption=zttp.SessionResumption(identity=ticket_id, psk=ticket_psk),
+)
+```
+
+Omit `credentials` and the server uses an ephemeral local identity (development
+only).
+
 !!! warning "Scope"
     HTTP/3 support is still experimental. The public surface is intentionally
     the same event model as HTTP/1.1 and HTTP/2, but the transport underneath is
