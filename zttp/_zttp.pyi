@@ -18,6 +18,23 @@ HTTP3: Final = 3
 
 @final
 class Request:
+    """A parsed request head: the request line and all headers.
+
+    Yielded by `next_event()` on a server connection once the head is complete,
+    before any body `Data`. Every value is raw `bytes`, exactly as received - zttp
+    does not percent-decode the target.
+
+    Attributes:
+        method: The request method, e.g. `b"GET"`.
+        target: The raw request-target, e.g. `b"/path?q=1"`.
+        path: `target` up to the first `?` (not percent-decoded).
+        query: `target` after the first `?`, or `b""` (not percent-decoded).
+        http_version: The version, e.g. `b"1.1"` (`b"2"` / `b"3"` on HTTP/2 and HTTP/3).
+        headers: The header fields as `(name, value)` byte pairs, in received order.
+        stream_id: The stream the request arrived on (`0` on HTTP/1.1).
+        expect_continue: Whether the client sent `Expect: 100-continue`.
+    """
+
     method: bytes
     target: bytes
     path: bytes
@@ -29,6 +46,19 @@ class Request:
 
 @final
 class Response:
+    """A parsed response head: the status line and all headers.
+
+    Yielded by `next_event()` on a client connection once the head is complete,
+    before any body `Data`.
+
+    Attributes:
+        status_code: The status code, e.g. `200`.
+        reason: The reason phrase, e.g. `b"OK"` (empty on HTTP/2 and HTTP/3).
+        http_version: The version, e.g. `b"1.1"`.
+        headers: The header fields as `(name, value)` byte pairs, in received order.
+        stream_id: The stream the response arrived on (`0` on HTTP/1.1).
+    """
+
     status_code: int
     reason: bytes
     http_version: bytes
@@ -37,44 +67,99 @@ class Response:
 
 @final
 class Data:
+    """A run of decoded body bytes.
+
+    One or more `Data` events arrive between the head and `EndOfMessage`; chunked
+    and content-length bodies both surface the same way, already decoded.
+
+    Attributes:
+        data: The body bytes, copied out of the parse buffer (safe to keep).
+        stream_id: The stream the body belongs to (`0` on HTTP/1.1).
+    """
+
     data: bytes
     stream_id: int
 
 @final
 class EndOfMessage:
+    """The end of a message, with any trailers.
+
+    Attributes:
+        trailers: Trailer fields as `(name, value)` byte pairs, or `[]`.
+        stream_id: The stream that finished (`0` on HTTP/1.1).
+    """
+
     trailers: list[tuple[bytes, bytes]]
     stream_id: int
 
 @final
 class RstStream:
+    """An HTTP/2 `RST_STREAM`: the peer abruptly cancelled a stream.
+
+    Attributes:
+        stream_id: The cancelled stream.
+        error_code: The RFC 9113 error code the peer sent.
+    """
+
     stream_id: int
     error_code: int
 
 @final
 class Goaway:
+    """An HTTP/2 `GOAWAY`: the peer is shutting the connection down.
+
+    Attributes:
+        last_stream_id: The highest stream the peer will still process.
+        error_code: The RFC 9113 error code.
+        debug: Optional opaque debug data, or `b""`.
+    """
+
     last_stream_id: int
     error_code: int
     debug: bytes
 
 @final
 class Settings:
+    """An HTTP/2 `SETTINGS` frame from the peer. zttp acks it for you.
+
+    Attributes:
+        params: The settings as `(identifier, value)` integer pairs; see
+            [`zttp.H2Settings`][zttp.H2Settings] for the identifier names.
+    """
+
     params: list[tuple[int, int]]
 
 @final
 class Ping:
+    """An HTTP/2 `PING`. zttp replies to a non-ack ping for you.
+
+    Attributes:
+        ack: Whether this is an ack of a ping zttp sent.
+        data: The 8 opaque payload bytes.
+    """
+
     ack: bool
     data: bytes
 
 @final
 class WindowUpdate:
+    """An HTTP/2 `WINDOW_UPDATE`: the peer granted more flow-control credit.
+
+    Attributes:
+        stream_id: The stream credited, or `0` for the whole connection.
+        increment: The number of bytes added to the send window.
+    """
+
     stream_id: int
     increment: int
 
 @final
-class NeedData: ...
+class NeedData:
+    """The type of the [`NEED_DATA`][zttp.NEED_DATA] sentinel."""
 
 @final
-class ConnectionClosed: ...
+class ConnectionClosed:
+    """The type of the [`CONNECTION_CLOSED`][zttp.CONNECTION_CLOSED] sentinel."""
 
 NEED_DATA: Final[NeedData]
 CONNECTION_CLOSED: Final[ConnectionClosed]
@@ -93,34 +178,58 @@ Event = (
     | ConnectionClosed
 )
 
-class ProtocolError(Exception): ...
-class RemoteProtocolError(ProtocolError): ...
-class LocalProtocolError(ProtocolError): ...
+class ProtocolError(Exception):
+    """Base class for the two protocol errors. Catch this to handle both."""
+
+class RemoteProtocolError(ProtocolError):
+    """The peer sent something malformed. Raised from `next_event()`."""
+
+class LocalProtocolError(ProtocolError):
+    """You used the send API in a way that cannot produce a valid message."""
 
 @final
 class Stream:
-    # A borrowed, re-validated handle to one multiplexed stream - the single send
-    # surface for both HTTP/2 and HTTP/3. Obtained via conn.stream(stream_id).
+    """A borrowed, re-validated handle to one stream - the single send surface for
+    HTTP/2 and HTTP/3. Obtained via `conn.stream(stream_id)`.
+
+    Attributes:
+        stream_id: The stream this handle sends on.
+        send_window: The stream's remaining send window in bytes, or `None`.
+        pending_bytes: Body bytes parked waiting for flow-control credit, or `None`.
+    """
+
     stream_id: int
     send_window: int | None
     pending_bytes: int | None
     def send_response(
         self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., end_stream: bool = ...
-    ) -> None: ...
-    def send_informational(self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., /) -> None: ...
-    def send_data(self, data: bytes, /) -> None: ...
-    def end_message(self, trailers: list[tuple[bytes, bytes]] | None = ..., /) -> None: ...
-    def reset(self, error_code: int = ..., /) -> None: ...
+    ) -> None:
+        """Send a response head on this stream. Set `end_stream` for a bodyless response."""
+
+    def send_informational(self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., /) -> None:
+        """Send an interim 1xx response; the real response still follows."""
+
+    def send_data(self, data: bytes, /) -> None:
+        """Send a run of body bytes, subject to the peer's flow-control window."""
+
+    def end_message(self, trailers: list[tuple[bytes, bytes]] | None = ..., /) -> None:
+        """End the message on this stream, with optional trailers."""
+
+    def reset(self, error_code: int = ..., /) -> None:
+        """Abruptly cancel this stream (`RST_STREAM` / `STOP_SENDING`)."""
 
 @disjoint_base
 class Connection:
-    # A factory base: constructing a Connection returns the protocol-specific subtype
-    # (H1Connection / H2Connection / H3Connection). Only next_event() is common to
-    # every transport. The read/write *byte* surface is transport-specific and lives
-    # on the subtypes - HTTP/1.1 and HTTP/2 are byte streams (receive_data +
-    # data_to_send() -> bytes), HTTP/3 rides UDP datagrams (receive_datagram +
-    # data_to_send() -> list[bytes]) - so the base does not promise a surface a given
-    # transport cannot honour.
+    """A factory for a protocol-specific connection, and the shared read API.
+
+    Constructing a `Connection` returns the subtype for the protocol you pick -
+    `H1Connection` (the default), `H2Connection`, or `H3Connection` - so the send
+    surface matches the wire. `Connection` itself is not instantiable directly and
+    cannot be subclassed; only `next_event()` is common to every transport, since
+    the read/write *byte* surface is transport-specific (HTTP/1.1 and HTTP/2 are
+    byte streams; HTTP/3 rides UDP datagrams).
+    """
+
     @overload
     def __new__(
         cls,
@@ -156,59 +265,109 @@ class Connection:
     def __new__(cls, role: int, protocol: Literal[2]) -> H2Connection: ...
     @overload
     def __new__(cls, role: int, protocol: Literal[1] = ...) -> H1Connection: ...
-    def next_event(self) -> Event: ...
+    def next_event(self) -> Event:
+        """Return the next parse event, or the `NEED_DATA` sentinel if more bytes are needed."""
 
 @final
 class H1Connection(Connection):
-    def receive_data(self, data: bytes, /) -> None: ...
-    def data_to_send(self) -> bytes: ...
-    def start_next_cycle(self) -> None: ...
-    def send_request(
-        self, method: bytes, target: bytes, version: bytes, headers: list[tuple[bytes, bytes]]
-    ) -> None: ...
-    def send_response(self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., /) -> None: ...
-    def send_informational(self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., /) -> None: ...
-    def send_data(self, data: bytes, /) -> None: ...
-    def end_message(self, trailers: list[tuple[bytes, bytes]] | None = ...) -> None: ...
-    def should_close(self) -> bool: ...
-    def upgrade(self) -> bytes | None: ...
+    """An HTTP/1.1 connection: a byte-stream transport with a message-scoped API."""
+
+    def receive_data(self, data: bytes, /) -> None:
+        """Append received bytes to the parse buffer (empty bytes signals EOF)."""
+
+    def data_to_send(self) -> bytes:
+        """Return and clear the bytes queued to send."""
+
+    def start_next_cycle(self) -> None:
+        """Reset to read the next message on a kept-alive connection."""
+
+    def send_request(self, method: bytes, target: bytes, version: bytes, headers: list[tuple[bytes, bytes]]) -> None:
+        """Serialize a request head (client role)."""
+
+    def send_response(self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., /) -> None:
+        """Serialize a response head; the reason phrase is derived from `status` and the version is 1.1."""
+
+    def send_informational(self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., /) -> None:
+        """Serialize an interim 1xx response; the real response still follows."""
+
+    def send_data(self, data: bytes, /) -> None:
+        """Serialize a run of body bytes (chunk-framed if the head declared `chunked`)."""
+
+    def end_message(self, trailers: list[tuple[bytes, bytes]] | None = ...) -> None:
+        """End the outgoing message, with optional trailers (chunked bodies only)."""
+
+    def should_close(self) -> bool:
+        """Whether the connection must close after this message (`Connection: close` / HTTP/1.0)."""
+
+    def upgrade(self) -> bytes | None:
+        """The request's `Upgrade` token if it asked to upgrade (`Connection: upgrade`), else `None`."""
 
 @final
 class H2Connection(Connection):
+    """An HTTP/2 connection: many streams multiplexed over one byte stream.
+
+    Attributes:
+        send_window: The connection-level send window in bytes (may go negative
+            after a `SETTINGS` shrink).
+    """
+
     send_window: int
-    def receive_data(self, data: bytes, /) -> None: ...
-    def data_to_send(self) -> bytes: ...
-    def initiate_connection(self) -> None: ...
-    def send_request(
-        self, method: bytes, target: bytes, version: bytes, headers: list[tuple[bytes, bytes]]
-    ) -> Stream: ...
+    def receive_data(self, data: bytes, /) -> None:
+        """Append received bytes to the parse buffer (empty bytes signals EOF)."""
+
+    def data_to_send(self) -> bytes:
+        """Return and clear the HTTP/2 frames queued to send."""
+
+    def initiate_connection(self) -> None:
+        """Emit the connection preface (client preface + SETTINGS, or the server's SETTINGS) now."""
+
+    def send_request(self, method: bytes, target: bytes, version: bytes, headers: list[tuple[bytes, bytes]]) -> Stream:
+        """Open a request stream and return its `Stream` (client role)."""
+
     def initiate_upgrade_connection(
         self,
         method: bytes,
         target: bytes,
         headers: list[tuple[bytes, bytes]],
         settings_header: bytes | None = ...,
-    ) -> Stream: ...
-    def stream(self, stream_id: int, /) -> Stream: ...
-    def close(self, error_code: int = ..., last_stream_id: int | None = ..., /) -> None: ...
-    def has_pending_send(self) -> bool: ...
+    ) -> Stream:
+        """Seed an h2c-upgraded connection: replay the parsed HTTP/1.1 request as stream 1."""
+
+    def stream(self, stream_id: int, /) -> Stream:
+        """Return the `Stream` handle for `stream_id` - the send surface for that stream."""
+
+    def close(self, error_code: int = ..., last_stream_id: int | None = ..., /) -> None:
+        """Send `GOAWAY` to shut the connection down."""
+
+    def has_pending_send(self) -> bool:
+        """Whether any stream still has body bytes (or a FIN) parked for the send window."""
 
 @final
 class H3Connection(Connection):
-    # Fed by UDP datagrams rather than a byte stream. Server credentials default
-    # to an ephemeral local identity; `alpn` defaults to b"h3" (ALPN is mandatory
-    # in QUIC - the parameter overrides the token, e.g. for an interop draft name,
-    # it is not an opt-out). `now` is the integrator's
-    # monotonic clock. data_to_send returns one bytes per UDP datagram (QUIC datagram
-    # boundaries are semantic), rather than the single byte string the H1/H2 stream
-    # transports return. Sends go through
-    # a Stream handle (conn.stream(req.stream_id)), the same surface HTTP/2 uses; a
-    # Stream send packetises against the most recent `now`.
-    def data_to_send(self) -> list[bytes]: ...
-    def receive_datagram(self, datagram: bytes, now: int = ..., peer_address: bytes | None = ..., /) -> None: ...
-    def data_to_send_with_addresses(self) -> list[tuple[bytes, bytes | None]]: ...
-    def challenge_path(self, peer_address: bytes, data: bytes, /) -> None: ...
-    def use_peer_connection_id(self, sequence_number: int, /) -> None: ...
+    """An HTTP/3 connection: the same streams over a from-scratch QUIC transport.
+
+    Fed UDP datagrams with `receive_datagram` rather than a byte stream, and
+    `data_to_send()` returns a datagram per element (QUIC datagram boundaries are
+    semantic). Responses go through a `Stream` handle, exactly as on HTTP/2. Server
+    credentials default to an ephemeral local identity; `now` is the integrator's
+    monotonic clock, in the unit later fed to `handle_timeout`.
+    """
+
+    def data_to_send(self) -> list[bytes]:
+        """Return and clear the pending outgoing UDP datagrams, one per list element."""
+
+    def receive_datagram(self, datagram: bytes, now: int = ..., peer_address: bytes | None = ..., /) -> None:
+        """Feed one received UDP datagram. `peer_address` is an opaque key for path validation."""
+
+    def data_to_send_with_addresses(self) -> list[tuple[bytes, bytes | None]]:
+        """Like `data_to_send`, but as `(datagram, peer_address)` pairs."""
+
+    def challenge_path(self, peer_address: bytes, data: bytes, /) -> None:
+        """Queue a QUIC `PATH_CHALLENGE` to a peer address (`data` must be 8 unpredictable bytes)."""
+
+    def use_peer_connection_id(self, sequence_number: int, /) -> None:
+        """Switch outgoing packets to a peer-issued `NEW_CONNECTION_ID` sequence."""
+
     def issue_connection_id(
         self,
         sequence_number: int,
@@ -216,12 +375,18 @@ class H3Connection(Connection):
         stateless_reset_token: bytes,
         retire_prior_to: int = ...,
         /,
-    ) -> None: ...
-    def request_key_update(self) -> None: ...
-    def initiate_connection(self) -> None: ...
-    def send_request(
-        self, method: bytes, target: bytes, version: bytes, headers: list[tuple[bytes, bytes]]
-    ) -> Stream: ...
+    ) -> None:
+        """Queue a QUIC `NEW_CONNECTION_ID` for a local connection ID."""
+
+    def request_key_update(self) -> None:
+        """Advance the QUIC 1-RTT send keys; the next packet carries the new key phase."""
+
+    def initiate_connection(self) -> None:
+        """Open the control stream and send `SETTINGS` now, rather than lazily on the first response."""
+
+    def send_request(self, method: bytes, target: bytes, version: bytes, headers: list[tuple[bytes, bytes]]) -> Stream:
+        """Open a request stream and return its `Stream` (client role)."""
+
     def send_session_ticket(
         self,
         ticket: bytes,
@@ -231,17 +396,44 @@ class H3Connection(Connection):
         extensions: bytes = ...,
         max_early_data_size: int | None = ...,
         /,
-    ) -> bytes | None: ...
-    def send_new_token(self, token: bytes, /) -> None: ...
-    def session_tickets(self) -> list[SessionTicket]: ...
-    def validation_tokens(self) -> list[bytes]: ...
-    def shutdown(self, stream_id: int, /) -> None: ...
-    def close(self, app: bool = ..., error_code: int = ..., reason: bytes = ...) -> None: ...
-    def stream(self, stream_id: int, /) -> Stream: ...
-    def next_timeout(self) -> int | None: ...
-    def handle_timeout(self, now: int, /) -> None: ...
-    def is_closed(self) -> bool: ...
-    def idle_timed_out(self) -> bool: ...
-    def close_info(self) -> CloseInfo | None: ...
-    def peer_settings(self) -> dict[str, int] | None: ...
-    def goaway_received(self) -> int | None: ...
+    ) -> bytes | None:
+        """Queue a TLS `NewSessionTicket` on a confirmed server connection; returns its PSK when available."""
+
+    def send_new_token(self, token: bytes, /) -> None:
+        """Queue a QUIC `NEW_TOKEN` address-validation token (server role)."""
+
+    def session_tickets(self) -> list[SessionTicket]:
+        """The TLS session tickets received from the peer, as [`SessionTicket`][zttp.SessionTicket]s."""
+
+    def validation_tokens(self) -> list[bytes]:
+        """The `NEW_TOKEN` address-validation tokens received, for reuse on a future connection."""
+
+    def shutdown(self, stream_id: int, /) -> None:
+        """Begin a graceful shutdown by sending `GOAWAY` (RFC 9114 5.2)."""
+
+    def close(self, app: bool = ..., error_code: int = ..., reason: bytes = ...) -> None:
+        """Send a QUIC `CONNECTION_CLOSE`. `app=True` sends an HTTP/3 application close."""
+
+    def stream(self, stream_id: int, /) -> Stream:
+        """Return the `Stream` handle for `stream_id` (the request's `stream_id`)."""
+
+    def next_timeout(self) -> int | None:
+        """The next idle/loss/PTO deadline (same clock as `now`), or `None` if no timer is armed."""
+
+    def handle_timeout(self, now: int, /) -> None:
+        """Fire the timer at time `now`: close on idle timeout, or re-queue loss probes."""
+
+    def is_closed(self) -> bool:
+        """Whether the connection has closed (peer `CONNECTION_CLOSE` or idle timeout)."""
+
+    def idle_timed_out(self) -> bool:
+        """Whether the connection was silently closed by the idle timeout (RFC 9000 10.1)."""
+
+    def close_info(self) -> CloseInfo | None:
+        """The peer's `CONNECTION_CLOSE` as a [`CloseInfo`][zttp.CloseInfo], or `None`."""
+
+    def peer_settings(self) -> dict[str, int] | None:
+        """The peer's HTTP/3 `SETTINGS` as a dict, or `None` until its SETTINGS frame arrives."""
+
+    def goaway_received(self) -> int | None:
+        """The id of a `GOAWAY` received from the peer (RFC 9114 5.2), or `None`."""
