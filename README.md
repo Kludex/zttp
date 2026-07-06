@@ -92,6 +92,12 @@ identical data, median of 15 interleaved batches:
 | Simple GET        | ~1.24M req/s | ~1.07M req/s | **~1.16x**        |
 | POST + JSON body  | ~1.42M req/s | ~1.25M req/s | **~1.14x**        |
 
+These ratios are medians; a single-digit-percent edge is close enough that
+run-to-run noise matters, so `scripts/bench` reports each workload's p25-p75
+quartiles and standard deviation alongside the median, and prints the ratio's own
+p25-p75 so you can see whether an edge is real or within the spread. On the
+closest workloads that band can straddle 1.0.
+
 zttp beats a C parser on 13 of the benchmark suite's 14 workloads while staying
 sans-IO and event-based, and is roughly 15x faster than the pure-Python
 alternative. Run it yourself: `./scripts/bench`.

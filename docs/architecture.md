@@ -132,6 +132,36 @@ The sans-IO discipline is unchanged: the core never touches a socket. The bounda
 just moved from "decrypted byte stream" (TCP) down to "UDP datagram" (QUIC); the
 event side - bytes in, events out, no I/O in the core - is identical.
 
+## Why the write API is imperative, not symmetric with the read API
+
+h11 is symmetric: you read with `conn.next_event()` and write with
+`conn.send(h11.Response(...))` - the same event objects flow both ways. zttp is
+deliberately **not** symmetric. The read side yields `Request` / `Response` /
+`Data` events; the write side is imperative methods (`send_response(status,
+headers)`, `send_data(...)`, `end_message(...)`), so the event objects are
+read-only outputs and are never constructed by the caller.
+
+This is a considered trade-off:
+
+- **The engine owns framing.** Content-Length vs chunked, HTTP/2 flow-control
+  parking, HTTP/3 packetisation against the current clock - the writer decides all
+  of it from the connection state. An imperative call passes the minimum the engine
+  cannot infer; a symmetric `send(Response(...))` would invite callers to set
+  framing fields the engine must then validate or override.
+- **Read and write payloads are not the same type.** A parsed `Request` carries a
+  synthesized `host` header, `expect_continue`, the decoded `path`/`query`, and a
+  `stream_id` the engine assigned. A caller building a request does not supply
+  those. Reusing one class for both directions would mean a type whose fields are
+  half input, half output.
+- **The event objects stay cheap.** They are read-only views over the parse buffer
+  with no constructor to validate, which is part of why the read path is fast.
+
+The cost is that a `Response` cannot be built as a value, passed around, and sent
+later - the pattern h11 proxies lean on. If a future need makes that compelling,
+an additive `stream.send(event)` overload could accept an event object without
+removing the imperative methods. Recording the decision here so the asymmetry
+reads as intentional, not accidental.
+
 ## Memory safety
 
 Because the core is Python-agnostic, every slice it hands out points into a buffer
