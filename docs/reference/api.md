@@ -9,10 +9,12 @@ importable straight from `zttp` (e.g. `from zttp import Connection`).
 
 ## Connection
 
-`zttp.Connection` is the base: the read side, shared by every protocol.
-Constructing one returns the subclass for the protocol you picked: an
-`H1Connection` (the default), an `H2Connection`, or an `H3Connection`, so the
-send surface you get matches the protocol.
+`zttp.Connection` is a factory. Constructing one returns the subtype for the
+protocol you picked - an `H1Connection` (the default), an `H2Connection`, or an
+`H3Connection` - so the surface you get matches the wire. `Connection` itself
+isn't a usable instance type and can't be subclassed; only `next_event()` is
+common to all three, because the read/write *byte* surface is transport-specific
+(HTTP/1.1 and HTTP/2 read `receive_data`; HTTP/3 reads `receive_datagram`).
 
 ::: zttp.Connection
 
@@ -38,10 +40,23 @@ A `Connection`'s role and protocol are fixed at construction:
 - `zttp.HTTP3`: the same streams over QUIC; you feed UDP datagrams with
   `receive_datagram` (see [HTTP/3](../usage/http3.md)).
 
-For HTTP/3, zttp supplies QUIC transport defaults internally. Optional
-constructor fields such as `transport_params`, `connection_id`, `random`, and
-`ephemeral_seed` are advanced overrides for deterministic tests and
-interoperability work.
+For HTTP/3, a server's TLS identity is passed as
+[`credentials=TlsCredentials(...)`][zttp.TlsCredentials] and a resumption secret
+as [`resumption=SessionResumption(...)`][zttp.SessionResumption] - typed value
+objects, so the same-typed `bytes` pairs can't be transposed (omit `credentials`
+and the server uses an ephemeral local identity). zttp supplies the QUIC
+transport defaults internally; the remaining constructor fields
+(`transport_params`, `connection_id`, `random`, `ephemeral_seed`, ...) are
+advanced overrides for deterministic tests and interoperability work.
+
+### HTTP/3 value objects
+
+Passed to the HTTP/3 constructor; both are keyword-only frozen dataclasses so the
+same-typed `bytes` fields can't be swapped.
+
+::: zttp.TlsCredentials
+
+::: zttp.SessionResumption
 
 ## Events
 
@@ -70,6 +85,18 @@ the ones that matter on its own; they're here when you want visibility.
 ::: zttp.RstStream
 
 ::: zttp.Goaway
+
+The integer ids in a `Settings` event's `params` have names (RFC 9113 6.5.2):
+
+::: zttp.H2Settings
+
+### HTTP/3 results
+
+Returned by an [`H3Connection`](#zttp.H3Connection)'s introspection methods.
+
+::: zttp.SessionTicket
+
+::: zttp.CloseInfo
 
 ### Sentinels
 

@@ -15,6 +15,12 @@ __all__ = ["H2Settings"]
 
 
 class H2Settings(IntEnum):
+    """The HTTP/2 SETTINGS parameter identifiers (RFC 9113 6.5.2).
+
+    Names the integer ids carried in a [`Settings`][zttp.Settings] event's `params`,
+    so they can be read without magic numbers.
+    """
+
     HEADER_TABLE_SIZE = 0x01
     ENABLE_PUSH = 0x02
     MAX_CONCURRENT_STREAMS = 0x03
