@@ -461,8 +461,8 @@ def timed(fn: Runner, n: int) -> float:
         gc.enable()
 
 
-# The ratio's p25-p75 per workload, filled by bench() and shown in the summary.
-dispersion: dict[str, tuple[float, float]] = {}
+# The paired-ratio median and p25-p75 per workload, filled by bench() for the summary.
+dispersion: dict[str, tuple[float, float, float]] = {}  # workload -> (ratio median, p25, p75)
 
 
 def _quartiles(values: list[float]) -> tuple[float, float, float]:
@@ -492,7 +492,7 @@ def bench(w: Workload, batch: int, repeats: int) -> dict[str, float]:
     rates: dict[str, float] = {}
     for label, values in per_batch.items():
         p25, median, p75 = _quartiles(values)
-        stdev = statistics.stdev(values)
+        stdev = statistics.stdev(values) if len(values) > 1 else 0.0
         rates[label] = median
         print(
             f"  {label:>10}: {median:12,.0f} msg/s  "
@@ -500,10 +500,11 @@ def bench(w: Workload, batch: int, repeats: int) -> dict[str, float]:
         )
 
     # The ratio's own dispersion: pair the interleaved zttp/httptools batches and
-    # take each batch's ratio, so the headline number comes with error bars.
+    # take each batch's ratio, so the headline number comes with error bars. Store the
+    # paired-ratio median (not median/median) so the summary is consistent with its band.
     ratios = [z / h for z, h in zip(per_batch["zttp"], per_batch["httptools"], strict=True)]
     r25, rmed, r75 = _quartiles(ratios)
-    dispersion[w.name] = (r25, r75)
+    dispersion[w.name] = (rmed, r25, r75)
     line = f"  -> zttp is {rmed:.2f}x httptools (p25-p75 {r25:.2f}-{r75:.2f})"
     if "h11" in rates:
         line += f", {rates['zttp'] / rates['h11']:.2f}x h11"
@@ -527,11 +528,10 @@ def main() -> None:
 
     print(f"\n{'workload':<32} {'zttp':>12} {'httptools':>12} {'ratio':>7} {'p25-p75':>13}")
     for name, rates in results.items():
-        ratio = rates["zttp"] / rates["httptools"]
-        r25, r75 = dispersion[name]
+        rmed, r25, r75 = dispersion[name]
         print(
             f"{name:<32} {rates['zttp']:>12,.0f} {rates['httptools']:>12,.0f} "
-            f"{ratio:>6.2f}x {f'{r25:.2f}-{r75:.2f}':>13}"
+            f"{rmed:>6.2f}x {f'{r25:.2f}-{r75:.2f}':>13}"
         )
 
 

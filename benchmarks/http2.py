@@ -408,8 +408,8 @@ def timed(fn: Runner, n: int) -> float:
         gc.enable()
 
 
-# The ratio's p25-p75 per workload, filled by bench() and shown in the summary.
-dispersion: dict[str, tuple[float, float]] = {}
+# The paired-ratio median and p25-p75 per workload, filled by bench() for the summary.
+dispersion: dict[str, tuple[float, float, float]] = {}  # workload -> (ratio median, p25, p75)
 
 
 def _quartiles(values: list[float]) -> tuple[float, float, float]:
@@ -439,7 +439,7 @@ def bench(w: Workload, batch: int, repeats: int) -> dict[str, float]:
     rates: dict[str, float] = {}
     for label, values in per_batch.items():
         p25, median, p75 = _quartiles(values)
-        stdev = statistics.stdev(values)
+        stdev = statistics.stdev(values) if len(values) > 1 else 0.0
         rates[label] = median
         print(
             f"  {label:>10}: {median:14,.0f} msg/s  "
@@ -447,10 +447,11 @@ def bench(w: Workload, batch: int, repeats: int) -> dict[str, float]:
         )
 
     # The ratio's own dispersion: pair the interleaved zttp/h2 batches and take
-    # each batch's ratio, so the headline number comes with error bars.
+    # each batch's ratio, so the headline number comes with error bars. Store the
+    # paired-ratio median (not median/median) so the summary is consistent with its band.
     ratios = [z / h for z, h in zip(per_batch["zttp"], per_batch["h2"], strict=True)]
     r25, rmed, r75 = _quartiles(ratios)
-    dispersion[w.name] = (r25, r75)
+    dispersion[w.name] = (rmed, r25, r75)
     print(f"  -> zttp is {rmed:.2f}x h2 (p25-p75 {r25:.2f}-{r75:.2f})")
     return rates
 
@@ -469,9 +470,8 @@ def main() -> None:
 
     print(f"\n{'workload':<36} {'zttp':>14} {'h2':>14} {'ratio':>7} {'p25-p75':>13}")
     for name, rates in results.items():
-        ratio = rates["zttp"] / rates["h2"]
-        r25, r75 = dispersion[name]
-        print(f"{name:<36} {rates['zttp']:>14,.0f} {rates['h2']:>14,.0f} {ratio:>6.2f}x {f'{r25:.2f}-{r75:.2f}':>13}")
+        rmed, r25, r75 = dispersion[name]
+        print(f"{name:<36} {rates['zttp']:>14,.0f} {rates['h2']:>14,.0f} {rmed:>6.2f}x {f'{r25:.2f}-{r75:.2f}':>13}")
 
 
 if __name__ == "__main__":
