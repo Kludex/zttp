@@ -117,6 +117,12 @@ That's it. The buffering, the header parsing, the body framing: all Zig. 🎉
 
     The 30-second tour of the read side: feed bytes, pull events.
 
+-   :material-server: **[A real server](usage/real-server.md)**
+
+    ---
+
+    A complete `asyncio` HTTP/1.1 server you can run and `curl`.
+
 -   :material-upload-network: **[HTTP/1.1](usage/http1.md)**
 
     ---
