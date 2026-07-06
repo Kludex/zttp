@@ -42,3 +42,15 @@ def test_h3_constructor_rejects_the_old_raw_kwargs() -> None:
     ):
         with pytest.raises(TypeError):
             zttp.Connection(zttp.SERVER, zttp.HTTP3, **bad)  # type: ignore[call-overload]
+
+
+def test_value_objects_are_keyword_only() -> None:
+    # Positional construction is where a same-typed swap could still hide, so the
+    # fields are keyword-only: TlsCredentials(key, cert) is a TypeError, not a silent
+    # transposition.
+    with pytest.raises(TypeError):
+        zttp.TlsCredentials(b"cert", b"key")  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        zttp.SessionResumption(b"id", b"psk")  # type: ignore[misc]
+    # Keyword construction is unaffected.
+    assert zttp.TlsCredentials(certificate=b"c", private_key=b"k").private_key == b"k"
