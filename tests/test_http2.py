@@ -362,6 +362,16 @@ def test_invalid_protocol_rejected() -> None:
         zttp.Connection(zttp.SERVER, protocol=99)
 
 
+def test_connection_factory_cannot_be_subclassed() -> None:
+    # Connection is a factory: it has no usable instance surface of its own, so a
+    # subclass instance would be a half-built object. Constructing one is rejected.
+    class Custom(zttp.Connection):
+        pass
+
+    with pytest.raises(TypeError):
+        Custom(zttp.SERVER)
+
+
 # -- Stream object -------------------------------------------------------------
 
 

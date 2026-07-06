@@ -1353,29 +1353,32 @@ fn allocAndBuild(tp: ?*c.PyTypeObject, role: Role, protocol_val: c_long) py.Obje
 }
 
 // Base `Connection` tp_new: a factory. Called as `Connection(role, protocol=...)`
-// it picks the H1/H2 subtype and returns an instance of THAT type, so the runtime
-// type is truthful (isinstance(obj, Connection) still holds via the base). Called
-// on a user subclass of Connection, it builds in place with the requested protocol
-// (the subclass is honoured; no foreign-type substitution).
+// it picks the H1/H2/H3 subtype and returns an instance of THAT type, so the runtime
+// type is truthful (isinstance(obj, Connection) still holds via the base). Connection
+// itself is not a usable instance type - it carries only the shared read API - so
+// subclassing it is rejected rather than yielding a half-built object.
 fn new_base(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    // A user subclass of Connection is none of the concrete subtypes, so it would get
+    // an instance with only next_event() and none of the transport's read/write
+    // surface (receive_data / data_to_send / the send API live on the subtypes).
+    // Reject it with a clear error instead of handing back a broken object.
+    if (@intFromPtr(tp) != @intFromPtr(connection_type)) {
+        return py.raiseType("zttp.Connection is a factory and cannot be subclassed; call zttp.Connection(role, protocol=...) to build an H1/H2/H3Connection");
+    }
     // HTTP/3 carries server-credential kwargs that the (role, protocol) parser would
     // reject, so detect it first by a cheap peek and route the whole call through
     // new_h3, which owns the full parse. The H1/H2 fast path is unchanged.
     if (peekProtocol(args, kwds) == HTTP3) {
-        const target = if (@intFromPtr(tp) == @intFromPtr(connection_type)) @as(?*c.PyTypeObject, @ptrCast(h3_connection_type)) else tp;
-        return new_h3(target, args, kwds);
+        return new_h3(@ptrCast(h3_connection_type), args, kwds);
     }
     var role: Role = .server;
     var protocol_val: c_long = HTTP1;
     if (!parseArgs(args, kwds, &role, &protocol_val, null)) return null;
-    if (@intFromPtr(tp) == @intFromPtr(connection_type)) {
-        const sub: ?*c.PyTypeObject = @ptrCast(switch (protocol_val) {
-            HTTP2 => h2_connection_type,
-            else => h1_connection_type,
-        });
-        return allocAndBuild(sub, role, protocol_val);
-    }
-    return allocAndBuild(tp, role, protocol_val);
+    const sub: ?*c.PyTypeObject = @ptrCast(switch (protocol_val) {
+        HTTP2 => h2_connection_type,
+        else => h1_connection_type,
+    });
+    return allocAndBuild(sub, role, protocol_val);
 }
 
 // Peek the `protocol` argument (2nd positional or the `protocol` kwarg) without the
