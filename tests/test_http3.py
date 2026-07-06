@@ -14,8 +14,7 @@ SERVER_PUBLIC_KEY = bytes.fromhex(
     "89c6c886572fd6dad9d01e0b98c5fec3276e9a2e4b89705140f564f7eb65016b95"
 )
 SERVER_CONFIG = {
-    "certificate": SERVER_PUBLIC_KEY,
-    "private_key": b"\x42" * 32,
+    "credentials": zttp.TlsCredentials(certificate=SERVER_PUBLIC_KEY, private_key=b"\x42" * 32),
     "transport_params": (
         b"\x04\x04\x80\x10\x00\x00"  # initial_max_data = 1048576
         b"\x08\x01\x08"  # initial_max_streams_bidi = 8
@@ -171,7 +170,7 @@ def test_http3_default_client_and_server_exchange_request() -> None:
 
 def test_http3_client_rejects_unverifiable_server_certificate() -> None:
     config = dict(SERVER_CONFIG)
-    config["certificate"] = b"\xcc" * 48
+    config["credentials"] = zttp.TlsCredentials(certificate=b"\xcc" * 48, private_key=b"\x42" * 32)
     client = make_client()
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
 
@@ -291,8 +290,7 @@ def test_http3_received_session_ticket_psk_resumes_later_connection() -> None:
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x47",
-            "resumption_identity": identity,
-            "resumption_psk": psk,
+            "resumption": zttp.SessionResumption(identity=identity, psk=psk),
             "obfuscated_ticket_age": obfuscated_ticket_age(age_add, 3000, 6000),
         }
     )
@@ -339,8 +337,7 @@ def test_http3_ticket_age_mismatch_does_not_accept_zero_rtt() -> None:
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x48",
-            "resumption_identity": identity,
-            "resumption_psk": psk,
+            "resumption": zttp.SessionResumption(identity=identity, psk=psk),
             "obfuscated_ticket_age": 0,
             "early_data": True,
             "remembered_transport_params": SERVER_CONFIG["transport_params"],
@@ -382,8 +379,7 @@ def test_http3_expired_ticket_does_not_accept_zero_rtt() -> None:
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x49",
-            "resumption_identity": identity,
-            "resumption_psk": psk,
+            "resumption": zttp.SessionResumption(identity=identity, psk=psk),
             "obfuscated_ticket_age": obfuscated_ticket_age(age_add, 3000, resume_at),
             "early_data": True,
             "remembered_transport_params": SERVER_CONFIG["transport_params"],
@@ -425,8 +421,7 @@ def test_http3_ticket_without_early_data_extension_does_not_accept_zero_rtt() ->
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x4a",
-            "resumption_identity": identity,
-            "resumption_psk": psk,
+            "resumption": zttp.SessionResumption(identity=identity, psk=psk),
             "obfuscated_ticket_age": obfuscated_ticket_age(age_add, 3000, 6000),
             "early_data": True,
             "remembered_transport_params": SERVER_CONFIG["transport_params"],
@@ -468,8 +463,7 @@ def test_http3_zero_rtt_ticket_is_single_use() -> None:
         client_config.update(
             {
                 "connection_id": connection_id,
-                "resumption_identity": identity,
-                "resumption_psk": psk,
+                "resumption": zttp.SessionResumption(identity=identity, psk=psk),
                 "obfuscated_ticket_age": obfuscated_ticket_age(age_add, 3000, now),
                 "early_data": True,
                 "remembered_transport_params": SERVER_CONFIG["transport_params"],
@@ -502,16 +496,14 @@ def test_http3_client_server_resumed_handshake() -> None:
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x45",
-            "resumption_identity": b"ticket-identity",
-            "resumption_psk": psk,
+            "resumption": zttp.SessionResumption(identity=b"ticket-identity", psk=psk),
             "obfuscated_ticket_age": 0x01020304,
         }
     )
     server_config = dict(SERVER_CONFIG)
     server_config.update(
         {
-            "resumption_identity": b"ticket-identity",
-            "resumption_psk": psk,
+            "resumption": zttp.SessionResumption(identity=b"ticket-identity", psk=psk),
         }
     )
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
@@ -539,8 +531,7 @@ def test_http3_static_resumption_credentials_do_not_accept_zero_rtt() -> None:
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x46",
-            "resumption_identity": b"ticket-identity",
-            "resumption_psk": psk,
+            "resumption": zttp.SessionResumption(identity=b"ticket-identity", psk=psk),
             "obfuscated_ticket_age": 0x01020304,
             "early_data": True,
             "remembered_transport_params": SERVER_CONFIG["transport_params"],
@@ -549,8 +540,7 @@ def test_http3_static_resumption_credentials_do_not_accept_zero_rtt() -> None:
     server_config = dict(SERVER_CONFIG)
     server_config.update(
         {
-            "resumption_identity": b"ticket-identity",
-            "resumption_psk": psk,
+            "resumption": zttp.SessionResumption(identity=b"ticket-identity", psk=psk),
         }
     )
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
@@ -721,10 +711,11 @@ def test_http3_server_defaults_transport_settings_and_credentials() -> None:
 
 
 def test_http3_server_custom_credentials_must_be_a_pair() -> None:
+    # TlsCredentials names both halves, so a lone certificate or key cannot be built.
     with pytest.raises(TypeError):
-        zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, certificate=b"\xcc" * 48)
+        zttp.TlsCredentials(certificate=b"\xcc" * 48)  # type: ignore[call-arg]
     with pytest.raises(TypeError):
-        zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, private_key=b"\x42" * 32)
+        zttp.TlsCredentials(private_key=b"\x42" * 32)  # type: ignore[call-arg]
 
 
 def test_http3_rejects_a_wrong_size_key() -> None:
@@ -732,8 +723,7 @@ def test_http3_rejects_a_wrong_size_key() -> None:
         zttp.Connection(
             zttp.SERVER,
             protocol=zttp.HTTP3,
-            certificate=b"\xcc" * 48,
-            private_key=b"\x42" * 16,
+            credentials=zttp.TlsCredentials(certificate=b"\xcc" * 48, private_key=b"\x42" * 16),
             transport_params=b"\x00\x01",
             random=b"\xab" * 32,
             ephemeral_seed=b"\x33" * 32,
