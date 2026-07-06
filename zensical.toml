@@ -2,7 +2,7 @@
 site_name = "zttp"
 site_description = "A sans-IO HTTP/1.1, HTTP/2, and HTTP/3 parser for Python with a Zig core."
 site_author = "Marcelo Trylesinski"
-#site_url = "https://zttp.dev/"
+site_url = "https://zttp.marcelotryle.com/"
 repo_url = "https://github.com/Kludex/zttp"
 repo_name = "Kludex/zttp"
 copyright = """
