@@ -8,7 +8,6 @@ from zttp._zttp import (
     HTTP3,
     NEED_DATA,
     SERVER,
-    CloseInfo,
     Connection,
     ConnectionClosed,
     Data,
@@ -25,12 +24,12 @@ from zttp._zttp import (
     Request,
     Response,
     RstStream,
-    SessionTicket,
     Settings,
     Stream,
     WindowUpdate,
 )
 from zttp.config import SessionResumption, TlsCredentials
+from zttp.results import CloseInfo, SessionTicket
 from zttp.settings import H2Settings
 
 Event = (

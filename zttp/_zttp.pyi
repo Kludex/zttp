@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Final, Literal, NamedTuple, final, overload
+from typing import Final, Literal, final, overload
 
 from typing_extensions import disjoint_base
 
 from zttp.config import SessionResumption, TlsCredentials
+from zttp.results import CloseInfo, SessionTicket
 
 SERVER: Final = 1
 CLIENT: Final = 2
@@ -74,20 +75,6 @@ class NeedData: ...
 
 @final
 class ConnectionClosed: ...
-
-class SessionTicket(NamedTuple):
-    lifetime: int
-    age_add: int
-    nonce: bytes
-    ticket: bytes
-    extensions: bytes
-    max_early_data_size: int | None
-    psk: bytes | None
-
-class CloseInfo(NamedTuple):
-    error_code: int
-    reason: bytes
-    is_application: bool
 
 NEED_DATA: Final[NeedData]
 CONNECTION_CLOSED: Final[ConnectionClosed]

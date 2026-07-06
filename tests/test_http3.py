@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import pickle
 
 import pytest
@@ -245,18 +246,16 @@ def test_http3_server_can_send_session_ticket() -> None:
     tickets = client.session_tickets()
     assert len(tickets) == 1
     ticket = tickets[0]
-    assert ticket[:6] == (
-        7200,
-        0x01020304,
-        b"\xaa\xbb",
-        b"ticket-bytes",
-        b"\xfa\xce\x00\x00\x00\x2a\x00\x04\x00\x00\x10\x00",
-        4096,
-    )
-    assert isinstance(ticket[6], bytes)
-    assert len(ticket[6]) == 32
-    assert ticket[6] != b"\x00" * 32
-    assert ticket[6] == issued_psk
+    assert ticket.lifetime == 7200
+    assert ticket.age_add == 0x01020304
+    assert ticket.nonce == b"\xaa\xbb"
+    assert ticket.ticket == b"ticket-bytes"
+    assert ticket.extensions == b"\xfa\xce\x00\x00\x00\x2a\x00\x04\x00\x00\x10\x00"
+    assert ticket.max_early_data_size == 4096
+    assert isinstance(ticket.psk, bytes)
+    assert len(ticket.psk) == 32
+    assert ticket.psk != b"\x00" * 32
+    assert ticket.psk == issued_psk
 
 
 def test_http3_received_session_ticket_psk_resumes_later_connection() -> None:
@@ -279,11 +278,12 @@ def test_http3_received_session_ticket_psk_resumes_later_connection() -> None:
     assert isinstance(issued_psk, bytes)
     assert len(issued_psk) == 32
     assert transfer(first_server, first_client, 5000)
-    [(lifetime, age_add, nonce, identity, _extensions, max_early, psk)] = first_client.session_tickets()
-    assert lifetime == 7200
-    assert age_add == 0x01020304
-    assert nonce == b"\x01"
-    assert max_early == 4096
+    [ticket] = first_client.session_tickets()
+    identity, age_add, psk = ticket.ticket, ticket.age_add, ticket.psk
+    assert ticket.lifetime == 7200
+    assert ticket.age_add == 0x01020304
+    assert ticket.nonce == b"\x01"
+    assert ticket.max_early_data_size == 4096
     assert isinstance(psk, bytes)
     assert len(psk) == 32
     assert psk == issued_psk
@@ -333,7 +333,8 @@ def test_http3_ticket_age_mismatch_does_not_accept_zero_rtt() -> None:
         4096,
     )
     assert transfer(first_server, first_client, 5000)
-    [(_lifetime, _age_add, _nonce, identity, _extensions, _max_early, psk)] = first_client.session_tickets()
+    [ticket] = first_client.session_tickets()
+    identity, psk = ticket.ticket, ticket.psk
 
     client_config = dict(CLIENT_CONFIG)
     client_config.update(
@@ -374,7 +375,8 @@ def test_http3_expired_ticket_does_not_accept_zero_rtt() -> None:
         4096,
     )
     assert transfer(first_server, first_client, 5000)
-    [(_lifetime, age_add, _nonce, identity, _extensions, _max_early, psk)] = first_client.session_tickets()
+    [ticket] = first_client.session_tickets()
+    age_add, identity, psk = ticket.age_add, ticket.ticket, ticket.psk
 
     resume_at = 2_500_000
     client_config = dict(CLIENT_CONFIG)
@@ -416,8 +418,9 @@ def test_http3_ticket_without_early_data_extension_does_not_accept_zero_rtt() ->
         None,
     )
     assert transfer(first_server, first_client, 5000)
-    [(_lifetime, age_add, _nonce, identity, _extensions, max_early, psk)] = first_client.session_tickets()
-    assert max_early is None
+    [ticket] = first_client.session_tickets()
+    age_add, identity, psk = ticket.age_add, ticket.ticket, ticket.psk
+    assert ticket.max_early_data_size is None
 
     client_config = dict(CLIENT_CONFIG)
     client_config.update(
@@ -458,7 +461,8 @@ def test_http3_zero_rtt_ticket_is_single_use() -> None:
         4096,
     )
     assert transfer(first_server, first_client, 5000)
-    [(_lifetime, age_add, _nonce, identity, _extensions, _max_early, psk)] = first_client.session_tickets()
+    [ticket] = first_client.session_tickets()
+    age_add, identity, psk = ticket.age_add, ticket.ticket, ticket.psk
 
     def make_early_client(connection_id: bytes, now: int) -> zttp.H3Connection:
         client_config = dict(CLIENT_CONFIG)
@@ -1355,7 +1359,7 @@ def test_http3_close_sends_application_connection_close() -> None:
     transfer(client, server, 4000)
 
     assert server.is_closed() is True
-    assert server.close_info() == (0x0100, b"done", True)
+    assert server.close_info() == zttp.CloseInfo(0x0100, b"done", True)
     assert server.next_event() is zttp.CONNECTION_CLOSED
 
 
@@ -1366,7 +1370,7 @@ def test_http3_close_can_send_transport_connection_close() -> None:
     transfer(server, client, 4000)
 
     assert client.is_closed() is True
-    assert client.close_info() == (0x0A, b"transport", False)
+    assert client.close_info() == zttp.CloseInfo(0x0A, b"transport", False)
     assert client.next_event() is zttp.CONNECTION_CLOSED
 
 
@@ -1416,17 +1420,18 @@ def test_close_info_exposes_named_fields() -> None:
 
     info = server.close_info()
     assert info is not None
-    # Named access, and still a plain tuple for unpacking / equality.
+    # A frozen dataclass: named access, no positional/tuple semantics.
     assert info.error_code == 0x0100
     assert info.reason == b"done"
     assert info.is_application is True
     assert isinstance(info, zttp.CloseInfo)
-    assert isinstance(info, tuple)
-    assert info == (0x0100, b"done", True)
+    assert not isinstance(info, tuple)
+    assert info == zttp.CloseInfo(0x0100, b"done", True)
 
 
-def test_session_ticket_type_is_a_named_tuple() -> None:
-    assert zttp.SessionTicket._fields == (
+def test_h3_result_rows_are_frozen_dataclasses() -> None:
+    assert dataclasses.is_dataclass(zttp.SessionTicket)
+    assert [f.name for f in dataclasses.fields(zttp.SessionTicket)] == [
         "lifetime",
         "age_add",
         "nonce",
@@ -1434,19 +1439,20 @@ def test_session_ticket_type_is_a_named_tuple() -> None:
         "extensions",
         "max_early_data_size",
         "psk",
-    )
+    ]
     row = zttp.SessionTicket(1, 2, b"n", b"t", b"e", None, None)
     assert row.lifetime == 1
     assert row.max_early_data_size is None
-    assert isinstance(row, tuple)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        row.lifetime = 2  # type: ignore[misc]
 
 
 def test_h3_result_rows_are_picklable() -> None:
-    # namedtuple rows must set __module__ = "zttp._zttp" so pickle can find them by
-    # reference, matching the plain tuples they replaced.
+    # Defined in zttp.results, so __module__ is correct and pickle finds them by
+    # reference (the plain tuples they replaced pickled too).
     ticket = zttp.SessionTicket(7200, 1, b"nonce", b"ticket", b"", 4096, b"\x00" * 32)
     info = zttp.CloseInfo(0x0100, b"done", True)
     assert pickle.loads(pickle.dumps(ticket)) == ticket
     assert pickle.loads(pickle.dumps(info)) == info
-    assert zttp.SessionTicket.__module__ == "zttp._zttp"
-    assert zttp.CloseInfo.__module__ == "zttp._zttp"
+    assert zttp.SessionTicket.__module__ == "zttp.results"
+    assert zttp.CloseInfo.__module__ == "zttp.results"
