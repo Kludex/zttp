@@ -20,6 +20,7 @@ nav = [
     "usage/http2.md",
     "usage/http3.md",
     "usage/errors.md",
+    "usage/real-server.md",
   ] },
   { "Architecture" = "architecture.md" },
   { "Reference" = [

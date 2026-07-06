@@ -141,4 +141,5 @@ the `Request` event.
 You've seen the read side. Next:
 
 * [HTTP/1.1](http1.md): the read and write sides in depth - bodies, chunked encoding, trailers, building messages.
+* [A real server](real-server.md): wire it all to a socket - a complete `asyncio` server you can run.
 * [Errors](errors.md): what zttp rejects, and how.
