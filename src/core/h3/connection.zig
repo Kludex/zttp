@@ -514,7 +514,7 @@ pub const Connection = struct {
         if (self.qc.streamFinished(id) and rs.blocked_headers == null and consumed_total < ready.len) {
             return self.fail(.frame_error, "stream ended with a truncated HTTP/3 frame");
         }
-        if (self.qc.streamFinished(id) and rs.blocked_headers == null) {
+        if (self.qc.streamFinished(id) and rs.blocked_headers == null and rs.state != .done) {
             if (rs.state != .headers_done and rs.state != .trailers_done) return self.rejectStream(id, .message_error);
             if (!rs.expects_bodyless) {
                 if (rs.content_length) |cl| if (rs.body_received != cl) return self.rejectStream(id, .message_error);

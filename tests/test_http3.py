@@ -1456,3 +1456,32 @@ def test_h3_result_rows_are_picklable() -> None:
     assert pickle.loads(pickle.dumps(info)) == info
     assert zttp.SessionTicket.__module__ == "zttp.results"
     assert zttp.CloseInfo.__module__ == "zttp.results"
+
+
+def test_http3_many_sequential_requests_on_one_connection() -> None:
+    # Regression: request/response round-trips past the second failed with a
+    # "QUIC final size error". A completed (.done) response stream lingered while its
+    # send half awaited an ack, got re-pumped, and pumpResponse re-entered the
+    # stream-finished block - whose negative state check also matched .done - and
+    # wrongly re-rejected the finished stream (message_error), sending a RESET_STREAM
+    # with a stale final size.
+    client, server = make_client(), make_server()
+    now = 1000
+    for _ in range(4):
+        transfer(client, server, now)
+        transfer(server, client, now)
+        now += 1000
+
+    for i in range(10):
+        now += 1000
+        stream = client.send_request(b"GET", b"/req", b"3", [(b"host", b"example.test")])
+        stream.end_message()
+        transfer(client, server, now)
+        requests = [e for e in drain_events(server) if isinstance(e, zttp.Request)]
+        assert len(requests) == 1, (i, requests)
+        response = server.stream(requests[0].stream_id)
+        response.send_response(200, [(b"content-length", b"0")])
+        response.end_message()
+        transfer(server, client, now)
+        statuses = [e.status_code for e in drain_events(client) if isinstance(e, zttp.Response)]
+        assert statuses == [200], (i, statuses)
