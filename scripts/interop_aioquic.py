@@ -358,7 +358,9 @@ def assert_aioquic_client_to_zttp_server() -> None:
     server = zttp.Connection(
         zttp.SERVER,
         protocol=zttp.HTTP3,
-        credentials=zttp.TlsCredentials(certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32),
+        credentials=zttp.TlsCredentials(
+            certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
+        ),
         transport_params=ZTTP_SERVER_TP,
         random=b"\xab" * 32,
         ephemeral_seed=b"\x33" * 32,
@@ -512,7 +514,9 @@ def assert_aioquic_client_to_zttp_server() -> None:
     resumed_server = zttp.Connection(
         zttp.SERVER,
         protocol=zttp.HTTP3,
-        credentials=zttp.TlsCredentials(certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32),
+        credentials=zttp.TlsCredentials(
+            certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
+        ),
         transport_params=ZTTP_SERVER_TP,
         random=b"\xac" * 32,
         ephemeral_seed=b"\x34" * 32,
@@ -763,7 +767,9 @@ def assert_udp_loopback_aioquic_client_to_zttp_server(drop_first_server_datagram
     server = zttp.Connection(
         zttp.SERVER,
         protocol=zttp.HTTP3,
-        credentials=zttp.TlsCredentials(certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32),
+        credentials=zttp.TlsCredentials(
+            certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
+        ),
         transport_params=ZTTP_SERVER_TP,
         random=b"\xad" * 32,
         ephemeral_seed=b"\x35" * 32,
