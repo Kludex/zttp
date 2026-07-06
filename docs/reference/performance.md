@@ -55,13 +55,18 @@ against the fastest Python parser for that protocol:
 | --- | --- |
 | `benchmarks/http1.py` | httptools (C) and h11 (pure Python) |
 | `benchmarks/http2.py` | h2 (the pure-Python `python-hyper` stack) |
+| `benchmarks/http3.py` | aioquic (the mainstream Python HTTP/3 stack) |
 
 ```console
 ./scripts/bench
 ```
 
-runs both. `./scripts/bench http2` runs one and forwards any extra flags
+runs all three. `./scripts/bench http2` runs one and forwards any extra flags
 (`--batch`, `--repeats`, `--only <substring>`) to it.
+
+HTTP/3 is measured differently: it has no plaintext mode, so `http3.py` times a
+full request/response **round-trip** (both sides' QUIC + QPACK + framing), not an
+isolated parse, against aioquic - the only mainstream Python HTTP/3 stack.
 
 The table above is the HTTP/1 suite. Each benchmark feeds its parsers identical
 input and verifies they extract identical data before timing, so the comparison
