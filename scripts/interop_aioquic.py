@@ -70,7 +70,7 @@ ZTTP_SERVER_PUBLIC_KEY_SEC1 = bytes.fromhex(
 def make_cert_chain(tmp: Path) -> tuple[Path, Path]:
     key = ec.generate_private_key(ec.SECP256R1())
     subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
-    now = dt.datetime.now(dt.UTC)
+    now = dt.datetime.now(dt.timezone.utc)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -99,7 +99,7 @@ def make_zttp_server_cert_der() -> bytes:
     public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ZTTP_SERVER_PUBLIC_KEY_SEC1)
     signing_key = ec.generate_private_key(ec.SECP256R1())
     subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
-    now = dt.datetime.now(dt.UTC)
+    now = dt.datetime.now(dt.timezone.utc)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
