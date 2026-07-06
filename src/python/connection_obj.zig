@@ -734,6 +734,7 @@ const H3Engine = struct {
     fn sessionTickets(self: *const H3Engine) py.Object {
         const q = self.qc orelse return py.newList(0);
         const tickets = q.sessionTickets();
+        const st_type = resultType(&session_ticket_type, "SessionTicket") orelse return null;
         const list = py.newList(@intCast(tickets.len));
         if (list == null) return null;
         for (tickets, 0..) |ticket, i| {
@@ -768,7 +769,13 @@ const H3Engine = struct {
             py.tupleSet(tuple, 4, extensions);
             py.tupleSet(tuple, 5, max_early_data_size);
             py.tupleSet(tuple, 6, psk);
-            py.listSet(list, @intCast(i), tuple);
+            const row = c.PyObject_CallObject(st_type, tuple);
+            py.decref(tuple);
+            if (row == null) {
+                py.decref(list);
+                return null;
+            }
+            py.listSet(list, @intCast(i), row);
         }
         return list;
     }
@@ -858,12 +865,13 @@ const H3Engine = struct {
         return c.PyLong_FromUnsignedLongLong(id);
     }
 
-    /// The peer's CONNECTION_CLOSE as (error_code, reason, is_application), or None if
+    /// The peer's CONNECTION_CLOSE as a zttp.results.CloseInfo, or None if
     /// the peer has not sent one - so an integrator learns WHY the peer closed, not
     /// just that it did.
     fn closeInfo(self: *const H3Engine) py.Object {
         const q = self.qc orelse return py.none();
         const pc = q.peer_close orelse return py.none();
+        const ci_type = resultType(&close_info_type, "CloseInfo") orelse return null;
         const tuple = py.tupleNew(3);
         if (tuple == null) return null;
         const code = c.PyLong_FromUnsignedLongLong(pc.error_code);
@@ -879,7 +887,9 @@ const H3Engine = struct {
         py.tupleSet(tuple, 0, code);
         py.tupleSet(tuple, 1, reason);
         py.tupleSet(tuple, 2, app);
-        return tuple;
+        const row = c.PyObject_CallObject(ci_type, tuple);
+        py.decref(tuple);
+        return row;
     }
 
     /// The peer's HTTP/3 SETTINGS as a dict of the named values, or None until its
@@ -1022,6 +1032,21 @@ var h1_connection_type: py.Object = null;
 var h2_connection_type: py.Object = null;
 var h3_connection_type: py.Object = null;
 var stream_type: py.Object = null;
+// The frozen dataclasses returned by session_tickets() / close_info(), defined in
+// zttp/results.py and loaded lazily on first use (importing a sibling module during
+// the extension's own init would race the package __init__). Cached for the process.
+var session_ticket_type: py.Object = null;
+var close_info_type: py.Object = null;
+
+// Return the zttp.results dataclass named `name`, importing and caching it once.
+fn resultType(cache: *py.Object, name: [*c]const u8) py.Object {
+    if (cache.* != null) return cache.*;
+    const mod = py.import("zttp.results") orelse return null;
+    defer py.decref(mod);
+    const t = py.getAttr(mod, name) orelse return null; // owned; retained for the process
+    cache.* = t;
+    return t;
+}
 
 /// A handle to one HTTP/2 stream on a Connection. It is a borrowed view: the
 /// Connection owns the stream state (the core's stream map); the handle holds the
@@ -2435,10 +2460,10 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "idle_timed_out", .ml_meth = h3_idle_timed_out, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection was silently closed by the idle timeout (RFC 9000 10.1), as opposed to a CONNECTION_CLOSE." },
     .{ .ml_name = "send_session_ticket", .ml_meth = h3_send_session_ticket, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a TLS NewSessionTicket on a confirmed HTTP/3 server connection and return its PSK when available: send_session_ticket(ticket, lifetime=0, age_add=0, nonce=b'', extensions=b'', max_early_data_size=None). Drain it with data_to_send." },
     .{ .ml_name = "send_new_token", .ml_meth = h3_send_new_token, .ml_flags = c.METH_O, .ml_doc = "Queue a QUIC NEW_TOKEN address-validation token from a confirmed HTTP/3 server connection. Drain it with data_to_send." },
-    .{ .ml_name = "session_tickets", .ml_meth = h3_session_tickets, .ml_flags = c.METH_NOARGS, .ml_doc = "Return received TLS session tickets as (lifetime, age_add, nonce, ticket, extensions, max_early_data_size, psk) tuples." },
+    .{ .ml_name = "session_tickets", .ml_meth = h3_session_tickets, .ml_flags = c.METH_NOARGS, .ml_doc = "Return received TLS session tickets as a list of zttp.SessionTicket (fields: lifetime, age_add, nonce, ticket, extensions, max_early_data_size, psk)." },
     .{ .ml_name = "validation_tokens", .ml_meth = h3_validation_tokens, .ml_flags = c.METH_NOARGS, .ml_doc = "Return NEW_TOKEN address-validation tokens received from the peer for use as validation_token on a future HTTP/3 client connection." },
     .{ .ml_name = "close", .ml_meth = @ptrCast(&h3_close), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Send a QUIC CONNECTION_CLOSE: close(app=True, error_code=0, reason=b''). app=True sends an HTTP/3 application close once 1-RTT keys exist; app=False sends a transport close. Drain it with data_to_send." },
-    .{ .ml_name = "close_info", .ml_meth = h3_close_info, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's CONNECTION_CLOSE as (error_code, reason, is_application), or None if the peer has not closed." },
+    .{ .ml_name = "close_info", .ml_meth = h3_close_info, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's CONNECTION_CLOSE as a zttp.CloseInfo (fields: error_code, reason, is_application), or None if the peer has not closed." },
     .{ .ml_name = "peer_settings", .ml_meth = h3_peer_settings, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's HTTP/3 SETTINGS as a dict (max_field_section_size, qpack_max_table_capacity, qpack_blocked_streams), or None until its SETTINGS frame has been received." },
     .{ .ml_name = "shutdown", .ml_meth = h3_shutdown, .ml_flags = c.METH_O, .ml_doc = "Begin a graceful shutdown: send a GOAWAY. Servers announce the first request stream not processed; clients announce the first push ID not accepted (RFC 9114 5.2). A later GOAWAY may only lower the id. Drain it with data_to_send." },
     .{ .ml_name = "goaway_received", .ml_meth = h3_goaway_received, .ml_flags = c.METH_NOARGS, .ml_doc = "The id of a GOAWAY received from the peer (RFC 9114 5.2), or None - the peer is shutting down and will not process streams at or above this id." },

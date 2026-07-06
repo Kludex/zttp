@@ -29,6 +29,8 @@ from zttp._zttp import (
     WindowUpdate,
 )
 from zttp.config import SessionResumption, TlsCredentials
+from zttp.results import CloseInfo, SessionTicket
+from zttp.settings import H2Settings
 
 Event = (
     Request
@@ -52,12 +54,14 @@ __all__ = [
     "HTTP2",
     "HTTP3",
     "NEED_DATA",
+    "CloseInfo",
     "Connection",
     "ConnectionClosed",
     "Data",
     "EndOfMessage",
     "Event",
     "Goaway",
+    "H2Settings",
     "H1Connection",
     "H2Connection",
     "H3Connection",
@@ -70,6 +74,7 @@ __all__ = [
     "Response",
     "RstStream",
     "SessionResumption",
+    "SessionTicket",
     "Settings",
     "Stream",
     "TlsCredentials",
