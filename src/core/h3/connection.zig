@@ -451,7 +451,11 @@ pub const Connection = struct {
         }
         // Consume BEFORE dropping: consuming the last byte of a finished stream is
         // what moves its receive state to terminal, which dropStream then reclaims.
-        if (consumed_total > 0) self.qc.consumeStream(id, consumed_total);
+        // A FIN-only completion (the FIN arrived as a zero-length STREAM frame) still
+        // needs the consume, or the stream never reaches terminal and cannot be dropped.
+        if (consumed_total > 0 or (self.qc.streamFinished(id) and rs.state == .done)) {
+            self.qc.consumeStream(id, consumed_total);
+        }
         // A peer RESET_STREAM cancels the request: surface it as an event (with the
         // peer's error code) once, before the stream is dropped, so the integrator is
         // not left waiting on a request that silently vanished. The flag guards against
@@ -523,7 +527,13 @@ pub const Connection = struct {
             try self.push(.{ .end_of_message = .{ .trailers = trailers, .stream_id = id } });
             rs.state = .done;
         }
-        if (consumed_total > 0) self.qc.consumeStream(id, consumed_total);
+        // Consume the completion even when it carried no new frame bytes (a FIN-only
+        // STREAM frame): consuming is what advances the recv side to its terminal
+        // state, so dropStream below reclaims a finished stream instead of leaving it
+        // for pumpAll to revisit on every datagram.
+        if (consumed_total > 0 or (self.qc.streamFinished(id) and rs.state == .done)) {
+            self.qc.consumeStream(id, consumed_total);
+        }
         if (self.qc.streamReset(id) and !rs.rst_emitted) {
             try self.cancelQpackSectionIfPending(id, rs);
             try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = self.qc.streamResetCode(id) orelse 0 } });
@@ -2017,6 +2027,60 @@ fn buildRequestFin(gpa: std.mem.Allocator, dcid: []const u8, h3_bytes: []const u
     try varint.append(&sframe, gpa, h3_bytes.len);
     try sframe.appendSlice(gpa, h3_bytes);
     return @import("../quic/connection.zig").testBuildApp(gpa, dcid, 0, sframe.items);
+}
+
+// Build an Application-space datagram carrying a zero-length STREAM frame with the
+// FIN bit at `offset` on stream 0 - the request's FIN arriving separately from the
+// HEADERS, as when a peer flushes the head and ends the message in a later send.
+fn buildFinOnly(gpa: std.mem.Allocator, dcid: []const u8, packet_number: u64, offset: u64) ![]u8 {
+    var sframe: std.ArrayListUnmanaged(u8) = .empty;
+    defer sframe.deinit(gpa);
+    try sframe.append(gpa, 0x0f); // STREAM, OFF|LEN|FIN set
+    try varint.append(&sframe, gpa, 0); // stream id 0
+    try varint.append(&sframe, gpa, offset);
+    try varint.append(&sframe, gpa, 0); // length 0, no data
+    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, packet_number, sframe.items);
+}
+
+test "a FIN-only completion reclaims the request stream" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    const qpack_block = [_]u8{
+        0x00, 0x00, // prefix
+        0xC0 | 17, // :method GET
+        0xC0 | 23, // :scheme https
+        0xC0 | 1, // :path /
+        0x50 | 0, 0x03, 'e', 'x', 'y', // literal :authority = "exy"
+    };
+    var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer h3_bytes.deinit(gpa);
+    try h3_frame.append(&h3_bytes, gpa, .headers, &qpack_block);
+
+    // The HEADERS arrive first, without a FIN: the request is delivered and the
+    // stream is tracked, awaiting the end of the message.
+    const headers_dgram = try buildRequest(gpa, &dcid, 0, h3_bytes.items);
+    defer gpa.free(headers_dgram);
+    try qc.receiveDatagram(headers_dgram, 1000);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expectEqual(@as(usize, 1), h3.streams.count());
+
+    // The FIN then arrives as a separate zero-length STREAM frame. The message ends,
+    // and the completed stream must be reclaimed - not left for pumpAll to revisit on
+    // every future datagram (the FIN-only completion still has to be consumed to move
+    // the recv side terminal).
+    const fin_dgram = try buildFinOnly(gpa, &dcid, 1, h3_bytes.items.len);
+    defer gpa.free(fin_dgram);
+    try qc.receiveDatagram(fin_dgram, 1001);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .end_of_message);
+    try testing.expectEqual(@as(usize, 0), h3.streams.count());
 }
 
 test "a request stream ending before HEADERS is request incomplete" {
