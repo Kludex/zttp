@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Final, Literal, NamedTuple, overload
+from typing import Final, Literal, NamedTuple, final, overload
+
+from typing_extensions import disjoint_base
+
+from zttp.config import SessionResumption, TlsCredentials
 
 SERVER: Final = 1
 CLIENT: Final = 2
@@ -11,6 +15,7 @@ HTTP1: Final = 1
 HTTP2: Final = 2
 HTTP3: Final = 3
 
+@final
 class Request:
     method: bytes
     target: bytes
@@ -21,6 +26,7 @@ class Request:
     stream_id: int
     expect_continue: bool
 
+@final
 class Response:
     status_code: int
     reason: bytes
@@ -28,35 +34,45 @@ class Response:
     headers: list[tuple[bytes, bytes]]
     stream_id: int
 
+@final
 class Data:
     data: bytes
     stream_id: int
 
+@final
 class EndOfMessage:
     trailers: list[tuple[bytes, bytes]]
     stream_id: int
 
+@final
 class RstStream:
     stream_id: int
     error_code: int
 
+@final
 class Goaway:
     last_stream_id: int
     error_code: int
     debug: bytes
 
+@final
 class Settings:
     params: list[tuple[int, int]]
 
+@final
 class Ping:
     ack: bool
     data: bytes
 
+@final
 class WindowUpdate:
     stream_id: int
     increment: int
 
+@final
 class NeedData: ...
+
+@final
 class ConnectionClosed: ...
 
 class SessionTicket(NamedTuple):
@@ -94,6 +110,7 @@ class ProtocolError(Exception): ...
 class RemoteProtocolError(ProtocolError): ...
 class LocalProtocolError(ProtocolError): ...
 
+@final
 class Stream:
     # A borrowed, re-validated handle to one multiplexed stream - the single send
     # surface for both HTTP/2 and HTTP/3. Obtained via conn.stream(stream_id).
@@ -104,10 +121,11 @@ class Stream:
         self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., end_stream: bool = ...
     ) -> None: ...
     def send_informational(self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., /) -> None: ...
-    def send_data(self, data: bytes) -> None: ...
+    def send_data(self, data: bytes, /) -> None: ...
     def end_message(self, trailers: list[tuple[bytes, bytes]] | None = ..., /) -> None: ...
     def reset(self, error_code: int = ..., /) -> None: ...
 
+@disjoint_base
 class Connection:
     # A factory base: constructing a Connection returns the protocol-specific subtype
     # (H1Connection / H2Connection / H3Connection). Only next_event() is common to
@@ -122,14 +140,12 @@ class Connection:
         role: Literal[1],
         protocol: Literal[3],
         *,
-        certificate: bytes | None = ...,
-        private_key: bytes | None = ...,
+        credentials: TlsCredentials | None = ...,
         transport_params: bytes | None = ...,
         random: bytes | None = ...,
         ephemeral_seed: bytes | None = ...,
         alpn: bytes | None = ...,
-        resumption_identity: bytes | None = ...,
-        resumption_psk: bytes | None = ...,
+        resumption: SessionResumption | None = ...,
     ) -> H3Connection: ...
     @overload
     def __new__(
@@ -143,8 +159,7 @@ class Connection:
         connection_id: bytes | None = ...,
         alpn: bytes | None = ...,
         server_name: bytes | None = ...,
-        resumption_identity: bytes | None = ...,
-        resumption_psk: bytes | None = ...,
+        resumption: SessionResumption | None = ...,
         obfuscated_ticket_age: int = ...,
         early_data: bool = ...,
         remembered_transport_params: bytes | None = ...,
@@ -156,6 +171,7 @@ class Connection:
     def __new__(cls, role: int, protocol: Literal[1] = ...) -> H1Connection: ...
     def next_event(self) -> Event: ...
 
+@final
 class H1Connection(Connection):
     def receive_data(self, data: bytes, /) -> None: ...
     def data_to_send(self) -> bytes: ...
@@ -165,11 +181,12 @@ class H1Connection(Connection):
     ) -> None: ...
     def send_response(self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., /) -> None: ...
     def send_informational(self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., /) -> None: ...
-    def send_data(self, data: bytes) -> None: ...
+    def send_data(self, data: bytes, /) -> None: ...
     def end_message(self, trailers: list[tuple[bytes, bytes]] | None = ...) -> None: ...
     def should_close(self) -> bool: ...
     def upgrade(self) -> bytes | None: ...
 
+@final
 class H2Connection(Connection):
     send_window: int
     def receive_data(self, data: bytes, /) -> None: ...
@@ -189,6 +206,7 @@ class H2Connection(Connection):
     def close(self, error_code: int = ..., last_stream_id: int | None = ..., /) -> None: ...
     def has_pending_send(self) -> bool: ...
 
+@final
 class H3Connection(Connection):
     # Fed by UDP datagrams rather than a byte stream. Server credentials default
     # to an ephemeral local identity; `alpn` defaults to b"h3" (ALPN is mandatory

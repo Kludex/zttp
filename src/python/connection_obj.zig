@@ -1413,30 +1413,48 @@ fn new_h2(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
 fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
     var role_val: c_long = 0;
     var protocol_val: c_long = HTTP3;
-    var cert_obj: ?*c.PyObject = null;
-    var key_obj: ?*c.PyObject = null;
+    var credentials_obj: ?*c.PyObject = null;
     var tp_obj: ?*c.PyObject = null;
     var random_obj: ?*c.PyObject = null;
     var ephemeral_obj: ?*c.PyObject = null;
     var alpn_obj: ?*c.PyObject = null;
     var cid_obj: ?*c.PyObject = null;
     var sni_obj: ?*c.PyObject = null;
-    var resumption_identity_obj: ?*c.PyObject = null;
-    var resumption_psk_obj: ?*c.PyObject = null;
+    var resumption_obj: ?*c.PyObject = null;
     var obfuscated_ticket_age_obj: ?*c.PyObject = null;
     var early_data_obj: ?*c.PyObject = null;
     var remembered_tp_obj: ?*c.PyObject = null;
     var validation_token_obj: ?*c.PyObject = null;
     var kwlist = [_][*c]u8{
-        @constCast("role"),                  @constCast("protocol"),            @constCast("certificate"),
-        @constCast("private_key"),           @constCast("transport_params"),    @constCast("random"),
-        @constCast("ephemeral_seed"),        @constCast("alpn"),                @constCast("connection_id"),
-        @constCast("server_name"),           @constCast("resumption_identity"), @constCast("resumption_psk"),
-        @constCast("obfuscated_ticket_age"), @constCast("early_data"),          @constCast("remembered_transport_params"),
-        @constCast("validation_token"),      null,
+        @constCast("role"),                        @constCast("protocol"),              @constCast("credentials"),
+        @constCast("transport_params"),            @constCast("random"),                @constCast("ephemeral_seed"),
+        @constCast("alpn"),                        @constCast("connection_id"),         @constCast("server_name"),
+        @constCast("resumption"),                  @constCast("obfuscated_ticket_age"), @constCast("early_data"),
+        @constCast("remembered_transport_params"), @constCast("validation_token"),      null,
     };
-    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$OOOOOOOOOOOOOO", @ptrCast(&kwlist), &role_val, &protocol_val, &cert_obj, &key_obj, &tp_obj, &random_obj, &ephemeral_obj, &alpn_obj, &cid_obj, &sni_obj, &resumption_identity_obj, &resumption_psk_obj, &obfuscated_ticket_age_obj, &early_data_obj, &remembered_tp_obj, &validation_token_obj) == 0) return null;
+    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$OOOOOOOOOOOO", @ptrCast(&kwlist), &role_val, &protocol_val, &credentials_obj, &tp_obj, &random_obj, &ephemeral_obj, &alpn_obj, &cid_obj, &sni_obj, &resumption_obj, &obfuscated_ticket_age_obj, &early_data_obj, &remembered_tp_obj, &validation_token_obj) == 0) return null;
     if (protocol_val != HTTP3) return py.raiseValue("protocol does not match this Connection subclass; construct zttp.Connection to choose by protocol");
+
+    // Unpack the credential / resumption value objects into the raw byte objects the
+    // builders consume. TlsCredentials(certificate, private_key) and
+    // SessionResumption(identity, psk) name the same-typed byte pairs so a caller
+    // cannot transpose them. The GetAttr results are owned refs; free them on return.
+    var cert_obj: ?*c.PyObject = null;
+    var key_obj: ?*c.PyObject = null;
+    var resumption_identity_obj: ?*c.PyObject = null;
+    var resumption_psk_obj: ?*c.PyObject = null;
+    defer py.xdecref(cert_obj);
+    defer py.xdecref(key_obj);
+    defer py.xdecref(resumption_identity_obj);
+    defer py.xdecref(resumption_psk_obj);
+    if (credentials_obj != null and !py.isNone(credentials_obj)) {
+        cert_obj = c.PyObject_GetAttrString(credentials_obj, "certificate") orelse return null;
+        key_obj = c.PyObject_GetAttrString(credentials_obj, "private_key") orelse return null;
+    }
+    if (resumption_obj != null and !py.isNone(resumption_obj)) {
+        resumption_identity_obj = c.PyObject_GetAttrString(resumption_obj, "identity") orelse return null;
+        resumption_psk_obj = c.PyObject_GetAttrString(resumption_obj, "psk") orelse return null;
+    }
 
     const alloc = tp.?.tp_alloc.?;
     const obj = alloc(tp, 0);
@@ -2498,6 +2516,18 @@ var h3_spec = py.Spec{
     .slots = &h3_slots,
 };
 
+// Build a namedtuple type with module="zttp._zttp" so pickle can locate the
+// exported type by reference (register() adds it to the module below). Without an
+// explicit module, namedtuple infers __module__ from the import frame
+// (_frozen_importlib), and pickling a session_tickets()/close_info() row fails.
+fn makeNamedTuple(namedtuple: py.Object, name: [*c]const u8, fields: [*c]const u8) py.Object {
+    const args = c.Py_BuildValue("(ss)", name, fields) orelse return null;
+    defer py.decref(args);
+    const kwargs = c.Py_BuildValue("{s:s}", "module", "zttp._zttp") orelse return null;
+    defer py.decref(kwargs);
+    return c.PyObject_Call(namedtuple, args, kwargs);
+}
+
 pub fn register(module: py.Object) bool {
     connection_type = py.typeFromSpec(&base_spec);
     if (connection_type == null) return false;
@@ -2511,9 +2541,9 @@ pub fn register(module: py.Object) bool {
     if (stream_type == null) return false;
     const namedtuple = py.importFrom("collections", "namedtuple") orelse return false;
     defer py.decref(namedtuple);
-    session_ticket_type = c.PyObject_CallFunction(namedtuple, "ss", "SessionTicket", "lifetime age_add nonce ticket extensions max_early_data_size psk");
+    session_ticket_type = makeNamedTuple(namedtuple, "SessionTicket", "lifetime age_add nonce ticket extensions max_early_data_size psk");
     if (session_ticket_type == null) return false;
-    close_info_type = c.PyObject_CallFunction(namedtuple, "ss", "CloseInfo", "error_code reason is_application");
+    close_info_type = makeNamedTuple(namedtuple, "CloseInfo", "error_code reason is_application");
     if (close_info_type == null) return false;
     _ = c.PyModule_AddObjectRef(module, "Connection", connection_type);
     _ = c.PyModule_AddObjectRef(module, "H1Connection", h1_connection_type);

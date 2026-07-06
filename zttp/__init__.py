@@ -30,6 +30,7 @@ from zttp._zttp import (
     Stream,
     WindowUpdate,
 )
+from zttp.config import SessionResumption, TlsCredentials
 from zttp.settings import H2Settings
 
 Event = (
@@ -73,8 +74,10 @@ __all__ = [
     "Request",
     "Response",
     "RstStream",
+    "SessionResumption",
     "SessionTicket",
     "Settings",
     "Stream",
+    "TlsCredentials",
     "WindowUpdate",
 ]

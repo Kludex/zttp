@@ -10,6 +10,9 @@ set -x
 # Python.
 uv run --no-sync ruff format --check --diff $SOURCE_FILES
 uv run --no-sync mypy zttp
+# Verify the hand-written extension stub matches the compiled module, so the
+# types cannot silently drift from _zttp. Intentional gaps live in the allowlist.
+uv run --no-sync python -m mypy.stubtest zttp._zttp --allowlist tests/stubtest_allowlist.txt
 uv run --no-sync ruff check $SOURCE_FILES
 
 # Zig.
