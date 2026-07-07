@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 __all__ = [
     "CloseInfo",
+    "DatagramHeader",
     "SessionTicket",
 ]
 
@@ -35,3 +36,21 @@ class CloseInfo:
     error_code: int
     reason: bytes
     is_application: bool
+
+
+@dataclass(frozen=True)
+class DatagramHeader:
+    """The routable prefix of a received QUIC datagram (RFC 9000 17).
+
+    Returned by [`parse_datagram_header`][zttp.parse_datagram_header] to demultiplex a
+    shared UDP socket onto per-connection state. A long header carries the connection
+    ids and their lengths on the wire; a short (1-RTT) header does not encode the
+    destination id's length, so `destination_connection_id` is empty for one and the
+    receiver must match it against connection ids it already tracks.
+    """
+
+    destination_connection_id: bytes
+    source_connection_id: bytes
+    version: int
+    is_long_header: bool
+    is_initial: bool

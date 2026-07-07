@@ -61,6 +61,37 @@ pub fn isLong(first: u8) bool {
     return (first & constants.HEADER_FORM_LONG) != 0;
 }
 
+/// A routing view of a received datagram's first packet, for demultiplexing a
+/// shared socket onto per-connection state. A long header carries both connection
+/// ids and their lengths on the wire; a short (1-RTT) header does not encode the
+/// dcid length, so `dcid`/`scid` are empty for one and the receiver must match it
+/// against connection ids it already knows.
+pub const DatagramHeader = struct {
+    long: bool,
+    initial: bool,
+    version: u32,
+    dcid: []const u8,
+    scid: []const u8,
+};
+
+/// Parse just the routable prefix of a received datagram (RFC 9000 17), without
+/// decrypting. Zero-copy: the connection-id slices point into `buf`. A short-header
+/// packet returns `long = false` with empty ids; the caller demuxes it by its own
+/// connection ids. This does no version dispatch, so it also routes unsupported
+/// versions and Version Negotiation packets (neither is ever `initial`).
+pub fn parseDatagramHeader(buf: []const u8) Error!DatagramHeader {
+    if (buf.len < 1) return error.Truncated;
+    if (!isLong(buf[0])) {
+        return .{ .long = false, .initial = false, .version = 0, .dcid = &.{}, .scid = &.{} };
+    }
+    const prefix = try parseLongPrefix(buf);
+    // The long-header type bits are only meaningful for a version we speak; a
+    // Version Negotiation packet (version 0) is never an Initial.
+    const initial = prefix.version != 0 and
+        @as(LongType, @enumFromInt(@as(u2, @truncate(buf[0] >> 4)))) == .initial;
+    return .{ .long = true, .initial = initial, .version = prefix.version, .dcid = prefix.dcid, .scid = prefix.scid };
+}
+
 /// Parse only the invariant long-header prefix: form/fixed bits, version, and
 /// connection IDs. This works before version dispatch, so the connection layer can
 /// generate Version Negotiation for unsupported versions.
@@ -358,6 +389,38 @@ test "parseLongPrefix reads connection ids before version dispatch" {
     try std.testing.expectEqualStrings("dst", p.dcid);
     try std.testing.expectEqualStrings("src", p.scid);
     try std.testing.expectEqual(@as(usize, pkt.len), p.header_len);
+}
+
+test "parseDatagramHeader routes a long-header Initial" {
+    // 0xC0: long form + fixed bit + type bits 00 (Initial); version 1; dcid "dst", scid "src".
+    var pkt = [_]u8{ 0xC0, 0x00, 0x00, 0x00, 0x01, 0x03, 'd', 's', 't', 0x03, 's', 'r', 'c' };
+    const h = try parseDatagramHeader(&pkt);
+    try std.testing.expect(h.long);
+    try std.testing.expect(h.initial);
+    try std.testing.expectEqual(@as(u32, 1), h.version);
+    try std.testing.expectEqualStrings("dst", h.dcid);
+    try std.testing.expectEqualStrings("src", h.scid);
+}
+
+test "parseDatagramHeader reports a short header without connection ids" {
+    var pkt = [_]u8{ 0x40, 0xAA, 0xBB, 0xCC }; // form bit clear = short header
+    const h = try parseDatagramHeader(&pkt);
+    try std.testing.expect(!h.long);
+    try std.testing.expect(!h.initial);
+    try std.testing.expectEqual(@as(usize, 0), h.dcid.len);
+}
+
+test "parseDatagramHeader does not flag Version Negotiation as Initial" {
+    // Version 0 is a Version Negotiation packet; its type bits are meaningless.
+    var pkt = [_]u8{ 0xC0, 0x00, 0x00, 0x00, 0x00, 0x03, 'd', 's', 't', 0x00 };
+    const h = try parseDatagramHeader(&pkt);
+    try std.testing.expect(h.long);
+    try std.testing.expect(!h.initial);
+    try std.testing.expectEqual(@as(u32, 0), h.version);
+}
+
+test "parseDatagramHeader rejects an empty datagram" {
+    try std.testing.expectError(error.Truncated, parseDatagramHeader(&[_]u8{}));
 }
 
 test "parseLong reads a Retry packet and validates its integrity tag" {
