@@ -218,7 +218,11 @@ pub const Decoder = struct {
     }
 
     fn emit(self: *Decoder, name: Span, value: Span, section_size: *usize) Error!void {
-        section_size.* += name.len + value.len + 32; // RFC 9204 4.1 size accounting
+        // RFC 9204 4.1 size accounting. Checked so an attacker-influenced length cannot
+        // wrap the running total in an unchecked (ReleaseFast) build.
+        const field = std.math.add(usize, name.len, value.len) catch return error.DecompressionFailed;
+        const charged = std.math.add(usize, field, 32) catch return error.DecompressionFailed;
+        section_size.* = std.math.add(usize, section_size.*, charged) catch return error.DecompressionFailed;
         self.fields.append(self.gpa, .{ .name = name, .value = value }) catch return error.OutOfMemory;
     }
 
@@ -320,11 +324,17 @@ pub const Decoder = struct {
         const len = try p.integer(prefix);
         const raw = try p.take(len);
         const start = self.store.items.len;
+        // A single field's string cannot legitimately exceed the whole field-section
+        // budget, so reject an oversized one BEFORE growing the store. Otherwise a
+        // peer could force an allocation past the advertised limit (up to the QUIC
+        // flow-control window) before the per-field section-size check catches it.
         if (huff) {
             const need = huffman.decodedLen(raw) catch return error.DecompressionFailed;
+            if (need > self.max_field_section_size) return error.DecompressionFailed;
             self.store.appendNTimes(self.gpa, 0, need) catch return error.OutOfMemory;
             _ = huffman.decode(raw, self.store.items[start..]) catch return error.DecompressionFailed;
         } else {
+            if (raw.len > self.max_field_section_size) return error.DecompressionFailed;
             self.store.appendSlice(self.gpa, raw) catch return error.OutOfMemory;
         }
         return .{ .off = start, .len = self.store.items.len - start };
@@ -408,6 +418,16 @@ test "decode a literal with a static name reference (no Huffman)" {
     const hs = try dec.decode(&block);
     try testing.expectEqualStrings(":authority", hs[0].name);
     try testing.expectEqualStrings("h", hs[0].value);
+}
+
+test "a value larger than the field-section limit is rejected before it is allocated" {
+    const gpa = testing.allocator;
+    var dec = Decoder.init(gpa, 16); // advertise a 16-byte field-section cap
+    defer dec.deinit();
+    // :authority literal (0x50) with a 32-byte value: exceeds the cap on its own, so the
+    // string decoder must reject it rather than grow the store to hold it.
+    const block = [_]u8{ 0x00, 0x00, 0x50, 0x20 } ++ [_]u8{'x'} ** 32;
+    try testing.expectError(error.DecompressionFailed, dec.decode(&block));
 }
 
 test "many literal fields stay valid across store growth (realloc regression)" {
