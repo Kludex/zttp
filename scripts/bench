@@ -1,11 +1,12 @@
 #!/bin/sh -e
 
-# Benchmark each protocol against the fastest Python parser for it: HTTP/1 vs
-# httptools and h11, HTTP/2 vs h2. Local installs default to Debug, whose numbers
-# are meaningless, so rebuild the way wheels ship before measuring.
+# Benchmark each protocol against the fastest Python stack for it: HTTP/1 vs
+# httptools and h11, HTTP/2 vs h2, HTTP/3 vs aioquic. Local installs default to
+# Debug, whose numbers are meaningless, so rebuild the way wheels ship before
+# measuring.
 #
-# No args runs both with their defaults. To pass flags (e.g. --batch, --repeats,
-# or --only), target one protocol:
+# No args runs all three with their defaults. To pass flags (e.g. --batch,
+# --repeats, or --only), target one protocol:
 #   scripts/bench http2 --only GET
 
 set -x
@@ -13,7 +14,7 @@ set -x
 HATCH_ZIG_BUILD_MODE=ReleaseSafe uv sync --all-groups
 
 case "$1" in
-    http1 | http2)
+    http1 | http2 | http3)
         proto="$1"
         shift
         uv run --no-sync python "benchmarks/$proto.py" "$@"
@@ -21,9 +22,10 @@ case "$1" in
     "")
         uv run --no-sync python benchmarks/http1.py
         uv run --no-sync python benchmarks/http2.py
+        uv run --no-sync python benchmarks/http3.py
         ;;
     *)
-        echo "usage: scripts/bench [http1|http2] [args...]" >&2
+        echo "usage: scripts/bench [http1|http2|http3] [args...]" >&2
         exit 2
         ;;
 esac

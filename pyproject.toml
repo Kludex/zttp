@@ -46,6 +46,9 @@ bench = [
     "httptools",
     "h11",
     "h2",
+    # aioquic (the mainstream Python HTTP/3 stack) is the peer for benchmarks/http3.py;
+    # it pulls in cryptography and the pylsqpack QPACK extension.
+    "aioquic",
 ]
 docs = [
     "zensical",
