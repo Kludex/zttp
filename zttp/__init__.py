@@ -27,9 +27,10 @@ from zttp._zttp import (
     Settings,
     Stream,
     WindowUpdate,
+    parse_datagram_header,
 )
 from zttp.config import SessionResumption, TlsCredentials
-from zttp.results import CloseInfo, SessionTicket
+from zttp.results import CloseInfo, DatagramHeader, SessionTicket
 from zttp.settings import H2Settings
 
 Event = (
@@ -58,6 +59,7 @@ __all__ = [
     "Connection",
     "ConnectionClosed",
     "Data",
+    "DatagramHeader",
     "EndOfMessage",
     "Event",
     "Goaway",
@@ -79,4 +81,5 @@ __all__ = [
     "Stream",
     "TlsCredentials",
     "WindowUpdate",
+    "parse_datagram_header",
 ]

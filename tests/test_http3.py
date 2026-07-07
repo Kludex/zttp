@@ -111,6 +111,51 @@ def test_http3_constant_exists() -> None:
     assert zttp.HTTP3 not in (zttp.HTTP1, zttp.HTTP2)
 
 
+def test_parse_datagram_header_routes_a_client_initial() -> None:
+    client = zttp.Connection(
+        zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"localhost", connection_id=b"\xaa\xbb\xcc\xdd"
+    )
+    initial = client.data_to_send()[0]
+    header = zttp.parse_datagram_header(initial)
+    assert isinstance(header, zttp.DatagramHeader)
+    assert header.is_long_header
+    assert header.is_initial
+    assert header.version == 1
+    assert header.destination_connection_id == b"\xaa\xbb\xcc\xdd"
+
+
+def test_parse_datagram_header_reports_a_short_header() -> None:
+    header = zttp.parse_datagram_header(b"\x40\x01\x02\x03")  # form bit clear = short header
+    assert not header.is_long_header
+    assert not header.is_initial
+    assert header.destination_connection_id == b""
+    assert header.source_connection_id == b""
+
+
+def test_parse_datagram_header_rejects_a_malformed_datagram() -> None:
+    with pytest.raises(zttp.RemoteProtocolError):
+        zttp.parse_datagram_header(b"")
+    with pytest.raises(zttp.RemoteProtocolError):
+        zttp.parse_datagram_header(b"\xc0\x00")  # long header truncated mid-prefix
+    with pytest.raises(zttp.RemoteProtocolError):
+        zttp.parse_datagram_header(b"\x00\xaa\xbb")  # short header with the fixed bit clear
+
+
+def test_parse_datagram_header_does_not_trust_an_unsupported_version() -> None:
+    # Type bits 00 resemble an Initial, but only under QUIC v1; an unsupported
+    # version must not be reported as one.
+    header = zttp.parse_datagram_header(b"\xc0\x0a\x0a\x0a\x0a\x03dst\x00")
+    assert header.is_long_header
+    assert not header.is_initial
+    assert header.version == 0x0A0A0A0A
+
+
+def test_parse_datagram_header_result_is_frozen() -> None:
+    header = zttp.parse_datagram_header(b"\x40\x00")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        header.version = 9  # type: ignore[misc]
+
+
 def test_http3_client_construction_emits_an_initial() -> None:
     conn = make_client()
     assert type(conn) is zttp.H3Connection

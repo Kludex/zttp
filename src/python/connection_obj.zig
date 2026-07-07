@@ -1037,6 +1037,46 @@ var stream_type: py.Object = null;
 // the extension's own init would race the package __init__). Cached for the process.
 var session_ticket_type: py.Object = null;
 var close_info_type: py.Object = null;
+var datagram_header_type: py.Object = null;
+
+/// Module-level `parse_datagram_header(datagram) -> DatagramHeader`: the routable
+/// prefix of a received QUIC datagram, for demultiplexing a shared UDP socket onto
+/// per-connection state without constructing a connection.
+fn parse_datagram_header(_: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+    const data = py.asBytes(arg) orelse return null;
+    const hdr = core.quic.packet.parseDatagramHeader(data) catch
+        return py.raise(exceptions.RemoteProtocolError, "malformed QUIC packet header");
+    const dh_type = resultType(&datagram_header_type, "DatagramHeader") orelse return null;
+    const tuple = py.tupleNew(5);
+    if (tuple == null) return null;
+    const dcid = py.fromBytes(hdr.dcid);
+    const scid = py.fromBytes(hdr.scid);
+    const version = c.PyLong_FromUnsignedLong(hdr.version);
+    const long = py.boolean(hdr.long);
+    const initial = py.boolean(hdr.initial);
+    if (dcid == null or scid == null or version == null or long == null or initial == null) {
+        py.xdecref(dcid);
+        py.xdecref(scid);
+        py.xdecref(version);
+        py.xdecref(long);
+        py.xdecref(initial);
+        py.decref(tuple);
+        return null;
+    }
+    py.tupleSet(tuple, 0, dcid);
+    py.tupleSet(tuple, 1, scid);
+    py.tupleSet(tuple, 2, version);
+    py.tupleSet(tuple, 3, long);
+    py.tupleSet(tuple, 4, initial);
+    const row = c.PyObject_CallObject(dh_type, tuple);
+    py.decref(tuple);
+    return row;
+}
+
+pub var module_methods = [_]c.PyMethodDef{
+    .{ .ml_name = "parse_datagram_header", .ml_meth = parse_datagram_header, .ml_flags = c.METH_O, .ml_doc = "Parse the routable prefix of a received QUIC datagram: parse_datagram_header(datagram) -> DatagramHeader. Reads no connection state; for demultiplexing a shared UDP socket by connection id." },
+    .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
+};
 
 // Return the zttp.results dataclass named `name`, importing and caching it once.
 fn resultType(cache: *py.Object, name: [*c]const u8) py.Object {

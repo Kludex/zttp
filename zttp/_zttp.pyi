@@ -7,7 +7,7 @@ from typing import Final, Literal, final, overload
 from typing_extensions import disjoint_base
 
 from zttp.config import SessionResumption, TlsCredentials
-from zttp.results import CloseInfo, SessionTicket
+from zttp.results import CloseInfo, DatagramHeader, SessionTicket
 
 SERVER: Final = 1
 CLIENT: Final = 2
@@ -15,6 +15,17 @@ CLIENT: Final = 2
 HTTP1: Final = 1
 HTTP2: Final = 2
 HTTP3: Final = 3
+
+def parse_datagram_header(datagram: bytes, /) -> DatagramHeader:
+    """Parse the routable prefix of a received QUIC datagram (RFC 9000 17).
+
+    Reads no connection state and does not decrypt - it just exposes the form bit,
+    version, and connection ids so a server sharing one UDP socket can demultiplex
+    datagrams onto per-connection state by destination connection id. A short (1-RTT)
+    header does not encode the destination id's length, so `is_long_header` is `False`
+    and the ids are empty; match those against the connection ids you already track.
+    Raises `RemoteProtocolError` on a truncated or malformed header.
+    """
 
 @final
 class Request:

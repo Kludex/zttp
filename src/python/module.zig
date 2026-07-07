@@ -13,7 +13,7 @@ var module_def = c.PyModuleDef{
     .m_name = "_zttp",
     .m_doc = "zttp: a sans-IO HTTP parser with a Zig core.",
     .m_size = -1,
-    .m_methods = null,
+    .m_methods = &connection.module_methods,
 };
 
 fn PyInit__zttp() callconv(.c) ?*c.PyObject {
