@@ -137,6 +137,17 @@ def test_parse_datagram_header_rejects_a_malformed_datagram() -> None:
         zttp.parse_datagram_header(b"")
     with pytest.raises(zttp.RemoteProtocolError):
         zttp.parse_datagram_header(b"\xc0\x00")  # long header truncated mid-prefix
+    with pytest.raises(zttp.RemoteProtocolError):
+        zttp.parse_datagram_header(b"\x00\xaa\xbb")  # short header with the fixed bit clear
+
+
+def test_parse_datagram_header_does_not_trust_an_unsupported_version() -> None:
+    # Type bits 00 resemble an Initial, but only under QUIC v1; an unsupported
+    # version must not be reported as one.
+    header = zttp.parse_datagram_header(b"\xc0\x0a\x0a\x0a\x0a\x03dst\x00")
+    assert header.is_long_header
+    assert not header.is_initial
+    assert header.version == 0x0A0A0A0A
 
 
 def test_parse_datagram_header_result_is_frozen() -> None:

@@ -82,12 +82,15 @@ pub const DatagramHeader = struct {
 pub fn parseDatagramHeader(buf: []const u8) Error!DatagramHeader {
     if (buf.len < 1) return error.Truncated;
     if (!isLong(buf[0])) {
+        // A short header still carries the QUIC fixed bit; a clear one is malformed.
+        if ((buf[0] & constants.FIXED_BIT) == 0) return error.Malformed;
         return .{ .long = false, .initial = false, .version = 0, .dcid = &.{}, .scid = &.{} };
     }
     const prefix = try parseLongPrefix(buf);
-    // The long-header type bits are only meaningful for a version we speak; a
-    // Version Negotiation packet (version 0) is never an Initial.
-    const initial = prefix.version != 0 and
+    // The long-header type bits are version-specific, so only trust them for QUIC v1;
+    // an unsupported version (or a Version Negotiation packet, version 0) is never an
+    // Initial we would open a connection for.
+    const initial = prefix.version == constants.VERSION_1 and
         @as(LongType, @enumFromInt(@as(u2, @truncate(buf[0] >> 4)))) == .initial;
     return .{ .long = true, .initial = initial, .version = prefix.version, .dcid = prefix.dcid, .scid = prefix.scid };
 }
@@ -403,11 +406,16 @@ test "parseDatagramHeader routes a long-header Initial" {
 }
 
 test "parseDatagramHeader reports a short header without connection ids" {
-    var pkt = [_]u8{ 0x40, 0xAA, 0xBB, 0xCC }; // form bit clear = short header
+    var pkt = [_]u8{ 0x40, 0xAA, 0xBB, 0xCC }; // form bit clear, fixed bit set = short header
     const h = try parseDatagramHeader(&pkt);
     try std.testing.expect(!h.long);
     try std.testing.expect(!h.initial);
     try std.testing.expectEqual(@as(usize, 0), h.dcid.len);
+}
+
+test "parseDatagramHeader rejects a short header with the fixed bit clear" {
+    var pkt = [_]u8{ 0x00, 0xAA, 0xBB }; // form bit clear AND fixed bit clear = malformed
+    try std.testing.expectError(error.Malformed, parseDatagramHeader(&pkt));
 }
 
 test "parseDatagramHeader does not flag Version Negotiation as Initial" {
@@ -417,6 +425,16 @@ test "parseDatagramHeader does not flag Version Negotiation as Initial" {
     try std.testing.expect(h.long);
     try std.testing.expect(!h.initial);
     try std.testing.expectEqual(@as(u32, 0), h.version);
+}
+
+test "parseDatagramHeader does not flag an unsupported version as Initial" {
+    // Type bits 00 look like Initial, but they are only v1 semantics; a nonzero
+    // unsupported version must not be reported as an Initial.
+    var pkt = [_]u8{ 0xC0, 0x0A, 0x0A, 0x0A, 0x0A, 0x03, 'd', 's', 't', 0x00 };
+    const h = try parseDatagramHeader(&pkt);
+    try std.testing.expect(h.long);
+    try std.testing.expect(!h.initial);
+    try std.testing.expectEqual(@as(u32, 0x0A0A_0A0A), h.version);
 }
 
 test "parseDatagramHeader rejects an empty datagram" {
