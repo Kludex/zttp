@@ -1,7 +1,11 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Wheels must run on CPUs other than the machine that built them. Keep a
+    // conservative default while still allowing an explicit -Dcpu override.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .cpu_model = .baseline },
+    });
     const optimize = b.standardOptimizeOption(.{});
     // DWARF debug info is ~3 MB per extension (vs ~450 KB of code); shipped
     // wheels don't need it. Keep it for Debug builds.
