@@ -29,6 +29,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          # hatch-vcs derives the version from git tags; the default shallow
+          # checkout fetches none, so it would stamp a fallback (0.0.1.dev1) onto
+          # the wheels and sdist. Fetch the full history + tags for the real version.
+          fetch-depth: 0
 
       # cibuildwheel's build[uv] frontend needs uv on PATH; the manylinux
       # containers ship it, the macOS runner does not.
@@ -54,6 +58,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          # hatch-vcs derives the version from git tags; the default shallow
+          # checkout fetches none, so it would stamp a fallback (0.0.1.dev1) onto
+          # the wheels and sdist. Fetch the full history + tags for the real version.
+          fetch-depth: 0
 
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
@@ -90,7 +98,7 @@ jobs:
           merge-multiple: true
 
       - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           repository-url: https://test.pypi.org/legacy/
           # main is pushed repeatedly with the same dev version; don't fail when
@@ -119,7 +127,10 @@ jobs:
           merge-multiple: true
 
       - name: Publish to PyPI
-        # Pinned by release tag, not bare SHA: this is a Docker action and the
-        # runner resolves its published image by the release ref. A SHA pin makes
-        # it look up ghcr.io/...:<sha>, which has no manifest ("manifest unknown").
-        uses: pypa/gh-action-pypi-publish@release/v1
+        # SHA-pinned like every other action: this step runs with id-token: write
+        # (OIDC trusted publishing to real PyPI), so a mutable ref is the highest-
+        # value supply-chain target in the repo. Current release/v1 is a composite
+        # action that builds its own container at run time - it does not resolve a
+        # per-ref image - so SHA pinning works (no "manifest unknown"). Bump with the
+        # release tag when updating.
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
