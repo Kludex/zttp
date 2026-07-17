@@ -22,7 +22,7 @@ import zttp
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     conn = zttp.Connection(zttp.SERVER)
     try:
-        while not conn.should_close():
+        while True:
             request = None
             body = bytearray()
             # Pull complete events; refill from the socket whenever we run dry.
@@ -48,6 +48,10 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
             conn.end_message()
             writer.write(conn.data_to_send())
             await writer.drain()
+            # should_close() reflects the request just parsed (Connection: close, or
+            # HTTP/1.0 without keep-alive); start_next_cycle() clears it, so ask now.
+            if conn.should_close():
+                return
             conn.start_next_cycle()  # reuse the connection for the next request
     except zttp.RemoteProtocolError:
         conn.send_response(400, [(b"content-length", b"0")])
@@ -137,12 +141,16 @@ await writer.drain()
 
 HTTP/1.1 reuses the connection, so the outer loop serves request after request.
 zttp works out from the head whether the peer wants to close, so you don't scan
-headers - you ask:
+headers - you ask. `should_close()` is only meaningful once the request head is
+parsed, and `start_next_cycle()` resets it, so check it **after** you've answered
+and before you cycle:
 
 ```python
-while not conn.should_close():   # Connection: close, or HTTP/1.0 without keep-alive
+while True:
     ...
-    conn.start_next_cycle()      # parse the next request on the same connection
+    if conn.should_close():   # Connection: close, or HTTP/1.0 without keep-alive
+        return                # honor it before start_next_cycle() clears the signal
+    conn.start_next_cycle()   # otherwise parse the next request on the same connection
 ```
 
 ## When the peer misbehaves
