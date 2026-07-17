@@ -24,6 +24,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Zig",
     "Topic :: Internet :: WWW/HTTP",
 ]
@@ -99,11 +100,16 @@ include = ["zttp", "src", "tools", "build.zig"]
 # Zig comes from the `ziglang` build requirement (build isolation), so no system
 # toolchain install is needed. The sans-IO core has no OS dependencies, so it
 # builds for glibc, musl, macOS, and Windows alike. Skip only 32-bit and PyPy.
-# cp314t is the free-threaded build; the extension declares Py_MOD_GIL_NOT_USED.
-# Windows is skipped for cp314t: its pyconfig.h doesn't self-define Py_GIL_DISABLED
-# (POSIX does), so translate-c would compile against the GIL ABI and mismatch.
-build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
-skip = "*_i686 *-pp* cp314t-win*"
+# cp314t/cp315t are the free-threaded builds; the extension declares Py_MOD_GIL_NOT_USED.
+# Windows is skipped for the free-threaded builds: their pyconfig.h doesn't self-define
+# Py_GIL_DISABLED (POSIX does), so translate-c would compile against the GIL ABI and
+# mismatch (still true in 3.15's PC/pyconfig.h).
+build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-* cp315-* cp315t-*"
+skip = "*_i686 *-pp* cp314t-win* cp315t-win*"
+# 3.15 is in beta; cibuildwheel only offers it behind this flag. Drop it (and cut
+# a release to rebuild the cp315 wheels) once 3.15.0 final is out - the C ABI is
+# only guaranteed stable from rc1 onward.
+enable = ["cpython-prerelease"]
 build-frontend = "build[uv]"
 test-command = 'python -c "import zttp; c = zttp.Connection(zttp.SERVER); c.receive_data(b\"GET / HTTP/1.1\r\n\r\n\"); assert type(c.next_event()).__name__ == \"Request\""'
 

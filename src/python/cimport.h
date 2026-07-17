@@ -10,6 +10,15 @@
 #define NDEBUG 1
 #endif
 #define PY_SSIZE_T_CLEAN
+/* 3.15's free-threaded object.h wraps ob_tid in
+ * _Py_ALIGNED_DEF(_PyObject_MIN_ALIGNMENT, uintptr_t), whose C11 expansion is
+ * `_Alignas(4) _Alignas(uintptr_t)`. Zig's translate-c rejects the first
+ * specifier as under-aligned instead of combining them, so pre-define the macro
+ * (pymacro.h honors an existing definition) with CPython's own GCC/Clang
+ * fallback: `aligned` never decreases alignment, giving the same layout. */
+#ifndef _Py_ALIGNED_DEF
+#define _Py_ALIGNED_DEF(N, T) __attribute__((aligned(N))) T
+#endif
 #include <Python.h>
 /* The Py_T_* / Py_READONLY member-def constants are 3.12+. On 3.10/3.11 the
  * equivalents (T_OBJECT_EX / T_BOOL / READONLY) live in structmember.h, which
