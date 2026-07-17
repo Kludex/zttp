@@ -455,6 +455,13 @@ pub const Connection = struct {
         // DATA; surfacing a body here would let a proxy forward one where none is
         // permitted (response smuggling). Reject before the event escapes.
         if (s.expects_bodyless and content.len > 0) {
+            // Terminate the stream so a peer streaming bad bodyless responses cannot
+            // leave a trail of reset-but-tracked streams. Evict directly rather than
+            // via resetStream: this is our reset of the peer's misbehavior, so it
+            // must NOT count against our own reset-flood budget (chargeReset), which
+            // a malicious server could otherwise use to trip us into a GOAWAY.
+            s.recvApply(.rst_stream, false); // -> closed
+            self.evictStream(f.header.stream_id);
             self.pushRst(f.header.stream_id, .protocol_error);
             return;
         }
@@ -991,7 +998,10 @@ pub const Connection = struct {
     /// stream send windows (and the peer's max frame) allow, parking the rest.
     pub fn sendStreamData(self: *Connection, writer: *writer_mod.Writer, id: u32, data: []const u8, end_stream: bool) writer_mod.WriteError!void {
         try self.registerSendStream(id);
-        const s = self.streams.getPtr(id).?;
+        // registerSendStream refuses to resurrect a stream the peer already reset,
+        // so it may be absent here; sending on a dead stream is a recoverable local
+        // protocol error, not a null-optional trap.
+        const s = self.streams.getPtr(id) orelse return error.LocalProtocol;
         if (data.len != 0) s.send_pending.appendSlice(self.gpa, data) catch return error.OutOfMemory;
         if (end_stream) s.send_end_pending = true;
         try self.flushStream(writer, id);
@@ -1749,6 +1759,13 @@ test "a peer RST evicts the stream so a late server response cannot reopen it" {
     try c.endResponseStream(1);
     try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
 
+    // A late send_data on the reset stream is a recoverable local protocol error,
+    // not a null-optional trap.
+    var writer = writer_mod.Writer.init(testing.allocator, .server);
+    defer writer.deinit();
+    try testing.expectError(error.LocalProtocol, c.sendStreamData(&writer, 1, "body", false));
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
+
     // Late peer DATA on the closed stream is a stream error, not a Data event.
     var more: std.ArrayList(u8) = .empty;
     defer more.deinit(testing.allocator);
@@ -1773,6 +1790,9 @@ test "client rejects a body on a bodyless (HEAD) response" {
     // The forbidden body is rejected as a stream PROTOCOL_ERROR, not surfaced.
     const ev = try c.nextEvent();
     try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), ev.rst_stream.error_code);
+    // And the reset stream is evicted, not left tracked (no state leak from a peer
+    // streaming bad bodyless responses).
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
 }
 
 // A client's inbound handshake is just the server's SETTINGS - no preface to
