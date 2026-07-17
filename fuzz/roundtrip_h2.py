@@ -22,8 +22,10 @@ def roundtrip_h2(data: bytes) -> None:
     method, target, headers, body = draw_request(data, safe=True)
     # The client derives :authority from a host header; keep exactly one so the
     # roundtrip is deterministic (a request with no host still works - :authority
-    # is just absent).
-    sent_headers = [(k, v) for k, v in headers if k.lower() != b"host"]
+    # is just absent). Lowercase every name: HTTP/2 forbids uppercase field names
+    # and the writer rejects them, so the safe corpus (HTTP/1-style capitalized)
+    # would otherwise make send_request raise and skip the differential entirely.
+    sent_headers = [(k.lower(), v) for k, v in headers if k.lower() != b"host"]
     sent_headers.append((b"host", b"example.com"))
 
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
