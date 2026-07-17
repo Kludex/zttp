@@ -45,6 +45,16 @@ client = zttp.Connection(
 Omit `credentials` and the server uses an ephemeral local identity (development
 only).
 
+!!! danger "The client does not authenticate the server"
+    The HTTP/3 client completes the TLS 1.3 handshake but does **not** verify the
+    server's certificate: it does not check that the certificate chains to a
+    trusted CA, is within its validity period, or matches `server_name` (which is
+    used for SNI only). An active on-path attacker can present a self-signed
+    certificate and complete the handshake, so the HTTP/3 client is **not safe
+    over untrusted networks** - use it only against servers you already trust
+    (local testing, interoperability work). Certificate verification is planned:
+    [#144](https://github.com/Kludex/zttp/issues/144).
+
 !!! warning "Scope"
     HTTP/3 support is still experimental. The public surface is intentionally
     the same event model as HTTP/1.1 and HTTP/2, but the transport underneath is
