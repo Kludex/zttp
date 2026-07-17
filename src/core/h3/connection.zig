@@ -375,7 +375,14 @@ pub const Connection = struct {
         // began before the GOAWAY is left to complete (it is below the id, or already
         // tracked).
         if (self.goaway_sent) |limit| {
-            if (id >= limit and !self.streams.contains(id)) {
+            // Exempt only a stream we have actually begun processing (a Request was
+            // surfaced, so its state left .idle). A merely pre-tracked idle
+            // placeholder - created when a partial HEADERS frame arrived but no
+            // Request was emitted yet - must still be rejected: otherwise a peer
+            // could send a HEADERS fragment on a high stream id, wait for the
+            // GOAWAY, then complete it and slip a request past the advertised limit.
+            const already_processing = if (self.streams.getPtr(id)) |rs| rs.state != .idle else false;
+            if (id >= limit and !already_processing) {
                 // We promised not to process this request (RFC 9114 5.2): reject it
                 // with H3_REQUEST_REJECTED so the client knows it may safely retry on a
                 // fresh connection, rather than silently dropping it.
@@ -1952,6 +1959,38 @@ test "a rejected open stream stays quarantined on a later frame" {
     try qc.receiveDatagram(d2, 1100);
     try h3.pump(0);
     try testing.expect(h3.nextEvent() == .need_data); // still no request
+}
+
+test "a partial request stream cannot slip past a GOAWAY by completing later" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x9a, 0x9b, 0x9c, 0x9d };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A HEADERS frame on stream 0 (type 0x01, declared length 5) of which only 3 of
+    // the 5 payload bytes arrive: decode needs more, so the request stream is merely
+    // tracked as idle and no Request is surfaced yet.
+    const d1 = try buildRequest(gpa, &dcid, 0, &.{ 0x01, 0x05, 0x00, 0x00, 0xC0 | 17 });
+    defer gpa.free(d1);
+    try qc.receiveDatagram(d1, 1000);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .need_data);
+
+    // The server then advertises a GOAWAY: it will not process stream 0 or above.
+    try h3.shutdown(0);
+
+    // The peer completes the header block (the remaining 2 bytes at stream offset 5).
+    // Because the stream was only pre-tracked (idle), the GOAWAY guard must still
+    // reject it - surfacing a Request here would process a request past the limit
+    // the server just promised not to cross.
+    const d2 = try buildRequestAt(gpa, &dcid, 5, 1, &.{ 0xC0 | 23, 0xC0 | 1 });
+    defer gpa.free(d2);
+    try qc.receiveDatagram(d2, 1100);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .need_data); // rejected, not surfaced
 }
 
 test "a control byte in a field value is malformed" {
