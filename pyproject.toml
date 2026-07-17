@@ -1,5 +1,8 @@
 [build-system]
-requires = ["hatchling", "hatch-ziglang>=0.2", "uv-dynamic-versioning>=0.8.0", "ziglang==0.16.0"]
+# hatch-vcs over uv-dynamic-versioning: the latter drags in jinja2 -> markupsafe,
+# whose missing-wheel source build breaks cross-compiled macOS wheels on new
+# CPythons. The hatch-vcs chain is pure Python.
+requires = ["hatchling", "hatch-vcs", "hatch-ziglang>=0.2", "ziglang==0.16.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -76,14 +79,15 @@ cache-keys = [
 ]
 
 [tool.hatch.version]
-source = "uv-dynamic-versioning"
+source = "vcs"
 
-[tool.uv-dynamic-versioning]
-vcs = "git"
-style = "pep440"
-bump = true
-metadata = false  # drop the +<hash> local segment; PyPI rejects it on uploads
-fallback-version = "0.0.0"
+[tool.hatch.version.raw-options]
+# guess-next-dev matches the old uv-dynamic-versioning bump=true behavior
+# (tag 0.0.16 + N commits -> 0.0.17.devN); no-local-version drops the +<hash>
+# local segment, which PyPI rejects on uploads.
+version_scheme = "guess-next-dev"
+local_scheme = "no-local-version"
+fallback_version = "0.0.0"
 
 [tool.hatch.build.targets.wheel]
 packages = ["zttp"]
