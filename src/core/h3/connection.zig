@@ -881,6 +881,18 @@ pub const Connection = struct {
                     else => return e,
                 };
                 self.clearBlockedHeaders(rs);
+                // A QPACK-blocked request whose headers only just unblocked is still
+                // an idle pre-tracked stream at this point. If we have advertised a
+                // GOAWAY at or below its id, we promised not to process it (RFC 9114
+                // 5.2) - reject here too, or this resume path would surface it past
+                // the limit, bypassing the guard in pumpRequest. Trailers are not
+                // checked: they belong to a request already being processed.
+                if (self.goaway_sent) |limit| {
+                    if (id >= limit) {
+                        try self.rejectStream(id, .request_rejected);
+                        return false;
+                    }
+                }
                 try self.push(.{ .request = req });
                 rs.state = .headers_done;
                 return true;
@@ -4502,6 +4514,38 @@ test "a request blocked on QPACK resumes when encoder inserts arrive" {
     try testing.expectEqualStrings("x", ev.request.headers[0].name);
     try testing.expectEqualStrings("y", ev.request.headers[0].value);
     try testing.expect(h3.nextEvent() == .end_of_message);
+}
+
+test "a QPACK-blocked request cannot slip past a GOAWAY when it unblocks" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xcc, 0xcd, 0xce, 0xd4 };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    // A HEADERS block referencing a dynamic entry blocks on QPACK: it is consumed
+    // and stored, the stream tracked as idle, no Request surfaced.
+    const qpack_block = [_]u8{ 0x02, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x80 };
+    var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer h3_bytes.deinit(gpa);
+    try h3_frame.append(&h3_bytes, gpa, .headers, &qpack_block);
+    const req_dgram = try buildRequestOnFin(gpa, &dcid, 0, 0, h3_bytes.items);
+    defer gpa.free(req_dgram);
+    try qc.receiveDatagram(req_dgram, 1000);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .need_data);
+
+    // The server advertises a GOAWAY at stream 0 while the request is still blocked.
+    try h3.shutdown(0);
+
+    // The encoder inserts arrive and unblock the headers. The resume path must
+    // honor the GOAWAY too - reject the request, do not surface it past the limit.
+    const enc_dgram = try buildUni(gpa, &dcid, 2, 1, &.{ 0x02, 0x3f, 0x61, 0x41, 'x', 0x01, 'y' });
+    defer gpa.free(enc_dgram);
+    try qc.receiveDatagram(enc_dgram, 2000);
+    try h3.pump(2);
+    try testing.expect(h3.nextEvent() == .need_data); // rejected, not surfaced
 }
 
 test "too many QPACK-blocked request streams is a decompression error" {
