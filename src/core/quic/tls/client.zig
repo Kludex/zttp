@@ -7,6 +7,7 @@ const std = @import("std");
 const wire = @import("wire.zig");
 const keyshare = @import("keyshare.zig");
 const sign = @import("sign.zig");
+const verify = @import("verify.zig");
 const extension = @import("extension.zig");
 const client_hello = @import("client_hello.zig");
 const handshake = @import("handshake.zig");
@@ -21,6 +22,9 @@ pub const Error = error{
     UnexpectedMessage,
     BadServerHello,
     BadNewSessionTicket,
+    /// The server's certificate chain failed verification (untrusted, expired,
+    /// or the SubjectAltName did not match server_name).
+    BadCertificate,
     Internal,
     OutOfMemory,
 };
@@ -33,6 +37,13 @@ pub const Config = struct {
     server_name: ?[]const u8 = null,
     resumption: ?ResumptionPsk = null,
     validation_token: ?[]const u8 = null,
+    /// How the server certificate is authenticated. Defaults to `.insecure`: this
+    /// is a low-level sans-IO primitive, and the caller (the Python binding, or an
+    /// integrator) is expected to pass an explicit trust store - the binding is
+    /// fail-closed. `server_name`, when set, is matched against the leaf SAN.
+    trust: verify.Trust = .insecure,
+    /// Current time in Unix seconds, for certificate validity checks.
+    now_sec: i64 = 0,
 };
 
 pub const ResumptionPsk = struct {
@@ -89,9 +100,17 @@ pub const Client = struct {
     resumption_master_secret: ?[schedule.SECRET_LEN]u8 = null,
     expected_alpn: [255]u8 = [_]u8{0} ** 255,
     expected_alpn_len: u8 = 0,
+    trust: verify.Trust = .insecure,
+    now_sec: i64 = 0,
+    host: [255]u8 = [_]u8{0} ** 255,
+    host_len: u8 = 0,
 
     pub fn init() Client {
         return .{};
+    }
+
+    fn hostSlice(self: *const Client) ?[]const u8 {
+        return if (self.host_len == 0) null else self.host[0..self.host_len];
     }
 
     pub fn start(self: *Client, out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, cfg: Config) Error!void {
@@ -109,6 +128,15 @@ pub const Client = struct {
             self.expected_alpn_len = @intCast(proto.len);
         } else {
             self.expected_alpn_len = 0;
+        }
+        self.trust = cfg.trust;
+        self.now_sec = cfg.now_sec;
+        if (cfg.server_name) |name| {
+            if (name.len > self.host.len) return error.Internal;
+            @memcpy(self.host[0..name.len], name);
+            self.host_len = @intCast(name.len);
+        } else {
+            self.host_len = 0;
         }
         self.transcript.update(out.items[before..]);
         self.early_traffic_secret = if (cfg.resumption) |psk|
@@ -146,6 +174,15 @@ pub const Client = struct {
             if (!std.mem.eql(u8, selected, self.expected_alpn[0..self.expected_alpn_len])) return error.BadServerHello;
         }
         const cert = handshake.firstCertificate(scanned.cert.body) catch return error.BadServerHello;
+
+        // Authenticate the server: the certificate chain must be trusted for
+        // server_name at now_sec. Without this the CertificateVerify below only
+        // proves the peer holds *some* key, not that it is the intended server.
+        verify.verifyCertificateMessage(scanned.cert.body, .{
+            .trust = self.trust,
+            .host = self.hostSlice(),
+            .now_sec = self.now_sec,
+        }) catch return error.BadCertificate;
 
         self.transcript.update(scanned.ee.raw);
         self.transcript.update(scanned.cert.raw);
@@ -511,6 +548,132 @@ fn appendFinished(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, veri
 }
 
 const testing = std.testing;
+const x509 = @import("x509.zig");
+const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+
+const CERT_NOW: i64 = 1700000000; // 2023-11-14
+const CERT_NOT_BEFORE: i64 = 1672531200; // 2023-01-01
+const CERT_NOT_AFTER: i64 = 1988150400; // 2033-01-01
+
+// Build a full server flight (with a real cert chain, signed by `signer`) for a
+// client whose ClientHello is in `ch_items`. Caller frees the returned bytes.
+fn serverFlightWithCert(alloc: std.mem.Allocator, ch_items: []const u8, cert_der: []const u8, signer: sign.Signer) ![]u8 {
+    const server_flight = @import("flight.zig");
+    const decoded = try client_hello.parse(ch_items);
+    var server_transcript = transcript.Transcript{};
+    server_transcript.update(decoded.value.raw);
+    var flight_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer flight_bytes.deinit(alloc);
+    _ = try server_flight.build(&flight_bytes, alloc, &server_transcript, .{
+        .legacy_session_id = decoded.value.legacy_session_id,
+        .client_key_share = decoded.value.client_key_share,
+    }, .{
+        .random = [_]u8{0xAB} ** 32,
+        .ephemeral_seed = [_]u8{0x33} ** 32,
+        .signer = signer,
+        .cert_chain = cert_der,
+        .transport_params = &.{ 0x04, 0x01, 0x40 },
+        .alpn = "h3",
+    });
+    return flight_bytes.toOwnedSlice(alloc);
+}
+
+// A deterministic self-signed cert for example.com whose key matches `signer`.
+fn exampleCert(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), seed: [32]u8) ![]const u8 {
+    const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
+    return x509.selfSigned(buf, alloc, kp, .{ .dns_name = "example.com", .not_before = CERT_NOT_BEFORE, .not_after = CERT_NOT_AFTER });
+}
+
+test "client accepts a pinned, in-date server certificate for the right host" {
+    const alloc = testing.allocator;
+    const seed = [_]u8{0x42} ** 32;
+    const signer = try sign.Signer.fromSeed(seed);
+    var cert_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer cert_buf.deinit(alloc);
+    const cert_der = try exampleCert(alloc, &cert_buf, seed);
+
+    var bundle = try verify.bundleFromDer(alloc, &.{cert_der}, CERT_NOW);
+    defer bundle.deinit(alloc);
+
+    var ch: std.ArrayListUnmanaged(u8) = .empty;
+    defer ch.deinit(alloc);
+    var client = Client.init();
+    try client.start(&ch, alloc, .{
+        .random = [_]u8{0x11} ** 32,
+        .ephemeral_seed = [_]u8{0x22} ** 32,
+        .transport_params = &.{ 0x04, 0x01, 0x40 },
+        .alpn = "h3",
+        .server_name = "example.com",
+        .trust = .{ .anchors = &bundle },
+        .now_sec = CERT_NOW,
+    });
+    const flight = try serverFlightWithCert(alloc, ch.items, cert_der, signer);
+    defer alloc.free(flight);
+    const sh = handshake.peek(flight).?;
+    _ = try client.onServerHello(flight[0..sh.len]);
+    const outcome = try client.onServerFlight(&ch, alloc, flight[sh.len..]);
+    try testing.expect(outcome != null);
+}
+
+test "client rejects an untrusted server certificate" {
+    const alloc = testing.allocator;
+    const seed = [_]u8{0x42} ** 32;
+    const signer = try sign.Signer.fromSeed(seed);
+    var cert_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer cert_buf.deinit(alloc);
+    const cert_der = try exampleCert(alloc, &cert_buf, seed);
+
+    var empty_bundle: std.crypto.Certificate.Bundle = .empty; // trusts nothing
+    defer empty_bundle.deinit(alloc);
+
+    var ch: std.ArrayListUnmanaged(u8) = .empty;
+    defer ch.deinit(alloc);
+    var client = Client.init();
+    try client.start(&ch, alloc, .{
+        .random = [_]u8{0x11} ** 32,
+        .ephemeral_seed = [_]u8{0x22} ** 32,
+        .transport_params = &.{ 0x04, 0x01, 0x40 },
+        .alpn = "h3",
+        .server_name = "example.com",
+        .trust = .{ .anchors = &empty_bundle },
+        .now_sec = CERT_NOW,
+    });
+    const flight = try serverFlightWithCert(alloc, ch.items, cert_der, signer);
+    defer alloc.free(flight);
+    const sh = handshake.peek(flight).?;
+    _ = try client.onServerHello(flight[0..sh.len]);
+    try testing.expectError(error.BadCertificate, client.onServerFlight(&ch, alloc, flight[sh.len..]));
+}
+
+test "client rejects a pinned certificate presented for the wrong host" {
+    const alloc = testing.allocator;
+    const seed = [_]u8{0x42} ** 32;
+    const signer = try sign.Signer.fromSeed(seed);
+    var cert_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer cert_buf.deinit(alloc);
+    const cert_der = try exampleCert(alloc, &cert_buf, seed); // SAN = example.com
+
+    var bundle = try verify.bundleFromDer(alloc, &.{cert_der}, CERT_NOW);
+    defer bundle.deinit(alloc);
+
+    var ch: std.ArrayListUnmanaged(u8) = .empty;
+    defer ch.deinit(alloc);
+    var client = Client.init();
+    try client.start(&ch, alloc, .{
+        .random = [_]u8{0x11} ** 32,
+        .ephemeral_seed = [_]u8{0x22} ** 32,
+        .transport_params = &.{ 0x04, 0x01, 0x40 },
+        .alpn = "h3",
+        .server_name = "attacker.example", // does not match the cert SAN
+        .trust = .{ .anchors = &bundle },
+        .now_sec = CERT_NOW,
+    });
+    const flight = try serverFlightWithCert(alloc, ch.items, cert_der, signer);
+    defer alloc.free(flight);
+    const sh = handshake.peek(flight).?;
+    _ = try client.onServerHello(flight[0..sh.len]);
+    try testing.expectError(error.BadCertificate, client.onServerFlight(&ch, alloc, flight[sh.len..]));
+}
 
 test "buildClientHello emits a parseable QUIC ClientHello" {
     var out: std.ArrayListUnmanaged(u8) = .empty;

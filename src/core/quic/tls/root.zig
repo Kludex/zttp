@@ -11,6 +11,8 @@ pub const transcript = @import("transcript.zig");
 pub const schedule = @import("schedule.zig");
 pub const keyshare = @import("keyshare.zig");
 pub const sign = @import("sign.zig");
+pub const x509 = @import("x509.zig");
+pub const verify = @import("verify.zig");
 pub const finished = @import("finished.zig");
 pub const wire = @import("wire.zig");
 pub const extension = @import("extension.zig");
@@ -25,6 +27,8 @@ test {
     _ = schedule;
     _ = keyshare;
     _ = sign;
+    _ = x509;
+    _ = verify;
     _ = finished;
     _ = wire;
     _ = extension;
