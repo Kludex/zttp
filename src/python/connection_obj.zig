@@ -1838,6 +1838,13 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
             while (true) {
                 const ev = e.reader.nextEvent() catch |err| {
                     e.dropPending();
+                    // A parse failure means there is no valid current request, but
+                    // req_method survives start_next_cycle by design. Clear it so an
+                    // error response the app sends next (e.g. send_response(400,
+                    // content-length: ...)) is framed on its own headers - not on a
+                    // stale HEAD/CONNECT method, which would wrongly make it bodyless
+                    // and turn remote input into a LocalProtocolError.
+                    e.req_method_len = 0;
                     return exceptions.raiseParse(err);
                 };
                 if (ev == .need_data and e.pending_obj != null) {

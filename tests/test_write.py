@@ -135,6 +135,32 @@ def test_head_response_bodyless_after_early_start_next_cycle() -> None:
     assert conn.data_to_send() == b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n"
 
 
+def test_error_response_keeps_its_body_after_a_head_then_malformed_request() -> None:
+    # A HEAD request leaves the remembered method = HEAD, which survives
+    # start_next_cycle by design. If the next pipelined request fails to parse, no
+    # new Request replaces the method, so an error response the app sends must NOT
+    # be framed as bodyless off the stale HEAD - that would turn remote input into a
+    # LocalProtocolError in common error-handling code.
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n")
+    list(drain(conn))
+    conn.send_response(200, [])
+    conn.end_message()
+    conn.data_to_send()
+    conn.start_next_cycle()
+
+    conn.receive_data(b"GET / HTTP/1.1\r\nBad Header\r\n\r\n")  # malformed head
+    with pytest.raises(zttp.RemoteProtocolError):
+        list(drain(conn))
+
+    # The 400 carries a body; before the fix the stale HEAD made it bodyless and
+    # send_data raised LocalProtocolError.
+    conn.send_response(400, [(b"Content-Length", b"11")])
+    conn.send_data(b"bad request")
+    conn.end_message()
+    assert conn.data_to_send() == b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nbad request"
+
+
 def test_status_code_formatting() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(404, [])
