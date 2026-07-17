@@ -161,6 +161,25 @@ def test_error_response_keeps_its_body_after_a_head_then_malformed_request() -> 
     assert conn.data_to_send() == b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nbad request"
 
 
+def test_head_body_parse_error_keeps_bodyless_framing() -> None:
+    # A HEAD request whose (chunked) body then fails to parse must keep HEAD framing
+    # for its error response: a response to HEAD is bodyless regardless of headers,
+    # so the method must NOT be cleared mid-request - unlike a failure on a fresh
+    # next-request head (see the test above), which does clear it.
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"HEAD / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+    assert any(isinstance(e, zttp.Request) for e in drain(conn))
+    conn.receive_data(b"zz\r\n")  # invalid chunk size -> body parse error
+    with pytest.raises(zttp.RemoteProtocolError):
+        list(drain(conn))
+    # The error response to the HEAD stays bodyless: sending a body is rejected.
+    conn.send_response(400, [(b"Content-Length", b"11")])
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.send_data(b"bad request")
+    conn.end_message()
+    assert conn.data_to_send() == b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\n"
+
+
 def test_status_code_formatting() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(404, [])
