@@ -28,4 +28,4 @@ docker run --rm --platform linux/amd64 \
     -e FUZZING_LANGUAGE=c++ \
     -v "$ROOT":/src/zttp \
     -v "$ROOT/.oss-fuzz/build.sh":/src/build.sh \
-    "$IMAGE" bash -c "cd /src/zttp && rm -rf zig-out .zig-cache && compile && /out/zttp_fuzz_reader $*"
+    "$IMAGE" bash -c 'cd /src/zttp && rm -rf zig-out .zig-cache && compile && /out/zttp_fuzz_reader "$@"' _ "$@"
