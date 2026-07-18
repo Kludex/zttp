@@ -451,6 +451,20 @@ pub const Connection = struct {
         self.conn_recv_window += @intCast(f.header.length);
         self.conn_recv_credit +|= f.header.length;
         s.creditRecvWindow(f.header.length);
+        // A response the request marked bodyless (HEAD, or a 204/304) must carry no
+        // DATA; surfacing a body here would let a proxy forward one where none is
+        // permitted (response smuggling). Reject before the event escapes.
+        if (s.expects_bodyless and content.len > 0) {
+            // Terminate the stream so a peer streaming bad bodyless responses cannot
+            // leave a trail of reset-but-tracked streams. Evict directly rather than
+            // via resetStream: this is our reset of the peer's misbehavior, so it
+            // must NOT count against our own reset-flood budget (chargeReset), which
+            // a malicious server could otherwise use to trip us into a GOAWAY.
+            s.recvApply(.rst_stream, false); // -> closed
+            self.evictStream(f.header.stream_id);
+            self.pushRst(f.header.stream_id, .protocol_error);
+            return;
+        }
         if (content.len > 0) self.push(.{ .data = .{ .data = content, .stream_id = f.header.stream_id } });
         s.recvApply(.data, end_stream);
         if (end_stream) try self.endMessage(s, f.header.stream_id, &.{});
@@ -593,7 +607,11 @@ pub const Connection = struct {
             return;
         }
 
-        const s = self.streams.getPtr(id).?;
+        // The app may have reset this stream mid-field-block (localReset evicts it
+        // while fb_stream stays open across HEADERS/CONTINUATION); the block was
+        // still decoded above to keep the HPACK table in sync, so just drop it,
+        // like the ignored case, instead of unwrapping a null stream and trapping.
+        const s = self.streams.getPtr(id) orelse return;
         if (is_trailer) {
             // Trailers: a second HEADERS block; must carry END_STREAM (8.1) and
             // must not contain pseudo-headers or otherwise-invalid fields.
@@ -825,8 +843,13 @@ pub const Connection = struct {
     /// stream by sending; the read side has no entry until then. The send window
     /// is seeded from the peer's INITIAL_WINDOW_SIZE (what the peer will accept).
     pub fn registerSendStream(self: *Connection, id: u32) error{OutOfMemory}!void {
+        if (self.streams.getPtr(id) != null) return; // already live
+        // A stream that was opened and then closed (e.g. reset by the peer, which
+        // evicts it) is no longer idle. Do not resurrect it as freshly open, or
+        // subsequent peer DATA on the closed stream would be classified valid and
+        // surfaced instead of rejected as STREAM_CLOSED.
+        if (!self.isIdle(id)) return;
         if (id > self.highest_local_id) self.highest_local_id = id;
-        if (self.streams.getPtr(id) != null) return;
         self.openStream(id) catch return error.OutOfMemory;
     }
 
@@ -907,6 +930,15 @@ pub const Connection = struct {
             error.OutOfMemory => return error.OutOfMemory,
         };
 
+        // The upgraded stream-1 request is surfaced as complete and bodyless (any
+        // body belonged to the H1 exchange, which is over). A non-zero declared
+        // Content-Length would make the immediate end_of_message below a smuggling
+        // lie - it bypasses the stream content-length-vs-data guard endMessage runs
+        // on every other end path - so reject it here.
+        if (req.content_length) |cl| {
+            if (cl != 0) return error.Malformed;
+        }
+
         // The first stream can never trip the churn cap; OOM is the only failure.
         self.openPeerStream(1) catch return error.OutOfMemory;
         self.highest_peer_id = 1;
@@ -932,7 +964,10 @@ pub const Connection = struct {
     /// toward MAX_CONCURRENT_STREAMS. Call after the writer serializes the frame.
     pub fn endResponseStream(self: *Connection, id: u32) error{OutOfMemory}!void {
         try self.registerSendStream(id);
-        self.streams.getPtr(id).?.sendApply(true);
+        // registerSendStream refuses to resurrect an already-closed (reset) stream,
+        // so the entry may be absent; tolerate that rather than unwrapping null.
+        const s = self.streams.getPtr(id) orelse return;
+        s.sendApply(true);
         self.maybeEvictDone(id);
     }
 
@@ -963,7 +998,10 @@ pub const Connection = struct {
     /// stream send windows (and the peer's max frame) allow, parking the rest.
     pub fn sendStreamData(self: *Connection, writer: *writer_mod.Writer, id: u32, data: []const u8, end_stream: bool) writer_mod.WriteError!void {
         try self.registerSendStream(id);
-        const s = self.streams.getPtr(id).?;
+        // registerSendStream refuses to resurrect a stream the peer already reset,
+        // so it may be absent here; sending on a dead stream is a recoverable local
+        // protocol error, not a null-optional trap.
+        const s = self.streams.getPtr(id) orelse return error.LocalProtocol;
         if (data.len != 0) s.send_pending.appendSlice(self.gpa, data) catch return error.OutOfMemory;
         if (end_stream) s.send_end_pending = true;
         try self.flushStream(writer, id);
@@ -1664,6 +1702,97 @@ test "a malformed upgrade SETTINGS payload is rejected" {
     defer c.deinit();
     const bad = [_]u8{ 0x00, 0x04, 0x00 }; // not a multiple of 6
     try testing.expectError(error.BadSettings, c.initiateUpgradeConnection("GET", "/", "http", "example.com", &.{}, &bad));
+}
+
+test "an h2c upgrade declaring a non-zero content-length is rejected" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // The upgraded stream-1 request is surfaced complete and bodyless; a positive
+    // Content-Length would smuggle a body past the end_of_message it emits at once.
+    const bad = [_]events.Header{.{ .name = "content-length", .value = "5" }};
+    try testing.expectError(error.Malformed, c.initiateUpgradeConnection("POST", "/", "http", "example.com", &bad, null));
+
+    // Content-Length: 0 is honest (no body) and allowed.
+    var ok_conn = Connection.init(testing.allocator, .server);
+    defer ok_conn.deinit();
+    const ok = [_]events.Header{.{ .name = "content-length", .value = "0" }};
+    try ok_conn.initiateUpgradeConnection("POST", "/", "http", "example.com", &ok, null);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try ok_conn.nextEvent()));
+}
+
+test "resetting a stream mid-CONTINUATION does not trap when the block completes" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    // HEADERS without END_HEADERS opens the field block but surfaces nothing yet.
+    var first: std.ArrayList(u8) = .empty;
+    defer first.deinit(testing.allocator);
+    try frameBytes(&first, .headers, Flags.end_stream, 1, GET_BLOCK[0..3]);
+    try handshook(&c, first.items);
+    try testing.expectEqual(std.meta.Tag(Event).need_data, std.meta.activeTag(try c.nextEvent()));
+
+    // The app cancels the in-flight stream while its field block is still open.
+    c.localReset(1);
+
+    // The peer completes the header block. Before the fix, completeFieldBlock
+    // unwrapped the evicted stream and trapped; now the decoded block is dropped.
+    var rest: std.ArrayList(u8) = .empty;
+    defer rest.deinit(testing.allocator);
+    try frameBytes(&rest, .continuation, Flags.end_headers, 1, GET_BLOCK[3..]);
+    try c.feed(rest.items);
+    try testing.expectEqual(std.meta.Tag(Event).need_data, std.meta.activeTag(try c.nextEvent()));
+}
+
+test "a peer RST evicts the stream so a late server response cannot reopen it" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &GET_BLOCK); // open, no END_STREAM
+    try frameBytes(&frames, .rst_stream, 0, 1, &[_]u8{ 0, 0, 0, 8 }); // peer cancels
+    try handshook(&c, frames.items);
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(try c.nextEvent()));
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount()); // evicted
+
+    // The app, not having drained the RST, responds late. It must not resurrect
+    // the evicted stream as freshly open.
+    try c.endResponseStream(1);
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
+
+    // A late send_data on the reset stream is a recoverable local protocol error,
+    // not a null-optional trap.
+    var writer = writer_mod.Writer.init(testing.allocator, .server);
+    defer writer.deinit();
+    try testing.expectError(error.LocalProtocol, c.sendStreamData(&writer, 1, "body", false));
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
+
+    // Late peer DATA on the closed stream is a stream error, not a Data event.
+    var more: std.ArrayList(u8) = .empty;
+    defer more.deinit(testing.allocator);
+    try frameBytes(&more, .data, Flags.end_stream, 1, "late");
+    try c.feed(more.items);
+    const ev = try c.nextEvent();
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.stream_closed)), ev.rst_stream.error_code);
+}
+
+test "client rejects a body on a bodyless (HEAD) response" {
+    var c = Connection.init(testing.allocator, .client);
+    defer c.deinit();
+    // The client sent a HEAD request on stream 1, so its response is bodyless.
+    try c.registerSendStream(1);
+    c.markBodylessRequest(1);
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frameBytes(&frames, .headers, Flags.end_headers, 1, &STATUS_200_BLOCK); // open, no END_STREAM
+    try frameBytes(&frames, .data, Flags.end_stream, 1, "body");
+    try clientHandshook(&c, frames.items);
+    try testing.expectEqual(@as(u16, 200), (try c.nextEvent()).response.status_code);
+    // The forbidden body is rejected as a stream PROTOCOL_ERROR, not surfaced.
+    const ev = try c.nextEvent();
+    try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), ev.rst_stream.error_code);
+    // And the reset stream is evicted, not left tracked (no state leak from a peer
+    // streaming bad bodyless responses).
+    try testing.expectEqual(@as(u32, 0), c.liveStreamCount());
 }
 
 // A client's inbound handshake is just the server's SETTINGS - no preface to

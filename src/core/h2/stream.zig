@@ -215,7 +215,12 @@ pub const Stream = struct {
     /// At END_STREAM, verify the body length matched a declared Content-Length.
     /// A mismatch is a STREAM error PROTOCOL_ERROR (h2->h1 smuggling guard).
     pub fn checkContentLength(self: *const Stream) Transition {
-        if (self.expects_bodyless) return Transition.ok;
+        if (self.expects_bodyless) {
+            // A bodyless response may still declare a Content-Length that mirrors
+            // the GET entity, but any actual DATA bytes are a violation.
+            if (self.data_seen != 0) return Transition.streamErr(.protocol_error);
+            return Transition.ok;
+        }
         if (self.content_length) |cl| {
             if (cl != self.data_seen) return Transition.streamErr(.protocol_error);
         }
