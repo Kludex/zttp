@@ -104,7 +104,9 @@ include = ["zttp", "src", "tools", "build.zig"]
 # Zig comes from the `ziglang` build requirement (build isolation), so no system
 # toolchain install is needed. The sans-IO core has no OS dependencies, so it
 # builds for glibc, musl, macOS, and Windows alike. Skip only 32-bit and PyPy.
-# cp314t/cp315t are the free-threaded builds; the extension declares Py_MOD_GIL_NOT_USED.
+# cp314t/cp315t are the free-threaded builds. The extension does NOT yet declare
+# Py_MOD_GIL_NOT_USED (it isn't synchronized - #151), so on these interpreters
+# CPython re-enables the compatibility GIL at import; the wheels still load and run.
 # Windows is skipped for the free-threaded builds: their pyconfig.h doesn't self-define
 # Py_GIL_DISABLED (POSIX does), so translate-c would compile against the GIL ABI and
 # mismatch (still true in 3.15's PC/pyconfig.h).
@@ -136,7 +138,14 @@ archs = ["AMD64"]
 addopts = "-rxXs --strict-config --strict-markers"
 xfail_strict = true
 testpaths = ["tests"]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # Free-threaded builds (3.13t+): the extension deliberately does not declare
+    # Py_MOD_GIL_NOT_USED until it is synchronized (#151), so CPython re-enables the
+    # GIL at import and warns. That is the intended, safe behavior - don't let the
+    # expected warning fail the suite when running under a free-threaded interpreter.
+    "ignore:The global interpreter lock:RuntimeWarning",
+]
 markers = [
     "http3_interop: optional HTTP/3 interop checks that require external protocol stacks",
 ]
