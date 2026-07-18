@@ -592,8 +592,9 @@ test "client accepts a pinned, in-date server certificate for the right host" {
     defer cert_buf.deinit(alloc);
     const cert_der = try exampleCert(alloc, &cert_buf, seed);
 
-    var bundle = try verify.bundleFromDer(alloc, &.{cert_der}, CERT_NOW);
+    var bundle = verify.AnchorSet.empty;
     defer bundle.deinit(alloc);
+    try bundle.addDer(alloc, cert_der);
 
     var ch: std.ArrayListUnmanaged(u8) = .empty;
     defer ch.deinit(alloc);
@@ -623,7 +624,7 @@ test "client rejects an untrusted server certificate" {
     defer cert_buf.deinit(alloc);
     const cert_der = try exampleCert(alloc, &cert_buf, seed);
 
-    var empty_bundle: std.crypto.Certificate.Bundle = .empty; // trusts nothing
+    var empty_bundle = verify.AnchorSet.empty; // trusts nothing
     defer empty_bundle.deinit(alloc);
 
     var ch: std.ArrayListUnmanaged(u8) = .empty;
@@ -653,8 +654,9 @@ test "client rejects a pinned certificate presented for the wrong host" {
     defer cert_buf.deinit(alloc);
     const cert_der = try exampleCert(alloc, &cert_buf, seed); // SAN = example.com
 
-    var bundle = try verify.bundleFromDer(alloc, &.{cert_der}, CERT_NOW);
+    var bundle = verify.AnchorSet.empty;
     defer bundle.deinit(alloc);
+    try bundle.addDer(alloc, cert_der);
 
     var ch: std.ArrayListUnmanaged(u8) = .empty;
     defer ch.deinit(alloc);
