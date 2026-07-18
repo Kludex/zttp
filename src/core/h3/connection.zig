@@ -375,7 +375,14 @@ pub const Connection = struct {
         // began before the GOAWAY is left to complete (it is below the id, or already
         // tracked).
         if (self.goaway_sent) |limit| {
-            if (id >= limit and !self.streams.contains(id)) {
+            // Exempt only a stream we have actually begun processing (a Request was
+            // surfaced, so its state left .idle). A merely pre-tracked idle
+            // placeholder - created when a partial HEADERS frame arrived but no
+            // Request was emitted yet - must still be rejected: otherwise a peer
+            // could send a HEADERS fragment on a high stream id, wait for the
+            // GOAWAY, then complete it and slip a request past the advertised limit.
+            const already_processing = if (self.streams.getPtr(id)) |rs| rs.state != .idle else false;
+            if (id >= limit and !already_processing) {
                 // We promised not to process this request (RFC 9114 5.2): reject it
                 // with H3_REQUEST_REJECTED so the client knows it may safely retry on a
                 // fresh connection, rather than silently dropping it.
@@ -874,6 +881,18 @@ pub const Connection = struct {
                     else => return e,
                 };
                 self.clearBlockedHeaders(rs);
+                // A QPACK-blocked request whose headers only just unblocked is still
+                // an idle pre-tracked stream at this point. If we have advertised a
+                // GOAWAY at or below its id, we promised not to process it (RFC 9114
+                // 5.2) - reject here too, or this resume path would surface it past
+                // the limit, bypassing the guard in pumpRequest. Trailers are not
+                // checked: they belong to a request already being processed.
+                if (self.goaway_sent) |limit| {
+                    if (id >= limit) {
+                        try self.rejectStream(id, .request_rejected);
+                        return false;
+                    }
+                }
                 try self.push(.{ .request = req });
                 rs.state = .headers_done;
                 return true;
@@ -1952,6 +1971,38 @@ test "a rejected open stream stays quarantined on a later frame" {
     try qc.receiveDatagram(d2, 1100);
     try h3.pump(0);
     try testing.expect(h3.nextEvent() == .need_data); // still no request
+}
+
+test "a partial request stream cannot slip past a GOAWAY by completing later" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x9a, 0x9b, 0x9c, 0x9d };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // A HEADERS frame on stream 0 (type 0x01, declared length 5) of which only 3 of
+    // the 5 payload bytes arrive: decode needs more, so the request stream is merely
+    // tracked as idle and no Request is surfaced yet.
+    const d1 = try buildRequest(gpa, &dcid, 0, &.{ 0x01, 0x05, 0x00, 0x00, 0xC0 | 17 });
+    defer gpa.free(d1);
+    try qc.receiveDatagram(d1, 1000);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .need_data);
+
+    // The server then advertises a GOAWAY: it will not process stream 0 or above.
+    try h3.shutdown(0);
+
+    // The peer completes the header block (the remaining 2 bytes at stream offset 5).
+    // Because the stream was only pre-tracked (idle), the GOAWAY guard must still
+    // reject it - surfacing a Request here would process a request past the limit
+    // the server just promised not to cross.
+    const d2 = try buildRequestAt(gpa, &dcid, 5, 1, &.{ 0xC0 | 23, 0xC0 | 1 });
+    defer gpa.free(d2);
+    try qc.receiveDatagram(d2, 1100);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .need_data); // rejected, not surfaced
 }
 
 test "a control byte in a field value is malformed" {
@@ -4463,6 +4514,38 @@ test "a request blocked on QPACK resumes when encoder inserts arrive" {
     try testing.expectEqualStrings("x", ev.request.headers[0].name);
     try testing.expectEqualStrings("y", ev.request.headers[0].value);
     try testing.expect(h3.nextEvent() == .end_of_message);
+}
+
+test "a QPACK-blocked request cannot slip past a GOAWAY when it unblocks" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xcc, 0xcd, 0xce, 0xd4 };
+    var qc: quic_conn.Connection = undefined;
+    var h3 = newH3Server(gpa, &dcid, &qc);
+    defer qc.deinit();
+    defer h3.deinit();
+
+    // A HEADERS block referencing a dynamic entry blocks on QPACK: it is consumed
+    // and stored, the stream tracked as idle, no Request surfaced.
+    const qpack_block = [_]u8{ 0x02, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x80 };
+    var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer h3_bytes.deinit(gpa);
+    try h3_frame.append(&h3_bytes, gpa, .headers, &qpack_block);
+    const req_dgram = try buildRequestOnFin(gpa, &dcid, 0, 0, h3_bytes.items);
+    defer gpa.free(req_dgram);
+    try qc.receiveDatagram(req_dgram, 1000);
+    try h3.pump(0);
+    try testing.expect(h3.nextEvent() == .need_data);
+
+    // The server advertises a GOAWAY at stream 0 while the request is still blocked.
+    try h3.shutdown(0);
+
+    // The encoder inserts arrive and unblock the headers. The resume path must
+    // honor the GOAWAY too - reject the request, do not surface it past the limit.
+    const enc_dgram = try buildUni(gpa, &dcid, 2, 1, &.{ 0x02, 0x3f, 0x61, 0x41, 'x', 0x01, 'y' });
+    defer gpa.free(enc_dgram);
+    try qc.receiveDatagram(enc_dgram, 2000);
+    try h3.pump(2);
+    try testing.expect(h3.nextEvent() == .need_data); // rejected, not surfaced
 }
 
 test "too many QPACK-blocked request streams is a decompression error" {
