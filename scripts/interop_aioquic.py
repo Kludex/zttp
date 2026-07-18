@@ -143,6 +143,7 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
         connection_id=dcid,
         alpn=b"h3",
         server_name=b"localhost",
+        verify=False,  # transport interop against aioquic's RSA identity; zttp verifies ECDSA only
     )
 
     client_initial = client.data_to_send()[0]
@@ -170,8 +171,7 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
         or tickets[0].max_early_data_size != MAX_EARLY_DATA
     ):
         raise SystemExit(
-            "zttp did not receive aioquic's NewSessionTicket: "
-            f"issued={issued_tickets!r} stored={tickets!r}"
+            f"zttp did not receive aioquic's NewSessionTicket: issued={issued_tickets!r} stored={tickets!r}"
         )
     ticket = tickets[0]
     if ticket.psk != issued_tickets[0].resumption_secret:
@@ -190,6 +190,7 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
         obfuscated_ticket_age=obfuscated_ticket_age(ticket.age_add, 3_000, 10_000),
         early_data=True,
         remembered_transport_params=ZTTP_SERVER_TP,
+        verify=False,
     )
     early_stream = resumed.send_request(
         b"GET",
@@ -358,9 +359,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
     server = zttp.Connection(
         zttp.SERVER,
         protocol=zttp.HTTP3,
-        credentials=zttp.TlsCredentials(
-            certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
-        ),
+        credentials=zttp.TlsCredentials(certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32),
         transport_params=ZTTP_SERVER_TP,
         random=b"\xab" * 32,
         ephemeral_seed=b"\x33" * 32,
@@ -407,8 +406,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
         client.receive_datagram(datagram, ("server", 4433), 0.011)
         drain_quic_to_h3(client, h3)
     if not any(
-        cid.sequence_number == 1 and cid.cid == b"server-cid-1"
-        for cid in getattr(client, "_peer_cid_available", [])
+        cid.sequence_number == 1 and cid.cid == b"server-cid-1" for cid in getattr(client, "_peer_cid_available", [])
     ):
         raise SystemExit("aioquic did not receive zttp's NEW_CONNECTION_ID")
     client.change_connection_id()
@@ -486,7 +484,11 @@ def assert_aioquic_client_to_zttp_server() -> None:
         raise SystemExit(f"aioquic did not receive the zttp response headers: {response_events!r}")
     if not response_data or response_data[0].data != b"ok":
         raise SystemExit(f"aioquic did not receive the zttp response body: {response_events!r}")
-    if len(response_headers) < 2 or (b"x-zttp-trailer", b"done") not in response_headers[-1].headers or not response_headers[-1].stream_ended:
+    if (
+        len(response_headers) < 2
+        or (b"x-zttp-trailer", b"done") not in response_headers[-1].headers
+        or not response_headers[-1].stream_ended
+    ):
         raise SystemExit(f"aioquic did not receive the zttp response trailers/end: {response_events!r}")
 
     issued_zttp_psk = server.send_session_ticket(
@@ -514,9 +516,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
     resumed_server = zttp.Connection(
         zttp.SERVER,
         protocol=zttp.HTTP3,
-        credentials=zttp.TlsCredentials(
-            certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
-        ),
+        credentials=zttp.TlsCredentials(certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32),
         transport_params=ZTTP_SERVER_TP,
         random=b"\xac" * 32,
         ephemeral_seed=b"\x34" * 32,
@@ -552,8 +552,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
             resumed_server.receive_datagram(datagram, 50_000, b"aioquic-early-client")
         except zttp.RemoteProtocolError as exc:
             raise SystemExit(
-                "zttp rejected aioquic's resumed 0-RTT datagram: "
-                f"close={resumed_server.close_info()!r} exc={exc}"
+                f"zttp rejected aioquic's resumed 0-RTT datagram: close={resumed_server.close_info()!r} exc={exc}"
             ) from exc
     early_events = []
     while True:
@@ -634,6 +633,7 @@ def assert_udp_loopback_zttp_client_to_aioquic_server(tmp: Path, drop_first_serv
         connection_id=b"\x11\x22\x33\x46",
         alpn=b"h3",
         server_name=b"localhost",
+        verify=False,
     )
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -689,7 +689,10 @@ def assert_udp_loopback_zttp_client_to_aioquic_server(tmp: Path, drop_first_serv
             for event in drain_quic_to_h3(server, h3):
                 if isinstance(event, HeadersReceived):
                     request_seen = True
-                    if (b":method", b"GET") not in event.headers or (b":path", b"/udp-loopback-zttp") not in event.headers:
+                    if (b":method", b"GET") not in event.headers or (
+                        b":path",
+                        b"/udp-loopback-zttp",
+                    ) not in event.headers:
                         raise SystemExit(f"aioquic UDP loopback received unexpected headers: {event.headers!r}")
                     h3.send_headers(event.stream_id, [(b":status", b"200"), (b"content-length", b"2")])
                     h3.send_data(event.stream_id, b"ok", end_stream=True)
@@ -767,9 +770,7 @@ def assert_udp_loopback_aioquic_client_to_zttp_server(drop_first_server_datagram
     server = zttp.Connection(
         zttp.SERVER,
         protocol=zttp.HTTP3,
-        credentials=zttp.TlsCredentials(
-            certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
-        ),
+        credentials=zttp.TlsCredentials(certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32),
         transport_params=ZTTP_SERVER_TP,
         random=b"\xad" * 32,
         ephemeral_seed=b"\x35" * 32,
@@ -912,14 +913,10 @@ def assert_udp_loopback_aioquic_client_to_zttp_server(drop_first_server_datagram
             responses = [event for event in client_events if isinstance(event, HeadersReceived)]
             bodies = [event for event in client_events if isinstance(event, DataReceived)]
             migrated_responses = [
-                event
-                for event in responses
-                if migrated_stream_id is not None and event.stream_id == migrated_stream_id
+                event for event in responses if migrated_stream_id is not None and event.stream_id == migrated_stream_id
             ]
             migrated_bodies = [
-                event
-                for event in bodies
-                if migrated_stream_id is not None and event.stream_id == migrated_stream_id
+                event for event in bodies if migrated_stream_id is not None and event.stream_id == migrated_stream_id
             ]
             first_done = (
                 request_seen
@@ -966,10 +963,7 @@ def assert_udp_loopback_aioquic_client_to_zttp_server(drop_first_server_datagram
                 and any(body.data == b"ok" for body in migrated_bodies)
                 and migrated_bodies[-1].stream_ended
             )
-            if (
-                first_done
-                and migrated_done
-            ):
+            if first_done and migrated_done:
                 return
 
         raise SystemExit(

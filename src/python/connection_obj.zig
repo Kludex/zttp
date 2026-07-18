@@ -24,8 +24,39 @@ const FlightConfig = core.quic.tls.flight.Config;
 const ResumptionCredential = core.quic.tls.flight.ResumptionCredential;
 const tls_sign = core.quic.tls.sign;
 const Signer = tls_sign.Signer;
+const tls_x509 = core.quic.tls.x509;
+const tls_verify = core.quic.tls.verify;
+const AnchorSet = tls_verify.AnchorSet;
 
 const gpa = std.heap.c_allocator;
+
+/// Wall-clock Unix seconds, for certificate validity (server) and verification
+/// (client). This is the OS-facing binding, not the sans-IO core, so reading a
+/// real clock here is fine; a now_sec= constructor argument overrides it for
+/// deterministic tests.
+fn nowSeconds() i64 {
+    const time_mod = c.PyImport_ImportModule("time") orelse {
+        c.PyErr_Clear();
+        return 0;
+    };
+    defer py.decref(time_mod);
+    const t = c.PyObject_CallMethod(time_mod, "time", null) orelse {
+        c.PyErr_Clear();
+        return 0;
+    };
+    defer py.decref(t);
+    const secs = c.PyFloat_AsDouble(t);
+    if (secs == -1.0 and c.PyErr_Occurred() != null) {
+        c.PyErr_Clear();
+        return 0;
+    }
+    return @intFromFloat(secs);
+}
+
+/// A self-signed cert's default validity: from a day before now (clock skew) to
+/// ten years out. Ephemeral dev identities are short-lived in practice, but a wide
+/// window keeps a pinned dev cert from silently expiring mid-project.
+const EPHEMERAL_CERT_DAYS: i64 = 3650;
 
 const SERVER: c_long = 1;
 const CLIENT: c_long = 2;
@@ -475,6 +506,9 @@ const H3Engine = struct {
     config: ?ServerConfig = null,
     qc: ?*QuicConnection = null,
     h3: ?*H3Connection = null,
+    /// Client trust anchors, heap-owned so the tls client's borrowed pointer stays
+    /// valid for the connection's life. null on servers and insecure clients.
+    trust_bundle: ?*AnchorSet = null,
     /// The integrator's clock at the last receive_datagram / handle_timeout. A Stream
     /// send does not carry its own `now` (the API matches H2's, which has no clock),
     /// so it packetises against the most recent time the caller gave us.
@@ -927,6 +961,11 @@ const H3Engine = struct {
             gpa.destroy(q);
         }
         if (self.config) |*cfg| cfg.deinit();
+        // Freed after qc: the tls client borrowed a pointer into this bundle.
+        if (self.trust_bundle) |b| {
+            b.deinit(gpa);
+            gpa.destroy(b);
+        }
     }
 };
 
@@ -1042,6 +1081,35 @@ var datagram_header_type: py.Object = null;
 /// Module-level `parse_datagram_header(datagram) -> DatagramHeader`: the routable
 /// prefix of a received QUIC datagram, for demultiplexing a shared UDP socket onto
 /// per-connection state without constructing a connection.
+// generate_self_signed(dns_name, private_key, not_before, not_after) -> certificate.
+// Mint a self-signed prime256v1 certificate for `dns_name`, valid over the given
+// Unix-second window, signed by the 32-byte `private_key` seed (the same seed a
+// TlsCredentials.private_key carries). A convenience for dev/test identities and
+// for pinning: the certificate is what a client passes as trust=. Sans-IO - the
+// key seed and validity bounds come entirely from the caller.
+fn generate_self_signed(_: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    var dns_obj: ?*c.PyObject = null;
+    var key_obj: ?*c.PyObject = null;
+    var nb: c_longlong = 0;
+    var na: c_longlong = 0;
+    if (c.PyArg_ParseTuple(args, "OOLL", &dns_obj, &key_obj, &nb, &na) == 0) return null;
+    const dns = py.asBytes(dns_obj) orelse return null;
+    const key = py.asBytes(key_obj) orelse return null;
+    if (key.len != 32) return py.raiseValue("private_key must be 32 bytes (the signing key seed)");
+    const signer = Signer.fromSeed(key[0..32].*) catch return py.raiseValue("private_key is not a valid signing key seed");
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    const der = tls_x509.selfSigned(&buf, gpa, signer.key_pair, .{
+        .dns_name = dns,
+        .not_before = @intCast(nb),
+        .not_after = @intCast(na),
+    }) catch |e| switch (e) {
+        error.OutOfMemory => return c.PyErr_NoMemory(),
+        error.InvalidName => return py.raiseValue("dns_name must be 1..65535 bytes"),
+    };
+    return py.fromBytes(der);
+}
+
 fn parse_datagram_header(_: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const data = py.asBytes(arg) orelse return null;
     const hdr = core.quic.packet.parseDatagramHeader(data) catch
@@ -1075,6 +1143,7 @@ fn parse_datagram_header(_: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Obj
 
 pub var module_methods = [_]c.PyMethodDef{
     .{ .ml_name = "parse_datagram_header", .ml_meth = parse_datagram_header, .ml_flags = c.METH_O, .ml_doc = "Parse the routable prefix of a received QUIC datagram: parse_datagram_header(datagram) -> DatagramHeader. Reads no connection state; for demultiplexing a shared UDP socket by connection id." },
+    .{ .ml_name = "generate_self_signed", .ml_meth = generate_self_signed, .ml_flags = c.METH_VARARGS, .ml_doc = "generate_self_signed(dns_name, private_key, not_before, not_after) -> certificate DER. Mint a self-signed prime256v1 certificate for dns_name over the [not_before, not_after] Unix-second window, signed by the 32-byte private_key seed. For dev/test TLS identities and pinning (the returned bytes are what a client passes as trust=)." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
@@ -1480,14 +1549,18 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     var early_data_obj: ?*c.PyObject = null;
     var remembered_tp_obj: ?*c.PyObject = null;
     var validation_token_obj: ?*c.PyObject = null;
+    var trust_obj: ?*c.PyObject = null;
+    var verify_obj: ?*c.PyObject = null;
+    var now_sec_obj: ?*c.PyObject = null;
     var kwlist = [_][*c]u8{
         @constCast("role"),                        @constCast("protocol"),              @constCast("credentials"),
         @constCast("transport_params"),            @constCast("random"),                @constCast("ephemeral_seed"),
         @constCast("alpn"),                        @constCast("connection_id"),         @constCast("server_name"),
         @constCast("resumption"),                  @constCast("obfuscated_ticket_age"), @constCast("early_data"),
-        @constCast("remembered_transport_params"), @constCast("validation_token"),      null,
+        @constCast("remembered_transport_params"), @constCast("validation_token"),      @constCast("trust"),
+        @constCast("verify"),                      @constCast("now_sec"),               null,
     };
-    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$OOOOOOOOOOOO", @ptrCast(&kwlist), &role_val, &protocol_val, &credentials_obj, &tp_obj, &random_obj, &ephemeral_obj, &alpn_obj, &cid_obj, &sni_obj, &resumption_obj, &obfuscated_ticket_age_obj, &early_data_obj, &remembered_tp_obj, &validation_token_obj) == 0) return null;
+    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$OOOOOOOOOOOOOOO", @ptrCast(&kwlist), &role_val, &protocol_val, &credentials_obj, &tp_obj, &random_obj, &ephemeral_obj, &alpn_obj, &cid_obj, &sni_obj, &resumption_obj, &obfuscated_ticket_age_obj, &early_data_obj, &remembered_tp_obj, &validation_token_obj, &trust_obj, &verify_obj, &now_sec_obj) == 0) return null;
     if (protocol_val != HTTP3) return py.raiseValue("protocol does not match this Connection subclass; construct zttp.Connection to choose by protocol");
 
     // Unpack the credential / resumption value objects into the raw byte objects the
@@ -1509,6 +1582,15 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     if (resumption_obj != null and !py.isNone(resumption_obj)) {
         resumption_identity_obj = c.PyObject_GetAttrString(resumption_obj, "identity") orelse return null;
         resumption_psk_obj = c.PyObject_GetAttrString(resumption_obj, "psk") orelse return null;
+    }
+
+    // The clock for certificate validity (server) and verification (client).
+    // Defaults to the real wall-clock; a now_sec= argument pins it for tests.
+    var now_sec: i64 = nowSeconds();
+    if (now_sec_obj != null and !py.isNone(now_sec_obj)) {
+        const v = c.PyLong_AsLongLong(now_sec_obj);
+        if (v == -1 and c.PyErr_Occurred() != null) return null;
+        now_sec = @intCast(v);
     }
 
     const alloc = tp.?.tp_alloc.?;
@@ -1547,13 +1629,21 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
             py.decref(obj);
             return py.raiseValue("validation_token is only valid for HTTP/3 clients");
         }
-        const config = buildServerConfig(cert_obj, key_obj, tp_obj, random_obj, ephemeral_obj, alpn_obj, resumption_identity_obj, resumption_psk_obj) orelse {
+        if (trust_obj != null and !py.isNone(trust_obj)) {
+            py.decref(obj);
+            return py.raiseValue("trust is only valid for HTTP/3 clients");
+        }
+        if (verify_obj != null and !py.isNone(verify_obj)) {
+            py.decref(obj);
+            return py.raiseValue("verify is only valid for HTTP/3 clients");
+        }
+        const config = buildServerConfig(cert_obj, key_obj, tp_obj, random_obj, ephemeral_obj, alpn_obj, resumption_identity_obj, resumption_psk_obj, now_sec) orelse {
             py.decref(obj);
             return null;
         };
         engine.* = .{ .h3 = .{ .config = config } };
     } else if (role_val == CLIENT) {
-        engine.* = .{ .h3 = buildClientH3(tp, tp_obj, random_obj, ephemeral_obj, alpn_obj, cid_obj, sni_obj, resumption_identity_obj, resumption_psk_obj, obfuscated_ticket_age_obj, early_data_obj, remembered_tp_obj, validation_token_obj) orelse {
+        engine.* = .{ .h3 = buildClientH3(tp, tp_obj, random_obj, ephemeral_obj, alpn_obj, cid_obj, sni_obj, resumption_identity_obj, resumption_psk_obj, obfuscated_ticket_age_obj, early_data_obj, remembered_tp_obj, validation_token_obj, trust_obj, verify_obj, now_sec) orelse {
             py.decref(obj);
             return null;
         } };
@@ -1563,6 +1653,127 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     }
     self.engine = engine;
     return obj;
+}
+
+const ClientTrust = struct {
+    trust: tls_verify.Trust,
+    /// Heap-owned when `.anchors`; freed by H3Engine.deinit. null for `.insecure`.
+    bundle: ?*AnchorSet,
+};
+
+fn freeTrust(t: ClientTrust) void {
+    if (t.bundle) |b| {
+        b.deinit(gpa);
+        gpa.destroy(b);
+    }
+}
+
+/// Resolve the client's certificate-verification policy. Sans-IO: the library
+/// never reads the OS trust store or any file - the caller loads their CAs at their
+/// own I/O layer (ssl / certifi / truststore) and passes the bytes via `trust=`.
+/// `verify=False` opts out (dangerous, explicit); otherwise `trust=<PEM or DER>` is
+/// required. Fail-closed: a verifying client with no anchors is an error, never a
+/// silent bypass. On failure sets a Python error and returns null.
+fn resolveClientTrust(trust_obj: ?*c.PyObject, verify_obj: ?*c.PyObject, now_sec: i64) ?ClientTrust {
+    const has_trust = trust_obj != null and !py.isNone(trust_obj);
+    const verify = if (verify_obj != null and !py.isNone(verify_obj)) blk: {
+        const t = c.PyObject_IsTrue(verify_obj);
+        if (t < 0) return null;
+        break :blk t != 0;
+    } else true;
+
+    if (!verify) {
+        if (has_trust) {
+            _ = py.raiseValue("trust= cannot be combined with verify=False");
+            return null;
+        }
+        return .{ .trust = .insecure, .bundle = null };
+    }
+    if (!has_trust) {
+        _ = py.raiseValue("an HTTP/3 client must be given trust=<CA certificates, PEM or DER> to verify the server, or verify=False to disable verification (sans-IO: zttp does not read the system trust store; load it yourself, e.g. ssl.create_default_context().get_ca_certs())");
+        return null;
+    }
+
+    const bundle = gpa.create(AnchorSet) catch {
+        _ = c.PyErr_NoMemory();
+        return null;
+    };
+    bundle.* = AnchorSet.empty;
+    if (!addTrustAnchors(bundle, trust_obj.?, now_sec) or bundle.count() == 0) {
+        if (c.PyErr_Occurred() == null) _ = py.raiseValue("trust= contained no usable certificates");
+        bundle.deinit(gpa);
+        gpa.destroy(bundle);
+        return null;
+    }
+    return .{ .trust = .{ .anchors = bundle }, .bundle = bundle };
+}
+
+fn addTrustAnchors(bundle: *AnchorSet, obj: *c.PyObject, now_sec: i64) bool {
+    const bytes = py.asBytes(obj) orelse return false;
+    if (std.mem.indexOf(u8, bytes, "-----BEGIN CERTIFICATE-----") != null) return addPemAnchors(bundle, bytes, now_sec);
+    return addDerAnchor(bundle, bytes, false);
+}
+
+/// Add one DER certificate as a trust anchor. AnchorSet.addDer runs zttp's own
+/// bounded parser, so malformed bytes are a clean error, never a trap. `lenient`
+/// skips an unparseable cert (in a multi-cert PEM bundle, one odd cert must not
+/// break the rest); otherwise it is a caller error.
+fn addDerAnchor(bundle: *AnchorSet, der: []const u8, lenient: bool) bool {
+    bundle.addDer(gpa, der) catch |e| switch (e) {
+        error.OutOfMemory => {
+            _ = c.PyErr_NoMemory();
+            return false;
+        },
+        error.BadCertificate => {
+            if (lenient) return true;
+            _ = py.raiseValue("trust contains an unparseable certificate (not a valid X.509 DER certificate)");
+            return false;
+        },
+    };
+    return true;
+}
+
+fn addPemAnchors(bundle: *AnchorSet, pem: []const u8, now_sec: i64) bool {
+    _ = now_sec;
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end = "-----END CERTIFICATE-----";
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(gpa);
+    var rest = pem;
+    var count: usize = 0;
+    while (std.mem.indexOf(u8, rest, begin)) |b| {
+        const after = rest[b + begin.len ..];
+        const stop = std.mem.indexOf(u8, after, end) orelse break;
+        scratch.clearRetainingCapacity();
+        for (after[0..stop]) |ch| {
+            if (ch != '\n' and ch != '\r' and ch != ' ' and ch != '\t') scratch.append(gpa, ch) catch {
+                _ = c.PyErr_NoMemory();
+                return false;
+            };
+        }
+        const dec = std.base64.standard.Decoder;
+        const der_len = dec.calcSizeForSlice(scratch.items) catch {
+            _ = py.raiseValue("trust contains malformed PEM base64");
+            return false;
+        };
+        const der = gpa.alloc(u8, der_len) catch {
+            _ = c.PyErr_NoMemory();
+            return false;
+        };
+        defer gpa.free(der);
+        dec.decode(der, scratch.items) catch {
+            _ = py.raiseValue("trust contains malformed PEM base64");
+            return false;
+        };
+        if (!addDerAnchor(bundle, der, true)) return false; // lenient: skip odd anchors
+        count += 1;
+        rest = after[stop + end.len ..];
+    }
+    if (count == 0) {
+        _ = py.raiseValue("trust PEM contained no CERTIFICATE blocks");
+        return false;
+    }
+    return true;
 }
 
 fn buildClientH3(
@@ -1579,6 +1790,9 @@ fn buildClientH3(
     early_data_obj: ?*c.PyObject,
     remembered_tp_obj: ?*c.PyObject,
     validation_token_obj: ?*c.PyObject,
+    trust_obj: ?*c.PyObject,
+    verify_obj: ?*c.PyObject,
+    now_sec: i64,
 ) ?H3Engine {
     const tp_src = optionalBytes(tp_obj, &DEFAULT_CLIENT_TRANSPORT_PARAMS) orelse return null;
     const random = optionalBytes32(random_obj, "random must be exactly 32 bytes") orelse return null;
@@ -1605,6 +1819,10 @@ fn buildClientH3(
         _ = c.PyErr_NoMemory();
         return null;
     };
+    const client_trust = resolveClientTrust(trust_obj, verify_obj, now_sec) orelse {
+        gpa.destroy(q);
+        return null;
+    };
     q.* = QuicConnection.initClient(gpa, cid, .{
         .random = random,
         .ephemeral_seed = ephemeral_seed,
@@ -1618,18 +1836,23 @@ fn buildClientH3(
             .early_data = r.early_data,
         } else null,
         .validation_token = validation_token,
+        .trust = client_trust.trust,
+        .now_sec = now_sec,
     }, 0) catch |e| {
+        freeTrust(client_trust);
         gpa.destroy(q);
         _ = exceptions.raiseQuic(e);
         return null;
     };
     if (remembered_tp_obj != null and !py.isNone(remembered_tp_obj)) {
         const remembered = py.asBytes(remembered_tp_obj) orelse {
+            freeTrust(client_trust);
             q.deinit();
             gpa.destroy(q);
             return null;
         };
         q.applyRememberedPeerTransportParameters(remembered) catch |e| {
+            freeTrust(client_trust);
             q.deinit();
             gpa.destroy(q);
             _ = exceptions.raiseQuic(e);
@@ -1637,13 +1860,14 @@ fn buildClientH3(
         };
     }
     const h = gpa.create(H3Connection) catch {
+        freeTrust(client_trust);
         q.deinit();
         gpa.destroy(q);
         _ = c.PyErr_NoMemory();
         return null;
     };
     h.* = H3Connection.init(gpa, q);
-    return .{ .qc = q, .h3 = h };
+    return .{ .qc = q, .h3 = h, .trust_bundle = client_trust.bundle };
 }
 
 // Copy the integrator's server credentials into an owned ServerConfig, validating
@@ -1658,12 +1882,15 @@ fn buildServerConfig(
     alpn_obj: ?*c.PyObject,
     resumption_identity_obj: ?*c.PyObject,
     resumption_psk_obj: ?*c.PyObject,
+    now_sec: i64,
 ) ?ServerConfig {
     const tp_src = optionalBytes(tp_obj, &DEFAULT_SERVER_TRANSPORT_PARAMS) orelse return null;
     const random = optionalBytes32(random_obj, "random must be exactly 32 bytes") orelse return null;
     const ephemeral_seed = optionalBytes32(ephemeral_obj, "ephemeral_seed must be exactly 32 bytes") orelse return null;
     var signer: Signer = undefined;
-    var default_cert: [tls_sign.PUBLIC_SEC1_LEN]u8 = undefined;
+    // The ephemeral identity's self-signed X.509 DER, owned until the dupe below.
+    var ephemeral_cert: std.ArrayListUnmanaged(u8) = .empty;
+    defer ephemeral_cert.deinit(gpa);
     const cert_src: []const u8 = if (key_obj != null and !py.isNone(key_obj)) blk: {
         const key_src = py.asBytes(key_obj) orelse return null;
         if (key_src.len != 32) {
@@ -1677,8 +1904,21 @@ fn buildServerConfig(
         break :blk py.asBytes(cert_obj) orelse return null;
     } else blk: {
         signer = randomSigner() orelse return null;
-        default_cert = signer.publicKeySec1();
-        break :blk &default_cert;
+        // Present a real self-signed X.509 (not a bare public key) so a verifying
+        // client can authenticate or pin the ephemeral dev identity. SAN "localhost":
+        // a client that verifies an ephemeral server uses server_name=b"localhost"
+        // (or pins the certificate, or opts out with verify=INSECURE).
+        break :blk tls_x509.selfSigned(&ephemeral_cert, gpa, signer.key_pair, .{
+            .dns_name = "localhost",
+            .not_before = now_sec - tls_x509.SECONDS_PER_DAY,
+            .not_after = now_sec + EPHEMERAL_CERT_DAYS * tls_x509.SECONDS_PER_DAY,
+        }) catch |e| {
+            switch (e) {
+                error.OutOfMemory => _ = c.PyErr_NoMemory(),
+                error.InvalidName => _ = py.raiseValue("could not build the ephemeral server certificate"),
+            }
+            return null;
+        };
     };
     const resumption = parseResumptionCredential(resumption_identity_obj, resumption_psk_obj, null, null);
     if (resumption == null and c.PyErr_Occurred() != null) return null;

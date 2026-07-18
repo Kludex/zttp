@@ -31,6 +31,7 @@ def test_h3_constructor_takes_value_objects() -> None:
         zttp.HTTP3,
         server_name=b"example.com",
         resumption=zttp.SessionResumption(identity=b"ticket", psk=b"\x00" * 32),
+        verify=False,
     )
     assert isinstance(client, zttp.H3Connection)
 

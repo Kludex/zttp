@@ -16,6 +16,7 @@ client = zttp.Connection(
     zttp.CLIENT,
     protocol=zttp.HTTP3,
     server_name=b"example.com",
+    trust=ca_certificates,  # PEM or DER; see "Verifying the server" below
 )
 ```
 
@@ -42,8 +43,49 @@ client = zttp.Connection(
 )
 ```
 
-Omit `credentials` and the server uses an ephemeral local identity (development
-only).
+Omit `credentials` and the server uses an ephemeral self-signed identity for
+`localhost` (development only).
+
+## Verifying the server
+
+The HTTP/3 client authenticates the server: it checks the certificate chain
+against trust anchors **you** provide, that it is in date, and that a
+SubjectAltName matches `server_name`. Verification is **on by default and
+fail-closed** - a client with no anchors raises rather than trusting silently:
+
+```python
+client = zttp.Connection(
+    zttp.CLIENT, zttp.HTTP3,
+    server_name=b"example.com",
+    trust=ca_certificates,  # bytes: one DER cert, or a PEM bundle of them
+)
+```
+
+Staying sans-IO, zttp never reads the system trust store or a clock itself - you
+load the CAs at your own I/O layer and pass the bytes, and the clock defaults to
+`time.time()` (override with `now_sec=`). To verify against the OS trust store,
+hand it in:
+
+```python
+import ssl
+
+der_certs = b"".join(ssl.create_default_context().get_ca_certs(binary_form=True))
+client = zttp.Connection(zttp.CLIENT, zttp.HTTP3, server_name=b"example.com", trust=der_certs)
+```
+
+Two escape hatches:
+
+- **Pinning.** Pass the exact server certificate as `trust=` - handy for a
+  self-signed dev server. `zttp.generate_self_signed(dns_name, private_key,
+  not_before, not_after)` mints one (the same DER goes to the server as
+  `credentials` and to the client as `trust`).
+- **Opt out.** `verify=False` disables authentication entirely. It is explicit
+  and dangerous - only for local testing over a trusted link.
+
+!!! note "ECDSA only"
+    zttp verifies ECDSA P-256/P-384 chains (the schemes it speaks). An RSA
+    certificate fails verification. This is a parser limitation, not a security
+    fallback - it never trusts what it cannot check.
 
 !!! warning "Scope"
     HTTP/3 support is still experimental. The public surface is intentionally

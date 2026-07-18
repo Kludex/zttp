@@ -27,6 +27,15 @@ def parse_datagram_header(datagram: bytes, /) -> DatagramHeader:
     Raises `RemoteProtocolError` on a truncated or malformed header.
     """
 
+def generate_self_signed(dns_name: bytes, private_key: bytes, not_before: int, not_after: int, /) -> bytes:
+    """Mint a self-signed prime256v1 certificate for `dns_name`.
+
+    Valid over `[not_before, not_after]` (Unix seconds) and signed by the 32-byte
+    `private_key` seed - the same seed a `TlsCredentials.private_key` carries. Returns
+    the certificate as DER. For dev/test TLS identities and for pinning: the returned
+    bytes are what an HTTP/3 client passes as `trust=` to authenticate the server.
+    """
+
 @final
 class Request:
     """A parsed request head: the request line and all headers.
@@ -253,6 +262,7 @@ class Connection:
         ephemeral_seed: bytes | None = ...,
         alpn: bytes | None = ...,
         resumption: SessionResumption | None = ...,
+        now_sec: int | None = ...,
     ) -> H3Connection: ...
     @overload
     def __new__(
@@ -271,6 +281,9 @@ class Connection:
         early_data: bool = ...,
         remembered_transport_params: bytes | None = ...,
         validation_token: bytes | None = ...,
+        trust: bytes | None = ...,
+        verify: bool = ...,
+        now_sec: int | None = ...,
     ) -> H3Connection: ...
     @overload
     def __new__(cls, role: int, protocol: Literal[2]) -> H2Connection: ...

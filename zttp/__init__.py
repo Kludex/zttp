@@ -27,6 +27,7 @@ from zttp._zttp import (
     Settings,
     Stream,
     WindowUpdate,
+    generate_self_signed,
     parse_datagram_header,
 )
 from zttp.config import SessionResumption, TlsCredentials
@@ -57,6 +58,7 @@ __all__ = [
     "NEED_DATA",
     "CloseInfo",
     "Connection",
+    "generate_self_signed",
     "ConnectionClosed",
     "Data",
     "DatagramHeader",

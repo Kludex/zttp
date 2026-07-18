@@ -43,6 +43,10 @@ CLIENT_CONFIG = {
     "connection_id": b"\x11\x22\x33\x44",
     "alpn": b"h3",
     "server_name": b"example.test",
+    # These transport/QPACK/framing tests use the deterministic raw-key server
+    # identity, which is not an X.509 chain; verification is exercised separately in
+    # test_http3_verify.py, so opt out here.
+    "verify": False,
 }
 
 
@@ -113,7 +117,7 @@ def test_http3_constant_exists() -> None:
 
 def test_parse_datagram_header_routes_a_client_initial() -> None:
     client = zttp.Connection(
-        zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"localhost", connection_id=b"\xaa\xbb\xcc\xdd"
+        zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"localhost", connection_id=b"\xaa\xbb\xcc\xdd", verify=False
     )
     initial = client.data_to_send()[0]
     header = zttp.parse_datagram_header(initial)
@@ -191,14 +195,14 @@ def test_http3_validation_token_is_client_only() -> None:
 
 
 def test_http3_client_defaults_transport_settings_and_connection_id() -> None:
-    conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
+    conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test", verify=False)
     datagrams = conn.data_to_send()
     assert len(datagrams) == 1
     assert len(datagrams[0]) >= 1200
 
 
 def test_http3_default_client_and_server_exchange_request() -> None:
-    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test", verify=False)
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
 
     assert transfer(client, server, 1000)
