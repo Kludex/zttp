@@ -137,6 +137,11 @@ const H1Engine = struct {
     /// response is serialized (see next_message).
     req_method: [16]u8 = undefined,
     req_method_len: usize = 0,
+    /// Whether the remembered method belongs to a request already surfaced (server)
+    /// or sent (client) in the current read cycle. Reset by start_next_cycle. Used
+    /// to decide, on a parse failure, whether the method is stale (fresh-head
+    /// failure -> clear) or still owed a response (mid-body failure -> keep).
+    request_surfaced: bool = false,
     /// Connection signals for the last parsed request, captured at event time so
     /// they outlive the head buffer. `upgrade_obj` is held Python bytes (or null).
     should_close: bool = false,
@@ -155,6 +160,7 @@ const H1Engine = struct {
         }
         @memcpy(self.req_method[0..m.len], m);
         self.req_method_len = m.len;
+        self.request_surfaced = true;
     }
 
     fn method(self: *const H1Engine) []const u8 {
@@ -1838,6 +1844,15 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
             while (true) {
                 const ev = e.reader.nextEvent() catch |err| {
                     e.dropPending();
+                    // req_method survives start_next_cycle by design. Clear it ONLY
+                    // when the failure is on a fresh request head (no request
+                    // surfaced this cycle): otherwise an error response the app sends
+                    // (e.g. send_response(400, content-length: ...)) would be framed
+                    // on a stale HEAD/CONNECT method and wrongly forced bodyless. But
+                    // if a request WAS already surfaced and its body then fails, the
+                    // response to THAT request (a HEAD stays bodyless regardless of
+                    // headers) still needs the method - keep it.
+                    if (!e.request_surfaced) e.req_method_len = 0;
                     return exceptions.raiseParse(err);
                 };
                 if (ev == .need_data and e.pending_obj != null) {
@@ -2222,6 +2237,10 @@ fn next_message(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const e = h1(self) orelse return null;
     e.reader.reset();
+    // A new read cycle: the remembered method now belongs to the previous request,
+    // no longer one surfaced this cycle (so a parse failure on the next head clears
+    // it - see next_event).
+    e.request_surfaced = false;
     // req_method is intentionally NOT cleared: a caller may call start_next_cycle()
     // before serializing the previous response (e.g. pipelined keep-alive reads),
     // and send_response reads it to frame HEAD / CONNECT responses as bodyless. It
