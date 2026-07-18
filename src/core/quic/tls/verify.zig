@@ -22,7 +22,20 @@ const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 pub const Trust = union(enum) {
     insecure,
     anchors: *const AnchorSet,
+    /// Trust is decided by an injected callback (e.g. the OS-native verifier, via
+    /// the integrator's I/O layer). The core still does no I/O - it hands the raw
+    /// chain to `call` and honors the verdict, like rustls's ServerCertVerifier.
+    verifier: Verifier,
 };
+
+pub const Verifier = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, chain: []const []const u8, host: ?[]const u8, now_sec: i64) bool,
+};
+
+/// Certificate chains longer than this are refused before the callback runs; real
+/// chains are a handful of certificates and this bounds the on-stack chain array.
+pub const MAX_CHAIN = 12;
 
 pub const Options = struct {
     trust: Trust,
@@ -385,6 +398,19 @@ pub fn verifyCertificateMessage(body: []const u8, opts: Options) Error!void {
 
     switch (opts.trust) {
         .insecure => return,
+        .verifier => |v| {
+            // Hand the raw chain to the caller's verifier and honor its verdict.
+            var chain: [MAX_CHAIN][]const u8 = undefined;
+            var n: usize = 0;
+            while (list.remaining() != 0) {
+                if (n >= MAX_CHAIN) return error.BadCertificate;
+                chain[n] = (list.vector(3) catch return error.BadCertificate).buf;
+                _ = list.vector(2) catch return error.BadCertificate; // entry extensions
+                n += 1;
+            }
+            if (v.call(v.ctx, chain[0..n], opts.host, opts.now_sec)) return;
+            return error.ChainUntrusted;
+        },
         .anchors => |anchors| {
             var prev: Cert = undefined;
             var index: usize = 0;
@@ -547,6 +573,36 @@ test "insecure trust skips verification but still requires a leaf" {
     const empty_msg = try certMessage(gpa, &.{});
     defer gpa.free(empty_msg);
     try testing.expectError(error.EmptyChain, verifyCertificateMessage(empty_msg, .{ .trust = .insecure, .host = null, .now_sec = NOW }));
+}
+
+test "a verifier callback decides trust and receives the chain" {
+    const gpa = testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    const der = try selfSigned(gpa, &buf, [_]u8{0x42} ** 32, "example.com", NOT_AFTER);
+    const msg = try certMessage(gpa, &.{der});
+    defer gpa.free(msg);
+
+    const Ctx = struct {
+        seen_certs: usize = 0,
+        seen_host_len: usize = 0,
+        accept: bool,
+        fn call(ctx: *anyopaque, chain: []const []const u8, host: ?[]const u8, now_sec: i64) bool {
+            _ = now_sec;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen_certs = chain.len;
+            self.seen_host_len = if (host) |h| h.len else 0;
+            return self.accept;
+        }
+    };
+    var ctx = Ctx{ .accept = true };
+    const trust: Trust = .{ .verifier = .{ .ctx = &ctx, .call = Ctx.call } };
+    try verifyCertificateMessage(msg, .{ .trust = trust, .host = "example.com", .now_sec = NOW });
+    try testing.expectEqual(@as(usize, 1), ctx.seen_certs); // the callback saw the leaf
+    try testing.expectEqual(@as(usize, 11), ctx.seen_host_len); // and the host "example.com"
+
+    ctx.accept = false;
+    try testing.expectError(error.ChainUntrusted, verifyCertificateMessage(msg, .{ .trust = trust, .host = "example.com", .now_sec = NOW }));
 }
 
 test "malformed certificates are rejected, never panic" {

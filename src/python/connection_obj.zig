@@ -509,6 +509,9 @@ const H3Engine = struct {
     /// Client trust anchors, heap-owned so the tls client's borrowed pointer stays
     /// valid for the connection's life. null on servers and insecure clients.
     trust_bundle: ?*AnchorSet = null,
+    /// Held Python callable when verify=<callable>; the tls client's verifier ctx
+    /// borrows it, so it must outlive the connection. null otherwise.
+    verify_callable: ?*c.PyObject = null,
     /// The integrator's clock at the last receive_datagram / handle_timeout. A Stream
     /// send does not carry its own `now` (the API matches H2's, which has no clock),
     /// so it packetises against the most recent time the caller gave us.
@@ -547,9 +550,17 @@ const H3Engine = struct {
         }
 
         if (peer_address) |addr| {
-            self.qc.?.receiveDatagramFrom(dgram, now, addr) catch |e| return exceptions.raiseQuic(e);
+            self.qc.?.receiveDatagramFrom(dgram, now, addr) catch |e| {
+                // A verify callback that raised left its exception set; propagate it
+                // rather than masking it with a generic QUIC protocol error.
+                if (c.PyErr_Occurred() != null) return null;
+                return exceptions.raiseQuic(e);
+            };
         } else {
-            self.qc.?.receiveDatagram(dgram, now) catch |e| return exceptions.raiseQuic(e);
+            self.qc.?.receiveDatagram(dgram, now) catch |e| {
+                if (c.PyErr_Occurred() != null) return null;
+                return exceptions.raiseQuic(e);
+            };
         }
         self.h3.?.pumpAll() catch |e| return exceptions.raiseH3(e);
         return py.none();
@@ -961,11 +972,12 @@ const H3Engine = struct {
             gpa.destroy(q);
         }
         if (self.config) |*cfg| cfg.deinit();
-        // Freed after qc: the tls client borrowed a pointer into this bundle.
+        // Freed after qc: the tls client borrowed pointers into these.
         if (self.trust_bundle) |b| {
             b.deinit(gpa);
             gpa.destroy(b);
         }
+        if (self.verify_callable) |cb| py.decref(cb);
     }
 };
 
@@ -1657,8 +1669,10 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
 
 const ClientTrust = struct {
     trust: tls_verify.Trust,
-    /// Heap-owned when `.anchors`; freed by H3Engine.deinit. null for `.insecure`.
+    /// Heap-owned when `.anchors`; freed by H3Engine.deinit. null otherwise.
     bundle: ?*AnchorSet,
+    /// Held Python callable when `verify=<callable>`; freed by H3Engine.deinit.
+    callable: ?*c.PyObject,
 };
 
 fn freeTrust(t: ClientTrust) void {
@@ -1666,6 +1680,34 @@ fn freeTrust(t: ClientTrust) void {
         b.deinit(gpa);
         gpa.destroy(b);
     }
+    if (t.callable) |cb| py.decref(cb);
+}
+
+// Bridges the core's certificate verifier to a Python callable, verify(certs, host)
+// -> bool, called synchronously mid-handshake with the GIL held (we are inside a
+// receive_datagram call). A raise or a falsy return is a rejection; on a raise the
+// exception is left set so receive_datagram propagates it rather than masking it
+// with a generic QUIC error. `certs` is the DER chain leaf-first; `host` is
+// server_name or None. Any I/O the verifier needs happens here, in the caller's
+// code - the core stays sans-IO.
+fn verifierTrampoline(ctx: *anyopaque, chain: []const []const u8, host: ?[]const u8, now_sec: i64) bool {
+    _ = now_sec;
+    const callable: py.Object = @ptrCast(@alignCast(ctx));
+    const list = c.PyList_New(@intCast(chain.len));
+    if (list == null) return false;
+    defer py.decref(list);
+    for (chain, 0..) |der, i| {
+        const item = py.fromBytes(der);
+        if (item == null) return false;
+        _ = c.PyList_SetItem(list, @intCast(i), item); // steals the reference
+    }
+    const host_obj = if (host) |h| py.fromBytes(h) else py.none();
+    if (host_obj == null) return false;
+    defer py.decref(host_obj);
+    const result = c.PyObject_CallFunctionObjArgs(callable, list, host_obj, @as(py.Object, null));
+    if (result == null) return false; // the callback raised; the error stays set
+    defer py.decref(result);
+    return c.PyObject_IsTrue(result) == 1;
 }
 
 /// Resolve the client's certificate-verification policy. Sans-IO: the library
@@ -1676,7 +1718,24 @@ fn freeTrust(t: ClientTrust) void {
 /// silent bypass. On failure sets a Python error and returns null.
 fn resolveClientTrust(trust_obj: ?*c.PyObject, verify_obj: ?*c.PyObject, now_sec: i64) ?ClientTrust {
     const has_trust = trust_obj != null and !py.isNone(trust_obj);
-    const verify = if (verify_obj != null and !py.isNone(verify_obj)) blk: {
+    const has_verify = verify_obj != null and !py.isNone(verify_obj);
+
+    // verify=<callable>: the caller decides trust from the chain (e.g. via truststore
+    // or the OS verifier). zttp surfaces the certificates and honors the verdict.
+    if (has_verify and c.PyCallable_Check(verify_obj) != 0) {
+        if (has_trust) {
+            _ = py.raiseValue("trust= cannot be combined with a verify callback; the callback receives the chain and decides");
+            return null;
+        }
+        py.incref(verify_obj.?);
+        return .{
+            .trust = .{ .verifier = .{ .ctx = @ptrCast(verify_obj.?), .call = verifierTrampoline } },
+            .bundle = null,
+            .callable = verify_obj,
+        };
+    }
+
+    const verify = if (has_verify) blk: {
         const t = c.PyObject_IsTrue(verify_obj);
         if (t < 0) return null;
         break :blk t != 0;
@@ -1687,10 +1746,10 @@ fn resolveClientTrust(trust_obj: ?*c.PyObject, verify_obj: ?*c.PyObject, now_sec
             _ = py.raiseValue("trust= cannot be combined with verify=False");
             return null;
         }
-        return .{ .trust = .insecure, .bundle = null };
+        return .{ .trust = .insecure, .bundle = null, .callable = null };
     }
     if (!has_trust) {
-        _ = py.raiseValue("an HTTP/3 client must be given trust=<CA certificates, PEM or DER> to verify the server, or verify=False to disable verification (sans-IO: zttp does not read the system trust store; load it yourself, e.g. ssl.create_default_context().get_ca_certs())");
+        _ = py.raiseValue("an HTTP/3 client must be given trust=<CA certificates, PEM or DER>, a verify=<callable> that decides from the chain, or verify=False to disable verification (sans-IO: zttp does not read the system trust store; load it yourself, e.g. ssl.create_default_context().get_ca_certs())");
         return null;
     }
 
@@ -1705,7 +1764,7 @@ fn resolveClientTrust(trust_obj: ?*c.PyObject, verify_obj: ?*c.PyObject, now_sec
         gpa.destroy(bundle);
         return null;
     }
-    return .{ .trust = .{ .anchors = bundle }, .bundle = bundle };
+    return .{ .trust = .{ .anchors = bundle }, .bundle = bundle, .callable = null };
 }
 
 fn addTrustAnchors(bundle: *AnchorSet, obj: *c.PyObject, now_sec: i64) bool {
@@ -1867,7 +1926,7 @@ fn buildClientH3(
         return null;
     };
     h.* = H3Connection.init(gpa, q);
-    return .{ .qc = q, .h3 = h, .trust_bundle = client_trust.bundle };
+    return .{ .qc = q, .h3 = h, .trust_bundle = client_trust.bundle, .verify_callable = client_trust.callable };
 }
 
 // Copy the integrator's server credentials into an owned ServerConfig, validating

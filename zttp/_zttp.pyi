@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Final, Literal, final, overload
 
 from typing_extensions import disjoint_base
@@ -282,7 +283,7 @@ class Connection:
         remembered_transport_params: bytes | None = ...,
         validation_token: bytes | None = ...,
         trust: bytes | None = ...,
-        verify: bool = ...,
+        verify: bool | Callable[[list[bytes], bytes | None], bool] = ...,
         now_sec: int | None = ...,
     ) -> H3Connection: ...
     @overload

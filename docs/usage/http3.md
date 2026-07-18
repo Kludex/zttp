@@ -73,7 +73,27 @@ der_certs = b"".join(ssl.create_default_context().get_ca_certs(binary_form=True)
 client = zttp.Connection(zttp.CLIENT, zttp.HTTP3, server_name=b"example.com", trust=der_certs)
 ```
 
-Two escape hatches:
+Other ways to decide trust:
+
+- **Your own verifier.** Pass a callable as `verify=` and zttp hands it the
+  certificate chain to judge - the sans-IO way to use the OS-native verifier, or
+  [`truststore`][truststore], or any policy. It runs during the handshake and
+  returns `True` to accept; a `False` or a raised exception rejects (and your
+  exception propagates). Any I/O it needs happens in *your* code, so zttp stays
+  sans-IO. This also sidesteps the ECDSA-only limit below, since zttp does not do
+  the checking:
+
+    ```python
+    import truststore
+
+    ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+    def verify(certificates: list[bytes], server_name: bytes | None) -> bool:
+        # certificates is the DER chain, leaf first; decide with your own tooling
+        return my_policy_ok(certificates, server_name)
+
+    client = zttp.Connection(zttp.CLIENT, zttp.HTTP3, server_name=b"example.com", verify=verify)
+    ```
 
 - **Pinning.** Pass the exact server certificate as `trust=` - handy for a
   self-signed dev server. `zttp.generate_self_signed(dns_name, private_key,
@@ -82,10 +102,13 @@ Two escape hatches:
 - **Opt out.** `verify=False` disables authentication entirely. It is explicit
   and dangerous - only for local testing over a trusted link.
 
-!!! note "ECDSA only"
-    zttp verifies ECDSA P-256/P-384 chains (the schemes it speaks). An RSA
-    certificate fails verification. This is a parser limitation, not a security
-    fallback - it never trusts what it cannot check.
+!!! note "ECDSA only (built-in `trust=` verification)"
+    zttp's own chain verification handles ECDSA P-256/P-384 (the schemes it
+    speaks); an RSA chain fails - it never trusts what it cannot check. This is a
+    limitation of the `trust=` path only; a `verify=` callback does its own
+    checking and has no such limit.
+
+  [truststore]: https://truststore.readthedocs.io/
 
 !!! warning "Scope"
     HTTP/3 support is still experimental. The public surface is intentionally

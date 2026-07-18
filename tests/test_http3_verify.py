@@ -104,6 +104,49 @@ def test_matching_san_wildcard_is_accepted() -> None:
     handshake(client, server)
 
 
+# -- verify=<callable>: the caller decides trust from the chain (truststore, ssl, ...) --
+
+
+def test_verify_callback_receives_the_chain_and_decides() -> None:
+    cert = server_cert(b"example.test")
+    seen: dict[str, object] = {}
+
+    def verifier(certificates: list[bytes], server_name: bytes | None) -> bool:
+        seen["certs"] = certificates
+        seen["host"] = server_name
+        return True  # the caller's own verification would go here
+
+    client, server = make_pair(cert=cert, server_name=b"example.test", verify=verifier)
+    handshake(client, server)  # accepted
+    assert seen["certs"] == [cert]  # got the DER chain, leaf first
+    assert seen["host"] == b"example.test"
+
+
+def test_verify_callback_rejection_fails_the_handshake() -> None:
+    cert = server_cert()
+    client, server = make_pair(cert=cert, server_name=b"localhost", verify=lambda certs, host: False)
+    with pytest.raises(zttp.RemoteProtocolError):
+        handshake(client, server)
+
+
+def test_verify_callback_exception_propagates() -> None:
+    cert = server_cert()
+
+    def verifier(certificates: list[bytes], server_name: bytes | None) -> bool:
+        raise RuntimeError("policy check failed")
+
+    client, server = make_pair(cert=cert, server_name=b"localhost", verify=verifier)
+    with pytest.raises(RuntimeError, match="policy check failed"):
+        handshake(client, server)  # the callback's own exception, not a masked QUIC error
+
+
+def test_verify_callback_conflicts_with_trust() -> None:
+    with pytest.raises(ValueError, match="callback"):
+        zttp.Connection(
+            zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"x", trust=server_cert(), verify=lambda certs, host: True
+        )
+
+
 # -- constructor policy (no handshake needed) ---------------------------------
 
 
