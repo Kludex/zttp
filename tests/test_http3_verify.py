@@ -136,3 +136,38 @@ def test_trust_and_verify_are_client_only() -> None:
     for kw in ({"trust": server_cert()}, {"verify": False}):
         with pytest.raises(ValueError, match="only valid for HTTP/3 clients"):
             zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **kw)  # type: ignore[arg-type]
+
+
+# A real 2048-bit RSA self-signed root (OpenSSL). Certificate verification is
+# ECDSA + RSA (PKCS#1 v1.5 / PSS), so an RSA CA is a usable trust anchor - the DER
+# parses through the binding without error. (The chain-verification math itself is
+# covered end to end by the Zig tests, which drive real RSA fixtures.)
+RSA_ROOT_DER = bytes.fromhex(
+    "30820311308201f9a003020102021446201ad42ef894e101f97948bbb9080643f3b56d300d06092a8648"
+    "86f70d01010b050030183116301406035504030c0d7a7474702052534120526f6f74301e170d32363037"
+    "31383131333134305a170d3336303731353131333134305a30183116301406035504030c0d7a74747020"
+    "52534120526f6f7430820122300d06092a864886f70d01010105000382010f003082010a0282010100b0"
+    "a78a6bde412ab773f447b7a0fb16d69f53d62e29d3313e9010e6541cdd1f426b17b4c1870c77497cde8f9"
+    "65f9545ca69baaf2c481d13da0380a292f9123c42e3321919243e0749e85f4495b119fc57278082 31e41"
+    "e5f6e56888603cc52d0989c7456e2b57796ceb9f3b3c7ab2627972e4e5811a44b84fe1a2041caa3647756"
+    "f459aa704b18399afa05ea414ac62a5f1ad299d84d906669b5edae488fc8aeeea3e3f186286dfd7beadd5"
+    "e89eb4a708e26badced8ae10b0de3f641afab5b3c3b598844776c5ee608231dc51dd888c272c033e3308a"
+    "d2e2ea366593569321c37623a77e7c34eb74b53e148bfb201273ad946e3074ba9df347151eea5f4077d7d"
+    "b0203010001a3533051301d0603551d0e041604142487baccc2bd48dc5c60ce2538e8915b205c4534301f"
+    "0603551d230418301680142487baccc2bd48dc5c60ce2538e8915b205c4534300f0603551d130101ff04"
+    "0530030101ff300d06092a864886f70d01010b05000382010100875c7d06e4193c10b63b95adf9ebe6ed"
+    "e2d0f20738aed10dea48e05258d07c514c10757ff0fd1d765fa46fe87491e2f2e848d5642995e50799 3d8"
+    "618b96005b580bccb7c0cdc43af6155e0192d521984a23b81a597e2f0fe7414cbed3da532d549057c327c"
+    "7af18c695e22a8c60d92e35e8d577fac73751204d755f31bc90e5dfedc88de1795157d7e728369bea8350"
+    "a9b7621526dc2994725f67cb1fc1cc02002befba88b9b075e511435d7336dfa86062cb22a35067531dc4d"
+    "3e328015078004def1944b401e022c3173736c0c622a4f2547626f3ffd0448042137c184bb712b945f6c8"
+    "171f78af7ff98fd06438c5f172a821d4c7f063daa5b60d3dfcc9fc8".replace(" ", "")
+)
+
+
+def test_an_rsa_certificate_is_a_usable_trust_anchor() -> None:
+    # Constructs without error: the RSA anchor parses through the binding.
+    client = zttp.Connection(
+        zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test", trust=RSA_ROOT_DER, now_sec=1800000000
+    )
+    assert isinstance(client, zttp.H3Connection)

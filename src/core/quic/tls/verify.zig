@@ -3,21 +3,28 @@
 //! reader. std.crypto.Certificate.parse indexes without bounds checks and traps on
 //! malformed input - unacceptable for a certificate that arrives over the wire from
 //! an untrusted peer - so we do the ASN.1 walk here and lean on std.crypto only for
-//! the vetted ECDSA math. The reader returns null on any truncation, length lie, or
-//! over-deep nesting, so a crafted certificate is a clean verification failure, not
-//! a crash.
+//! the vetted signature math. The reader returns null on any truncation, length lie,
+//! or over-deep nesting, so a crafted certificate is a clean verification failure,
+//! not a crash.
 //!
 //! Sans-IO: the trust anchors and the current time are injected. zttp never reads a
 //! trust store or a clock; the caller provides both.
 //!
-//! Scope: the leaf and every chain link must be ECDSA P-256/P-384 (the schemes zttp
-//! itself speaks). RSA links are unsupported and fail verification, not the parser.
+//! Signature coverage is the full real-world set: ECDSA P-256/P-384 and RSA
+//! (PKCS#1 v1.5 and RSASSA-PSS) with SHA-256/384/512, so an ordinary chain - an
+//! ECDSA or RSA leaf under RSA certificate authorities - verifies. std.crypto's own
+//! DER-parsing RSA/ECDSA key loaders would reintroduce the panic, so keys are parsed
+//! by the bounded reader and only the raw big-integer/point bytes reach std's math.
 
 const std = @import("std");
 const wire = @import("wire.zig");
 
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+const rsa = std.crypto.Certificate.rsa; // the RSA math only; we do the DER ourselves
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha384 = std.crypto.hash.sha2.Sha384;
+const Sha512 = std.crypto.hash.sha2.Sha512;
 
 pub const Trust = union(enum) {
     insecure,
@@ -99,15 +106,35 @@ const Reader = struct {
 // -- certificate model --------------------------------------------------------
 
 const Curve = enum { p256, p384 };
-const SigAlgo = enum { ecdsa_sha256, ecdsa_sha384 };
+const Hash = enum { sha256, sha384, sha512 };
+const SigAlgo = union(enum) {
+    ecdsa: Hash,
+    rsa_pkcs1: Hash,
+    rsa_pss: Hash,
+};
 
-// ecdsa-with-SHA256 / -SHA384 (RFC 5758), id-ecPublicKey, and the two named curves.
-const OID_ECDSA_SHA256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 };
-const OID_ECDSA_SHA384 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03 };
+/// A certificate's public key: whichever an issuer signs with.
+const PublicKey = union(enum) {
+    ecdsa: struct { curve: Curve, point: []const u8 }, // SEC1 point (0x04 || X || Y)
+    rsa: struct { modulus: []const u8, exponent: []const u8 }, // big-endian, no leading zeros
+};
+
+// id-ecPublicKey / rsaEncryption, the named curves, the SubjectAltName extension,
+// and the signature-algorithm OIDs (RFC 5758, RFC 8017, RFC 5480).
 const OID_EC_PUBLIC_KEY = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
+const OID_RSA_ENCRYPTION = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
 const OID_PRIME256V1 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
 const OID_SECP384R1 = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 };
 const OID_SUBJECT_ALT_NAME = [_]u8{ 0x55, 0x1d, 0x11 };
+const OID_ECDSA_SHA256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 };
+const OID_ECDSA_SHA384 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03 };
+const OID_RSA_SHA256 = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b };
+const OID_RSA_SHA384 = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c };
+const OID_RSA_SHA512 = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d };
+const OID_RSASSA_PSS = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a };
+const OID_SHA256 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
+const OID_SHA384 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02 };
+const OID_SHA512 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03 };
 
 const Cert = struct {
     tbs: []const u8, // raw TBSCertificate: the bytes the signature covers
@@ -115,11 +142,10 @@ const Cert = struct {
     subject: []const u8, // raw subject Name
     not_before: i64,
     not_after: i64,
-    curve: Curve,
-    point: []const u8, // SEC1 public point (0x04 || X || Y)
+    key: PublicKey,
     san: []const u8, // raw SubjectAltName GeneralNames (empty if absent)
     sig_algo: SigAlgo,
-    sig: []const u8, // DER ECDSA-Sig-Value
+    sig: []const u8, // signatureValue: DER ECDSA-Sig-Value, or raw RSA signature
 
     fn validAt(self: *const Cert, now_sec: i64) bool {
         return now_sec >= self.not_before and now_sec <= self.not_after;
@@ -168,39 +194,87 @@ fn parseCert(der: []const u8) ?Cert {
         .subject = subject.raw,
         .not_before = not_before,
         .not_after = not_after,
-        .curve = spki.curve,
-        .point = spki.point,
+        .key = spki,
         .san = san,
         .sig_algo = sig_algo,
         .sig = sig_bits.content[1..],
     };
 }
 
-const Spki = struct { curve: Curve, point: []const u8 };
-
-fn parseSpki(spki_elem: Element) ?Spki {
+fn parseSpki(spki_elem: Element) ?PublicKey {
     var spki = Reader{ .buf = spki_elem.content };
     var algo = Reader{ .buf = (spki.expect(TAG_SEQUENCE) orelse return null).content };
     const algo_oid = algo.expect(TAG_OID) orelse return null;
-    if (!std.mem.eql(u8, algo_oid.content, &OID_EC_PUBLIC_KEY)) return null;
-    const curve_oid = algo.expect(TAG_OID) orelse return null;
-    const curve: Curve = if (std.mem.eql(u8, curve_oid.content, &OID_PRIME256V1))
-        .p256
-    else if (std.mem.eql(u8, curve_oid.content, &OID_SECP384R1))
-        .p384
-    else
-        return null;
-    const key_bits = spki.expect(TAG_BITSTRING) orelse return null;
-    // BITSTRING: leading unused-bits octet (0), then 0x04 || X || Y.
-    if (key_bits.content.len < 2 or key_bits.content[0] != 0x00 or key_bits.content[1] != 0x04) return null;
-    return .{ .curve = curve, .point = key_bits.content[1..] };
+
+    if (std.mem.eql(u8, algo_oid.content, &OID_EC_PUBLIC_KEY)) {
+        const curve_oid = algo.expect(TAG_OID) orelse return null;
+        const curve: Curve = if (std.mem.eql(u8, curve_oid.content, &OID_PRIME256V1))
+            .p256
+        else if (std.mem.eql(u8, curve_oid.content, &OID_SECP384R1))
+            .p384
+        else
+            return null;
+        const key_bits = spki.expect(TAG_BITSTRING) orelse return null;
+        // BITSTRING: leading unused-bits octet (0), then 0x04 || X || Y.
+        if (key_bits.content.len < 2 or key_bits.content[0] != 0x00 or key_bits.content[1] != 0x04) return null;
+        return .{ .ecdsa = .{ .curve = curve, .point = key_bits.content[1..] } };
+    }
+
+    if (std.mem.eql(u8, algo_oid.content, &OID_RSA_ENCRYPTION)) {
+        const key_bits = spki.expect(TAG_BITSTRING) orelse return null;
+        if (key_bits.content.len < 1 or key_bits.content[0] != 0x00) return null; // unused bits = 0
+        // The BIT STRING wraps RSAPublicKey ::= SEQUENCE { modulus, publicExponent }.
+        var key = Reader{ .buf = key_bits.content[1..] };
+        var rsa_seq = Reader{ .buf = (key.expect(TAG_SEQUENCE) orelse return null).content };
+        const modulus = trimLeadingZeros((rsa_seq.expect(TAG_INTEGER) orelse return null).content);
+        const exponent = trimLeadingZeros((rsa_seq.expect(TAG_INTEGER) orelse return null).content);
+        if (modulus.len == 0 or exponent.len == 0) return null;
+        return .{ .rsa = .{ .modulus = modulus, .exponent = exponent } };
+    }
+
+    return null;
+}
+
+// DER encodes a positive INTEGER with a leading 0x00 when the high bit is set;
+// std's RSA math wants the raw big-endian magnitude, so strip those.
+fn trimLeadingZeros(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < s.len and s[i] == 0) i += 1;
+    return s[i..];
 }
 
 fn parseSigAlgo(algo_elem: Element) ?SigAlgo {
     var algo = Reader{ .buf = algo_elem.content };
     const oid = algo.expect(TAG_OID) orelse return null;
-    if (std.mem.eql(u8, oid.content, &OID_ECDSA_SHA256)) return .ecdsa_sha256;
-    if (std.mem.eql(u8, oid.content, &OID_ECDSA_SHA384)) return .ecdsa_sha384;
+    if (std.mem.eql(u8, oid.content, &OID_ECDSA_SHA256)) return .{ .ecdsa = .sha256 };
+    if (std.mem.eql(u8, oid.content, &OID_ECDSA_SHA384)) return .{ .ecdsa = .sha384 };
+    if (std.mem.eql(u8, oid.content, &OID_RSA_SHA256)) return .{ .rsa_pkcs1 = .sha256 };
+    if (std.mem.eql(u8, oid.content, &OID_RSA_SHA384)) return .{ .rsa_pkcs1 = .sha384 };
+    if (std.mem.eql(u8, oid.content, &OID_RSA_SHA512)) return .{ .rsa_pkcs1 = .sha512 };
+    if (std.mem.eql(u8, oid.content, &OID_RSASSA_PSS)) {
+        // RSASSA-PSS-params carries the hash in its parameters, not the OID; the
+        // MGF hash and salt length are recovered by std's PSS verify.
+        const params = algo.expect(TAG_SEQUENCE) orelse return null;
+        return .{ .rsa_pss = pssHash(params.content) orelse return null };
+    }
+    return null;
+}
+
+// The hashAlgorithm from RSASSA-PSS-params ([0] AlgorithmIdentifier), default SHA-1
+// per RFC 8017 - which we do not accept, so an absent hash is a rejection.
+fn pssHash(params_content: []const u8) ?Hash {
+    var params = Reader{ .buf = params_content };
+    while (params.next()) |field| {
+        if (field.tag != TAG_CONTEXT0) continue; // [0] hashAlgorithm
+        var h = Reader{ .buf = field.content };
+        const oid = (h.expect(TAG_SEQUENCE) orelse return null);
+        var inner = Reader{ .buf = oid.content };
+        const hash_oid = inner.expect(TAG_OID) orelse return null;
+        if (std.mem.eql(u8, hash_oid.content, &OID_SHA256)) return .sha256;
+        if (std.mem.eql(u8, hash_oid.content, &OID_SHA384)) return .sha384;
+        if (std.mem.eql(u8, hash_oid.content, &OID_SHA512)) return .sha512;
+        return null;
+    }
     return null;
 }
 
@@ -285,23 +359,66 @@ fn civilToUnix(year: i64, month: u8, day: u8, hour: u8, minute: u8, second: u8) 
 
 // Verify `sig` over `tbs` with the issuer's key, per `algo`. All parse/verify
 // errors collapse to false; a crafted signature or key is a rejection, not a trap.
-fn verifySignature(tbs: []const u8, algo: SigAlgo, sig: []const u8, issuer_curve: Curve, issuer_point: []const u8) bool {
+fn verifySignature(tbs: []const u8, algo: SigAlgo, sig: []const u8, issuer_key: PublicKey) bool {
     switch (algo) {
-        .ecdsa_sha256 => {
-            if (issuer_curve != .p256) return false;
-            const pk = EcdsaP256.PublicKey.fromSec1(issuer_point) catch return false;
-            const s = EcdsaP256.Signature.fromDer(sig) catch return false;
-            s.verify(tbs, pk) catch return false;
-            return true;
+        .ecdsa => |hash| {
+            const ec = switch (issuer_key) {
+                .ecdsa => |e| e,
+                else => return false,
+            };
+            switch (hash) {
+                .sha256 => {
+                    if (ec.curve != .p256) return false;
+                    const pk = EcdsaP256.PublicKey.fromSec1(ec.point) catch return false;
+                    const s = EcdsaP256.Signature.fromDer(sig) catch return false;
+                    s.verify(tbs, pk) catch return false;
+                    return true;
+                },
+                .sha384 => {
+                    if (ec.curve != .p384) return false;
+                    const pk = EcdsaP384.PublicKey.fromSec1(ec.point) catch return false;
+                    const s = EcdsaP384.Signature.fromDer(sig) catch return false;
+                    s.verify(tbs, pk) catch return false;
+                    return true;
+                },
+                .sha512 => return false, // no ECDSA P-521
+            }
         },
-        .ecdsa_sha384 => {
-            if (issuer_curve != .p384) return false;
-            const pk = EcdsaP384.PublicKey.fromSec1(issuer_point) catch return false;
-            const s = EcdsaP384.Signature.fromDer(sig) catch return false;
-            s.verify(tbs, pk) catch return false;
-            return true;
-        },
+        .rsa_pkcs1 => |hash| return rsaVerify(.pkcs1, hash, tbs, sig, issuer_key),
+        .rsa_pss => |hash| return rsaVerify(.pss, hash, tbs, sig, issuer_key),
     }
+}
+
+const RsaPad = enum { pkcs1, pss };
+
+fn rsaVerify(pad: RsaPad, hash: Hash, tbs: []const u8, sig: []const u8, issuer_key: PublicKey) bool {
+    const key = switch (issuer_key) {
+        .rsa => |k| k,
+        else => return false,
+    };
+    // std's RSA verify is generic over the modulus length at comptime; support the
+    // standard 1024/2048/3072/4096-bit sizes.
+    return switch (key.modulus.len) {
+        inline 128, 256, 384, 512 => |mlen| blk: {
+            if (sig.len != mlen) break :blk false;
+            const pk = rsa.PublicKey.fromBytes(key.exponent, key.modulus) catch break :blk false;
+            const sig_arr: [mlen]u8 = sig[0..mlen].*;
+            (switch (pad) {
+                .pkcs1 => switch (hash) {
+                    .sha256 => rsa.PKCS1v1_5Signature.verify(mlen, sig_arr, tbs, pk, Sha256),
+                    .sha384 => rsa.PKCS1v1_5Signature.verify(mlen, sig_arr, tbs, pk, Sha384),
+                    .sha512 => rsa.PKCS1v1_5Signature.verify(mlen, sig_arr, tbs, pk, Sha512),
+                },
+                .pss => switch (hash) {
+                    .sha256 => rsa.PSSSignature.verify(mlen, sig_arr, tbs, pk, Sha256),
+                    .sha384 => rsa.PSSSignature.verify(mlen, sig_arr, tbs, pk, Sha384),
+                    .sha512 => rsa.PSSSignature.verify(mlen, sig_arr, tbs, pk, Sha512),
+                },
+            }) catch break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
 }
 
 // RFC 6125 hostname match against the leaf's dNSName SANs: case-insensitive, with a
@@ -365,7 +482,7 @@ pub const AnchorSet = struct {
             const anchor = parseCert(der) orelse continue;
             if (!std.mem.eql(u8, anchor.subject, subject.issuer)) continue;
             if (!anchor.validAt(now_sec)) continue;
-            if (verifySignature(subject.tbs, subject.sig_algo, subject.sig, anchor.curve, anchor.point)) return true;
+            if (verifySignature(subject.tbs, subject.sig_algo, subject.sig, anchor.key)) return true;
         }
         return false;
     }
@@ -398,7 +515,7 @@ pub fn verifyCertificateMessage(body: []const u8, opts: Options) Error!void {
                     if (opts.host) |h| {
                         if (!hostMatchesSan(cert.san, h)) return error.HostnameMismatch;
                     }
-                } else if (!verifySignature(prev.tbs, prev.sig_algo, prev.sig, cert.curve, cert.point)) {
+                } else if (!verifySignature(prev.tbs, prev.sig_algo, prev.sig, cert.key)) {
                     return error.BadCertificate;
                 }
 
@@ -451,7 +568,7 @@ test "parseCert extracts the fields x509.selfSigned wrote" {
     const cert = parseCert(der) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(i64, NOT_BEFORE), cert.not_before);
     try testing.expectEqual(@as(i64, NOT_AFTER), cert.not_after);
-    try testing.expectEqual(Curve.p256, cert.curve);
+    try testing.expectEqual(Curve.p256, cert.key.ecdsa.curve);
     try testing.expect(hostMatchesSan(cert.san, "example.com"));
     try testing.expect(!hostMatchesSan(cert.san, "evil.com"));
     try testing.expect(std.mem.eql(u8, cert.issuer, cert.subject)); // self-signed
@@ -534,6 +651,72 @@ test "a leaf signed by a trusted CA verifies through the chain" {
     var empty2 = AnchorSet.empty;
     defer empty2.deinit(gpa);
     try testing.expectError(error.ChainUntrusted, verifyCertificateMessage(msg, .{ .trust = .{ .anchors = &empty2 }, .host = "example.com", .now_sec = NOW }));
+}
+
+// Real OpenSSL fixtures (valid 2026-07 .. 2036-07): an ECDSA P-256 leaf for
+// example.test signed by a 2048-bit RSA root (sha256WithRSAEncryption), and an
+// RSA-PSS self-signed cert for pss.test. These exercise the RSA verification the
+// public web needs - ECDSA/RSA leaves under RSA certificate authorities.
+const RSA_NOW: i64 = 1800000000; // 2027-01-15, inside the fixtures' window
+const RSA_ROOT_HEX = "30820311308201f9a003020102021446201ad42ef894e101f97948bbb9080643f3b56d300d06092a864886f70d01010b050030183116301406035504030c0d7a7474702052534120526f6f74301e170d3236303731383131333134305a170d3336303731353131333134305a30183116301406035504030c0d7a7474702052534120526f6f7430820122300d06092a864886f70d01010105000382010f003082010a0282010100b0a78a6bde412ab773f447b7a0fb16d69f53d62e29d3313e9010e6541cdd1f426b17b4c1870c77497cde8f965f9545ca69baaf2c481d13da0380a292f9123c42e3321919243e0749e85f4495b119fc5727808231e41e5f6e56888603cc52d0989c7456e2b57796ceb9f3b3c7ab2627972e4e5811a44b84fe1a2041caa3647756f459aa704b18399afa05ea414ac62a5f1ad299d84d906669b5edae488fc8aeeea3e3f186286dfd7beadd5e89eb4a708e26badced8ae10b0de3f641afab5b3c3b598844776c5ee608231dc51dd888c272c033e3308ad2e2ea366593569321c37623a77e7c34eb74b53e148bfb201273ad946e3074ba9df347151eea5f4077d7db0203010001a3533051301d0603551d0e041604142487baccc2bd48dc5c60ce2538e8915b205c4534301f0603551d230418301680142487baccc2bd48dc5c60ce2538e8915b205c4534300f0603551d130101ff040530030101ff300d06092a864886f70d01010b05000382010100875c7d06e4193c10b63b95adf9ebe6ede2d0f20738aed10dea48e05258d07c514c10757ff0fd1d765fa46fe87491e2f2e848d5642995e507993d8618b96005b580bccb7c0cdc43af6155e0192d521984a23b81a597e2f0fe7414cbed3da532d549057c327c7af18c695e22a8c60d92e35e8d577fac73751204d755f31bc90e5dfedc88de1795157d7e728369bea8350a9b7621526dc2994725f67cb1fc1cc02002befba88b9b075e511435d7336dfa86062cb22a35067531dc4d3e328015078004def1944b401e022c3173736c0c622a4f2547626f3ffd0448042137c184bb712b945f6c8171f78af7ff98fd06438c5f172a821d4c7f063daa5b60d3dfcc9fc8";
+const RSA_LEAF_HEX = "3082025830820140a003020102021464d6997c5b2357f7c8d31d41e828e59077374475300d06092a864886f70d01010b050030183116301406035504030c0d7a7474702052534120526f6f74301e170d3236303731383131333135345a170d3336303731353131333135345a30173115301306035504030c0c6578616d706c652e746573743059301306072a8648ce3d020106082a8648ce3d03010703420004647bf087fffd6f44fee6402f9da534992376ac150545606a94a5d66bb405b9dc099722fd069974f64b3d937353a1e8bccb97fb98ce212985cf359624b3c11d29a366306430170603551d110410300e820c6578616d706c652e7465737430090603551d1304023000301d0603551d0e0416041447330cef7e7defc29784ddf12dff4acce5eeca77301f0603551d230418301680142487baccc2bd48dc5c60ce2538e8915b205c4534300d06092a864886f70d01010b05000382010100483645b2a2fe6145035f0ad256ed88a9284a9b8c6a227eb59992d6eaad40784c7c4e0c2fc5828b065a19f47bdc6f6aedb550fd70f3fb35e4acb0ea2c644deac119c0cef4037dbed9b14bf5fa37649acf5ba2906c20cd882cd88747e1d84d1e8e9d84dce524cae99b42e42569de5f067d069d841c5750d02d8a1bd7423168c7f0794b2279ca6bc86391b9819a796d7ff49c3ee5a122d01dac1debb4098820f30d1d9a885a69fad9aba1d0436155f18427003baa05cec23254aaf78da8c010e1d7f1c0b7722d11a0079e7c5785f6accbaa6c1a44e905ce936a740e81dbe402a7be231f321d84435e868c8ebef395caab0ba5fbf200facabe740b191439d56334b7";
+const RSA_PSS_HEX = "3082038430820238a00302010202144c9aa9be675ea2c70fb3eaf0652efbcaedb7267b304106092a864886f70d01010a3034a00f300d06096086480165030402010500a11c301a06092a864886f70d010108300d06096086480165030402010500a20302012030133111300f06035504030c087a74747020505353301e170d3236303731383131333135345a170d3336303731353131333135345a30133111300f06035504030c087a7474702050535330820122300d06092a864886f70d01010105000382010f003082010a028201010091f8e63579a5f62111c6d9efc71086f5c9ce161001e78d35d1ef6bc966b8ae230839023e25966652aeae7634c6ed2690399faa5ab8d5fc504c75fcaee168208d6077f7851222b1ca5b8912f645dcd5ef0cafe8ca7f9cd17e29b69bb81c2ab11529d6940e47c48083b5f2c2d6a6a5b257b9dc0f2235873885923943b9cf6eaec1931847588e4a36dbd1a7f2a83c6bc740c30ccf4ebe892c6b957a498ae41f6ac4c7b0ef41ff8c959516028b69008d8ec329e4ec22f615fe22edbf6c6ce6089903ed131c10c13bfcd89fc6e21c76eb53641cd7cf4316be06279ec6b02f46cbe7a19f4c1520bb6247e50b552f8644ca9ff3d1e1f7b6c97853701c0f43e6767806830203010001a3683066301d0603551d0e0416041479576872874ab226e776044a2259fb74a2b2c659301f0603551d2304183016801479576872874ab226e776044a2259fb74a2b2c659300f0603551d130101ff040530030101ff30130603551d11040c300a82087073732e74657374304106092a864886f70d01010a3034a00f300d06096086480165030402010500a11c301a06092a864886f70d010108300d06096086480165030402010500a20302012003820101001e69e1e65928d62f9df8069475a6ff81b6dd08799c31d97633226d8fe173a3ee4c271c813bcd3f677ac70ec16115e9b27ccd240e5d6909ceec245c7e0edd73f5e4bed29793ae13be8c6c0d7462063db9c8d4bc4f9736fe9f3d69ae2a2cebc05cc94eb83052f0e9eaccfe2f5c10b70ad66063b23ff33a1e5e9681a2fb5da43f5c574adaec1c63e949915a99f409e9e66fda001a12ddcc42eae575044f241eb527d0ad3f767e2b3650f920395391420cd4921157218b73f246ed355b30d9947f822698149e0ec7c0ad1259046387acbce0d8d12c1d4be5bf19bf71373aa45b2447c0ded9cbb5fb7b5edbc10d57037e3a99d680b5dc63b966ca32a29d7925415e76";
+
+fn hexDer(gpa: std.mem.Allocator, hex: []const u8) ![]u8 {
+    const out = try gpa.alloc(u8, hex.len / 2);
+    errdefer gpa.free(out);
+    _ = try std.fmt.hexToBytes(out, hex);
+    return out;
+}
+
+test "an ECDSA leaf under an RSA certificate authority verifies" {
+    const gpa = testing.allocator;
+    const root = try hexDer(gpa, RSA_ROOT_HEX);
+    defer gpa.free(root);
+    const leaf = try hexDer(gpa, RSA_LEAF_HEX);
+    defer gpa.free(leaf);
+    var anchors = AnchorSet.empty;
+    defer anchors.deinit(gpa);
+    try anchors.addDer(gpa, root); // trust the RSA root only
+    const msg = try certMessage(gpa, &.{ leaf, root });
+    defer gpa.free(msg);
+
+    try verifyCertificateMessage(msg, .{ .trust = .{ .anchors = &anchors }, .host = "example.test", .now_sec = RSA_NOW });
+    try testing.expectError(error.HostnameMismatch, verifyCertificateMessage(msg, .{ .trust = .{ .anchors = &anchors }, .host = "evil.test", .now_sec = RSA_NOW }));
+
+    var empty2 = AnchorSet.empty;
+    defer empty2.deinit(gpa);
+    try testing.expectError(error.ChainUntrusted, verifyCertificateMessage(msg, .{ .trust = .{ .anchors = &empty2 }, .host = "example.test", .now_sec = RSA_NOW }));
+}
+
+test "a tampered RSA-signed leaf is rejected" {
+    const gpa = testing.allocator;
+    const root = try hexDer(gpa, RSA_ROOT_HEX);
+    defer gpa.free(root);
+    const leaf = try hexDer(gpa, RSA_LEAF_HEX);
+    defer gpa.free(leaf);
+    leaf[leaf.len - 1] ^= 0xff; // corrupt the RSA signature
+    var anchors = AnchorSet.empty;
+    defer anchors.deinit(gpa);
+    try anchors.addDer(gpa, root);
+    const msg = try certMessage(gpa, &.{ leaf, root });
+    defer gpa.free(msg);
+    // The leaf no longer verifies against the CA (the "each link signed by the next"
+    // check), so the chain is rejected.
+    try testing.expectError(error.BadCertificate, verifyCertificateMessage(msg, .{ .trust = .{ .anchors = &anchors }, .host = "example.test", .now_sec = RSA_NOW }));
+}
+
+test "an RSA-PSS self-signed certificate verifies" {
+    const gpa = testing.allocator;
+    const pss = try hexDer(gpa, RSA_PSS_HEX);
+    defer gpa.free(pss);
+    var anchors = AnchorSet.empty;
+    defer anchors.deinit(gpa);
+    try anchors.addDer(gpa, pss);
+    const msg = try certMessage(gpa, &.{pss});
+    defer gpa.free(msg);
+    try verifyCertificateMessage(msg, .{ .trust = .{ .anchors = &anchors }, .host = "pss.test", .now_sec = RSA_NOW });
+    try testing.expectError(error.HostnameMismatch, verifyCertificateMessage(msg, .{ .trust = .{ .anchors = &anchors }, .host = "no.test", .now_sec = RSA_NOW }));
 }
 
 test "insecure trust skips verification but still requires a leaf" {

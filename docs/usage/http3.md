@@ -82,10 +82,14 @@ Two escape hatches:
 - **Opt out.** `verify=False` disables authentication entirely. It is explicit
   and dangerous - only for local testing over a trusted link.
 
-!!! note "ECDSA only"
-    zttp verifies ECDSA P-256/P-384 chains (the schemes it speaks). An RSA
-    certificate fails verification. This is a parser limitation, not a security
-    fallback - it never trusts what it cannot check.
+!!! note "Signature algorithms"
+    Chain verification covers the real-world set: ECDSA P-256/P-384 and RSA
+    (PKCS#1 v1.5 and PSS) with SHA-256/384/512 - so an ordinary chain (an ECDSA or
+    RSA leaf under RSA certificate authorities) verifies. The certificate the
+    *server presents as its own leaf* is still limited to ECDSA P-256 by the
+    handshake's `CertificateVerify` (RFC 9001), independent of this - so a
+    verifying client talks to servers with an ECDSA P-256 leaf, whatever CAs sign
+    it.
 
 !!! warning "Scope"
     HTTP/3 support is still experimental. The public surface is intentionally
