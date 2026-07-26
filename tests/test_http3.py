@@ -1330,7 +1330,7 @@ def test_http3_goaway_event_preserves_large_stream_id() -> None:
     events = []
     while (ev := client.next_event()) is not zttp.NEED_DATA:
         events.append(ev)
-    goaways = [ev for ev in events if isinstance(ev, zttp.Goaway)]
+    goaways = [ev for ev in events if isinstance(ev, zttp.GoAway)]
     assert len(goaways) == 1
     assert goaways[0].last_stream_id == big_id
     assert client.goaway_received() == big_id

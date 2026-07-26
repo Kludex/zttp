@@ -116,7 +116,7 @@ class RstStream:
     error_code: int
 
 @final
-class Goaway:
+class GoAway:
     """An HTTP/2 `GOAWAY`: the peer is shutting the connection down.
 
     Attributes:
@@ -181,7 +181,7 @@ Event = (
     | Data
     | EndOfMessage
     | RstStream
-    | Goaway
+    | GoAway
     | Settings
     | Ping
     | WindowUpdate

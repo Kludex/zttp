@@ -383,7 +383,7 @@ const H2Engine = struct {
     fn goaway(self: *H2Engine, code: u32, last_stream_id: ?u32) py.Object {
         if (!self.ensureHandshake()) return null;
         const last = last_stream_id orelse self.conn.lastPeerStreamId();
-        self.writer.sendGoaway(last, @enumFromInt(code), &.{}) catch |e| return h2RaiseWrite(e);
+        self.writer.sendGoAway(last, @enumFromInt(code), &.{}) catch |e| return h2RaiseWrite(e);
         return py.none();
     }
 
@@ -417,13 +417,13 @@ const H2Engine = struct {
     /// Serialize the GOAWAY owed after a connection-fatal error (RFC 9113 5.4.1),
     /// so data_to_send carries it before the integrator closes. Best-effort: if
     /// the writer itself OOMs there is nothing useful to do but close.
-    fn emitGoawayIfOwed(self: *H2Engine) void {
-        if (self.conn.takeGoawayOwed()) |code| {
+    fn emitGoAwayIfOwed(self: *H2Engine) void {
+        if (self.conn.takeGoAwayOwed()) |code| {
             if (!self.handshake_sent) {
                 self.sendOurPreface() catch return;
                 self.handshake_sent = true;
             }
-            self.writer.sendGoaway(self.conn.lastPeerStreamId(), code, &.{}) catch {};
+            self.writer.sendGoAway(self.conn.lastPeerStreamId(), code, &.{}) catch {};
         }
     }
 
@@ -1800,7 +1800,7 @@ fn receive_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Objec
     switch (engine.*) {
         .h2 => |*e| {
             e.conn.feed(bytes) catch |err| {
-                e.emitGoawayIfOwed(); // a fatal feed (e.g. max_buffer flood) still owes a GOAWAY
+                e.emitGoAwayIfOwed(); // a fatal feed (e.g. max_buffer flood) still owes a GOAWAY
                 return exceptions.raiseH2(err);
             };
             return py.none();
@@ -1834,7 +1834,7 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
         .h3 => |*e| return e.nextEvent(),
         .h2 => |*e| {
             const ev = e.conn.nextEvent() catch |err| {
-                e.emitGoawayIfOwed(); // queue one GOAWAY for the next data_to_send
+                e.emitGoAwayIfOwed(); // queue one GOAWAY for the next data_to_send
                 return exceptions.raiseH2(err);
             };
             e.autoRespond(ev) catch |err| return h2RaiseWrite(err);

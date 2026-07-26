@@ -99,7 +99,7 @@ pub const Writer = struct {
         try self.writeFrame(.rst_stream, 0, stream_id, &p);
     }
 
-    pub fn sendGoaway(self: *Writer, last_stream_id: u32, code: ErrorCode, debug: []const u8) WriteError!void {
+    pub fn sendGoAway(self: *Writer, last_stream_id: u32, code: ErrorCode, debug: []const u8) WriteError!void {
         var head: [8]u8 = undefined;
         std.mem.writeInt(u32, head[0..4], last_stream_id & 0x7FFF_FFFF, .big);
         std.mem.writeInt(u32, head[4..8], @intFromEnum(code), .big);

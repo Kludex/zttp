@@ -55,7 +55,7 @@ const RstStreamObject = extern struct {
     error_code: py.Object,
 };
 
-const GoawayObject = extern struct {
+const GoAwayObject = extern struct {
     ob_base: c.PyObject,
     last_stream_id: py.Object,
     error_code: py.Object,
@@ -137,9 +137,9 @@ var rst_stream_members = [_]py.MemberDef{
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var goaway_members = [_]py.MemberDef{
-    member("last_stream_id", @offsetOf(GoawayObject, "last_stream_id")),
-    member("error_code", @offsetOf(GoawayObject, "error_code")),
-    member("debug", @offsetOf(GoawayObject, "debug")),
+    member("last_stream_id", @offsetOf(GoAwayObject, "last_stream_id")),
+    member("error_code", @offsetOf(GoAwayObject, "error_code")),
+    member("debug", @offsetOf(GoAwayObject, "debug")),
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var settings_members = [_]py.MemberDef{
@@ -234,7 +234,7 @@ const response_gc = gcOps(ResponseObject);
 const data_gc = gcOps(DataObject);
 const eom_gc = gcOps(EndOfMessageObject);
 const rst_stream_gc = gcOps(RstStreamObject);
-const goaway_gc = gcOps(GoawayObject);
+const goaway_gc = gcOps(GoAwayObject);
 const settings_gc = gcOps(SettingsEventObject);
 const ping_gc = gcOps(PingObject);
 const window_update_gc = gcOps(WindowUpdateObject);
@@ -337,9 +337,9 @@ const rst_stream_fields = .{
     FieldInfo(RstStreamObject){ .name = "error_code", .field = "error_code" },
 };
 const goaway_fields = .{
-    FieldInfo(GoawayObject){ .name = "last_stream_id", .field = "last_stream_id" },
-    FieldInfo(GoawayObject){ .name = "error_code", .field = "error_code" },
-    FieldInfo(GoawayObject){ .name = "debug", .field = "debug" },
+    FieldInfo(GoAwayObject){ .name = "last_stream_id", .field = "last_stream_id" },
+    FieldInfo(GoAwayObject){ .name = "error_code", .field = "error_code" },
+    FieldInfo(GoAwayObject){ .name = "debug", .field = "debug" },
 };
 const settings_fields = .{FieldInfo(SettingsEventObject){ .name = "params", .field = "params" }};
 const ping_fields = .{
@@ -356,7 +356,7 @@ const reprResponse = reprFields(ResponseObject, "Response", response_fields);
 const reprData = reprFields(DataObject, "Data", data_fields);
 const reprEom = reprFields(EndOfMessageObject, "EndOfMessage", eom_fields);
 const reprRstStream = reprFields(RstStreamObject, "RstStream", rst_stream_fields);
-const reprGoaway = reprFields(GoawayObject, "Goaway", goaway_fields);
+const reprGoAway = reprFields(GoAwayObject, "GoAway", goaway_fields);
 const reprSettings = reprFields(SettingsEventObject, "Settings", settings_fields);
 const reprPing = reprFields(PingObject, "Ping", ping_fields);
 const reprWindowUpdate = reprFields(WindowUpdateObject, "WindowUpdate", window_update_fields);
@@ -366,7 +366,7 @@ const cmpResponse = richcompareFields(ResponseObject, response_fields);
 const cmpData = richcompareFields(DataObject, data_fields);
 const cmpEom = richcompareFields(EndOfMessageObject, eom_fields);
 const cmpRstStream = richcompareFields(RstStreamObject, rst_stream_fields);
-const cmpGoaway = richcompareFields(GoawayObject, goaway_fields);
+const cmpGoAway = richcompareFields(GoAwayObject, goaway_fields);
 const cmpSettings = richcompareFields(SettingsEventObject, settings_fields);
 const cmpPing = richcompareFields(PingObject, ping_fields);
 const cmpWindowUpdate = richcompareFields(WindowUpdateObject, window_update_fields);
@@ -390,7 +390,7 @@ var response_slots = slots(response_gc.dealloc, &response_members, response_gc.t
 var data_slots = slots(data_gc.dealloc, &data_members, data_gc.traverse, data_gc.clear, reprData, cmpData);
 var eom_slots = slots(eom_gc.dealloc, &eom_members, eom_gc.traverse, eom_gc.clear, reprEom, cmpEom);
 var rst_stream_slots = slots(rst_stream_gc.dealloc, &rst_stream_members, rst_stream_gc.traverse, rst_stream_gc.clear, reprRstStream, cmpRstStream);
-var goaway_slots = slots(goaway_gc.dealloc, &goaway_members, goaway_gc.traverse, goaway_gc.clear, reprGoaway, cmpGoaway);
+var goaway_slots = slots(goaway_gc.dealloc, &goaway_members, goaway_gc.traverse, goaway_gc.clear, reprGoAway, cmpGoAway);
 var settings_slots = slots(settings_gc.dealloc, &settings_members, settings_gc.traverse, settings_gc.clear, reprSettings, cmpSettings);
 var ping_slots = slots(ping_gc.dealloc, &ping_members, ping_gc.traverse, ping_gc.clear, reprPing, cmpPing);
 var window_update_slots = slots(window_update_gc.dealloc, &window_update_members, window_update_gc.traverse, window_update_gc.clear, reprWindowUpdate, cmpWindowUpdate);
@@ -410,7 +410,7 @@ var response_spec = spec("zttp.Response", @sizeOf(ResponseObject), &response_slo
 var data_spec = spec("zttp.Data", @sizeOf(DataObject), &data_slots);
 var eom_spec = spec("zttp.EndOfMessage", @sizeOf(EndOfMessageObject), &eom_slots);
 var rst_stream_spec = spec("zttp.RstStream", @sizeOf(RstStreamObject), &rst_stream_slots);
-var goaway_spec = spec("zttp.Goaway", @sizeOf(GoawayObject), &goaway_slots);
+var goaway_spec = spec("zttp.GoAway", @sizeOf(GoAwayObject), &goaway_slots);
 var settings_spec = spec("zttp.Settings", @sizeOf(SettingsEventObject), &settings_slots);
 var ping_spec = spec("zttp.Ping", @sizeOf(PingObject), &ping_slots);
 var window_update_spec = spec("zttp.WindowUpdate", @sizeOf(WindowUpdateObject), &window_update_slots);
@@ -630,7 +630,7 @@ pub fn fromH2Event(ev: events.H2Event) py.Object {
         .end_of_message => |e| makeEom(e),
         .need_data => py.newRef(need_data),
         .rst_stream => |r| makeRstStream(r),
-        .goaway => |g| makeGoaway(g),
+        .goaway => |g| makeGoAway(g),
         .settings => |s| makeSettings(s),
         .ping => |p| makePing(p),
         .window_update => |w| makeWindowUpdate(w),
@@ -646,7 +646,7 @@ pub fn fromH3Event(ev: events.H3Event) py.Object {
         .connection_closed => py.newRef(connection_closed),
         .need_data => py.newRef(need_data),
         .settings => |s| makeSettings(s),
-        .goaway => |g| makeGoaway(g),
+        .goaway => |g| makeGoAway(g),
         .rst_stream => |r| makeH3RstStream(r),
     };
 }
@@ -750,10 +750,10 @@ fn makeRstStream(r: events.RstStream) py.Object {
     return o;
 }
 
-fn makeGoaway(g: events.Goaway) py.Object {
+fn makeGoAway(g: events.GoAway) py.Object {
     const o = py.allocInstance(goaway_type);
     if (o == null) return null;
-    const s: *GoawayObject = @ptrCast(o);
+    const s: *GoAwayObject = @ptrCast(o);
     s.last_stream_id = c.PyLong_FromUnsignedLongLong(g.last_stream_id);
     s.error_code = u32Obj(g.error_code);
     s.debug = py.fromBytes(g.debug);
@@ -855,7 +855,7 @@ pub fn register(module: py.Object) bool {
     _ = c.PyModule_AddObjectRef(module, "Data", data_type);
     _ = c.PyModule_AddObjectRef(module, "EndOfMessage", end_of_message_type);
     _ = c.PyModule_AddObjectRef(module, "RstStream", rst_stream_type);
-    _ = c.PyModule_AddObjectRef(module, "Goaway", goaway_type);
+    _ = c.PyModule_AddObjectRef(module, "GoAway", goaway_type);
     _ = c.PyModule_AddObjectRef(module, "Settings", settings_type);
     _ = c.PyModule_AddObjectRef(module, "Ping", ping_type);
     _ = c.PyModule_AddObjectRef(module, "WindowUpdate", window_update_type);
