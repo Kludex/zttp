@@ -41,8 +41,9 @@ A `Connection`'s role and protocol are fixed at construction:
   `receive_datagram` (see [HTTP/3](../usage/http3.md)).
 
 For HTTP/3, a server's TLS identity is passed as
-[`credentials=TlsCredentials(...)`][zttp.TlsCredentials] and a resumption secret
-as [`resumption=SessionResumption(...)`][zttp.SessionResumption] - typed value
+[`credentials=TlsCredentials(...)`](#zttp.TlsCredentials) and a resumption
+secret as [`resumption=SessionResumption(...)`](#zttp.SessionResumption) -
+typed value
 objects, so the same-typed `bytes` pairs can't be transposed (omit `credentials`
 and the server uses an ephemeral local identity). zttp supplies the QUIC
 transport defaults internally; the remaining constructor fields
@@ -100,10 +101,61 @@ Returned by an [`H3Connection`](#zttp.H3Connection)'s introspection methods.
 
 ### Sentinels
 
+`next_event()` returns one of these instead of an event when there is nothing to
+report. Both are singletons - compare with `is`, not `==`.
+
 | Value | Meaning |
 | --- | --- |
-| `zttp.NEED_DATA` | No complete event yet; feed more bytes. Compare with `is`. |
-| `zttp.CONNECTION_CLOSED` | The peer closed the connection. Compare with `is`. |
+| `zttp.NEED_DATA` | No complete event yet; feed more bytes. |
+| `zttp.CONNECTION_CLOSED` | The peer closed the connection. |
+
+::: zttp.NeedData
+
+::: zttp.ConnectionClosed
+
+### The event union
+
+`Event` is the union of everything [`next_event`](#zttp.Connection.next_event)
+can return, for annotating your own handlers:
+
+```python
+import zttp
+
+
+def handle(event: zttp.Event) -> None:
+    match event:
+        case zttp.Request(method=method):
+            ...
+        case zttp.Data(data=chunk):
+            ...
+```
+
+A connection only ever yields the events its protocol has: HTTP/1.1 never
+produces a `stream_id`-bearing control event, and only HTTP/2 produces `Ping` or
+`WindowUpdate`. The union is the widest of the three.
+
+## Demultiplexing a shared UDP socket
+
+An HTTP/3 server usually has one UDP socket and many connections on it, so it
+must decide which `H3Connection` a datagram belongs to **before** feeding it to
+one. `parse_datagram_header` reads the routable prefix without decrypting
+anything or touching connection state.
+
+```python
+import zttp
+
+header = zttp.parse_datagram_header(datagram)
+if header.is_long_header:
+    conn = connections.get(header.destination_connection_id)
+else:
+    # A short (1-RTT) header does not encode the id's length on the wire, so
+    # match the prefix against the connection ids you already track.
+    conn = lookup_by_prefix(datagram)
+```
+
+::: zttp.parse_datagram_header
+
+::: zttp.DatagramHeader
 
 ## Exceptions
 

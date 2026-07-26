@@ -232,10 +232,13 @@ import zttp
 h1 = zttp.Connection(zttp.SERVER)
 h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
 
-type(h1).__name__  #> 'H1Connection'
-type(h2).__name__  #> 'H2Connection'
+print(type(h1).__name__)
+#> H1Connection
+print(type(h2).__name__)
+#> H2Connection
 
-isinstance(h2, zttp.Connection)  #> True
+print(isinstance(h2, zttp.Connection))
+#> True
 ```
 
 An `H1Connection` carries the message-scoped send API you saw in

@@ -43,6 +43,7 @@ The key features are:
   allocation (see [Performance](reference/performance.md) for the numbers).
 * **Safe**: strict by default. It defends against request smuggling, rejects bare
   `LF` line endings, bounds every buffer, and ships in Zig's safety-checked build.
+  See [Security](security.md).
 * **Typed**: a `py.typed` package with full type hints. Your editor knows every
   event field.
 * **Tested**: a high-level test suite at **100% coverage**, plus the Zig core's
@@ -146,6 +147,12 @@ That's it. The buffering, the header parsing, the body framing: all Zig. 🎉
     ---
 
     What sans-IO is, and why a parser should do no I/O.
+
+-   :material-shield: **[Security](security.md)**
+
+    ---
+
+    The threat model: what zttp defends against, and what is yours to handle.
 
 -   :material-speedometer: **[Performance](reference/performance.md)**
 
