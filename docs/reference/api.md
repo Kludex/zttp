@@ -84,7 +84,7 @@ the ones that matter on its own; they're here when you want visibility.
 
 ::: zttp.RstStream
 
-::: zttp.Goaway
+::: zttp.GoAway
 
 The integer ids in a `Settings` event's `params` have names (RFC 9113 6.5.2):
 

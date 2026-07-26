@@ -12,7 +12,7 @@ from zttp._zttp import (
     ConnectionClosed,
     Data,
     EndOfMessage,
-    Goaway,
+    GoAway,
     H1Connection,
     H2Connection,
     H3Connection,
@@ -39,7 +39,7 @@ Event = (
     | Data
     | EndOfMessage
     | RstStream
-    | Goaway
+    | GoAway
     | Settings
     | Ping
     | WindowUpdate
@@ -62,7 +62,7 @@ __all__ = [
     "DatagramHeader",
     "EndOfMessage",
     "Event",
-    "Goaway",
+    "GoAway",
     "H2Settings",
     "H1Connection",
     "H2Connection",
