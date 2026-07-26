@@ -257,6 +257,7 @@ pub const Reader = struct {
         // head cannot be buffered without bound before the limit fires.
         const candidate_len = maybe_head_end orelse region.len;
         if (candidate_len > self.limits.max_header_bytes) return error.MessageTooLong;
+        try enforceLineLimit(region[0..candidate_len], self.limits.max_line);
         const head_len = maybe_head_end orelse {
             if (self.eof_seen and region.len == 0) {
                 self.state = .closed;
@@ -276,11 +277,17 @@ pub const Reader = struct {
 
         var sc = Scanner.init(head);
         const strict = self.limits.strict_crlf;
-        const first = (sc.line(self.limits.max_line, strict) catch return error.InvalidLine).?;
+        const first = (sc.line(self.limits.max_line, strict) catch |e| switch (e) {
+            error.MessageTooLong => return error.MessageTooLong,
+            error.BareLf => return error.InvalidLine,
+        }).?;
 
         self.headers.clearRetainingCapacity();
         var header_bytes: usize = 0;
-        while (sc.line(self.limits.max_line, strict) catch return error.InvalidHeader) |hl| {
+        while (sc.line(self.limits.max_line, strict) catch |e| switch (e) {
+            error.MessageTooLong => return error.MessageTooLong,
+            error.BareLf => return error.InvalidHeader,
+        }) |hl| {
             if (hl.len == 0) break;
             header_bytes += hl.len;
             if (self.headers.items.len >= self.limits.max_headers or header_bytes > self.limits.max_header_bytes) {
@@ -424,6 +431,18 @@ pub const Reader = struct {
 
 /// Find the byte offset just past the blank line terminating the header block,
 /// i.e. the length of the head. Recognizes both CRLFCRLF and bare LFLF.
+fn enforceLineLimit(region: []const u8, max_line: usize) ParseError!void {
+    var start: usize = 0;
+    while (start < region.len) {
+        const lf = std.mem.indexOfScalarPos(u8, region, start, '\n') orelse break;
+        const has_cr = lf > start and region[lf - 1] == '\r';
+        const line_len = lf - start - @intFromBool(has_cr);
+        if (line_len > max_line) return error.MessageTooLong;
+        start = lf + 1;
+    }
+    if (region.len - start > max_line) return error.MessageTooLong;
+}
+
 pub fn findHeadEnd(region: []const u8) ?usize {
     var i: usize = 0;
     while (i < region.len) {
@@ -753,6 +772,30 @@ test "M-2: bare LF request accepted when lenient" {
     const e = try r.nextEvent();
     try t.expectEqualStrings("GET", e.request.method);
     try t.expectEqualStrings("x", e.request.headers[0].value);
+}
+
+test "line length cap is reported as MessageTooLong" {
+    var r = Reader.init(t.allocator, .server);
+    r.limits.max_line = 4;
+    defer r.deinit();
+    try r.feed("GET / HTTP/1.1\r\n\r\n");
+    try t.expectError(error.MessageTooLong, r.nextEvent());
+}
+
+test "line length cap applies before the head completes" {
+    var r = Reader.init(t.allocator, .server);
+    r.limits.max_line = 4;
+    defer r.deinit();
+    try r.feed("GET /");
+    try t.expectError(error.MessageTooLong, r.nextEvent());
+}
+
+test "header line length cap is reported as MessageTooLong" {
+    var r = Reader.init(t.allocator, .server);
+    r.limits.max_line = 8;
+    defer r.deinit();
+    try r.feed("GET / HTTP/1.1\r\nLong: xxxxx\r\n\r\n");
+    try t.expectError(error.MessageTooLong, r.nextEvent());
 }
 
 // -- fuzzing ------------------------------------------------------------------
