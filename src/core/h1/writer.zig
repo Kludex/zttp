@@ -281,6 +281,7 @@ pub const Writer = struct {
     }
 
     fn writeStatusLine(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header) WriteError!void {
+        if (status < 100 or status > 599) return error.InvalidField;
         try validLineToken(reason, true); // reason-phrase may contain SP/HTAB
         try validateHeaders(hdrs);
         try self.w("HTTP/");
@@ -463,6 +464,14 @@ test "status code formatting" {
     try wr.sendResponse("1.1", 404, "Not Found", &.{}, "GET");
     try wr.endMessage(&.{});
     try t.expectEqualStrings("HTTP/1.1 404 Not Found\r\n\r\n", wr.pending());
+}
+
+test "status code range rejected before formatting" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 99, "Too Low", &.{}, "GET"));
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 600, "Too High", &.{}, "GET"));
+    try t.expectEqualStrings("", wr.pending());
 }
 
 test "HEAD response is bodyless despite Content-Length" {
