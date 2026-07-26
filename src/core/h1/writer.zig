@@ -53,6 +53,30 @@ fn validValue(value: []const u8) WriteError!void {
     }
 }
 
+/// Send-side mirror of the reader's Transfer-Encoding framing guard: if the
+/// caller supplies TE, it must be an ordered comma-list that ends in exactly one
+/// `chunked` coding. Anything else would make the bytes we serialize ambiguous
+/// to downstream HTTP/1 parsers.
+const TransferEncoding = struct {
+    saw_chunked: bool = false,
+    coding_after_chunked: bool = false,
+
+    fn add(self: *TransferEncoding, value: []const u8) void {
+        var it = std.mem.splitScalar(u8, value, ',');
+        while (it.next()) |raw| {
+            const coding = trimOws(raw);
+            if (coding.len == 0) continue;
+            if (self.saw_chunked) self.coding_after_chunked = true;
+            if (eqIgnoreCase(coding, "chunked")) self.saw_chunked = true;
+        }
+    }
+
+    fn validate(self: TransferEncoding) WriteError!void {
+        if (!self.saw_chunked) return error.InvalidField;
+        if (self.coding_after_chunked) return error.InvalidField;
+    }
+};
+
 /// Normalize a caller-supplied HTTP version into the bare number (e.g. "1.1"),
 /// accepting both "1.1" and "HTTP/1.1" so a value round-tripped from the read
 /// side (which yields the bare "1.1") cannot double-prefix into "HTTP/HTTP/1.1".
@@ -168,11 +192,13 @@ fn validateHeaders(hdrs: []const Header) WriteError!void {
 /// Content-Length, or conflicting duplicate Content-Lengths, would let a
 /// downstream parser disagree about message boundaries (response splitting).
 fn validateFraming(hdrs: []const Header) WriteError!void {
+    var te = TransferEncoding{};
     var has_te = false;
     var content_length: ?[]const u8 = null;
     for (hdrs) |h| {
         if (eqIgnoreCase(h.name, "transfer-encoding")) {
             has_te = true;
+            te.add(h.value);
         } else if (eqIgnoreCase(h.name, "content-length")) {
             const v = trimOws(h.value);
             if (v.len > 0 and ascii.parseDecimal(u64, v) == null) return error.InvalidField; // digits, no overflow
@@ -182,6 +208,7 @@ fn validateFraming(hdrs: []const Header) WriteError!void {
             content_length = v;
         }
     }
+    if (has_te) try te.validate();
     if (has_te and content_length != null) return error.InvalidField; // TE + CL
 }
 
@@ -593,6 +620,37 @@ test "send-path injection: CRLF in trailer rejected" {
     try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     const trailers = [_]Header{.{ .name = "X", .value = "v\r\nInjected: 1" }};
     try t.expectError(error.InvalidField, wr.endMessage(&trailers));
+}
+
+test "send rejects non-chunked transfer-encoding" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+}
+
+test "send rejects non-final transfer-encoding chunked" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked, gzip" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+}
+
+test "send rejects duplicate transfer-encoding chunked" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked, chunked" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+}
+
+test "send accepts transfer-encoding with chunked final" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip, chunked" }};
+    try wr.sendResponse("1.1", 200, "OK", &h, "GET");
+    try wr.sendData("abc");
+    try wr.endMessage(&.{});
+    try t.expectEqualStrings("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n", wr.pending());
 }
 
 test "send rejects ambiguous framing (TE + CL)" {
