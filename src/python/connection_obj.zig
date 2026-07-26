@@ -142,8 +142,9 @@ const H1Engine = struct {
     /// to decide, on a parse failure, whether the method is stale (fresh-head
     /// failure -> clear) or still owed a response (mid-body failure -> keep).
     request_surfaced: bool = false,
-    /// Connection signals for the last parsed request, captured at event time so
-    /// they outlive the head buffer. `upgrade_obj` is held Python bytes (or null).
+    /// Connection close signal for the last parsed request/response, captured at
+    /// event time so it outlives the head buffer. `upgrade_obj` remains
+    /// request-only and is held as Python bytes (or null).
     should_close: bool = false,
     upgrade_obj: py.Object = null,
     /// Single-copy body path: when a fed buffer's prefix is a Content-Length
@@ -2475,7 +2476,7 @@ var h1_methods = [_]py.MethodDef{
     .{ .ml_name = "send_informational", .ml_meth = send_informational, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response: send_informational(status, headers=None). The real response still follows on the same cycle." },
     .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
     .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
-    .{ .ml_name = "should_close", .ml_meth = should_close, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request (Connection: close / HTTP/1.0)." },
+    .{ .ml_name = "should_close", .ml_meth = should_close, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request/response (Connection: close / HTTP/1.0 / close-delimited response)." },
     .{ .ml_name = "upgrade", .ml_meth = upgrade, .ml_flags = c.METH_NOARGS, .ml_doc = "The last request's Upgrade value if it asked to upgrade (Connection: upgrade), else None." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };

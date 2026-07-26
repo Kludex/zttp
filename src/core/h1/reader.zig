@@ -158,8 +158,9 @@ pub const Reader = struct {
         self.conn_upgrade = null;
     }
 
-    /// Whether the connection must close after the most recently parsed request
-    /// (RFC 9112 9.3). Valid after a Request event, until the next reset.
+    /// Whether the connection must close after the most recently parsed
+    /// request/response (RFC 9112 9.3, plus close-delimited responses). Valid
+    /// after a Request/Response event, until the next reset.
     pub fn shouldClose(self: *const Reader) bool {
         return self.conn_should_close;
     }
