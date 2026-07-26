@@ -17,10 +17,9 @@ In scope:
   Content-Length and chunked bodies, trailers).
 - HTTP/2 (RFC 9113): frame codec, HPACK, stream multiplexing and state, flow
   control, and the connection lifecycle, plus h2c upgrade (RFC 7540 3.2).
-- HTTP/3 (RFC 9114) over a QUIC transport (RFC 9000/9001/9002): the server read
-  path - QPACK decode and request-stream framing. The peer control stream and its
-  SETTINGS are **not yet processed** (only bidirectional request streams are
-  pumped), so HTTP/3 settings are neither negotiated nor enforced today.
+- HTTP/3 (RFC 9114) over a QUIC transport (RFC 9000/9001/9002): QPACK, request-
+  stream framing, the peer control stream and its SETTINGS, and the connection
+  lifecycle (GOAWAY, per-stream cancellation), in both roles.
 - The read side (`receive_data` / `next_event`) and the write side
   (`send_*` / `data_to_send`).
 
@@ -204,28 +203,60 @@ boundary (RFC 9113 8):
 
 ## HTTP/3
 
-HTTP/3 (RFC 9114) over QUIC is read-path-first and the **least mature** of the
-three protocols. It reuses the shared field validators on **regular** header
-fields - lowercase token names, no control bytes in values, connection-specific
-fields and a non-`trailers` `TE` rejected, duplicate Content-Length conflict
-rejected (`decodeRequest`, `src/core/h3/connection.zig`). It also enforces the
-pseudo-header structure rules (pseudo before regular, no duplicates, required
-request pseudo-headers).
+HTTP/3 (RFC 9114) over QUIC is the **least mature** of the three protocols - not
+because it enforces less, but because it is the newest code with the least
+adversarial exposure. The defenses below are enforced in `src/core/h3/` and
+covered by tests.
 
-Two gaps a downgrading proxy must NOT rely on yet:
+### Field validation
 
-- **Pseudo-header *values* are not validated.** Unlike the H2 path, `decodeRequest`
-  does not run the value check on `:method`/`:path`/`:authority`/`:scheme`, so a
-  `:authority` carrying CR/LF is currently accepted and synthesized into a `host`
-  header. An h3→h1 downgrade must validate the pseudo-header values itself until
-  this is closed.
-- **The control stream and SETTINGS are not processed** (only request streams are
-  pumped), so HTTP/3 settings are neither negotiated nor enforced.
+It reuses the shared field validators on **regular** header fields - lowercase
+token names, no control bytes in values, connection-specific fields and a
+non-`trailers` `TE` rejected, duplicate Content-Length conflict rejected
+(`decodeRequest`, `src/core/h3/connection.zig`). It enforces the pseudo-header
+structure rules (pseudo before regular, no duplicates, required request
+pseudo-headers, CONNECT's `:authority`-only shape) and validates pseudo-header
+**values** with the same check as regular values, so an `:authority` carrying
+CR/LF cannot be synthesized into a `host` header on an h3→h1 downgrade.
 
-The QUIC transport (RFC 9000/9001/9002) - handshake, packet protection, flow
-control - is in scope and held to the strict-reject bar, but its threat surface
-is broad and has had far less adversarial exposure than the H1/H2 paths. Treat
-HTTP/3 as experimental from a security standpoint.
+### Control stream and SETTINGS
+
+The peer's unidirectional streams are classified and pumped, and the control
+stream is held to RFC 9114 6.2.1:
+
+- A request stream arriving **before** the peer's SETTINGS is rejected; a control
+  stream that does not begin with SETTINGS, or sends a second SETTINGS, is a
+  connection error.
+- A **second** control, QPACK-encoder, or QPACK-decoder stream is a connection
+  error, as is closing any of those critical streams.
+- HTTP/2-only frame types, control frames on a request stream, DATA before
+  HEADERS, and frames not allowed on the control stream are all rejected.
+- GOAWAY and MAX_PUSH_ID are validated for malformed/trailing bytes, wrong role,
+  and monotonicity (a GOAWAY id that increases, or a MAX_PUSH_ID that decreases,
+  is an error); CANCEL_PUSH for an unpromised push is rejected. Server push is
+  disabled, so a client-opened push stream is a connection error.
+
+### QPACK and field-section bounds
+
+| Defense | Limit (default) | Class |
+| --- | --- | --- |
+| Decoded field-section size, checked mid-decode | `MAX_FIELD_SECTION_SIZE` (64 KiB) | QPACK bomb |
+| Dynamic table capacity | `QPACK_MAX_TABLE_CAPACITY` (4 KiB) | encoder-driven memory |
+| Streams blocked on encoder updates | `QPACK_BLOCKED_STREAMS` (16) | blocked-stream pile-up |
+
+As on the H2 path, **what zttp advertises is exactly what it enforces**: these
+three values are sent verbatim in its own SETTINGS, so a conformant peer
+self-limits. Exceeding the blocked-stream cap is `QPACK_DECOMPRESSION_FAILED`;
+an oversized or malformed field section is rejected before the list is
+materialized.
+
+### The transport
+
+The QUIC transport (RFC 9000/9001/9002) - handshake, packet protection,
+amplification limits, loss recovery, and flow control - is in scope and held to
+the strict-reject bar, but its threat surface is broad and has had far less
+adversarial exposure than the H1/H2 paths. Treat HTTP/3 as experimental from a
+security standpoint.
 
 ## Integrator responsibilities
 

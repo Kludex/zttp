@@ -67,7 +67,7 @@ import zttp
 
 conn = zttp.Connection(zttp.SERVER)
 conn.send_data(b"x")  # no head was sent first
-#> zttp.LocalProtocolError: invalid send for current connection state
+#> zttp.LocalProtocolError: cannot send body data now: send a head first, or this message takes no body
 ```
 
 ```python
