@@ -65,9 +65,22 @@ fn normalizeVersion(version: []const u8) WriteError![]const u8 {
     return v;
 }
 
-/// Request-line / status-line tokens (method, target, version, reason) must not
-/// carry CR/LF or controls. Reason allows SP; the others should not contain SP,
-/// but we only guard against the injection-relevant controls here.
+/// Methods are tokens on the wire, same grammar as field names.
+fn validMethod(method: []const u8) WriteError!void {
+    try validName(method);
+}
+
+/// Request targets use the same permissive-but-bounded class as the parser:
+/// no controls, SP, DEL, or DQUOTE, and not empty.
+fn validTarget(target: []const u8) WriteError!void {
+    if (target.len == 0) return error.InvalidField;
+    for (target) |ch| {
+        if (!tables.is_target_char[ch]) return error.InvalidField;
+    }
+}
+
+/// Status-line tokens such as the reason phrase must not carry CR/LF or
+/// controls. Reason allows SP/HTAB.
 fn validLineToken(s: []const u8, allow_sp: bool) WriteError!void {
     for (s) |ch| {
         if (ch == '\r' or ch == '\n' or ch == 0) return error.InvalidField;
@@ -235,8 +248,8 @@ pub const Writer = struct {
     /// Serialize a request-line + headers. `framing` decides body handling.
     pub fn sendRequest(self: *Writer, method: []const u8, target: []const u8, version: []const u8, hdrs: []const Header) WriteError!void {
         if (self.state != .idle) return error.MessageNotEnded;
-        try validLineToken(method, false);
-        try validLineToken(target, false);
+        try validMethod(method);
+        try validTarget(target);
         const ver = try normalizeVersion(version);
         try validateHeaders(hdrs);
         try self.w(method);
@@ -584,6 +597,16 @@ test "send-path injection: CRLF in target rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     try t.expectError(error.InvalidField, wr.sendRequest("GET", "/ HTTP/1.1\r\nX: y", "1.1", &.{}));
+}
+
+test "send rejects malformed request-line fields" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try t.expectError(error.InvalidField, wr.sendRequest("", "/", "1.1", &.{}));
+    try t.expectError(error.InvalidField, wr.sendRequest("GE:T", "/", "1.1", &.{}));
+    try t.expectError(error.InvalidField, wr.sendRequest("GET", "", "1.1", &.{}));
+    try t.expectError(error.InvalidField, wr.sendRequest("GET", "\"bad\"", "1.1", &.{}));
+    try t.expectEqualStrings("", wr.pending());
 }
 
 test "send-path injection: CRLF in trailer rejected" {
