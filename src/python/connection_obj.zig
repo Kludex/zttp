@@ -1891,6 +1891,8 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
                         e.upgrade_obj = py.fromBytes(u);
                         if (e.upgrade_obj == null) return null; // propagate the pending MemoryError
                     } else e.upgrade_obj = null;
+                } else if (ev == .response) {
+                    e.should_close = e.reader.shouldClose();
                 }
                 return events_obj.fromH1Event(ev);
             }

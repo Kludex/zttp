@@ -291,7 +291,7 @@ pub const Reader = struct {
 
         if (self.role == .server) {
             const rl = try headers_mod.parseRequestLine(first);
-            try self.frameBody(.{ .until_close_default = false });
+            _ = try self.frameBody(.{ .until_close_default = false });
             self.conn_should_close = connection_mod.shouldClose(rl.http_version, self.headers.items);
             self.conn_upgrade = connection_mod.upgrade(self.headers.items);
             return .{ .request = .{
@@ -307,11 +307,11 @@ pub const Reader = struct {
 
         const st = try headers_mod.parseStatusLine(first);
         const method = self.request_method[0..self.request_method_len];
-        try self.frameBody(.{
+        const framing = try self.frameBody(.{
             .bodyless = framing_mod.responseIsBodyless(method, st.status_code),
             .until_close_default = true,
         });
-        self.conn_should_close = connection_mod.shouldClose(st.http_version, self.headers.items);
+        self.conn_should_close = connection_mod.shouldClose(st.http_version, self.headers.items) or framing == .until_close;
         return .{ .response = .{
             .status_code = st.status_code,
             .reason = st.reason,
@@ -320,8 +320,10 @@ pub const Reader = struct {
         } };
     }
 
-    fn frameBody(self: *Reader, opts: framing_mod.FramingOptions) ParseError!void {
-        self.enterBody(try framing_mod.determine(self.headers.items, opts));
+    fn frameBody(self: *Reader, opts: framing_mod.FramingOptions) ParseError!Framing {
+        const framing = try framing_mod.determine(self.headers.items, opts);
+        self.enterBody(framing);
+        return framing;
     }
 
     fn enterBody(self: *Reader, f: Framing) void {
@@ -620,6 +622,14 @@ test "client treats HTTP/1.0 response as close unless keep-alive" {
     var r = Reader.init(t.allocator, .client);
     defer r.deinit();
     try r.feed("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+    try expectTag(.response, try r.nextEvent());
+    try t.expect(r.shouldClose());
+}
+
+test "client marks close-delimited response as closing" {
+    var r = Reader.init(t.allocator, .client);
+    defer r.deinit();
+    try r.feed("HTTP/1.1 200 OK\r\n\r\nbody");
     try expectTag(.response, try r.nextEvent());
     try t.expect(r.shouldClose());
 }

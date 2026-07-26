@@ -47,6 +47,20 @@ def test_should_close_resets_after_cycle() -> None:
     assert conn.should_close() is False
 
 
+def test_client_should_close_explicit_response_close() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+    assert isinstance(conn.next_event(), zttp.Response)
+    assert conn.should_close() is True
+
+
+def test_client_should_close_for_close_delimited_response() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.receive_data(b"HTTP/1.1 200 OK\r\n\r\nbody")
+    assert isinstance(conn.next_event(), zttp.Response)
+    assert conn.should_close() is True
+
+
 def test_upgrade_websocket() -> None:
     conn = _parse(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
     assert conn.upgrade() == b"websocket"
