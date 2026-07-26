@@ -53,13 +53,6 @@ fn validValue(value: []const u8) WriteError!void {
     }
 }
 
-/// Send-side Transfer-Encoding policy follows h11: zttp only knows how to emit
-/// `chunked`, so any caller-supplied TE must be one field whose value is exactly
-/// that coding. We do not serialize unsupported codings as metadata-only hints.
-fn validateTransferEncoding(value: []const u8) WriteError!void {
-    if (!eqIgnoreCase(trimOws(value), "chunked")) return error.InvalidField;
-}
-
 /// Normalize a caller-supplied HTTP version into the bare number (e.g. "1.1"),
 /// accepting both "1.1" and "HTTP/1.1" so a value round-tripped from the read
 /// side (which yields the bare "1.1") cannot double-prefix into "HTTP/HTTP/1.1".
@@ -184,7 +177,9 @@ fn validateFraming(hdrs: []const Header) WriteError!void {
         if (eqIgnoreCase(h.name, "transfer-encoding")) {
             if (has_te) return error.InvalidField;
             has_te = true;
-            try validateTransferEncoding(h.value);
+            // h11-style send policy: zttp only emits the `chunked` transfer
+            // coding it implements, never unsupported metadata-only codings.
+            if (!eqIgnoreCase(trimOws(h.value), "chunked")) return error.InvalidField;
         } else if (eqIgnoreCase(h.name, "content-length")) {
             const v = trimOws(h.value);
             if (v.len > 0 and ascii.parseDecimal(u64, v) == null) return error.InvalidField; // digits, no overflow
