@@ -625,6 +625,9 @@ test "send rejects non-digit Content-Length" {
 test "send rejects empty Content-Length" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    const h = [_]Header{.{ .name = "Content-Length", .value = "   " }};
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+    const empty = [_]Header{.{ .name = "Content-Length", .value = "" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &empty, "GET"));
+
+    const whitespace = [_]Header{.{ .name = "Content-Length", .value = "   " }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &whitespace, "GET"));
 }
