@@ -167,14 +167,19 @@ fn validateHeaders(hdrs: []const Header) WriteError!void {
 
 /// Refuse to serialize ambiguous framing - the send-side mirror of the reader's
 /// smuggling guards. A message carrying both Transfer-Encoding and
-/// Content-Length, or conflicting duplicate Content-Lengths, would let a
-/// downstream parser disagree about message boundaries (response splitting).
+/// Content-Length, multiple Transfer-Encoding fields, unsupported TE codings, or
+/// conflicting duplicate Content-Lengths would let a downstream parser disagree
+/// about message boundaries (response splitting).
 fn validateFraming(hdrs: []const Header) WriteError!void {
     var has_te = false;
     var content_length: ?[]const u8 = null;
     for (hdrs) |h| {
         if (eqIgnoreCase(h.name, "transfer-encoding")) {
+            if (has_te) return error.InvalidField;
             has_te = true;
+            // h11-style send policy: zttp only emits the `chunked` transfer
+            // coding it implements, never unsupported metadata-only codings.
+            if (!eqIgnoreCase(trimOws(h.value), "chunked")) return error.InvalidField;
         } else if (eqIgnoreCase(h.name, "content-length")) {
             const v = trimOws(h.value);
             if (v.len > 0 and ascii.parseDecimal(u64, v) == null) return error.InvalidField; // digits, no overflow
@@ -484,6 +489,13 @@ test "HEAD response is bodyless despite Content-Length" {
     try t.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n", wr.pending());
 }
 
+test "bodyless response rejects unsupported transfer-encoding" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 304, "Not Modified", &hdrs, "GET"));
+}
+
 test "data before head is rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
@@ -602,6 +614,44 @@ test "send-path injection: CRLF in trailer rejected" {
     try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     const trailers = [_]Header{.{ .name = "X", .value = "v\r\nInjected: 1" }};
     try t.expectError(error.InvalidField, wr.endMessage(&trailers));
+}
+
+test "send rejects non-chunked transfer-encoding" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+}
+
+test "send rejects non-final transfer-encoding chunked" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked, gzip" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+}
+
+test "send rejects duplicate transfer-encoding chunked" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked, chunked" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+}
+
+test "send rejects unsupported transfer-encoding comma list" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip, chunked" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+}
+
+test "send rejects multiple transfer-encoding fields" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{
+        .{ .name = "Transfer-Encoding", .value = "gzip" },
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+    };
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }
 
 test "send rejects ambiguous framing (TE + CL)" {
