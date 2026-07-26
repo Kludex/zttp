@@ -120,6 +120,7 @@ pub const Reader = struct {
             self.eof_seen = true;
             return;
         }
+        if (self.eof_seen) return error.ProtocolError;
         if (self.limits.max_buffer != 0) {
             const unconsumed = self.buf.items.len - self.consumed;
             if (unconsumed + data.len > self.limits.max_buffer) return error.MessageTooLong;
@@ -708,6 +709,13 @@ test "feed rejects input past max_buffer" {
     defer r.deinit();
     const big = "Z" ** 2048;
     try t.expectError(error.MessageTooLong, r.feed(big));
+}
+
+test "feed rejects data after EOF" {
+    var r = Reader.init(t.allocator, .server);
+    defer r.deinit();
+    try r.feed("");
+    try t.expectError(error.ProtocolError, r.feed("GET / HTTP/1.1\r\n\r\n"));
 }
 
 test "M-2: bare LF request rejected when strict" {
