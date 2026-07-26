@@ -309,7 +309,10 @@ pub const Reader = struct {
         if (st.status_code / 100 == 1 and st.status_code != 101) {
             // Informational responses are not the final response to the request:
             // surface the head, then keep reading the final response without
-            // requiring reset() or clearing the remembered request method.
+            // requiring reset() or clearing the remembered request method. Still
+            // validate framing fields with bodyless semantics before continuing,
+            // so malformed CL/TE cannot be surfaced as a trusted interim head.
+            _ = try framing_mod.determine(self.headers.items, .{ .bodyless = true, .until_close_default = true });
             self.state = .head;
             return .{ .response = .{
                 .status_code = st.status_code,
@@ -628,6 +631,14 @@ test "informational response preserves HEAD method for final response" {
     try t.expectEqual(@as(u16, 100), (try r.nextEvent()).response.status_code);
     try t.expectEqual(@as(u16, 200), (try r.nextEvent()).response.status_code);
     try expectTag(.end_of_message, try r.nextEvent());
+}
+
+test "informational response validates framing headers" {
+    var r = Reader.init(t.allocator, .client);
+    defer r.deinit();
+    r.setRequestMethod("GET");
+    try r.feed("HTTP/1.1 100 Continue\r\nContent-Length: x\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    try t.expectError(error.InvalidFraming, r.nextEvent());
 }
 
 test "client still frames a normal GET response body" {
