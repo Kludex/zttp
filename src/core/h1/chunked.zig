@@ -108,9 +108,10 @@ pub const ChunkDecoder = struct {
 fn parseChunkSize(line: []const u8) ParseError!u64 {
     var n: u64 = 0;
     var digits: usize = 0;
-    for (line) |ch| {
+    for (line, 0..) |ch, i| {
         if (ch == ';') {
             if (digits == 0) return error.InvalidChunk;
+            if (!validChunkExtension(line[i + 1 ..])) return error.InvalidChunk;
             return n;
         }
         const v = tables.hex_value[ch];
@@ -121,6 +122,16 @@ fn parseChunkSize(line: []const u8) ParseError!u64 {
     }
     if (digits == 0) return error.InvalidChunk;
     return n;
+}
+
+/// We do not interpret chunk extensions, but we still reject bytes that cannot
+/// appear in HTTP field content so malformed framing cannot slip through one
+/// parser and be rejected by another.
+fn validChunkExtension(ext: []const u8) bool {
+    for (ext) |ch| {
+        if (!tables.is_field_vchar[ch]) return false;
+    }
+    return true;
 }
 
 /// Consume a CRLF at the cursor (a bare LF too when not strict). Returns false
@@ -179,6 +190,12 @@ test "chunk extensions ignored" {
     defer r.body.deinit(t.allocator);
     try t.expect(r.done);
     try t.expectEqualStrings("hello", r.body.items);
+}
+
+test "chunk extensions reject control bytes" {
+    var dec = ChunkDecoder{};
+    var sc = Scanner.init("5;bad=\x00\r\nhello\r\n0\r\n\r\n");
+    try t.expectError(error.InvalidChunk, dec.next(&sc));
 }
 
 test "hex chunk size" {
