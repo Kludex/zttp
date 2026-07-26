@@ -93,9 +93,8 @@ fn parseVersion(tok: []const u8) ParseError![]const u8 {
     return num;
 }
 
-/// Parse one header field-line into a (name, value) pair. The name is the raw
-/// token (case preserved); the value has surrounding OWS stripped. A line with
-/// leading whitespace is obs-fold (RFC 9112 5.2) and is rejected.
+/// Whether a field-name is allowed in a chunked trailer section. Trailers cannot
+/// carry message framing, connection routing, or payload-processing metadata.
 pub fn trailerFieldAllowed(name: []const u8) bool {
     inline for (.{
         // Message framing / connection routing fields.
@@ -116,6 +115,9 @@ pub fn trailerFieldAllowed(name: []const u8) bool {
     return true;
 }
 
+/// Parse one header field-line into a (name, value) pair. The name is the raw
+/// token (case preserved); the value has surrounding OWS stripped. A line with
+/// leading whitespace is obs-fold (RFC 9112 5.2) and is rejected.
 pub fn parseHeaderLine(line: []const u8) ParseError!Header {
     if (line.len == 0) return error.InvalidHeader;
     if (line[0] == ' ' or line[0] == '\t') return error.InvalidHeader; // obs-fold
