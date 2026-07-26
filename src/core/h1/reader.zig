@@ -311,6 +311,7 @@ pub const Reader = struct {
             .bodyless = framing_mod.responseIsBodyless(method, st.status_code),
             .until_close_default = true,
         });
+        self.conn_should_close = connection_mod.shouldClose(st.http_version, self.headers.items);
         return .{ .response = .{
             .status_code = st.status_code,
             .reason = st.reason,
@@ -605,6 +606,22 @@ test "client still frames a normal GET response body" {
     const d = try r.nextEvent();
     try t.expectEqualStrings("hello", d.data.data);
     try expectTag(.end_of_message, try r.nextEvent());
+}
+
+test "client exposes response connection close signal" {
+    var r = Reader.init(t.allocator, .client);
+    defer r.deinit();
+    try r.feed("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    try expectTag(.response, try r.nextEvent());
+    try t.expect(r.shouldClose());
+}
+
+test "client treats HTTP/1.0 response as close unless keep-alive" {
+    var r = Reader.init(t.allocator, .client);
+    defer r.deinit();
+    try r.feed("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+    try expectTag(.response, try r.nextEvent());
+    try t.expect(r.shouldClose());
 }
 
 test "truncated content-length body errors at EOF" {
