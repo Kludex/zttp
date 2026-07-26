@@ -56,10 +56,12 @@ fn validValue(value: []const u8) WriteError!void {
 /// Normalize a caller-supplied HTTP version into the bare number (e.g. "1.1"),
 /// accepting both "1.1" and "HTTP/1.1" so a value round-tripped from the read
 /// side (which yields the bare "1.1") cannot double-prefix into "HTTP/HTTP/1.1".
-/// The result must be exactly `DIGIT "." DIGIT`.
+/// The result must be exactly `1 "." DIGIT`: this is the HTTP/1 serializer, so
+/// emitting an `HTTP/2.0` or `HTTP/0.9` start line would create a version
+/// differential with the reader.
 fn normalizeVersion(version: []const u8) WriteError![]const u8 {
     const v = if (version.len >= 5 and std.mem.eql(u8, version[0..5], "HTTP/")) version[5..] else version;
-    if (v.len != 3 or v[0] < '0' or v[0] > '9' or v[1] != '.' or v[2] < '0' or v[2] > '9') {
+    if (v.len != 3 or v[0] != '1' or v[1] != '.' or v[2] < '0' or v[2] > '9') {
         return error.InvalidField;
     }
     return v;
@@ -427,6 +429,13 @@ test "invalid version rejected" {
     var wr2 = Writer.init(t.allocator);
     defer wr2.deinit();
     try t.expectError(error.InvalidField, wr2.sendResponse("garbage", 200, "OK", &.{}, "GET"));
+}
+
+test "non-HTTP/1 versions rejected" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try t.expectError(error.InvalidField, wr.sendRequest("GET", "/", "HTTP/2.0", &.{}));
+    try t.expectError(error.InvalidField, wr.sendResponse("0.9", 200, "OK", &.{}, "GET"));
 }
 
 test "chunked response framing" {
