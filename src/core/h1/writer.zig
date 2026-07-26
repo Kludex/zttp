@@ -79,14 +79,13 @@ fn validTarget(target: []const u8) WriteError!void {
     }
 }
 
-/// Status-line tokens such as the reason phrase must not carry CR/LF or
-/// controls. Reason allows SP/HTAB.
-fn validLineToken(s: []const u8, allow_sp: bool) WriteError!void {
-    for (s) |ch| {
+/// Reason phrases may contain SP/HTAB, but not CR/LF, NUL, DEL, or other
+/// controls.
+fn validReasonPhrase(reason: []const u8) WriteError!void {
+    for (reason) |ch| {
         if (ch == '\r' or ch == '\n' or ch == 0) return error.InvalidField;
-        if (ch < 0x20 and !(allow_sp and ch == '\t')) return error.InvalidField;
+        if (ch < 0x20 and ch != '\t') return error.InvalidField;
         if (ch == 0x7F) return error.InvalidField;
-        if (!allow_sp and ch == ' ') return error.InvalidField;
     }
 }
 
@@ -294,7 +293,7 @@ pub const Writer = struct {
     }
 
     fn writeStatusLine(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header) WriteError!void {
-        try validLineToken(reason, true); // reason-phrase may contain SP/HTAB
+        try validReasonPhrase(reason);
         try validateHeaders(hdrs);
         try self.w("HTTP/");
         try self.w(version);
