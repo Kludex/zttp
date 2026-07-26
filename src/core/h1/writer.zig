@@ -179,19 +179,22 @@ pub fn reasonPhrase(status: u16) []const u8 {
     };
 }
 
-fn validateHeaders(hdrs: []const Header) WriteError!void {
+fn validateHeaders(hdrs: []const Header, require_te_chunked: bool) WriteError!void {
     for (hdrs) |h| {
         try validName(h.name);
         try validValue(h.value);
     }
-    try validateFraming(hdrs);
+    try validateFraming(hdrs, require_te_chunked);
 }
 
 /// Refuse to serialize ambiguous framing - the send-side mirror of the reader's
 /// smuggling guards. A message carrying both Transfer-Encoding and
 /// Content-Length, or conflicting duplicate Content-Lengths, would let a
 /// downstream parser disagree about message boundaries (response splitting).
-fn validateFraming(hdrs: []const Header) WriteError!void {
+/// Bodyless responses may carry metadata-only Transfer-Encoding values (e.g.
+/// HEAD/304 describing the representation), so `require_te_chunked` only applies
+/// when the message actually needs TE to delimit a body.
+fn validateFraming(hdrs: []const Header, require_te_chunked: bool) WriteError!void {
     var te = TransferEncoding{};
     var has_te = false;
     var content_length: ?[]const u8 = null;
@@ -208,7 +211,7 @@ fn validateFraming(hdrs: []const Header) WriteError!void {
             content_length = v;
         }
     }
-    if (has_te) try te.validate();
+    if (require_te_chunked and has_te) try te.validate();
     if (has_te and content_length != null) return error.InvalidField; // TE + CL
 }
 
@@ -265,7 +268,7 @@ pub const Writer = struct {
         try validLineToken(method, false);
         try validLineToken(target, false);
         const ver = try normalizeVersion(version);
-        try validateHeaders(hdrs);
+        try validateHeaders(hdrs, true);
         try self.w(method);
         try self.w(" ");
         try self.w(target);
@@ -283,8 +286,9 @@ pub const Writer = struct {
     /// is bodyless (RFC 9112 6.3), so the caller never tracks framing by hand.
     pub fn sendResponse(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header, request_method: []const u8) WriteError!void {
         if (self.state != .idle) return error.MessageNotEnded;
-        try self.writeStatusLine(try normalizeVersion(version), status, reason, hdrs);
-        if (responseIsBodyless(request_method, status)) {
+        const bodyless = responseIsBodyless(request_method, status);
+        try self.writeStatusLine(try normalizeVersion(version), status, reason, hdrs, !bodyless);
+        if (bodyless) {
             self.state = .body_none;
             self.body_remaining = 0;
         } else {
@@ -304,12 +308,12 @@ pub const Writer = struct {
     pub fn sendInformational(self: *Writer, status: u16, hdrs: []const Header) WriteError!void {
         if (self.state != .idle) return error.MessageNotEnded;
         if (status / 100 != 1 or status == 101) return error.InvalidField;
-        try self.writeStatusLine("1.1", status, reasonPhrase(status), hdrs);
+        try self.writeStatusLine("1.1", status, reasonPhrase(status), hdrs, false);
     }
 
-    fn writeStatusLine(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header) WriteError!void {
+    fn writeStatusLine(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header, require_te_chunked: bool) WriteError!void {
         try validLineToken(reason, true); // reason-phrase may contain SP/HTAB
-        try validateHeaders(hdrs);
+        try validateHeaders(hdrs, require_te_chunked);
         try self.w("HTTP/");
         try self.w(version);
         try self.w(" ");
@@ -362,7 +366,7 @@ pub const Writer = struct {
     pub fn endMessage(self: *Writer, trailers: []const Header) WriteError!void {
         switch (self.state) {
             .body_chunked => {
-                try validateHeaders(trailers);
+                try validateHeaders(trailers, true);
                 try self.w("0\r\n");
                 for (trailers) |tr| {
                     try self.w(tr.name);
@@ -500,6 +504,16 @@ test "HEAD response is bodyless despite Content-Length" {
     try t.expectError(error.NoBodyAllowed, wr.sendData("x"));
     try wr.endMessage(&.{});
     try t.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n", wr.pending());
+}
+
+test "bodyless response allows metadata-only transfer-encoding" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip" }};
+    try wr.sendResponse("1.1", 304, "Not Modified", &hdrs, "GET");
+    try t.expectError(error.NoBodyAllowed, wr.sendData("x"));
+    try wr.endMessage(&.{});
+    try t.expectEqualStrings("HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: gzip\r\n\r\n", wr.pending());
 }
 
 test "data before head is rejected" {
