@@ -175,7 +175,7 @@ fn validateFraming(hdrs: []const Header) WriteError!void {
             has_te = true;
         } else if (eqIgnoreCase(h.name, "content-length")) {
             const v = trimOws(h.value);
-            if (v.len > 0 and ascii.parseDecimal(u64, v) == null) return error.InvalidField; // digits, no overflow
+            if (ascii.parseDecimal(u64, v) == null) return error.InvalidField; // non-empty digits, no overflow
             if (content_length) |prev| {
                 if (!eqIgnoreCase(prev, v)) return error.InvalidField; // conflicting duplicate
             }
@@ -619,5 +619,12 @@ test "send rejects non-digit Content-Length" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     const h = [_]Header{.{ .name = "Content-Length", .value = "5x" }};
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+}
+
+test "send rejects empty Content-Length" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{.{ .name = "Content-Length", .value = "   " }};
     try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }
