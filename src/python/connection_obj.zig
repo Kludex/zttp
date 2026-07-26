@@ -211,6 +211,7 @@ const H1Engine = struct {
 
     fn receiveData(self: *H1Engine, data: []const u8, obj: py.Object) py.Object {
         if (!self.flushPending()) return null;
+        if (data.len > 0 and self.reader.eofSeen()) return exceptions.raiseParse(error.ProtocolError);
         if (data.len > 0 and self.reader.backlogEmpty()) {
             if (self.reader.bodyLengthRemaining() != null) {
                 self.stash(obj, data);

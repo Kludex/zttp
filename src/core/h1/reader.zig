@@ -170,6 +170,12 @@ pub const Reader = struct {
         return self.buf.items.len == self.consumed;
     }
 
+    /// True once EOF has been signalled on this read side; non-empty input after
+    /// this point is a protocol/API error.
+    pub fn eofSeen(self: *const Reader) bool {
+        return self.eof_seen;
+    }
+
     /// True when the reader is waiting for the head of a new message.
     pub fn atMessageStart(self: *const Reader) bool {
         return self.state == .head;
