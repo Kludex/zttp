@@ -85,7 +85,7 @@ pub const StreamReset = struct {
 /// The peer is shutting the connection down: HTTP/2 GOAWAY (RFC 9113 6.8) or
 /// HTTP/3 GOAWAY (RFC 9114 5.2). `last_stream_id` is u64 to hold the HTTP/3
 /// 62-bit id losslessly; HTTP/2's 31-bit id fits the same field.
-pub const Goaway = struct {
+pub const GoAway = struct {
     last_stream_id: u64,
     error_code: u32,
     debug: []const u8 = &.{},
@@ -138,7 +138,7 @@ pub const H2Event = union(enum) {
     end_of_message: EndOfMessage,
     need_data,
     rst_stream: RstStream,
-    goaway: Goaway,
+    goaway: GoAway,
     settings: SettingsEvent,
     ping: Ping,
     window_update: WindowUpdate,
@@ -158,7 +158,7 @@ pub const H3Event = union(enum) {
     connection_closed,
     need_data,
     settings: SettingsEvent,
-    goaway: Goaway,
+    goaway: GoAway,
     rst_stream: StreamReset,
 };
 
