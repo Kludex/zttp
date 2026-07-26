@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const events = @import("../events.zig");
+const ascii = @import("../ascii.zig");
 const headers_mod = @import("headers.zig");
 const framing_mod = @import("framing.zig");
 const connection_mod = @import("connection.zig");
@@ -316,10 +317,14 @@ pub const Reader = struct {
         if (st.status_code / 100 == 1 and st.status_code != 101) {
             // Informational responses are not the final response to the request:
             // surface the head, then keep reading the final response without
-            // requiring reset() or clearing the remembered request method. Still
-            // validate framing fields with bodyless semantics before continuing,
-            // so malformed CL/TE cannot be surfaced as a trusted interim head.
-            _ = try framing_mod.determine(self.headers.items, .{ .bodyless = true, .until_close_default = true });
+            // requiring reset() or clearing the remembered request method. 1xx
+            // responses cannot carry body framing fields; reject them before the
+            // interim head is surfaced as trusted metadata.
+            for (self.headers.items) |h| {
+                if (ascii.eqIgnoreCase(h.name, "content-length") or ascii.eqIgnoreCase(h.name, "transfer-encoding")) {
+                    return error.InvalidFraming;
+                }
+            }
             self.state = .head;
             return .{ .response = .{
                 .status_code = st.status_code,
@@ -652,12 +657,14 @@ test "informational response preserves HEAD method for final response" {
     try expectTag(.end_of_message, try r.nextEvent());
 }
 
-test "informational response validates framing headers" {
-    var r = Reader.init(t.allocator, .client);
-    defer r.deinit();
-    r.setRequestMethod("GET");
-    try r.feed("HTTP/1.1 100 Continue\r\nContent-Length: x\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-    try t.expectError(error.InvalidFraming, r.nextEvent());
+test "informational response rejects framing headers" {
+    inline for (.{ "Content-Length: 0", "Transfer-Encoding: chunked" }) |header| {
+        var r = Reader.init(t.allocator, .client);
+        defer r.deinit();
+        r.setRequestMethod("GET");
+        try r.feed("HTTP/1.1 100 Continue\r\n" ++ header ++ "\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        try t.expectError(error.InvalidFraming, r.nextEvent());
+    }
 }
 
 test "client still frames a normal GET response body" {
