@@ -3,19 +3,17 @@ queue_rules:
     merge_method: squash
     update_method: merge
     queue_conditions:
-      - '#approved-reviews-by>=1'
-      - '#changes-requested-reviews-by=0'
+      - base=main
+      - '-draft'
     merge_conditions:
       - check-success=All green
       - check-success=Run zizmor
 
 pull_request_rules:
-  - name: Queue approved pull requests
+  - name: Queue pull requests
     conditions:
       - base=main
       - '-draft'
-      - '#approved-reviews-by>=1'
-      - '#changes-requested-reviews-by=0'
     actions:
       queue:
         name: default
