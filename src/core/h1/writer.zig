@@ -599,13 +599,15 @@ test "send-path injection: CRLF in trailer rejected" {
     try t.expectError(error.InvalidField, wr.endMessage(&trailers));
 }
 
-test "send rejects framing trailers" {
-    var wr = Writer.init(t.allocator);
-    defer wr.deinit();
-    const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
-    try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
-    const trailers = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
-    try t.expectError(error.InvalidField, wr.endMessage(&trailers));
+test "send rejects prohibited trailers" {
+    inline for (.{ "Transfer-Encoding", "Trailer", "Content-Type" }) |name| {
+        var wr = Writer.init(t.allocator);
+        defer wr.deinit();
+        const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
+        try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+        const trailers = [_]Header{.{ .name = name, .value = "x" }};
+        try t.expectError(error.InvalidField, wr.endMessage(&trailers));
+    }
 }
 
 test "send rejects ambiguous framing (TE + CL)" {

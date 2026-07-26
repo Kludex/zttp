@@ -97,7 +97,20 @@ fn parseVersion(tok: []const u8) ParseError![]const u8 {
 /// token (case preserved); the value has surrounding OWS stripped. A line with
 /// leading whitespace is obs-fold (RFC 9112 5.2) and is rejected.
 pub fn trailerFieldAllowed(name: []const u8) bool {
-    inline for (.{ "content-length", "transfer-encoding", "host", "connection", "upgrade", "te" }) |forbidden| {
+    inline for (.{
+        // Message framing / connection routing fields.
+        "content-length",
+        "transfer-encoding",
+        "trailer",
+        "host",
+        "connection",
+        "upgrade",
+        "te",
+        // Payload-processing metadata that RFC 9110 forbids in trailers.
+        "content-encoding",
+        "content-type",
+        "content-range",
+    }) |forbidden| {
         if (ascii.eqIgnoreCase(name, forbidden)) return false;
     }
     return true;
@@ -207,9 +220,13 @@ test "parseHeaderLine rejects control chars in value" {
     try std.testing.expectError(error.InvalidHeader, parseHeaderLine("X: a\x00b"));
 }
 
-test "trailerFieldAllowed rejects framing fields" {
+test "trailerFieldAllowed rejects prohibited fields" {
     try std.testing.expect(!trailerFieldAllowed("Content-Length"));
     try std.testing.expect(!trailerFieldAllowed("Transfer-Encoding"));
+    try std.testing.expect(!trailerFieldAllowed("Trailer"));
     try std.testing.expect(!trailerFieldAllowed("Connection"));
+    try std.testing.expect(!trailerFieldAllowed("Content-Encoding"));
+    try std.testing.expect(!trailerFieldAllowed("Content-Type"));
+    try std.testing.expect(!trailerFieldAllowed("Content-Range"));
     try std.testing.expect(trailerFieldAllowed("X-Checksum"));
 }

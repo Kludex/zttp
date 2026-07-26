@@ -690,12 +690,14 @@ test "H-4: trailer byte cap rejected" {
     try t.expectError(error.MessageTooLong, r.nextEvent());
 }
 
-test "framing trailers are rejected" {
-    var r = Reader.init(t.allocator, .server);
-    defer r.deinit();
-    try r.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 0\r\n\r\n");
-    try expectTag(.request, try r.nextEvent());
-    try t.expectError(error.InvalidHeader, r.nextEvent());
+test "prohibited trailers are rejected" {
+    inline for (.{ "Content-Length: 0", "Trailer: Content-Length", "Content-Type: text/plain" }) |trailer| {
+        var r = Reader.init(t.allocator, .server);
+        defer r.deinit();
+        try r.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n" ++ trailer ++ "\r\n\r\n");
+        try expectTag(.request, try r.nextEvent());
+        try t.expectError(error.InvalidHeader, r.nextEvent());
+    }
 }
 
 test "M-1: oversized complete head rejected before full copy" {
