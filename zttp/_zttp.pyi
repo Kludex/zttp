@@ -193,7 +193,7 @@ class ProtocolError(Exception):
     """Base class for the two protocol errors. Catch this to handle both."""
 
 class RemoteProtocolError(ProtocolError):
-    """The peer sent something malformed. Raised from `next_event()`."""
+    """The peer sent something malformed. Raised by the read API."""
 
 class LocalProtocolError(ProtocolError):
     """You used the send API in a way that cannot produce a valid message."""
