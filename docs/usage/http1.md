@@ -289,7 +289,7 @@ import zttp
 conn = zttp.Connection(zttp.SERVER)
 conn.send_response(200, [(b"Content-Length", b"5")])
 conn.send_data(b"too long")
-#> zttp.LocalProtocolError: invalid send for current connection state
+#> zttp.LocalProtocolError: sent more body than the declared Content-Length
 ```
 
 For a body of unknown length, use `Transfer-Encoding: chunked` instead: then
