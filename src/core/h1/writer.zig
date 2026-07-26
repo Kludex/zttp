@@ -629,6 +629,21 @@ test "send rejects malformed request-line fields" {
     try t.expectEqualStrings("", wr.pending());
 }
 
+test "send validates reason phrase controls" {
+    inline for (.{ "O\x00K", "O\x07K", "O\x7fK" }) |reason| {
+        var wr = Writer.init(t.allocator);
+        defer wr.deinit();
+        try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, reason, &.{}, "GET"));
+        try t.expectEqualStrings("", wr.pending());
+    }
+
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try wr.sendResponse("1.1", 200, "O\tK", &.{}, "GET");
+    try wr.endMessage(&.{});
+    try t.expectEqualStrings("HTTP/1.1 200 O\tK\r\n\r\n", wr.pending());
+}
+
 test "send-path injection: CRLF in trailer rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
