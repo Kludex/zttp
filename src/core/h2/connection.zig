@@ -156,7 +156,7 @@ pub const Connection = struct {
     failed_with: H2Error = error.ProtocolError,
     /// Set to the GOAWAY error code on the FIRST transition to .failed, so the
     /// integrator can serialize one GOAWAY before closing (RFC 9113 5.4.1).
-    /// Consumed by takeGoawayOwed; re-raising the latched error does not re-set it.
+    /// Consumed by takeGoAwayOwed; re-raising the latched error does not re-set it.
     goaway_owed: ?constants.ErrorCode = null,
     eof_seen: bool = false,
 
@@ -214,7 +214,7 @@ pub const Connection = struct {
     /// Produce the next event, or `.need_data`. A connection error poisons the
     /// engine: it is latched and re-raised on every later call (as H1 does). The
     /// first failure records the GOAWAY code in goaway_owed (RFC 9113 5.4.1); the
-    /// integrator drains it via takeGoawayOwed and serializes one GOAWAY.
+    /// integrator drains it via takeGoAwayOwed and serializes one GOAWAY.
     pub fn nextEvent(self: *Connection) H2Error!Event {
         if (self.phase == .failed) return self.failed_with;
         return self.dispatch() catch |e| self.fail(e);
@@ -222,7 +222,7 @@ pub const Connection = struct {
 
     /// The GOAWAY error code owed after a connection-fatal error, or null. Returns
     /// it at most once so the integrator sends exactly one GOAWAY.
-    pub fn takeGoawayOwed(self: *Connection) ?constants.ErrorCode {
+    pub fn takeGoAwayOwed(self: *Connection) ?constants.ErrorCode {
         const owed = self.goaway_owed;
         self.goaway_owed = null;
         return owed;
@@ -319,7 +319,7 @@ pub const Connection = struct {
         switch (ftype) {
             .settings => try self.handleSettings(f),
             .ping => try self.handlePing(f),
-            .goaway => try self.handleGoaway(f),
+            .goaway => try self.handleGoAway(f),
             .window_update => try self.handleWindowUpdate(f),
             .data => try self.handleData(f),
             .rst_stream => try self.handleRstStream(f),
@@ -368,7 +368,7 @@ pub const Connection = struct {
         self.push(.{ .ping = .{ .ack = Flags.has(f.header.flags, Flags.ack), .opaque_data = data } });
     }
 
-    fn handleGoaway(self: *Connection, f: frame_mod.Frame) H2Error!void {
+    fn handleGoAway(self: *Connection, f: frame_mod.Frame) H2Error!void {
         if (f.header.stream_id != 0) return error.ProtocolError;
         const last_id = std.mem.readInt(u32, f.payload[0..4], .big) & 0x7FFF_FFFF;
         const code = std.mem.readInt(u32, f.payload[4..8], .big);
@@ -1440,11 +1440,11 @@ test "a connection-fatal error owes one GOAWAY with the mapped code" {
     try handshook(&c, hdr.items);
     try testing.expectError(error.ProtocolError, c.nextEvent());
     // The owed GOAWAY carries PROTOCOL_ERROR and is reported exactly once.
-    try testing.expectEqual(@as(?ErrorCode, .protocol_error), c.takeGoawayOwed());
-    try testing.expectEqual(@as(?ErrorCode, null), c.takeGoawayOwed());
+    try testing.expectEqual(@as(?ErrorCode, .protocol_error), c.takeGoAwayOwed());
+    try testing.expectEqual(@as(?ErrorCode, null), c.takeGoAwayOwed());
     // Re-raising the latched error does not re-arm a GOAWAY.
     try testing.expectError(error.ProtocolError, c.nextEvent());
-    try testing.expectEqual(@as(?ErrorCode, null), c.takeGoawayOwed());
+    try testing.expectEqual(@as(?ErrorCode, null), c.takeGoAwayOwed());
 }
 
 test "a fatal feed (max_buffer breach) poisons the connection and owes a GOAWAY" {
@@ -1453,11 +1453,11 @@ test "a fatal feed (max_buffer breach) poisons the connection and owes a GOAWAY"
     c.limits.max_buffer = 8;
     try testing.expectError(error.MessageTooLong, c.feed("123456789")); // 9 > 8
     // The breach owes ENHANCE_YOUR_CALM and poisons the connection.
-    try testing.expectEqual(@as(?ErrorCode, .enhance_your_calm), c.takeGoawayOwed());
+    try testing.expectEqual(@as(?ErrorCode, .enhance_your_calm), c.takeGoAwayOwed());
     try testing.expectError(error.MessageTooLong, c.nextEvent()); // latched
     // A later feed re-raises the latched error without re-arming a GOAWAY.
     try testing.expectError(error.MessageTooLong, c.feed("more"));
-    try testing.expectEqual(@as(?ErrorCode, null), c.takeGoawayOwed());
+    try testing.expectEqual(@as(?ErrorCode, null), c.takeGoAwayOwed());
 }
 
 test "localSettingsParams advertises the enforced limits" {

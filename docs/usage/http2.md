@@ -391,7 +391,7 @@ can observe (and react to) what the peer is doing:
 | `WindowUpdate` | The peer granted flow-control credit. |
 | `Ping` | A keepalive / round-trip probe. |
 | `RstStream` | The peer reset a single stream. |
-| `Goaway` | The peer is shutting the connection down. |
+| `GoAway` | The peer is shutting the connection down. |
 
 They flow out of `next_event` like any other event. Most applications can ignore
 them, since zttp acts on the ones that matter (crediting windows, releasing

@@ -335,7 +335,7 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
         if event is zttp.NEED_DATA:
             break
         goaway_events.append(event)
-    goaways = [event for event in goaway_events if event.__class__.__name__ == "Goaway"]
+    goaways = [event for event in goaway_events if event.__class__.__name__ == "GoAway"]
     if not goaways or goaways[-1].last_stream_id != 8 or client.goaway_received() != 8:
         raise SystemExit(f"zttp did not receive aioquic's GOAWAY: {goaway_events!r}")
 

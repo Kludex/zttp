@@ -103,7 +103,7 @@ What differs is each protocol's **event union**, so its surface is exactly as wi
 as its reality. HTTP/1.1 is a single stream and adds nothing. HTTP/2 and HTTP/3
 multiplex many concurrent streams over one connection, so every event carries a
 `stream_id` and they add the control events they actually have (`RstStream`,
-`Goaway`, `Settings`, `Ping`, `WindowUpdate` for H2; `Settings`, `Goaway` for H3).
+`GoAway`, `Settings`, `Ping`, `WindowUpdate` for H2; `Settings`, `GoAway` for H3).
 
 Multiplexing has to reach a flat, single pull. The resolution is a **single,
 arrival-ordered event queue** where every event carries a `stream_id` and the
