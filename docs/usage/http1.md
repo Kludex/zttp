@@ -260,6 +260,30 @@ print(conn.data_to_send())
 #> b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Checksum: abc\r\n\r\n'
 ```
 
+Other transfer codings may precede `chunked`, either in one field-line or across
+several. zttp treats them as one ordered list, requires `chunked` exactly once
+and last, preserves the field-lines you supplied, and adds the final chunk framing:
+
+```python
+import gzip
+
+import zttp
+
+already_gzipped = gzip.compress(b"hello")
+conn = zttp.Connection(zttp.SERVER)
+conn.send_response(200, [(b"Transfer-Encoding", b"gzip, chunked")])
+conn.send_data(already_gzipped)
+conn.end_message()
+wire_bytes = conn.data_to_send()  # write each produced byte to the socket
+```
+
+!!! warning "zttp does not apply the preceding coding"
+    `gzip` describes bytes your application already compressed. zttp does **not**
+    gzip `send_data`; it only adds the chunk framing it implements. Declaring
+    `gzip, chunked` around uncompressed bytes lies to the peer. A coding without
+    final `chunked`, `chunked, gzip`, duplicate `chunked`, and
+    `Transfer-Encoding` together with `Content-Length` are all rejected.
+
 ### Bodyless responses
 
 Some responses have no body no matter what (a `204`, a `304`, the reply to a

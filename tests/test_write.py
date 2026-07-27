@@ -97,6 +97,39 @@ def test_chunked_response() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [(b"Transfer-Encoding", b"gzip, chunked")],
+        [(b"Transfer-Encoding", b"gzip"), (b"Transfer-Encoding", b"chunked")],
+    ],
+)
+def test_chunked_framing_with_preceding_transfer_codings(headers: list[tuple[bytes, bytes]]) -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.send_response(200, headers)
+    conn.send_data(b"compressed")
+    conn.end_message()
+
+    head, body = conn.data_to_send().split(b"\r\n\r\n", 1)
+    assert head.count(b"chunked") == 1
+    assert body == b"a\r\ncompressed\r\n0\r\n\r\n"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [(b"Transfer-Encoding", b"gzip")],
+        [(b"Transfer-Encoding", b"chunked, gzip")],
+        [(b"Transfer-Encoding", b"chunked, chunked")],
+        [(b"Transfer-Encoding", b"chunked"), (b"Transfer-Encoding", b"chunked")],
+    ],
+)
+def test_invalid_transfer_coding_order_is_rejected(headers: list[tuple[bytes, bytes]]) -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.send_response(200, headers)
+
+
 def test_chunked_with_trailers() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(200, [(b"Transfer-Encoding", b"chunked")])

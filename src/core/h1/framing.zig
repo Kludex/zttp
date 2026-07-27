@@ -52,6 +52,23 @@ const TransferEncoding = struct {
     }
 };
 
+/// Validate Transfer-Encoding across all field-lines as one ordered comma list.
+/// Returns whether the message declared Transfer-Encoding. The caller owns any
+/// codings before `chunked`; this layer only requires the framing coding it can
+/// decode/emit: `chunked` exactly once and last (RFC 9112 6.1, 7.1).
+pub fn validateTransferEncoding(headers: []const Header) ParseError!bool {
+    var te = TransferEncoding{};
+    var has_te = false;
+    for (headers) |h| {
+        if (eqIgnoreCase(h.name, "transfer-encoding")) {
+            has_te = true;
+            te.add(h.value);
+        }
+    }
+    if (has_te) _ = try te.resolve();
+    return has_te;
+}
+
 fn parseContentLength(value: []const u8) ParseError!u64 {
     const v = ascii.trimOws(value);
     return ascii.parseDecimal(u64, v) orelse error.InvalidFraming;
@@ -79,15 +96,11 @@ pub const FramingOptions = struct {
 /// Inspect the parsed headers and return the body framing. Enforces the
 /// CL/TE conflict and duplicate-Content-Length rules.
 pub fn determine(headers: []const Header, opts: FramingOptions) ParseError!Framing {
-    var te = TransferEncoding{};
-    var has_te = false;
+    const has_te = try validateTransferEncoding(headers);
     var content_length: ?u64 = null;
 
     for (headers) |h| {
-        if (eqIgnoreCase(h.name, "transfer-encoding")) {
-            has_te = true;
-            te.add(h.value);
-        } else if (eqIgnoreCase(h.name, "content-length")) {
+        if (eqIgnoreCase(h.name, "content-length")) {
             const n = try parseContentLength(h.value);
             if (content_length) |prev| {
                 if (prev != n) return error.InvalidFraming; // conflicting duplicates
@@ -102,12 +115,7 @@ pub fn determine(headers: []const Header, opts: FramingOptions) ParseError!Frami
 
     if (opts.bodyless) return .none;
 
-    if (has_te) {
-        // chunked must be the sole/final coding across ALL field-lines; resolve
-        // rejects non-final or unframeable Transfer-Encodings to avoid smuggling.
-        _ = try te.resolve();
-        return .chunked;
-    }
+    if (has_te) return .chunked;
     if (content_length) |n| {
         return if (n == 0) .none else .{ .content_length = n };
     }

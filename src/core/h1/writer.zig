@@ -179,21 +179,16 @@ fn validateHeaders(hdrs: []const Header) WriteError!void {
 }
 
 /// Refuse to serialize ambiguous framing - the send-side mirror of the reader's
-/// smuggling guards. A message carrying both Transfer-Encoding and
-/// Content-Length, multiple Transfer-Encoding fields, unsupported TE codings, or
-/// conflicting duplicate Content-Lengths would let a downstream parser disagree
-/// about message boundaries (response splitting).
+/// smuggling guards. Transfer-Encoding field-lines form one ordered comma list;
+/// codings may precede `chunked`, but `chunked` must appear exactly once and last.
+/// The caller supplies bytes to which those preceding codings are already applied;
+/// zttp supplies only the final chunk framing. TE + CL and conflicting duplicate
+/// Content-Lengths remain errors.
 fn validateFraming(hdrs: []const Header) WriteError!void {
-    var has_te = false;
+    const has_te = framing.validateTransferEncoding(hdrs) catch return error.InvalidField;
     var content_length: ?[]const u8 = null;
     for (hdrs) |h| {
-        if (eqIgnoreCase(h.name, "transfer-encoding")) {
-            if (has_te) return error.InvalidField;
-            has_te = true;
-            // h11-style send policy: zttp only emits the `chunked` transfer
-            // coding it implements, never unsupported metadata-only codings.
-            if (!eqIgnoreCase(trimOws(h.value), "chunked")) return error.InvalidField;
-        } else if (eqIgnoreCase(h.name, "content-length")) {
+        if (eqIgnoreCase(h.name, "content-length")) {
             const v = trimOws(h.value);
             if (ascii.parseDecimal(u64, v) == null) return error.InvalidField; // non-empty digits, no overflow
             if (content_length) |prev| {
@@ -698,21 +693,33 @@ test "send rejects duplicate transfer-encoding chunked" {
     try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }
 
-test "send rejects unsupported transfer-encoding comma list" {
+test "send accepts transfer coding before final chunked in one field" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip, chunked" }};
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+    try wr.sendResponse("1.1", 200, "OK", &h, "GET");
+    try wr.sendData("hello");
+    try wr.endMessage(&.{});
+    try t.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        wr.pending(),
+    );
 }
 
-test "send rejects multiple transfer-encoding fields" {
+test "send combines transfer codings across field-lines" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
     const h = [_]Header{
         .{ .name = "Transfer-Encoding", .value = "gzip" },
         .{ .name = "Transfer-Encoding", .value = "chunked" },
     };
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+    try wr.sendResponse("1.1", 200, "OK", &h, "GET");
+    try wr.sendData("hello");
+    try wr.endMessage(&.{});
+    try t.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        wr.pending(),
+    );
 }
 
 test "send rejects ambiguous framing (TE + CL)" {
