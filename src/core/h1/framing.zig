@@ -67,10 +67,21 @@ pub fn responseIsBodyless(method: []const u8, status: u16) bool {
     return false;
 }
 
+/// RFC 9112 6.1 forbids Transfer-Encoding on 1xx/204 and successful CONNECT
+/// responses. HEAD and 304 are also bodyless, but may carry `chunked` metadata
+/// for the corresponding body (RFC 9110 8.6, 15.4.5).
+pub fn responseForbidsTransferEncoding(method: []const u8, status: u16) bool {
+    if (status / 100 == 1 or status == 204) return true;
+    return eqIgnoreCase(method, "CONNECT") and status >= 200 and status < 300;
+}
+
 pub const FramingOptions = struct {
     /// Responses to HEAD, 1xx/204/304, and the connect side have no body
     /// regardless of headers (RFC 9112 6.3). The connection layer sets this.
     bodyless: bool = false,
+    /// 1xx/204 and successful CONNECT responses forbid Transfer-Encoding.
+    /// Separate from bodyless because HEAD and 304 may carry TE metadata.
+    forbid_transfer_encoding: bool = false,
     /// Whether absence of length info means "read until close". True for
     /// responses, false for requests (a request without length has no body).
     until_close_default: bool = false,
@@ -99,6 +110,7 @@ pub fn determine(headers: []const Header, opts: FramingOptions) ParseError!Frami
     // RFC 9112 6.1: if both are present, Transfer-Encoding overrides, but this
     // is a smuggling vector - reject outright (what secure parsers do).
     if (has_te and content_length != null) return error.InvalidFraming;
+    if (has_te and opts.forbid_transfer_encoding) return error.InvalidFraming;
 
     if (opts.bodyless) return .none;
 
@@ -124,6 +136,15 @@ test "responseIsBodyless rule" {
     try std.testing.expect(!responseIsBodyless("CONNECT", 404));
     try std.testing.expect(!responseIsBodyless("GET", 200));
     try std.testing.expect(!responseIsBodyless("POST", 201));
+}
+
+test "responseForbidsTransferEncoding rule" {
+    try std.testing.expect(responseForbidsTransferEncoding("GET", 103));
+    try std.testing.expect(responseForbidsTransferEncoding("GET", 204));
+    try std.testing.expect(responseForbidsTransferEncoding("CONNECT", 200));
+    try std.testing.expect(!responseForbidsTransferEncoding("HEAD", 200));
+    try std.testing.expect(!responseForbidsTransferEncoding("GET", 304));
+    try std.testing.expect(!responseForbidsTransferEncoding("CONNECT", 404));
 }
 
 test "no body" {
@@ -230,6 +251,17 @@ test "bad content-length rejected" {
 
 test "bodyless forces none" {
     const h = [_]Header{.{ .name = "Content-Length", .value = "100" }};
+    try std.testing.expectEqual(Framing.none, try determine(&h, .{ .bodyless = true }));
+}
+
+test "forbidden Transfer-Encoding is rejected before bodyless framing" {
+    const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
+    try std.testing.expectError(error.InvalidFraming, determine(&h, .{
+        .bodyless = true,
+        .forbid_transfer_encoding = true,
+    }));
+    // HEAD/304 use bodyless without the forbidden flag and may describe the
+    // chunked coding that would have applied to their corresponding body.
     try std.testing.expectEqual(Framing.none, try determine(&h, .{ .bodyless = true }));
 }
 

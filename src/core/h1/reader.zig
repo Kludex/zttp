@@ -344,6 +344,7 @@ pub const Reader = struct {
         const method = self.request_method[0..self.request_method_len];
         const framing = try self.frameBody(.{
             .bodyless = framing_mod.responseIsBodyless(method, st.status_code),
+            .forbid_transfer_encoding = framing_mod.responseForbidsTransferEncoding(method, st.status_code),
             .until_close_default = true,
         });
         self.conn_should_close = connection_mod.shouldClose(st.http_version, self.headers.items) or framing == .until_close;
@@ -645,6 +646,35 @@ test "client auto-frames 304 response as bodyless" {
     try r.feed("HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n");
     try expectTag(.response, try r.nextEvent());
     try expectTag(.end_of_message, try r.nextEvent());
+}
+
+test "client rejects Transfer-Encoding where response semantics forbid it" {
+    const cases = .{
+        .{ "GET", "HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n" },
+        .{ "CONNECT", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" },
+    };
+    inline for (cases) |case| {
+        var r = Reader.init(t.allocator, .client);
+        defer r.deinit();
+        r.setRequestMethod(case[0]);
+        try r.feed(case[1]);
+        try t.expectError(error.InvalidFraming, r.nextEvent());
+    }
+}
+
+test "client permits chunked metadata on HEAD and 304" {
+    const cases = .{
+        .{ "HEAD", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" },
+        .{ "GET", "HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n" },
+    };
+    inline for (cases) |case| {
+        var r = Reader.init(t.allocator, .client);
+        defer r.deinit();
+        r.setRequestMethod(case[0]);
+        try r.feed(case[1]);
+        try expectTag(.response, try r.nextEvent());
+        try expectTag(.end_of_message, try r.nextEvent());
+    }
 }
 
 test "client continues through informational response" {
