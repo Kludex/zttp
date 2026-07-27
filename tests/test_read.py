@@ -110,6 +110,36 @@ def test_response_parsing() -> None:
     assert conn.next_event().data == b"xyz"
 
 
+@pytest.mark.parametrize(
+    ("method", "status", "reason"),
+    [(b"GET", 204, b"No Content"), (b"CONNECT", 200, b"OK")],
+)
+def test_response_rejects_forbidden_transfer_encoding(method: bytes, status: int, reason: bytes) -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(method, b"/", b"1.1", [(b"Host", b"example.com")])
+    conn.end_message()
+    conn.data_to_send()
+    conn.receive_data(b"HTTP/1.1 " + str(status).encode() + b" " + reason + b"\r\nTransfer-Encoding: chunked\r\n\r\n")
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
+
+
+@pytest.mark.parametrize(
+    ("method", "status", "reason"),
+    [(b"HEAD", 200, b"OK"), (b"GET", 304, b"Not Modified")],
+)
+def test_bodyless_response_accepts_transfer_encoding_metadata(method: bytes, status: int, reason: bytes) -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(method, b"/", b"1.1", [(b"Host", b"example.com")])
+    conn.end_message()
+    conn.data_to_send()
+    conn.receive_data(
+        b"HTTP/1.1 " + str(status).encode() + b" " + reason + b"\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"
+    )
+    assert isinstance(conn.next_event(), zttp.Response)
+    assert isinstance(conn.next_event(), zttp.EndOfMessage)
+
+
 def test_response_until_close() -> None:
     conn = zttp.Connection(zttp.CLIENT)
     conn.receive_data(b"HTTP/1.1 200 OK\r\nServer: z\r\n\r\nbody here")
