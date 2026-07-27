@@ -211,6 +211,182 @@ You get the same `Request` / `Data` / `EndOfMessage` events, now tagged with the
 QUIC `stream_id`. An HTTP/3 request collapses its pseudo-headers into the same
 shape the other protocols use, and `http_version` is `b"3"`.
 
+!!! warning "`data_to_send()` returns a **list**"
+    On HTTP/1.1 and HTTP/2 it returns `bytes`, because TCP is a byte stream and
+    boundaries don't matter. On HTTP/3 it returns `list[bytes]` - **one UDP
+    datagram per element**. QUIC's datagram boundaries are semantic (they bound
+    a packet's AEAD protection), so you must `sendto` each element as its own
+    datagram. Concatenating them breaks the connection.
+
+    ```python
+    for datagram in conn.data_to_send():
+        sock.sendto(datagram, peer_address)
+    ```
+
+    Use [`data_to_send_with_addresses()`](../reference/api.md#zttp.H3Connection.data_to_send_with_addresses)
+    instead if the peer may have migrated and you need the address to send each
+    one to.
+
+## Sending a response
+
+The send surface is the one you already know from [HTTP/2](http2.md): responses
+go out on a `Stream` handle, because a connection carries many requests at once.
+`conn.stream(request.stream_id)` gets the handle, then it's
+`send_response` / `send_data` / `end_message`.
+
+Before any of that, though, QUIC has to finish its handshake, and that is just
+datagrams moving in both directions. Here is a complete client-and-server
+exchange with no sockets at all - the whole thing is a `transfer` helper that
+hands one side's datagrams to the other:
+
+```python title="roundtrip.py"
+import zttp
+
+
+def drain(conn):
+    while (event := conn.next_event()) is not zttp.NEED_DATA:
+        yield event
+
+
+def transfer(src, dst, now):
+    """Move every pending datagram from one connection to the other."""
+    for datagram in src.data_to_send():
+        dst.receive_datagram(datagram, now)
+
+
+client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
+server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+
+transfer(client, server, 1000)  # ClientHello
+transfer(server, client, 2000)  # ServerHello and the rest of the server's flight
+transfer(client, server, 3000)  # the client's Finished - the handshake is done
+
+stream = client.send_request(b"GET", b"/", b"3", [(b"host", b"example.test")])
+stream.end_message()
+transfer(client, server, 4000)
+
+request = next(e for e in drain(server) if isinstance(e, zttp.Request))
+print(request.method, request.path, request.stream_id)
+#> b'GET' b'/' 0
+```
+
+The server answers on the stream the request arrived on:
+
+```python
+stream = server.stream(request.stream_id)
+stream.send_response(200, [(b"content-type", b"text/plain")])
+stream.send_data(b"Hello, HTTP/3!")
+stream.end_message()
+transfer(server, client, 5000)
+
+for event in drain(client):
+    print(event)
+#> Settings(params=[(1, 4096), (7, 16), (6, 65536)])
+#> Response(status_code=200, reason=b'', http_version=b'3', headers=[(b'content-type', b'text/plain')])
+#> Data(data=b'Hello, HTTP/3!')
+#> EndOfMessage(trailers=[])
+```
+
+That is the same `Stream` API as HTTP/2, and the same four building blocks as
+HTTP/1.1. Only the transport underneath changed.
+
+!!! note "The first client stream id is `0`"
+    On HTTP/2 the client's first request is stream `1`. QUIC numbers its streams
+    itself, and client-initiated bidirectional streams start at `0`, then `4`,
+    `8`, ... Don't hardcode either; use the `stream_id` the event carries.
+
+## Driving the clock
+
+This is the one duty HTTP/3 adds that the other protocols do not have. TCP ran
+its own timers inside the kernel. QUIC's timers are zttp's - but zttp is sans-IO
+and will not read a clock or sleep, so **you** have to fire them.
+
+There are two calls:
+
+* `next_timeout()`: the absolute deadline of the next armed timer, or `None` if
+  none is armed.
+* `handle_timeout(now)`: fire it. This retransmits a loss probe, or closes the
+  connection on an idle timeout.
+
+!!! danger "The clock is **microseconds**"
+    Every `now` you pass - to `receive_datagram`, to `handle_timeout` - and every
+    deadline `next_timeout()` returns is a monotonic timestamp in
+    **microseconds**. Pass milliseconds and every timer fires a thousand times
+    too early; pass nanoseconds and the connection never times out. Use
+    `time.monotonic_ns() // 1000`.
+
+Skip this and nothing appears broken at first - the handshake completes, requests
+flow - right up until a datagram is lost. Then nothing retransmits it, and the
+connection hangs forever instead of recovering.
+
+The loop looks like this:
+
+```python title="clock.py"
+import time
+
+
+def now_us() -> int:
+    return time.monotonic_ns() // 1000
+
+
+async def serve(conn, sock):
+    while not conn.is_closed():
+        deadline = conn.next_timeout()
+        timeout = None if deadline is None else max(0, deadline - now_us()) / 1_000_000
+
+        datagram = await recv_with_timeout(sock, timeout)
+        if datagram is None:
+            conn.handle_timeout(now_us())  # the timer expired before anything arrived
+        else:
+            conn.receive_datagram(datagram, now_us())
+
+        for event in drain(conn):
+            ...  # dispatch Request / Data / EndOfMessage
+
+        for out in conn.data_to_send():  # firing a timer can queue datagrams too
+            sock.sendto(out, peer_address)
+
+    if conn.idle_timed_out():
+        ...  # closed silently by the idle timeout, no CONNECTION_CLOSE was sent
+```
+
+The shape to keep: **wait for a datagram or the deadline, whichever comes
+first**, then always flush `data_to_send()` afterwards - firing a timer produces
+datagrams (a probe, a close) just as receiving one does.
+
+### Shutting down
+
+| Call | Effect |
+| --- | --- |
+| `conn.shutdown(stream_id)` | Graceful HTTP/3 `GOAWAY`: stop accepting new requests, finish the ones in flight (RFC 9114 5.2). |
+| `conn.close()` | Immediate QUIC `CONNECTION_CLOSE`. |
+| `conn.is_closed()` | Whether the connection is finished, for either reason. |
+| `conn.idle_timed_out()` | Whether it died silently on the idle timer rather than by a close. |
+| `conn.close_info()` | The peer's `CONNECTION_CLOSE` as a [`CloseInfo`](../reference/api.md#zttp.CloseInfo), or `None`. |
+
+After `close()`, flush `data_to_send()` one last time - the `CONNECTION_CLOSE`
+frame is queued like anything else, and the peer only learns you left if you
+actually send it.
+
+## Serving many connections on one socket
+
+A server has one UDP socket and many connections on it, so it has to route each
+datagram to the right `H3Connection` before feeding it. Use
+[`parse_datagram_header`](../reference/api.md#zttp.parse_datagram_header), which reads the routable
+prefix without decrypting anything:
+
+```python
+import zttp
+
+header = zttp.parse_datagram_header(datagram)
+if header.is_initial:
+    ...  # a new connection: create an H3Connection for header.destination_connection_id
+```
+
+See the [API reference](../reference/api.md#demultiplexing-a-shared-udp-socket)
+for the full picture, including short-header datagrams, which don't encode the
+connection id's length.
+
 ## The transport is inside
 
 For HTTP/1.1 and HTTP/2, the kernel's TCP gives zttp an ordered, reliable byte
@@ -239,5 +415,11 @@ protection, and the QPACK bomb defenses).
     ---
 
     How the from-scratch QUIC transport is built, layer by layer.
+
+-   :material-shield: **[Security](../security.md)**
+
+    ---
+
+    The threat model: what the QUIC transport defends against, and what is yours.
 
 </div>

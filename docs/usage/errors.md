@@ -67,7 +67,7 @@ import zttp
 
 conn = zttp.Connection(zttp.SERVER)
 conn.send_data(b"x")  # no head was sent first
-#> zttp.LocalProtocolError: invalid send for current connection state
+#> zttp.LocalProtocolError: cannot send body data now: send a head first, or this message takes no body
 ```
 
 ```python
@@ -100,3 +100,9 @@ def handle(conn, raw_bytes):
         conn.end_message()
         ...
 ```
+
+## Where to go next
+
+* [Security](../security.md): the full threat model - the smuggling and DoS
+  classes zttp rejects, and the timeouts and connection caps that stay yours.
+* [A real server](real-server.md): this loop wired to an actual socket.

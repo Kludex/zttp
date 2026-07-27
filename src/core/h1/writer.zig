@@ -9,6 +9,7 @@ const tables = @import("../tables.zig");
 const ascii = @import("../ascii.zig");
 const events = @import("../events.zig");
 const framing = @import("framing.zig");
+const headers_mod = @import("headers.zig");
 
 const Header = events.Header;
 const responseIsBodyless = framing.responseIsBodyless;
@@ -67,15 +68,27 @@ fn normalizeVersion(version: []const u8) WriteError![]const u8 {
     return v;
 }
 
-/// Request-line / status-line tokens (method, target, version, reason) must not
-/// carry CR/LF or controls. Reason allows SP; the others should not contain SP,
-/// but we only guard against the injection-relevant controls here.
-fn validLineToken(s: []const u8, allow_sp: bool) WriteError!void {
-    for (s) |ch| {
+/// Methods are tokens on the wire, same grammar as field names.
+fn validMethod(method: []const u8) WriteError!void {
+    try validName(method);
+}
+
+/// Request targets use the same permissive-but-bounded class as the parser:
+/// no controls, SP, DEL, or DQUOTE, and not empty.
+fn validTarget(target: []const u8) WriteError!void {
+    if (target.len == 0) return error.InvalidField;
+    for (target) |ch| {
+        if (!tables.is_target_char[ch]) return error.InvalidField;
+    }
+}
+
+/// Reason phrases may contain SP/HTAB, but not CR/LF, NUL, DEL, or other
+/// controls.
+fn validReasonPhrase(reason: []const u8) WriteError!void {
+    for (reason) |ch| {
         if (ch == '\r' or ch == '\n' or ch == 0) return error.InvalidField;
-        if (ch < 0x20 and !(allow_sp and ch == '\t')) return error.InvalidField;
+        if (ch < 0x20 and ch != '\t') return error.InvalidField;
         if (ch == 0x7F) return error.InvalidField;
-        if (!allow_sp and ch == ' ') return error.InvalidField;
     }
 }
 
@@ -242,8 +255,8 @@ pub const Writer = struct {
     /// Serialize a request-line + headers. `framing` decides body handling.
     pub fn sendRequest(self: *Writer, method: []const u8, target: []const u8, version: []const u8, hdrs: []const Header) WriteError!void {
         if (self.state != .idle) return error.MessageNotEnded;
-        try validLineToken(method, false);
-        try validLineToken(target, false);
+        try validMethod(method);
+        try validTarget(target);
         const ver = try normalizeVersion(version);
         try validateHeaders(hdrs);
         try self.w(method);
@@ -289,7 +302,7 @@ pub const Writer = struct {
 
     fn writeStatusLine(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header) WriteError!void {
         if (status < 100 or status > 599) return error.InvalidField;
-        try validLineToken(reason, true); // reason-phrase may contain SP/HTAB
+        try validReasonPhrase(reason);
         try validateHeaders(hdrs);
         try self.w("HTTP/");
         try self.w(version);
@@ -344,6 +357,9 @@ pub const Writer = struct {
         switch (self.state) {
             .body_chunked => {
                 try validateHeaders(trailers);
+                for (trailers) |tr| {
+                    if (!headers_mod.trailerFieldAllowed(tr.name)) return error.InvalidField;
+                }
                 try self.w("0\r\n");
                 for (trailers) |tr| {
                     try self.w(tr.name);
@@ -616,6 +632,31 @@ test "send-path injection: CRLF in target rejected" {
     try t.expectError(error.InvalidField, wr.sendRequest("GET", "/ HTTP/1.1\r\nX: y", "1.1", &.{}));
 }
 
+test "send rejects malformed request-line fields" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try t.expectError(error.InvalidField, wr.sendRequest("", "/", "1.1", &.{}));
+    try t.expectError(error.InvalidField, wr.sendRequest("GE:T", "/", "1.1", &.{}));
+    try t.expectError(error.InvalidField, wr.sendRequest("GET", "", "1.1", &.{}));
+    try t.expectError(error.InvalidField, wr.sendRequest("GET", "\"bad\"", "1.1", &.{}));
+    try t.expectEqualStrings("", wr.pending());
+}
+
+test "send validates reason phrase controls" {
+    inline for (.{ "O\x00K", "O\x07K", "O\x7fK" }) |reason| {
+        var wr = Writer.init(t.allocator);
+        defer wr.deinit();
+        try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, reason, &.{}, "GET"));
+        try t.expectEqualStrings("", wr.pending());
+    }
+
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    try wr.sendResponse("1.1", 200, "O\tK", &.{}, "GET");
+    try wr.endMessage(&.{});
+    try t.expectEqualStrings("HTTP/1.1 200 O\tK\r\n\r\n", wr.pending());
+}
+
 test "send-path injection: CRLF in trailer rejected" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
@@ -623,6 +664,17 @@ test "send-path injection: CRLF in trailer rejected" {
     try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     const trailers = [_]Header{.{ .name = "X", .value = "v\r\nInjected: 1" }};
     try t.expectError(error.InvalidField, wr.endMessage(&trailers));
+}
+
+test "send rejects prohibited trailers" {
+    inline for (.{ "Transfer-Encoding", "Trailer", "Content-Type" }) |name| {
+        var wr = Writer.init(t.allocator);
+        defer wr.deinit();
+        const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
+        try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+        const trailers = [_]Header{.{ .name = name, .value = "x" }};
+        try t.expectError(error.InvalidField, wr.endMessage(&trailers));
+    }
 }
 
 test "send rejects non-chunked transfer-encoding" {

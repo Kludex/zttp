@@ -232,10 +232,13 @@ import zttp
 h1 = zttp.Connection(zttp.SERVER)
 h2 = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
 
-type(h1).__name__  #> 'H1Connection'
-type(h2).__name__  #> 'H2Connection'
+print(type(h1).__name__)
+#> H1Connection
+print(type(h2).__name__)
+#> H2Connection
 
-isinstance(h2, zttp.Connection)  #> True
+print(isinstance(h2, zttp.Connection))
+#> True
 ```
 
 An `H1Connection` carries the message-scoped send API you saw in
@@ -254,20 +257,36 @@ are real `Connection` subclasses, so code that only reads (`receive_data` /
 ## The read side
 
 Reading is what you already do. The only addition is `stream_id` on every event,
-because one HTTP/2 connection multiplexes many requests at once:
+because one HTTP/2 connection multiplexes many requests at once.
+
+Every example on this page uses one small helper to pull the events that are
+ready. It's the same `drain` you'd write yourself:
+
+```python title="drain.py"
+import zttp
+
+
+def drain(conn):
+    """Yield every complete event currently available."""
+    while True:
+        event = conn.next_event()
+        if event is zttp.NEED_DATA:
+            return
+        yield event
+```
+
+Now a server reads a request off the wire:
 
 ```python title="server_read.py"
 import zttp
 
 server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
-server.receive_data(incoming_bytes)
+server.receive_data(incoming_bytes)  # whatever you just read off the socket
 
-while True:
-    event = server.next_event()
-    if event is zttp.NEED_DATA:
-        break
+for event in drain(server):
     if isinstance(event, zttp.Request):
         print(event.method, event.target, event.stream_id)
+        #> b'GET' b'/' 1
 ```
 
 `event.stream_id` tells you which stream this `Request` arrived on. On HTTP/1.1
@@ -276,6 +295,14 @@ request carries the same id.
 
 A **client** reads the mirror image (`Response` events instead of `Request`),
 again tagged with the `stream_id` of the request they answer.
+
+!!! note "The connection preface"
+    HTTP/2 opens with a preface (the client's magic string, then each side's
+    `SETTINGS`). zttp emits yours lazily, on the first `data_to_send()`, so you
+    normally don't think about it. Call `initiate_connection()` to send it
+    eagerly - useful for a server that wants its `SETTINGS` on the wire before
+    the first request arrives. That's also why the first event you drain is
+    usually a `Settings` from the peer.
 
 ## Streams
 
@@ -300,10 +327,11 @@ import zttp
 client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
 stream = client.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")])
 
-stream  #> Stream(stream_id=1)
+print(stream)
+#> Stream(stream_id=1)
 
 stream.end_message()
-print(client.data_to_send())  # the HTTP/2 frames to put on the wire
+request_bytes = client.data_to_send()  # the HTTP/2 frames to put on the wire
 ```
 
 The version arg is ignored (it's always `2`), and `:authority` is derived from
@@ -320,7 +348,7 @@ The server learns a stream's id by **reading** the request off it. Use
 import zttp
 
 server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
-server.receive_data(request_bytes)
+server.receive_data(request_bytes)  # from client.py above
 request = next(e for e in drain(server) if isinstance(e, zttp.Request))
 
 stream = server.stream(request.stream_id)
@@ -328,11 +356,21 @@ stream.send_response(200, [(b"content-type", b"text/plain")])
 stream.send_data(b"Hello, HTTP/2!")
 stream.end_message()
 
-print(server.data_to_send())
+response_bytes = server.data_to_send()
 ```
 
-`drain` is just a loop over `next_event` until `NEED_DATA`: the events carry the
-`stream_id` you need.
+Those two snippets are a complete round-trip: feed `response_bytes` back to the
+`client` and you get the mirror image out.
+
+```python
+client.receive_data(response_bytes)
+for event in drain(client):
+    print(event)
+#> Settings(params=[(3, 128), (6, 65536), (1, 4096), (5, 16384)])
+#> Response(status_code=200, reason=b'', http_version=b'2', headers=[(b'content-type', b'text/plain')])
+#> Data(data=b'Hello, HTTP/2!')
+#> EndOfMessage(trailers=[])
+```
 
 !!! tip "Many streams at once"
     Because each `Stream` names its own id, you can answer requests in **any
@@ -352,18 +390,18 @@ and **parks the rest**. As the peer grants more window (it sends you
 parked bytes automatically on the next `next_event`:
 
 ```python title="flow.py"
-import zttp
-
-stream = server.stream(1)
+stream = server.stream(request.stream_id)
 stream.send_response(200, [(b"content-type", b"text/plain")])
-stream.send_data(b"a very large body ...")
-out = server.data_to_send()                 # only what the window allowed
+stream.send_data(very_large_body)
+out = server.data_to_send()          # only what the window allowed
 
-# ... later, the peer grants more window ...
-server.receive_data(window_update_bytes)
+# ... later, the peer grants more window. Those WINDOW_UPDATE frames are just
+# ordinary inbound bytes off the socket:
+server.receive_data(bytes_from_socket)
 for event in drain(server):
-    ...                                      # a WindowUpdate flows past
-more = server.data_to_send()                 # the parked bytes, now freed
+    ...                              # a WindowUpdate flows past
+
+more = server.data_to_send()         # the parked bytes, now freed
 ```
 
 You hand zttp the whole body in one `send_data` call: it never blocks and never
