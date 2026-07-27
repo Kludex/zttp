@@ -62,11 +62,21 @@ class Example:
 
     @property
     def raises(self) -> tuple[int, str, str] | None:
-        """The (line index, exception name, message) of a documented exception."""
-        for index, line in enumerate(self.source.split("\n")):
-            if m := RAISES.match(line):
-                return index, m.group(1), m.group(2)
-        return None
+        """The (line index, exception name, message) of a documented exception.
+
+        A block documents at most one: execution stops at the first raise, so a
+        second marker could never be reached and would be silently ignored.
+        """
+        found = [
+            (index, m.group(1), m.group(2))
+            for index, line in enumerate(self.source.split("\n"))
+            if (m := RAISES.match(line))
+        ]
+        assert len(found) <= 1, (
+            f"{self.path.name}:{self.line} documents {len(found)} exceptions in one block. "
+            f"Execution stops at the first, so the rest can never be checked - split the block."
+        )
+        return found[0] if found else None
 
 
 def find_examples(root: Path) -> list[Example]:
@@ -114,6 +124,10 @@ def check_raises(example: Example, namespace: dict[str, Any]) -> None:
     assert found is not None
     index, name, message = found
     lines = example.source.split("\n")
+    assert len(example.claims) == 1, (
+        f"{example.path.name}:{example.line} documents an exception alongside other output. "
+        f"Nothing after the raise runs, so put the printed output in its own block."
+    )
 
     with pytest.raises(zttp.ProtocolError) as excinfo:
         exec("\n".join(lines[:index]), namespace)
@@ -196,15 +210,19 @@ def test_inline_output_markers_are_not_used() -> None:
 
 def undefined_names(source: str) -> set[str]:
     """The names `source` uses but never defines, via ruff's F821."""
-    with tempfile.NamedTemporaryFile("w", suffix=".py") as handle:
-        handle.write(source)
-        handle.flush()
+    with tempfile.TemporaryDirectory() as directory:
+        # A real file in a temp directory, not NamedTemporaryFile: Windows holds
+        # that one open exclusively, so ruff could not read it.
+        path = Path(directory) / "example.py"
+        path.write_text(source)
         result = subprocess.run(
-            ["ruff", "check", "--select", "F821", "--no-cache", "--output-format", "json", handle.name],
+            ["ruff", "check", "--select", "F821", "--no-cache", "--output-format", "json", str(path)],
             capture_output=True,
             text=True,
             check=False,
         )
+    if result.returncode not in (0, 1):  # 0 = clean, 1 = violations found
+        raise RuntimeError(f"ruff could not inspect the example: {result.stderr.strip()}")  # pragma: no cover
     return {m.group(1) for d in json.loads(result.stdout) if (m := re.search(r"`(.+)`", d["message"]))}
 
 
@@ -221,10 +239,17 @@ def test_examples_only_reference_documented_placeholders() -> None:
     for example in find_examples(DOCS):
         blocks[example.path.name].append(example.source)
 
+    seen = set()
     for page, sources in sorted(blocks.items()):
-        unexpected = undefined_names("\n".join(sources)) - PLACEHOLDERS.get(page, set())
+        undefined = undefined_names("\n".join(sources))
+        seen |= undefined
+        unexpected = undefined - PLACEHOLDERS.get(page, set())
         assert not unexpected, (
             f"{page} uses {sorted(unexpected)} without defining them. Define them in "
             f"the example, or add them to PLACEHOLDERS to declare that they are the "
             f"reader's to supply."
         )
+
+    # The pages above genuinely leave names to the reader, so finding none at all
+    # means ruff never really ran and this test passed vacuously.
+    assert seen, "ruff reported no undefined names anywhere - did it actually inspect the examples?"
