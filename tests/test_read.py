@@ -126,6 +126,16 @@ def test_eof_on_empty_connection_yields_closed() -> None:
     assert conn.next_event() is zttp.CONNECTION_CLOSED
 
 
+def test_data_after_eof_rejected_before_body_fast_path() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n")
+    assert isinstance(conn.next_event(), zttp.Request)
+    assert conn.next_event() is zttp.NEED_DATA
+    conn.receive_data(b"")
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.receive_data(b"hello")
+
+
 @pytest.mark.parametrize(
     "bad",
     [
