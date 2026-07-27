@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const tables = @import("../tables.zig");
+const ascii = @import("../ascii.zig");
 const events = @import("../events.zig");
 const scanner = @import("../scanner.zig");
 const Scanner = scanner.Scanner;
@@ -90,6 +91,28 @@ fn parseVersion(tok: []const u8) ParseError![]const u8 {
         return error.InvalidLine;
     }
     return num;
+}
+
+/// Whether a field-name is allowed in a chunked trailer section. Trailers cannot
+/// carry message framing, connection routing, or payload-processing metadata.
+pub fn trailerFieldAllowed(name: []const u8) bool {
+    inline for (.{
+        // Message framing / connection routing fields.
+        "content-length",
+        "transfer-encoding",
+        "trailer",
+        "host",
+        "connection",
+        "upgrade",
+        "te",
+        // Payload-processing metadata that RFC 9110 forbids in trailers.
+        "content-encoding",
+        "content-type",
+        "content-range",
+    }) |forbidden| {
+        if (ascii.eqIgnoreCase(name, forbidden)) return false;
+    }
+    return true;
 }
 
 /// Parse one header field-line into a (name, value) pair. The name is the raw
@@ -197,4 +220,15 @@ test "parseHeaderLine rejects obs-fold and bad names" {
 
 test "parseHeaderLine rejects control chars in value" {
     try std.testing.expectError(error.InvalidHeader, parseHeaderLine("X: a\x00b"));
+}
+
+test "trailerFieldAllowed rejects prohibited fields" {
+    try std.testing.expect(!trailerFieldAllowed("Content-Length"));
+    try std.testing.expect(!trailerFieldAllowed("Transfer-Encoding"));
+    try std.testing.expect(!trailerFieldAllowed("Trailer"));
+    try std.testing.expect(!trailerFieldAllowed("Connection"));
+    try std.testing.expect(!trailerFieldAllowed("Content-Encoding"));
+    try std.testing.expect(!trailerFieldAllowed("Content-Type"));
+    try std.testing.expect(!trailerFieldAllowed("Content-Range"));
+    try std.testing.expect(trailerFieldAllowed("X-Checksum"));
 }

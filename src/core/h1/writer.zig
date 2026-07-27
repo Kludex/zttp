@@ -9,6 +9,7 @@ const tables = @import("../tables.zig");
 const ascii = @import("../ascii.zig");
 const events = @import("../events.zig");
 const framing = @import("framing.zig");
+const headers_mod = @import("headers.zig");
 
 const Header = events.Header;
 const responseIsBodyless = framing.responseIsBodyless;
@@ -343,6 +344,9 @@ pub const Writer = struct {
         switch (self.state) {
             .body_chunked => {
                 try validateHeaders(trailers);
+                for (trailers) |tr| {
+                    if (!headers_mod.trailerFieldAllowed(tr.name)) return error.InvalidField;
+                }
                 try self.w("0\r\n");
                 for (trailers) |tr| {
                     try self.w(tr.name);
@@ -614,6 +618,17 @@ test "send-path injection: CRLF in trailer rejected" {
     try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
     const trailers = [_]Header{.{ .name = "X", .value = "v\r\nInjected: 1" }};
     try t.expectError(error.InvalidField, wr.endMessage(&trailers));
+}
+
+test "send rejects prohibited trailers" {
+    inline for (.{ "Transfer-Encoding", "Trailer", "Content-Type" }) |name| {
+        var wr = Writer.init(t.allocator);
+        defer wr.deinit();
+        const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
+        try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
+        const trailers = [_]Header{.{ .name = name, .value = "x" }};
+        try t.expectError(error.InvalidField, wr.endMessage(&trailers));
+    }
 }
 
 test "send rejects non-chunked transfer-encoding" {
