@@ -13,6 +13,7 @@ const headers_mod = @import("headers.zig");
 
 const Header = events.Header;
 const responseIsBodyless = framing.responseIsBodyless;
+const responseForbidsTransferEncoding = framing.responseForbidsTransferEncoding;
 const eqIgnoreCase = ascii.eqIgnoreCase;
 const trimOws = ascii.trimOws;
 
@@ -178,6 +179,11 @@ fn validateHeaders(hdrs: []const Header) WriteError!void {
     try validateFraming(hdrs);
 }
 
+fn hasHeader(hdrs: []const Header, name: []const u8) bool {
+    for (hdrs) |h| if (eqIgnoreCase(h.name, name)) return true;
+    return false;
+}
+
 /// Refuse to serialize ambiguous framing - the send-side mirror of the reader's
 /// smuggling guards. Transfer-Encoding field-lines form one ordered comma list;
 /// codings may precede `chunked`, but `chunked` must appear exactly once and last.
@@ -185,7 +191,7 @@ fn validateHeaders(hdrs: []const Header) WriteError!void {
 /// zttp supplies only the final chunk framing. TE + CL and conflicting duplicate
 /// Content-Lengths remain errors.
 fn validateFraming(hdrs: []const Header) WriteError!void {
-    const has_te = framing.validateTransferEncoding(hdrs) catch return error.InvalidField;
+    const has_te = framing.validateTransferEncoding(hdrs, .send) catch return error.InvalidField;
     var content_length: ?[]const u8 = null;
     for (hdrs) |h| {
         if (eqIgnoreCase(h.name, "content-length")) {
@@ -271,6 +277,7 @@ pub const Writer = struct {
     /// is bodyless (RFC 9112 6.3), so the caller never tracks framing by hand.
     pub fn sendResponse(self: *Writer, version: []const u8, status: u16, reason: []const u8, hdrs: []const Header, request_method: []const u8) WriteError!void {
         if (self.state != .idle) return error.MessageNotEnded;
+        if (responseForbidsTransferEncoding(request_method, status) and hasHeader(hdrs, "transfer-encoding")) return error.InvalidField;
         try self.writeStatusLine(try normalizeVersion(version), status, reason, hdrs);
         if (responseIsBodyless(request_method, status)) {
             self.state = .body_none;
@@ -292,6 +299,7 @@ pub const Writer = struct {
     pub fn sendInformational(self: *Writer, status: u16, hdrs: []const Header) WriteError!void {
         if (self.state != .idle) return error.MessageNotEnded;
         if (status / 100 != 1 or status == 101) return error.InvalidField;
+        if (hasHeader(hdrs, "transfer-encoding")) return error.InvalidField;
         try self.writeStatusLine("1.1", status, reasonPhrase(status), hdrs);
     }
 
@@ -512,11 +520,42 @@ test "HEAD response is bodyless despite Content-Length" {
     try t.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n", wr.pending());
 }
 
-test "bodyless response rejects unsupported transfer-encoding" {
+test "responses forbidden to carry Transfer-Encoding reject it before output" {
+    const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip, chunked" }};
+    const cases = .{
+        .{ @as(u16, 103), "Early Hints", "GET" },
+        .{ @as(u16, 204), "No Content", "GET" },
+        .{ @as(u16, 200), "OK", "CONNECT" },
+    };
+    inline for (cases) |case| {
+        var wr = Writer.init(t.allocator);
+        defer wr.deinit();
+        try t.expectError(error.InvalidField, wr.sendResponse("1.1", case[0], case[1], &hdrs, case[2]));
+        try t.expectEqualStrings("", wr.pending());
+    }
+}
+
+test "informational response rejects Transfer-Encoding before output" {
     var wr = Writer.init(t.allocator);
     defer wr.deinit();
-    const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip" }};
-    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 304, "Not Modified", &hdrs, "GET"));
+    const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
+    try t.expectError(error.InvalidField, wr.sendInformational(103, &hdrs));
+    try t.expectEqualStrings("", wr.pending());
+}
+
+test "HEAD and 304 may describe Transfer-Encoding of corresponding body" {
+    const hdrs = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip, chunked" }};
+    const cases = .{
+        .{ @as(u16, 200), "OK", "HEAD" },
+        .{ @as(u16, 304), "Not Modified", "GET" },
+    };
+    inline for (cases) |case| {
+        var wr = Writer.init(t.allocator);
+        defer wr.deinit();
+        try wr.sendResponse("1.1", case[0], case[1], &hdrs, case[2]);
+        try t.expectError(error.NoBodyAllowed, wr.sendData("x"));
+        try wr.endMessage(&.{});
+    }
 }
 
 test "data before head is rejected" {
@@ -672,6 +711,23 @@ test "send rejects prohibited trailers" {
         try wr.sendResponse("1.1", 200, "OK", &hdrs, "GET");
         const trailers = [_]Header{.{ .name = name, .value = "x" }};
         try t.expectError(error.InvalidField, wr.endMessage(&trailers));
+    }
+}
+
+test "send rejects malformed transfer-encoding grammar" {
+    inline for (.{
+        ",chunked",
+        "chunked,",
+        "gzip,,chunked",
+        ";bad, chunked",
+        "gzip;flag, chunked",
+        "gzip;note=\"unterminated, chunked",
+    }) |value| {
+        var wr = Writer.init(t.allocator);
+        defer wr.deinit();
+        const h = [_]Header{.{ .name = "Transfer-Encoding", .value = value }};
+        try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+        try t.expectEqualStrings("", wr.pending());
     }
 }
 

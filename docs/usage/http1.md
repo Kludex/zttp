@@ -280,9 +280,12 @@ wire_bytes = conn.data_to_send()  # write each produced byte to the socket
 !!! warning "zttp does not apply the preceding coding"
     `gzip` describes bytes your application already compressed. zttp does **not**
     gzip `send_data`; it only adds the chunk framing it implements. Declaring
-    `gzip, chunked` around uncompressed bytes lies to the peer. A coding without
-    final `chunked`, `chunked, gzip`, duplicate `chunked`, and
-    `Transfer-Encoding` together with `Content-Length` are all rejected.
+    `gzip, chunked` around uncompressed bytes lies to the peer. Malformed coding
+    lists, a coding without final `chunked`, `chunked, gzip`, duplicate `chunked`,
+    and `Transfer-Encoding` together with `Content-Length` are all rejected.
+    `Transfer-Encoding` is also forbidden on `1xx` / `204` and successful
+    `CONNECT` responses; `HEAD` and `304` may only describe the coding that would
+    have applied to the corresponding body.
 
 ### Bodyless responses
 

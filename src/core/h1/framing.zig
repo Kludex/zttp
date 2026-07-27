@@ -6,6 +6,7 @@
 const std = @import("std");
 const ascii = @import("../ascii.zig");
 const events = @import("../events.zig");
+const tables = @import("../tables.zig");
 const ParseError = @import("../errors.zig").ParseError;
 
 const Header = events.Header;
@@ -25,21 +26,103 @@ pub const Framing = union(enum) {
 /// Accumulates Transfer-Encoding codings across (possibly multiple) field-lines,
 /// which RFC 9112 6.1 requires to be treated as a single ordered comma list. The
 /// only framing we accept is `chunked` appearing exactly once and as the final
-/// coding overall; anything else (chunked not last, chunked twice, an unknown
-/// coding after chunked) is a framing error - the request-smuggling guard.
+/// coding overall; anything else (chunked not last, chunked twice, malformed
+/// list/parameter grammar) is a framing error - the request-smuggling guard.
 const TransferEncoding = struct {
     saw_chunked: bool = false,
     /// True once any coding has been seen after a `chunked` coding (illegal).
     coding_after_chunked: bool = false,
 
-    /// Fold one field-line value's comma-separated codings into the accumulator.
-    fn add(self: *TransferEncoding, value: []const u8) void {
-        var it = std.mem.splitScalar(u8, value, ',');
-        while (it.next()) |raw| {
-            const coding = std.mem.trim(u8, raw, " \t");
-            if (coding.len == 0) continue;
-            if (self.saw_chunked) self.coding_after_chunked = true;
-            if (eqIgnoreCase(coding, "chunked")) self.saw_chunked = true;
+    fn skipOws(value: []const u8, i: *usize) void {
+        while (i.* < value.len and (value[i.*] == ' ' or value[i.*] == '\t')) i.* += 1;
+    }
+
+    fn takeToken(value: []const u8, i: *usize) ?[]const u8 {
+        const start = i.*;
+        while (i.* < value.len and tables.is_tchar[value[i.*]]) i.* += 1;
+        return if (i.* == start) null else value[start..i.*];
+    }
+
+    /// quoted-string / quoted-pair (RFC 9110 5.6.4). The surrounding field-value
+    /// check already rejects CR/LF/NUL, but this enforces the narrower grammar.
+    fn takeQuotedString(value: []const u8, i: *usize) bool {
+        if (i.* >= value.len or value[i.*] != '"') return false;
+        i.* += 1;
+        while (i.* < value.len) {
+            const ch = value[i.*];
+            i.* += 1;
+            if (ch == '"') return true;
+            if (ch == '\\') {
+                if (i.* >= value.len) return false;
+                const escaped = value[i.*];
+                i.* += 1;
+                if (!(escaped == '\t' or escaped == ' ' or (escaped >= 0x21 and escaped <= 0x7E) or escaped >= 0x80)) return false;
+            } else if (!(ch == '\t' or ch == ' ' or ch == 0x21 or (ch >= 0x23 and ch <= 0x5B) or (ch >= 0x5D and ch <= 0x7E) or ch >= 0x80)) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    fn noteCoding(self: *TransferEncoding, coding: []const u8) bool {
+        if (self.saw_chunked) self.coding_after_chunked = true;
+        const is_chunked = eqIgnoreCase(coding, "chunked");
+        if (is_chunked) self.saw_chunked = true;
+        return is_chunked;
+    }
+
+    /// Fold one field-line's `#transfer-coding` value into the accumulator,
+    /// validating token names, parameters, quoted strings, and list separators.
+    /// RFC 9110 5.6.1 forbids senders from generating empty list elements but
+    /// requires recipients to ignore a reasonable number, hence the policy flag.
+    fn add(self: *TransferEncoding, value: []const u8, allow_empty_members: bool) ParseError!void {
+        var i: usize = 0;
+        skipOws(value, &i);
+        if (i == value.len) {
+            if (allow_empty_members) return;
+            return error.InvalidFraming;
+        }
+
+        while (true) {
+            if (value[i] == ',') {
+                if (!allow_empty_members) return error.InvalidFraming;
+                i += 1;
+                skipOws(value, &i);
+                if (i == value.len) return;
+                continue;
+            }
+
+            const coding = takeToken(value, &i) orelse return error.InvalidFraming;
+            const is_chunked = self.noteCoding(coding);
+            skipOws(value, &i);
+
+            // `chunked` defines no parameters. Keeping it exact also preserves
+            // the reader's pre-existing rejection of `chunked;anything`.
+            if (is_chunked and i < value.len and value[i] == ';') return error.InvalidFraming;
+            while (i < value.len and value[i] == ';') {
+                i += 1;
+                skipOws(value, &i);
+                _ = takeToken(value, &i) orelse return error.InvalidFraming;
+                skipOws(value, &i);
+                if (i == value.len or value[i] != '=') return error.InvalidFraming;
+                i += 1;
+                skipOws(value, &i);
+                if (i < value.len and value[i] == '"') {
+                    if (!takeQuotedString(value, &i)) return error.InvalidFraming;
+                } else {
+                    _ = takeToken(value, &i) orelse return error.InvalidFraming;
+                }
+                skipOws(value, &i);
+            }
+
+            if (i == value.len) return;
+            if (value[i] != ',') return error.InvalidFraming;
+            i += 1;
+            skipOws(value, &i);
+            if (i == value.len) {
+                if (allow_empty_members) return;
+                return error.InvalidFraming;
+            }
         }
     }
 
@@ -52,17 +135,24 @@ const TransferEncoding = struct {
     }
 };
 
+pub const TransferEncodingMode = enum {
+    /// Recipients ignore empty list members (RFC 9110 5.6.1).
+    receive,
+    /// Senders must not generate empty list members.
+    send,
+};
+
 /// Validate Transfer-Encoding across all field-lines as one ordered comma list.
 /// Returns whether the message declared Transfer-Encoding. The caller owns any
 /// codings before `chunked`; this layer only requires the framing coding it can
 /// decode/emit: `chunked` exactly once and last (RFC 9112 6.1, 7.1).
-pub fn validateTransferEncoding(headers: []const Header) ParseError!bool {
+pub fn validateTransferEncoding(headers: []const Header, mode: TransferEncodingMode) ParseError!bool {
     var te = TransferEncoding{};
     var has_te = false;
     for (headers) |h| {
         if (eqIgnoreCase(h.name, "transfer-encoding")) {
             has_te = true;
-            te.add(h.value);
+            try te.add(h.value, mode == .receive);
         }
     }
     if (has_te) _ = try te.resolve();
@@ -84,6 +174,14 @@ pub fn responseIsBodyless(method: []const u8, status: u16) bool {
     return false;
 }
 
+/// RFC 9112 6.1 forbids Transfer-Encoding on 1xx/204 and successful CONNECT
+/// responses. HEAD and 304 are also bodyless, but may carry the coding that
+/// would have applied to the corresponding body (RFC 9110 8.6, 15.4.5).
+pub fn responseForbidsTransferEncoding(method: []const u8, status: u16) bool {
+    if (status / 100 == 1 or status == 204) return true;
+    return eqIgnoreCase(method, "CONNECT") and status >= 200 and status < 300;
+}
+
 pub const FramingOptions = struct {
     /// Responses to HEAD, 1xx/204/304, and the connect side have no body
     /// regardless of headers (RFC 9112 6.3). The connection layer sets this.
@@ -96,7 +194,7 @@ pub const FramingOptions = struct {
 /// Inspect the parsed headers and return the body framing. Enforces the
 /// CL/TE conflict and duplicate-Content-Length rules.
 pub fn determine(headers: []const Header, opts: FramingOptions) ParseError!Framing {
-    const has_te = try validateTransferEncoding(headers);
+    const has_te = try validateTransferEncoding(headers, .receive);
     var content_length: ?u64 = null;
 
     for (headers) |h| {
@@ -134,6 +232,15 @@ test "responseIsBodyless rule" {
     try std.testing.expect(!responseIsBodyless("POST", 201));
 }
 
+test "responseForbidsTransferEncoding rule" {
+    try std.testing.expect(responseForbidsTransferEncoding("GET", 103));
+    try std.testing.expect(responseForbidsTransferEncoding("GET", 204));
+    try std.testing.expect(responseForbidsTransferEncoding("CONNECT", 200));
+    try std.testing.expect(!responseForbidsTransferEncoding("HEAD", 200));
+    try std.testing.expect(!responseForbidsTransferEncoding("GET", 304));
+    try std.testing.expect(!responseForbidsTransferEncoding("CONNECT", 404));
+}
+
 test "no body" {
     const h = [_]Header{.{ .name = "Host", .value = "x" }};
     try std.testing.expectEqual(Framing.none, try determine(&h, .{}));
@@ -158,6 +265,33 @@ test "chunked" {
 test "chunked with preceding coding" {
     const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip, chunked" }};
     try std.testing.expectEqual(Framing.chunked, try determine(&h, .{}));
+}
+
+test "transfer coding parameters and quoted commas" {
+    const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip ; level = 1 ; note = \"a,b\\\"c\", chunked" }};
+    try std.testing.expectEqual(Framing.chunked, try determine(&h, .{}));
+}
+
+test "receiver ignores empty transfer coding list members" {
+    inline for (.{ ",chunked", "chunked,", "gzip,,chunked", ",,gzip,,chunked,," }) |value| {
+        const h = [_]Header{.{ .name = "Transfer-Encoding", .value = value }};
+        try std.testing.expectEqual(Framing.chunked, try determine(&h, .{}));
+    }
+}
+
+test "malformed transfer coding grammar rejected" {
+    inline for (.{
+        "",
+        ";bad, chunked",
+        "gzip;flag, chunked",
+        "gzip;=value, chunked",
+        "gzip;level=, chunked",
+        "gzip;note=\"unterminated, chunked",
+        "gzip;note=\"bad\\\", chunked",
+    }) |value| {
+        const h = [_]Header{.{ .name = "Transfer-Encoding", .value = value }};
+        try std.testing.expectError(error.InvalidFraming, determine(&h, .{}));
+    }
 }
 
 test "te and cl together is rejected (smuggling)" {
