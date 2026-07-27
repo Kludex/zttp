@@ -302,12 +302,11 @@ def test_informational_round_trips_to_reader() -> None:
     interim = client.next_event()
     assert isinstance(interim, zttp.Response)
     assert interim.status_code == 100
-    assert isinstance(client.next_event(), zttp.EndOfMessage)
 
-    client.start_next_cycle()
     final = client.next_event()
     assert isinstance(final, zttp.Response)
     assert final.status_code == 200
+    assert isinstance(client.next_event(), zttp.EndOfMessage)
 
 
 def test_send_response_default_reason() -> None:
