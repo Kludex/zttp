@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gzip
+
 import pytest
 
 import zttp
@@ -105,14 +107,16 @@ def test_chunked_response() -> None:
     ],
 )
 def test_chunked_framing_with_preceding_transfer_codings(headers: list[tuple[bytes, bytes]]) -> None:
+    compressed = gzip.compress(b"hello", mtime=0)
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(200, headers)
-    conn.send_data(b"compressed")
+    conn.send_data(compressed)
     conn.end_message()
 
     head, body = conn.data_to_send().split(b"\r\n\r\n", 1)
     assert head.count(b"chunked") == 1
-    assert body == b"a\r\ncompressed\r\n0\r\n\r\n"
+    assert body == f"{len(compressed):x}\r\n".encode() + compressed + b"\r\n0\r\n\r\n"
+    assert gzip.decompress(compressed) == b"hello"
 
 
 @pytest.mark.parametrize(

@@ -405,6 +405,9 @@ fn parseLength(v: []const u8) u64 {
 }
 
 const t = std.testing;
+/// Deterministic gzip member for `hello` (mtime zero), used where the declared
+/// transfer-coding must agree with the bytes the test sends.
+const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
 
 test "serialize a simple response" {
     var wr = Writer.init(t.allocator);
@@ -698,10 +701,10 @@ test "send accepts transfer coding before final chunked in one field" {
     defer wr.deinit();
     const h = [_]Header{.{ .name = "Transfer-Encoding", .value = "gzip, chunked" }};
     try wr.sendResponse("1.1", 200, "OK", &h, "GET");
-    try wr.sendData("hello");
+    try wr.sendData(gzip_hello);
     try wr.endMessage(&.{});
     try t.expectEqualStrings(
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n19\r\n" ++ gzip_hello ++ "\r\n0\r\n\r\n",
         wr.pending(),
     );
 }
@@ -714,10 +717,10 @@ test "send combines transfer codings across field-lines" {
         .{ .name = "Transfer-Encoding", .value = "chunked" },
     };
     try wr.sendResponse("1.1", 200, "OK", &h, "GET");
-    try wr.sendData("hello");
+    try wr.sendData(gzip_hello);
     try wr.endMessage(&.{});
     try t.expectEqualStrings(
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n19\r\n" ++ gzip_hello ++ "\r\n0\r\n\r\n",
         wr.pending(),
     );
 }
