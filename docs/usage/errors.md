@@ -100,3 +100,9 @@ def handle(conn, raw_bytes):
         conn.end_message()
         ...
 ```
+
+## Where to go next
+
+* [Security](../security.md): the full threat model - the smuggling and DoS
+  classes zttp rejects, and the timeouts and connection caps that stay yours.
+* [A real server](real-server.md): this loop wired to an actual socket.

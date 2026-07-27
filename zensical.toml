@@ -23,6 +23,7 @@ nav = [
     "usage/real-server.md",
   ] },
   { "Architecture" = "architecture.md" },
+  { "Security" = "security.md" },
   { "Reference" = [
     "reference/performance.md",
     "reference/api.md",
@@ -121,6 +122,11 @@ pygments_lang_class = true
 [project.markdown_extensions.pymdownx.magiclink]
 [project.markdown_extensions.pymdownx.mark]
 [project.markdown_extensions.pymdownx.smartsymbols]
+[project.markdown_extensions.pymdownx.snippets]
+# THREAT_MODEL.md lives at the repo root (linked from the README and referenced
+# by security reports); docs/security.md includes it rather than duplicating it.
+base_path = ["."]
+check_paths = true
 [project.markdown_extensions.pymdownx.superfences]
 custom_fences = [
   { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" }

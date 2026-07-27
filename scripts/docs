@@ -8,4 +8,8 @@ if [ -z "$GITHUB_ACTIONS" ]; then
 fi
 
 uv sync --frozen --only-group docs --no-install-project
-uv run --no-sync zensical build
+# --strict aborts on warnings. Without it an unresolved cross-reference is only a
+# log line and still exits 0, so a broken link renders as literal `[text][ref]`
+# on the live site. Cloudflare Workers Builds runs this script, so the deploy
+# fails instead of publishing them.
+uv run --no-sync zensical build --strict
