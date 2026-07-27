@@ -27,6 +27,8 @@ It never reads a socket, never calls you back, never blocks. **You** own the I/O
 and the control flow; zttp owns only the protocol.
 
 ```python
+import zttp
+
 conn = zttp.Connection(zttp.SERVER)
 conn.receive_data(raw)        # bytes from wherever: socket, file, test
 event = conn.next_event()     # pull, when you want it

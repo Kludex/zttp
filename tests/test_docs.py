@@ -25,7 +25,12 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import re
+import shutil
+import subprocess
+import tempfile
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -90,6 +95,17 @@ def http2_request_bytes() -> bytes:
 
 # Placeholder names a page's prose describes but does not construct in a block.
 PAGE_CONTEXT = {"http2.md": http2_request_bytes}
+
+# Names an example deliberately leaves to the reader ("the bytes off your socket").
+# Anything undefined and *not* listed here is a broken example: either define it in
+# the block, or add it here to say it is the reader's to supply.
+PLACEHOLDERS = {
+    "architecture.md": {"raw", "udp_payload"},
+    "errors.md": {"conn"},
+    "first-steps.md": {"request", "transport"},
+    "http2.md": {"bytes_from_socket", "incoming_bytes", "very_large_body"},
+    "http3.md": {"cert", "key", "peer_address", "recv_with_timeout", "sock", "ticket_id", "ticket_psk", "udp_payload"},
+}
 
 
 def check_raises(example: Example, namespace: dict[str, Any]) -> None:
@@ -176,3 +192,39 @@ def test_inline_output_markers_are_not_used() -> None:
         if "#>" in line and not OUTPUT.match(line)
     ]
     assert not stray, f"`#>` must be on its own line, found trailing markers at: {stray}"
+
+
+def undefined_names(source: str) -> set[str]:
+    """The names `source` uses but never defines, via ruff's F821."""
+    with tempfile.NamedTemporaryFile("w", suffix=".py") as handle:
+        handle.write(source)
+        handle.flush()
+        result = subprocess.run(
+            ["ruff", "check", "--select", "F821", "--no-cache", "--output-format", "json", handle.name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    return {m.group(1) for d in json.loads(result.stdout) if (m := re.search(r"`(.+)`", d["message"]))}
+
+
+@pytest.mark.skipif(shutil.which("ruff") is None, reason="ruff is not installed")
+def test_examples_only_reference_documented_placeholders() -> None:
+    """An example may not silently depend on a name that nobody defines.
+
+    A reader copies a block and runs it. If it calls `now_us()` and the page never
+    says what that is, the example is broken - which is how this test came to be.
+    Concatenating a page's blocks mirrors reading it top to bottom, so a block may
+    still build on an earlier one.
+    """
+    blocks = defaultdict(list)
+    for example in find_examples(DOCS):
+        blocks[example.path.name].append(example.source)
+
+    for page, sources in sorted(blocks.items()):
+        unexpected = undefined_names("\n".join(sources)) - PLACEHOLDERS.get(page, set())
+        assert not unexpected, (
+            f"{page} uses {sorted(unexpected)} without defining them. Define them in "
+            f"the example, or add them to PLACEHOLDERS to declare that they are the "
+            f"reader's to supply."
+        )

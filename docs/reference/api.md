@@ -144,9 +144,24 @@ anything or touching connection state.
 There are four cases, and a server has to handle all of them:
 
 ```python
+import time
+
 import zttp
 
 connections: dict[bytes, zttp.H3Connection] = {}  # keyed by local connection id
+
+
+def now_us() -> int:
+    """QUIC timestamps are monotonic microseconds."""
+    return time.monotonic_ns() // 1000
+
+
+def lookup_by_prefix(datagram: bytes) -> zttp.H3Connection | None:
+    """Match a short header's destination id, whose length is not on the wire."""
+    for connection_id, conn in connections.items():
+        if datagram[1:].startswith(connection_id):
+            return conn
+    return None
 
 
 def route(datagram: bytes, peer_address: bytes) -> None:
