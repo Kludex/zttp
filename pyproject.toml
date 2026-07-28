@@ -112,11 +112,10 @@ include = ["zttp", "src", "tools", "build.zig"]
 # cp314t/cp315t are the free-threaded builds. The extension does NOT yet declare
 # Py_MOD_GIL_NOT_USED (it isn't synchronized - #151), so on these interpreters
 # CPython re-enables the compatibility GIL at import; the wheels still load and run.
-# Windows is skipped for the free-threaded builds: their pyconfig.h doesn't self-define
-# Py_GIL_DISABLED (POSIX does), so translate-c would compile against the GIL ABI and
-# mismatch (still true in 3.15's PC/pyconfig.h).
+# Their Windows variants need Py_GIL_DISABLED passed to translate-c by build.zig -
+# PC/pyconfig.h only tests the macro, where POSIX pyconfig.h defines it itself.
 build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-* cp315-* cp315t-*"
-skip = "*_i686 *-pp* cp314t-win* cp315t-win*"
+skip = "*_i686 *-pp*"
 # 3.15 is in beta; cibuildwheel only offers it behind this flag. Drop it (and cut
 # a release to rebuild the cp315 wheels) once 3.15.0 final is out - the C ABI is
 # only guaranteed stable from rc1 onward.
