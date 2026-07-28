@@ -83,6 +83,10 @@ pub fn build(b: *std.Build) void {
     // Windows only: the import library to link, e.g. "python314" (no extension).
     const py_lib = b.option([]const u8, "python-lib", "CPython import library name (Windows)") orelse
         b.graph.environ_map.get("HATCH_ZIG_PYTHON_LIB");
+    // The free-threaded ABI tag ("cp314t") is carried in the extension suffix -
+    // e.g. "_zttp.cp314t-win_amd64.pyd" - which every backend must get right for
+    // the module to be importable at all.
+    const free_threaded = std.mem.indexOf(u8, ext_suffix, "t-") != null;
 
     const core_mod = b.createModule(.{
         .root_source_file = b.path("src/core/root.zig"),
@@ -103,6 +107,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     translate.addIncludePath(.{ .cwd_relative = py_include });
+    // A free-threaded interpreter's headers describe a different ABI (extra
+    // PyObject fields, different inline bodies). POSIX pyconfig.h defines
+    // Py_GIL_DISABLED itself, but PC/pyconfig.h only ever *tests* it and relies
+    // on the build backend to pass it - so on Windows the translation silently
+    // targets the GIL ABI unless we define it here.
+    if (free_threaded and target.result.os.tag == .windows) translate.defineCMacro("Py_GIL_DISABLED", "1");
 
     const fixer = b.addExecutable(.{
         .name = "fix_cimport",
