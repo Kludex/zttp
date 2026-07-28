@@ -108,14 +108,15 @@ include = ["zttp", "src", "tools", "build.zig"]
 [tool.cibuildwheel]
 # Zig comes from the `ziglang` build requirement (build isolation), so no system
 # toolchain install is needed. The sans-IO core has no OS dependencies, so it
-# builds for glibc, musl, macOS, and Windows alike. Skip only 32-bit and PyPy.
+# builds for glibc, musl, macOS, and Windows alike. PyPy is excluded by the cp-only
+# `build` list; `skip` only has to drop 32-bit.
 # cp314t/cp315t are the free-threaded builds. The extension does NOT yet declare
 # Py_MOD_GIL_NOT_USED (it isn't synchronized - #151), so on these interpreters
 # CPython re-enables the compatibility GIL at import; the wheels still load and run.
 # Their Windows variants need Py_GIL_DISABLED passed to translate-c by build.zig -
 # PC/pyconfig.h only tests the macro, where POSIX pyconfig.h defines it itself.
 build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-* cp315-* cp315t-*"
-skip = "*_i686 *-pp*"
+skip = "*_i686"
 # 3.15 is in beta; cibuildwheel only offers it behind this flag. Drop it (and cut
 # a release to rebuild the cp315 wheels) once 3.15.0 final is out - the C ABI is
 # only guaranteed stable from rc1 onward.
