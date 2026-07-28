@@ -261,6 +261,7 @@ def test_query_response_is_not_bodyless() -> None:
     conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
     events = list(drain(conn))
     assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == b"abc"
+    assert isinstance(events[-1], zttp.EndOfMessage)
 
 
 def test_standard_methods_are_interned() -> None:
