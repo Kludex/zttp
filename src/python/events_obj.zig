@@ -487,7 +487,7 @@ const INTERNED_VALUES = [_][]const u8{
 // The request/status line draws from even smaller fixed sets: the standard
 // methods, the two HTTP/1.x versions, and the stock reason phrases. Same deal -
 // one PyBytes each at module init, returned on an exact-bytes match.
-const INTERNED_METHODS = [_][]const u8{ "GET", "POST", "HEAD", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH" };
+const INTERNED_METHODS = [_][]const u8{ "GET", "POST", "HEAD", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH", "QUERY" };
 const INTERNED_VERSIONS = [_][]const u8{ "1.1", "1.0" };
 const INTERNED_REASONS = [_][]const u8{
     "OK",

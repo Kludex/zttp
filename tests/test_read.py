@@ -246,6 +246,33 @@ def test_garbage_after_complete_message_raises_on_next_cycle() -> None:
         drain_all(conn)
 
 
+def test_query_carries_a_body() -> None:
+    events = parse_request(b"QUERY /search HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+    req = events[0]
+    assert isinstance(req, zttp.Request)
+    assert req.method == b"QUERY"
+    assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == b"hello"
+    assert isinstance(events[-1], zttp.EndOfMessage)
+
+
+def test_query_response_is_not_bodyless() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(b"QUERY", b"/search", b"1.1", [(b"Host", b"example.com")])
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
+    events = list(drain(conn))
+    assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == b"abc"
+
+
+def test_standard_methods_are_interned() -> None:
+    def method_of(raw: bytes) -> bytes:
+        req = parse_request(raw + b" / HTTP/1.1\r\nHost: x\r\n\r\n")[0]
+        assert isinstance(req, zttp.Request)
+        return req.method
+
+    assert method_of(b"QUERY") is method_of(b"QUERY")
+    assert method_of(b"FROBNICATE") is not method_of(b"FROBNICATE")
+
+
 def test_large_body_round_trips_unchanged() -> None:
     body = bytes(range(256)) * 256  # 64KB, every byte value
     raw = b"POST /up HTTP/1.1\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
