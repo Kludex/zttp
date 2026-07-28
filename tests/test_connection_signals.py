@@ -110,6 +110,51 @@ def test_rejected_response_does_not_set_should_close() -> None:
     assert conn.data_to_send() == b""
 
 
+def test_rejected_response_preserves_an_existing_close() -> None:
+    conn = _parse(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    with pytest.raises(zttp.LocalProtocolError):
+        conn.send_response(204, [(b"transfer-encoding", b"chunked")])
+    assert conn.should_close() is True
+
+
+def test_should_close_for_locally_sent_1_0_request() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(b"GET", b"/", b"1.0", [(b"Host", b"x")])
+    conn.end_message()
+    assert conn.should_close() is True
+
+
+def test_locally_sent_1_0_request_with_keep_alive_stays_open() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(b"GET", b"/", b"1.0", [(b"Host", b"x"), (b"Connection", b"keep-alive")])
+    conn.end_message()
+    assert conn.should_close() is False
+
+
+def test_locally_sent_request_close_survives_a_response_without_close() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(b"GET", b"/", b"1.1", [(b"Host", b"x"), (b"Connection", b"close")])
+    conn.end_message()
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    assert isinstance(conn.next_event(), zttp.Response)
+    assert conn.should_close() is True
+
+
+def test_locally_sent_request_close_does_not_leak_into_the_next_cycle() -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.send_request(b"GET", b"/a", b"1.1", [(b"Host", b"x"), (b"Connection", b"close")])
+    conn.end_message()
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    list(drain(conn))
+    assert conn.should_close() is True
+    conn.start_next_cycle()
+    conn.send_request(b"GET", b"/b", b"1.1", [(b"Host", b"x")])
+    conn.end_message()
+    conn.receive_data(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    assert isinstance(conn.next_event(), zttp.Response)
+    assert conn.should_close() is False
+
+
 def test_upgrade_websocket() -> None:
     conn = _parse(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
     assert conn.upgrade() == b"websocket"

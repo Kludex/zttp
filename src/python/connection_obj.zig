@@ -1894,7 +1894,10 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
                         if (e.upgrade_obj == null) return null; // propagate the pending MemoryError
                     } else e.upgrade_obj = null;
                 } else if (ev == .response) {
-                    e.should_close = e.reader.shouldClose();
+                    // A client that asked to close already set the flag when it
+                    // serialized the request; the peer omitting the token from
+                    // its response does not take that back.
+                    e.should_close = e.should_close or e.reader.shouldClose();
                 }
                 return events_obj.fromH1Event(ev);
             }
@@ -2040,7 +2043,7 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
             w.sendRequest(mb, tb, vb, hdrs.headers) catch |err| return raiseWrite(err);
             e.rememberMethod(mb);
             e.reader.setRequestMethod(mb);
-            if (core.h1.connection.connectionHasClose(hdrs.headers)) e.should_close = true;
+            if (core.h1.connection.shouldClose(vb, hdrs.headers)) e.should_close = true;
             return py.none();
         },
         .h3 => |*e| {
