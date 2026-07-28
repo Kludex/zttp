@@ -2040,6 +2040,7 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
             w.sendRequest(mb, tb, vb, hdrs.headers) catch |err| return raiseWrite(err);
             e.rememberMethod(mb);
             e.reader.setRequestMethod(mb);
+            if (core.h1.connection.connectionHasClose(hdrs.headers)) e.should_close = true;
             return py.none();
         },
         .h3 => |*e| {
@@ -2092,6 +2093,7 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     const rb = core.h1.writer.reasonPhrase(@intCast(status));
     const w = e.ensureWriter() orelse return null;
     w.sendResponse("1.1", @intCast(status), rb, header_slice, e.method()) catch |err| return raiseWrite(err);
+    if (core.h1.connection.connectionHasClose(header_slice)) e.should_close = true;
     return py.none();
 }
 
@@ -2477,7 +2479,7 @@ var h1_methods = [_]py.MethodDef{
     .{ .ml_name = "send_informational", .ml_meth = send_informational, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response: send_informational(status, headers=None). The real response still follows on the same cycle." },
     .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
     .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
-    .{ .ml_name = "should_close", .ml_meth = should_close, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request/response (Connection: close / HTTP/1.0 / close-delimited response)." },
+    .{ .ml_name = "should_close", .ml_meth = should_close, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request/response (Connection: close / HTTP/1.0 / close-delimited response). Covers both the head parsed from the peer and one serialized locally." },
     .{ .ml_name = "upgrade", .ml_meth = upgrade, .ml_flags = c.METH_NOARGS, .ml_doc = "The last request's Upgrade value if it asked to upgrade (Connection: upgrade), else None." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };

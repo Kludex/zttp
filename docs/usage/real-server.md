@@ -48,8 +48,9 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
             conn.end_message()
             writer.write(conn.data_to_send())
             await writer.drain()
-            # should_close() reflects the request just parsed (Connection: close, or
-            # HTTP/1.0 without keep-alive); start_next_cycle() clears it, so ask now.
+            # should_close() reflects the request just parsed and the response just
+            # sent (Connection: close, or HTTP/1.0 without keep-alive);
+            # start_next_cycle() clears it, so ask now.
             if conn.should_close():
                 return
             conn.start_next_cycle()  # reuse the connection for the next request
@@ -140,10 +141,12 @@ await writer.drain()
 ## Keep-alive
 
 HTTP/1.1 reuses the connection, so the outer loop serves request after request.
-zttp works out from the head whether the peer wants to close, so you don't scan
-headers - you ask. `should_close()` is only meaningful once the request head is
-parsed, and `start_next_cycle()` resets it, so check it **after** you've answered
-and before you cycle:
+zttp works out from the head whether the connection must close, so you don't scan
+headers - you ask. It covers both directions: the request the peer sent, and the
+response you serialized, so an application that answers with `Connection: close`
+is honored without you re-reading its headers. `should_close()` is only meaningful
+once the request head is parsed, and `start_next_cycle()` resets it, so check it
+**after** you've answered and before you cycle:
 
 ```python
 while True:

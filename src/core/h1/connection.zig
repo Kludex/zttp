@@ -23,9 +23,10 @@ fn listContains(value: []const u8, token: []const u8) bool {
     return false;
 }
 
-/// Whether the request `Connection` header carries the `close` token, across any
-/// number of `Connection` field-lines.
-fn connectionHasClose(headers: []const Header) bool {
+/// Whether a `Connection` header carries the `close` token, across any number of
+/// `Connection` field-lines. Applies to a head in either direction: a peer's, or
+/// one the caller is about to serialize.
+pub fn connectionHasClose(headers: []const Header) bool {
     for (headers) |h| {
         if (eqIgnoreCase(h.name, "connection") and listContains(h.value, "close")) return true;
     }
