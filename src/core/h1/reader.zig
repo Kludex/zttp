@@ -113,20 +113,37 @@ pub const Reader = struct {
         self.trailer_ranges.deinit(self.gpa);
     }
 
+    /// Poison the connection with `e`. Feed and parse failures share this
+    /// transition so every later operation re-raises the original error.
+    fn fail(self: *Reader, e: ParseError) ParseError {
+        self.state = .failed;
+        self.failed_with = e;
+        return e;
+    }
+
+    /// Reject and latch input that would push unconsumed bytes past
+    /// `max_buffer`, whether copied into `buf` or retained by a wrapper fast path.
+    pub fn checkBufferLimit(self: *Reader, data_len: usize) ParseError!void {
+        if (self.state == .failed) return self.failed_with;
+        if (self.limits.max_buffer == 0) return;
+        const unconsumed = self.buf.items.len - self.consumed;
+        if (unconsumed > self.limits.max_buffer or data_len > self.limits.max_buffer - unconsumed) {
+            return self.fail(error.MessageTooLong);
+        }
+    }
+
     /// Append received bytes. An empty slice signals end of input (peer close).
     /// Rejects input that would push the unconsumed buffer past `max_buffer`,
     /// bounding peer-forced memory and compaction cost.
     pub fn feed(self: *Reader, data: []const u8) ParseError!void {
+        if (self.state == .failed) return self.failed_with;
         if (data.len == 0) {
             self.eof_seen = true;
             return;
         }
-        if (self.eof_seen) return error.ProtocolError;
-        if (self.limits.max_buffer != 0) {
-            const unconsumed = self.buf.items.len - self.consumed;
-            if (unconsumed + data.len > self.limits.max_buffer) return error.MessageTooLong;
-        }
-        self.buf.appendSlice(self.gpa, data) catch return error.MessageTooLong;
+        if (self.eof_seen) return self.fail(error.ProtocolError);
+        try self.checkBufferLimit(data.len);
+        self.buf.appendSlice(self.gpa, data) catch return self.fail(error.MessageTooLong);
     }
 
     /// Remember the method the client just sent, so the reader frames the
@@ -224,11 +241,7 @@ pub const Reader = struct {
     /// h11 does), so a desynchronized stream can never be silently re-parsed.
     pub fn nextEvent(self: *Reader) ParseError!Event {
         if (self.state == .failed) return self.failed_with;
-        return self.dispatch() catch |e| {
-            self.state = .failed;
-            self.failed_with = e;
-            return e;
-        };
+        return self.dispatch() catch |e| self.fail(e);
     }
 
     fn dispatch(self: *Reader) ParseError!Event {
@@ -855,6 +868,10 @@ test "feed rejects input past max_buffer" {
     defer r.deinit();
     const big = "Z" ** 2048;
     try t.expectError(error.MessageTooLong, r.feed(big));
+    try t.expectError(error.MessageTooLong, r.feed("GET / HTTP/1.1\r\n\r\n"));
+    try t.expectError(error.MessageTooLong, r.nextEvent());
+    r.reset();
+    try t.expectError(error.MessageTooLong, r.nextEvent());
 }
 
 test "feed rejects data after EOF" {
