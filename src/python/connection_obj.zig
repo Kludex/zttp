@@ -221,6 +221,7 @@ const H1Engine = struct {
             }
             if (data.len >= head_split_min_feed and self.reader.atMessageStart()) {
                 if (core.h1.reader.findHeadEnd(data)) |head_end| {
+                    self.reader.checkBufferLimit(data.len) catch |err| return exceptions.raiseParse(err);
                     self.reader.feed(data[0..head_end]) catch |err| return exceptions.raiseParse(err);
                     if (head_end < data.len) self.stash(obj, data[head_end..]) catch |err| return exceptions.raiseParse(err);
                     return py.none();
