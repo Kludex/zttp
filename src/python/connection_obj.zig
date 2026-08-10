@@ -180,7 +180,8 @@ const H1Engine = struct {
         return w;
     }
 
-    fn stash(self: *H1Engine, obj: py.Object, rest: []const u8) void {
+    fn stash(self: *H1Engine, obj: py.Object, rest: []const u8) core.errors.ParseError!void {
+        try self.reader.checkBufferLimit(rest.len);
         py.incref(obj);
         self.pending_obj = obj;
         self.pending = rest;
@@ -215,13 +216,13 @@ const H1Engine = struct {
         if (data.len > 0 and self.reader.eofSeen()) return exceptions.raiseParse(error.ProtocolError);
         if (data.len > 0 and self.reader.backlogEmpty()) {
             if (self.reader.bodyLengthRemaining() != null) {
-                self.stash(obj, data);
+                self.stash(obj, data) catch |err| return exceptions.raiseParse(err);
                 return py.none();
             }
             if (data.len >= head_split_min_feed and self.reader.atMessageStart()) {
                 if (core.h1.reader.findHeadEnd(data)) |head_end| {
                     self.reader.feed(data[0..head_end]) catch |err| return exceptions.raiseParse(err);
-                    if (head_end < data.len) self.stash(obj, data[head_end..]);
+                    if (head_end < data.len) self.stash(obj, data[head_end..]) catch |err| return exceptions.raiseParse(err);
                     return py.none();
                 }
             }

@@ -179,6 +179,23 @@ def test_oversized_feed_raises_remote_protocol_error() -> None:
         conn.receive_data(b"Z" * (9 * 1024 * 1024))
 
 
+def test_content_length_fast_path_respects_max_buffer_on_single_feed() -> None:
+    body = b"A" * (9 * 1024 * 1024)
+    raw = b"POST / HTTP/1.1\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.receive_data(raw)
+
+
+def test_content_length_fast_path_respects_max_buffer_on_later_body_feed() -> None:
+    body = b"A" * (9 * 1024 * 1024)
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n")
+    assert isinstance(conn.next_event(), zttp.Request)
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.receive_data(body)
+
+
 def test_response_reason_with_control_byte_rejected() -> None:
     conn = zttp.Connection(zttp.CLIENT)
     conn.receive_data(b"HTTP/1.1 200 O\x00K\r\nContent-Length: 0\r\n\r\n")

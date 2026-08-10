@@ -113,6 +113,16 @@ pub const Reader = struct {
         self.trailer_ranges.deinit(self.gpa);
     }
 
+    /// Reject input that would push unconsumed bytes past `max_buffer`, whether
+    /// the bytes are copied into `buf` or retained by a wrapper fast path.
+    pub fn checkBufferLimit(self: *const Reader, data_len: usize) ParseError!void {
+        if (self.limits.max_buffer == 0) return;
+        const unconsumed = self.buf.items.len - self.consumed;
+        if (unconsumed > self.limits.max_buffer or data_len > self.limits.max_buffer - unconsumed) {
+            return error.MessageTooLong;
+        }
+    }
+
     /// Append received bytes. An empty slice signals end of input (peer close).
     /// Rejects input that would push the unconsumed buffer past `max_buffer`,
     /// bounding peer-forced memory and compaction cost.
@@ -122,10 +132,7 @@ pub const Reader = struct {
             return;
         }
         if (self.eof_seen) return error.ProtocolError;
-        if (self.limits.max_buffer != 0) {
-            const unconsumed = self.buf.items.len - self.consumed;
-            if (unconsumed + data.len > self.limits.max_buffer) return error.MessageTooLong;
-        }
+        try self.checkBufferLimit(data.len);
         self.buf.appendSlice(self.gpa, data) catch return error.MessageTooLong;
     }
 
