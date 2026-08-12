@@ -57,7 +57,7 @@ while True:
     if event is zttp.NEED_DATA:
         break
     print(type(event).__name__, getattr(event, "data", ""))
-    if isinstance(event, zttp.EndOfMessage):
+    if isinstance(event, zttp.EndOfMessage) or isinstance(event, zttp.Request) and event.end_stream:
         break
 ```
 
@@ -80,7 +80,7 @@ A server connection yields these, in order, per request:
 
 | Event | When | Useful fields |
 | --- | --- | --- |
-| `Request` | The request line + all headers are parsed | `.method`, `.target`, `.path`, `.query`, `.http_version`, `.headers`, `.expect_continue` |
+| `Request` | The request line + all headers are parsed | `.method`, `.target`, `.path`, `.query`, `.http_version`, `.headers`, `.expect_continue`, `.end_stream` |
 | `Data` | A chunk of the body is available | `.data` |
 | `EndOfMessage` | The body (and any trailers) finished | `.trailers` |
 | `NEED_DATA` | No complete event yet. Feed more | *(it's a sentinel)* |
@@ -109,9 +109,10 @@ A client connection is the mirror image: you get `Response` (with `.status_code`
 
 ## Keep-alive
 
-HTTP/1.1 connections are reused. After you've pulled `EndOfMessage` for one
-message, tell the connection to start the next one, unless the peer asked to
-close. zttp works that out from the head it parsed, so you don't scan headers:
+HTTP/1.1 connections are reused. After a `Request(end_stream=True)` or the
+request's `EndOfMessage`, tell the connection to start the next one, unless the
+peer asked to close. zttp works that out from the head it parsed, so you don't
+scan headers:
 
 ```python
 if conn.should_close():  # Connection: close, or HTTP/1.0 without keep-alive

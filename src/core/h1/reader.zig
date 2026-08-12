@@ -320,7 +320,16 @@ pub const Reader = struct {
 
         if (self.role == .server) {
             const rl = try headers_mod.parseRequestLine(first);
-            _ = try self.frameBody(.{ .until_close_default = false });
+            const framing = try framing_mod.determine(self.headers.items, .{ .until_close_default = false });
+            const end_stream = framing == .none;
+            if (end_stream) {
+                // The Request event itself completes a bodyless request. Avoid
+                // making every server perform another parser call merely to
+                // discover an empty EndOfMessage.
+                self.state = .done;
+            } else {
+                self.enterBody(framing);
+            }
             self.conn_should_close = connection_mod.shouldClose(rl.http_version, self.headers.items);
             self.conn_upgrade = connection_mod.upgrade(self.headers.items);
             return .{ .request = .{
@@ -331,6 +340,7 @@ pub const Reader = struct {
                 .http_version = rl.http_version,
                 .headers = self.headers.items,
                 .expect_continue = connection_mod.expectsContinue(self.headers.items),
+                .end_stream = end_stream,
             } };
         }
 
@@ -550,9 +560,8 @@ test "simple GET no body" {
     var r = try drainServer("GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n");
     defer r.ev.deinit(t.allocator);
     defer r.body.deinit(t.allocator);
-    try t.expectEqual(@as(usize, 2), r.ev.items.len);
+    try t.expectEqual(@as(usize, 1), r.ev.items.len);
     try t.expectEqual(EvTag.request, r.ev.items[0]);
-    try t.expectEqual(EvTag.eom, r.ev.items[1]);
 }
 
 test "POST content-length body" {
@@ -575,6 +584,7 @@ test "request fields exposed" {
     defer r.deinit();
     try r.feed("DELETE /x?y=1 HTTP/1.0\r\nHost: h\r\nAccept: */*\r\n\r\n");
     const e = try r.nextEvent();
+    try t.expect(e.request.end_stream);
     try t.expectEqualStrings("DELETE", e.request.method);
     try t.expectEqualStrings("/x?y=1", e.request.target);
     try t.expectEqualStrings("1.0", e.request.http_version);
@@ -613,7 +623,7 @@ test "keep-alive: two requests via reset" {
     try r.feed("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: y\r\n\r\n");
     var e = try r.nextEvent();
     try t.expectEqualStrings("/a", e.request.target);
-    try expectTag(.end_of_message, try r.nextEvent());
+    try t.expect(e.request.end_stream);
     r.reset();
     e = try r.nextEvent();
     try t.expectEqualStrings("/b", e.request.target);

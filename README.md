@@ -81,8 +81,8 @@ import zttp
 conn = zttp.Connection(zttp.SERVER)
 conn.receive_data(b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
 
-conn.next_event()   # Request(method=b'GET', target=b'/path?q=1', http_version=b'1.1', headers=[(b'Host', b'example.com')])
-conn.next_event()   # EndOfMessage(trailers=[])
+request = conn.next_event()  # Request(...)
+request.end_stream           # True: this bodyless request is already complete
 conn.next_event()   # NEED_DATA
 
 # Build a response:
@@ -93,7 +93,8 @@ conn.data_to_send()  # b'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello'
 ```
 
 The read side yields `Request` / `Response` / `Data` / `EndOfMessage`, or the
-`NEED_DATA` sentinel when more bytes are required. The write side serializes a
+`NEED_DATA` sentinel when more bytes are required. A `Request` with
+`end_stream=True` needs no separate `EndOfMessage`. The write side serializes a
 head, body data, and the end of the message, framing the body (Content-Length or
 chunked) for you.
 

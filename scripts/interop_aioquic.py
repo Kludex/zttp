@@ -562,8 +562,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
             break
         early_events.append(event)
     early_requests = [event for event in early_events if event.__class__.__name__ == "Request"]
-    early_eoms = [event for event in early_events if event.__class__.__name__ == "EndOfMessage"]
-    if not early_requests or early_requests[0].path != b"/aioquic-early" or not early_eoms:
+    if not early_requests or early_requests[0].path != b"/aioquic-early" or not early_requests[0].end_stream:
         raise SystemExit(f"zttp did not receive aioquic's 0-RTT request before handshake completion: {early_events!r}")
 
     server.send_new_token(b"zttp-validation-token")
@@ -607,8 +606,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
     key_update_requests = [event for event in key_update_events if event.__class__.__name__ == "Request"]
     if not key_update_requests or key_update_requests[0].path != b"/peer-key-update":
         raise SystemExit(f"zttp did not receive aioquic's post-key-update request: {key_update_events!r}")
-    key_update_eoms = [event for event in key_update_events if event.__class__.__name__ == "EndOfMessage"]
-    if not key_update_eoms:
+    if not key_update_requests[0].end_stream:
         raise SystemExit(f"zttp did not receive aioquic's post-key-update request end: {key_update_events!r}")
 
     client.close(error_code=0x0100, reason_phrase="aioquic-close")

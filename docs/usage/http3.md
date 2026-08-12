@@ -208,8 +208,10 @@ while (event := conn.next_event()) is not zttp.NEED_DATA:
 ```
 
 You get the same `Request` / `Data` / `EndOfMessage` events, now tagged with the
-QUIC `stream_id`. An HTTP/3 request collapses its pseudo-headers into the same
-shape the other protocols use, and `http_version` is `b"3"`.
+QUIC `stream_id`. If FIN arrives with the initial HEADERS, the `Request` has
+`end_stream=True` and needs no separate `EndOfMessage`. An HTTP/3 request
+collapses its pseudo-headers into the same shape the other protocols use, and
+`http_version` is `b"3"`.
 
 !!! warning "`data_to_send()` returns a **list**"
     On HTTP/1.1 and HTTP/2 it returns `bytes`, because TCP is a byte stream and

@@ -25,6 +25,7 @@ const RequestObject = extern struct {
     headers: py.Object,
     stream_id: c_ulonglong,
     expect_continue: c_char,
+    end_stream: c_char,
 };
 
 const ResponseObject = extern struct {
@@ -130,6 +131,7 @@ var request_members = [_]py.MemberDef{
     member("headers", @offsetOf(RequestObject, "headers")),
     .{ .name = "stream_id", .type = py.T_ULONGLONG, .offset = @intCast(@offsetOf(RequestObject, "stream_id")), .flags = py.READONLY, .doc = null },
     .{ .name = "expect_continue", .type = py.T_BOOL, .offset = @intCast(@offsetOf(RequestObject, "expect_continue")), .flags = py.READONLY, .doc = null },
+    .{ .name = "end_stream", .type = py.T_BOOL, .offset = @intCast(@offsetOf(RequestObject, "end_stream")), .flags = py.READONLY, .doc = null },
     .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
 };
 var response_members = [_]py.MemberDef{
@@ -1059,6 +1061,7 @@ fn makeRequestImpl(r: events.Request, lazy_headers: bool) py.Object {
     s.headers = if (lazy_headers) buildHeaderBlock(r.headers) else buildHeaders(r.headers);
     s.stream_id = r.stream_id;
     s.expect_continue = @intFromBool(r.expect_continue);
+    s.end_stream = @intFromBool(r.end_stream);
     if (s.method == null or s.target == null or s.path == null or s.query == null or s.http_version == null or s.headers == null) {
         py.decref(o);
         return null;

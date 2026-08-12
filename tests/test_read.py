@@ -11,15 +11,14 @@ from tests.conftest import drain, drain_all, parse_request
 
 def test_simple_get() -> None:
     events = parse_request(b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
-    assert len(events) == 2
-    req, eom = events
+    assert len(events) == 1
+    (req,) = events
     assert isinstance(req, zttp.Request)
     assert req.method == b"GET"
     assert req.target == b"/path?q=1"
     assert req.http_version == b"1.1"
     assert req.headers == [(b"Host", b"example.com")]
-    assert isinstance(eom, zttp.EndOfMessage)
-    assert eom.trailers == []
+    assert req.end_stream is True
 
 
 def test_post_content_length() -> None:
@@ -33,12 +32,14 @@ def test_post_content_length() -> None:
 def test_zero_content_length_has_no_data() -> None:
     events = parse_request(b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
     assert not any(isinstance(e, zttp.Data) for e in events)
-    assert isinstance(events[-1], zttp.EndOfMessage)
+    assert isinstance(events[-1], zttp.Request)
+    assert events[-1].end_stream is True
 
 
-def test_no_body_get_emits_end_of_message() -> None:
+def test_no_body_get_completes_on_request() -> None:
     events = parse_request(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-    assert isinstance(events[-1], zttp.EndOfMessage)
+    assert len(events) == 1
+    assert events[0].end_stream is True
 
 
 def test_chunked_body() -> None:
@@ -207,8 +208,9 @@ def test_body_buffer_with_pipelined_bytes_keeps_copy_path() -> None:
 def test_keep_alive_two_requests() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: y\r\n\r\n")
-    assert conn.next_event().target == b"/a"
-    assert isinstance(conn.next_event(), zttp.EndOfMessage)
+    first = conn.next_event()
+    assert first.target == b"/a"
+    assert first.end_stream is True
     conn.start_next_cycle()
     assert conn.next_event().target == b"/b"
 
