@@ -159,6 +159,46 @@ def test_body_split_across_feeds() -> None:
     assert isinstance(conn.next_event(), zttp.EndOfMessage)
 
 
+def test_large_content_length_body_reuses_exact_received_bytes() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    body = b"x" * 1024
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n")
+    assert isinstance(conn.next_event(), zttp.Request)
+
+    conn.receive_data(body)
+    event = conn.next_event()
+    assert isinstance(event, zttp.Data)
+    assert event.data is body
+    assert isinstance(conn.next_event(), zttp.EndOfMessage)
+
+
+def test_small_content_length_body_keeps_copy_path() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    body = b"small body"
+    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n")
+    assert isinstance(conn.next_event(), zttp.Request)
+
+    conn.receive_data(body)
+    event = conn.next_event()
+    assert isinstance(event, zttp.Data)
+    assert event.data == body
+    assert event.data is not body
+
+
+def test_body_buffer_with_pipelined_bytes_keeps_copy_path() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    body = b"x" * 1024
+    conn.receive_data(
+        b"POST / HTTP/1.1\r\nContent-Length: 1024\r\n\r\n" + body + b"GET /next HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert isinstance(conn.next_event(), zttp.Request)
+    event = conn.next_event()
+    assert isinstance(event, zttp.Data)
+    assert event.data == body
+    assert event.data is not body
+    assert isinstance(conn.next_event(), zttp.EndOfMessage)
+
+
 def test_keep_alive_two_requests() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: y\r\n\r\n")
