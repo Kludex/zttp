@@ -90,6 +90,10 @@ jobs:
       url: https://test.pypi.org/project/zttp
 
     steps:
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: false
+
       - name: Download all distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -98,12 +102,12 @@ jobs:
           merge-multiple: true
 
       - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          # main is pushed repeatedly with the same dev version; don't fail when
-          # that version already exists on TestPyPI.
-          skip-existing: true
+        # main is pushed repeatedly with the same dev version, so check TestPyPI
+        # first and skip files that have already been uploaded unchanged.
+        run: >-
+          uv publish
+          --publish-url https://test.pypi.org/legacy/
+          --check-url https://test.pypi.org/simple/
 
   publish:
     name: Publish to PyPI
@@ -119,6 +123,10 @@ jobs:
       url: https://pypi.org/project/zttp
 
     steps:
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: false
+
       - name: Download all distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -127,10 +135,4 @@ jobs:
           merge-multiple: true
 
       - name: Publish to PyPI
-        # SHA-pinned like every other action: this step runs with id-token: write
-        # (OIDC trusted publishing to real PyPI), so a mutable ref is the highest-
-        # value supply-chain target in the repo. Current release/v1 is a composite
-        # action that builds its own container at run time - it does not resolve a
-        # per-ref image - so SHA pinning works (no "manifest unknown"). Bump with the
-        # release tag when updating.
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        run: uv publish
