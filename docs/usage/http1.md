@@ -72,6 +72,23 @@ print(request.headers)
 #> [(b'Host', b'example.com')]
 ```
 
+### Headers
+
+HTTP/1 request and response headers are an immutable `HeaderBlock`. It preserves
+wire order and duplicate fields, supports normal sequence operations, and owns
+its bytes, so it remains valid after the connection advances:
+
+```python
+request.headers[0]                 # (b"Host", b"example.com")
+request.headers.get(b"host")      # b"example.com" (case-insensitive)
+request.headers.getall(b"x-tag")  # every matching value, in wire order
+list(request.headers)              # materialize all (name, value) pairs
+```
+
+Prefer `get()` / `getall()` when you only need selected fields. zttp keeps the
+block packed until accessed, avoiding a Python bytes object and tuple for every
+header. Use `to_list()` when an integration specifically needs a mutable list.
+
 ### Chunked transfer encoding
 
 You don't do anything special for `Transfer-Encoding: chunked`. zttp decodes the

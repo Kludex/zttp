@@ -115,10 +115,11 @@ def test_event_cycle_is_collectable() -> None:
     def make_cycle() -> None:
         c = zttp.Connection(zttp.SERVER)
         c.receive_data(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+        c.next_event()
         e = c.next_event()
         can = Canary()
-        e.headers.append(e)
-        e.headers.append(can)
+        e.trailers.append(e)
+        e.trailers.append(can)
         can.back = e
 
     for _ in range(25):

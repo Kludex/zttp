@@ -1831,7 +1831,7 @@ fn receive_datagram(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.
     }
 }
 
-fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
     switch (engine.*) {
@@ -1901,10 +1901,21 @@ fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
                     // its response does not take that back.
                     e.should_close = e.should_close or e.reader.shouldClose();
                 }
-                return events_obj.fromH1Event(ev);
+                return if (eager_headers)
+                    events_obj.fromH1Event(ev)
+                else
+                    events_obj.fromH1EventWithHeaderBlock(ev);
             }
         },
     }
+}
+
+fn next_event(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    return nextEventImpl(self_obj, false);
+}
+
+fn next_event_eager_for_benchmark(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    return nextEventImpl(self_obj, true);
 }
 
 /// Headers borrowed (zero-copy) from a Python sequence of (name, value) bytes
@@ -2477,6 +2488,7 @@ var base_methods = [_]py.MethodDef{
 // keep-alive / upgrade signals.
 var h1_methods = [_]py.MethodDef{
     .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
+    .{ .ml_name = "_next_event_eager_for_benchmark", .ml_meth = next_event_eager_for_benchmark, .ml_flags = c.METH_NOARGS, .ml_doc = "Private benchmark control for comparing the legacy eager header list." },
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
     .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
