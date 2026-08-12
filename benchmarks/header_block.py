@@ -35,8 +35,11 @@ class FrameworkRequest:
         self.path = event.path
         self.query = event.query
         self.http_version = event.http_version
-        headers = event.headers.to_list() if isinstance(event.headers, zttp.HeaderBlock) else event.headers
-        self.headers = {name.lower(): value for name, value in headers}
+        if isinstance(event.headers, zttp.HeaderBlock):
+            headers = event.headers.to_list(lowercase_names=True)
+        else:
+            headers = ((name.lower(), value) for name, value in event.headers)
+        self.headers = dict(headers)
 
 
 def consume(event: zttp.Request, operation: str) -> object:

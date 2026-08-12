@@ -692,12 +692,38 @@ fn headerValue(data: []const u8, range: HeaderRange) []const u8 {
     return data[start .. start + range.value_len];
 }
 
-fn headerPair(self: *HeaderBlockObject, idx: usize) py.Object {
+fn lowerHeaderName(name: []const u8) py.Object {
+    // Reuse the lowercase half of the common-name cache where possible.  ASGI
+    // servers require lowercase names, so adapters can materialize their scope
+    // without a Python callback and bytes.lower() call for every header.
+    @setEvalBranchQuota(3000);
+    switch (name.len) {
+        inline 3...25 => |L| {
+            inline for (INTERNED_NAMES, 0..) |candidate, i| {
+                if (comptime candidate.len == L and std.ascii.isLower(candidate[0])) {
+                    if (headerNameEql(name, candidate)) return py.newRef(interned[i]);
+                }
+            }
+        },
+        else => {},
+    }
+
+    const result = c.PyBytes_FromStringAndSize(null, @intCast(name.len));
+    if (result == null) return null;
+    const dst: [*]u8 = @ptrCast(c.PyBytes_AsString(result));
+    for (name, 0..) |ch, i| dst[i] = std.ascii.toLower(ch);
+    return result;
+}
+
+fn headerPair(self: *HeaderBlockObject, idx: usize, lowercase_name: bool) py.Object {
     const data = headerData(self) orelse return null;
     const range = headerRanges(self)[idx];
     const name_bytes = headerName(data, range);
     const value_bytes = headerValue(data, range);
-    const name = internName(name_bytes) orelse py.fromBytes(name_bytes);
+    const name = if (lowercase_name)
+        lowerHeaderName(name_bytes)
+    else
+        internName(name_bytes) orelse py.fromBytes(name_bytes);
     const value = internValue(value_bytes) orelse py.fromBytes(value_bytes);
     if (name == null or value == null) {
         py.xdecref(name);
@@ -715,11 +741,11 @@ fn headerPair(self: *HeaderBlockObject, idx: usize) py.Object {
     return pair;
 }
 
-fn materializeHeaderBlock(self: *HeaderBlockObject) py.Object {
+fn materializeHeaderBlock(self: *HeaderBlockObject, lowercase_names: bool) py.Object {
     const list = py.newList(@intCast(self.count));
     if (list == null) return null;
     for (0..self.count) |i| {
-        const pair = headerPair(self, i);
+        const pair = headerPair(self, i, lowercase_names);
         if (pair == null) {
             py.decref(list);
             return null;
@@ -779,7 +805,7 @@ fn headerBlockItem(obj: ?*c.PyObject, raw_idx: py.ssize) callconv(.c) py.Object 
         c.PyErr_SetString(c.PyExc_IndexError, "header index out of range");
         return null;
     }
-    return headerPair(self, @intCast(idx));
+    return headerPair(self, @intCast(idx), false);
 }
 
 fn headerBlockSubscript(obj: ?*c.PyObject, key: ?*c.PyObject) callconv(.c) py.Object {
@@ -791,7 +817,10 @@ fn headerBlockSubscript(obj: ?*c.PyObject, key: ?*c.PyObject) callconv(.c) py.Ob
         if (idx == -1 and py.errOccurred()) return null;
         return headerBlockItem(obj, idx);
     }
-    if (c.PySlice_Check(key) != 0) {
+    // PySlice_Check expands through _PyObject_CAST_CONST on CPython 3.10;
+    // translate-c cannot lower that macro. Exact type comparison is sufficient
+    // because slice is final and keeps the extension buildable on 3.10.
+    if (@intFromPtr(c.Py_TYPE(key)) == @intFromPtr(&c.PySlice_Type)) {
         const self: *HeaderBlockObject = @ptrCast(obj.?);
         var start: py.ssize = 0;
         var stop: py.ssize = 0;
@@ -802,7 +831,7 @@ fn headerBlockSubscript(obj: ?*c.PyObject, key: ?*c.PyObject) callconv(.c) py.Ob
         if (list == null) return null;
         var idx = start;
         for (0..@intCast(slice_len)) |out_idx| {
-            const pair = headerPair(self, @intCast(idx));
+            const pair = headerPair(self, @intCast(idx), false);
             if (pair == null) {
                 py.decref(list);
                 return null;
@@ -859,12 +888,15 @@ fn headerBlockGetAll(obj: ?*c.PyObject, name_obj: ?*c.PyObject) callconv(.c) py.
     return list;
 }
 
-fn headerBlockToList(obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
-    return materializeHeaderBlock(@ptrCast(obj.?));
+fn headerBlockToList(obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) callconv(.c) py.Object {
+    var lowercase_names: c_int = 0;
+    var kwlist = [_][*c]u8{ @constCast("lowercase_names"), null };
+    if (c.PyArg_ParseTupleAndKeywords(args, kwargs, "|$p", @ptrCast(&kwlist), &lowercase_names) == 0) return null;
+    return materializeHeaderBlock(@ptrCast(obj.?), lowercase_names != 0);
 }
 
 fn headerBlockRepr(obj: ?*c.PyObject) callconv(.c) py.Object {
-    const list = materializeHeaderBlock(@ptrCast(obj.?));
+    const list = materializeHeaderBlock(@ptrCast(obj.?), false);
     if (list == null) return null;
     defer py.decref(list);
     return c.PyObject_Repr(list);
@@ -872,11 +904,11 @@ fn headerBlockRepr(obj: ?*c.PyObject) callconv(.c) py.Object {
 
 fn headerBlockCmp(a: ?*c.PyObject, b: ?*c.PyObject, op: c_int) callconv(.c) py.Object {
     if (op != c.Py_EQ and op != c.Py_NE) return py.newRef(c.Py_NotImplemented());
-    const left = materializeHeaderBlock(@ptrCast(a.?));
+    const left = materializeHeaderBlock(@ptrCast(a.?), false);
     if (left == null) return null;
     defer py.decref(left);
     if (c.Py_TYPE(b) == @as([*c]c.PyTypeObject, @ptrCast(header_block_type))) {
-        const right = materializeHeaderBlock(@ptrCast(b.?));
+        const right = materializeHeaderBlock(@ptrCast(b.?), false);
         if (right == null) return null;
         defer py.decref(right);
         return c.PyObject_RichCompare(left, right, op);
@@ -897,7 +929,7 @@ fn headerBlockNew(_: ?*c.PyTypeObject, _: ?*c.PyObject, _: ?*c.PyObject) callcon
 var header_block_methods = [_]py.MethodDef{
     .{ .ml_name = "get", .ml_meth = headerBlockGet, .ml_flags = c.METH_VARARGS, .ml_doc = "Return the first case-insensitive header value, or default." },
     .{ .ml_name = "getall", .ml_meth = headerBlockGetAll, .ml_flags = c.METH_O, .ml_doc = "Return all values for a case-insensitive header name." },
-    .{ .ml_name = "to_list", .ml_meth = headerBlockToList, .ml_flags = c.METH_NOARGS, .ml_doc = "Materialize and return the list of (name, value) bytes pairs." },
+    .{ .ml_name = "to_list", .ml_meth = @ptrCast(&headerBlockToList), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Materialize the fields, optionally with lowercase names." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

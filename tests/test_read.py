@@ -79,6 +79,11 @@ def test_headers_are_owned_and_sequence_compatible() -> None:
     assert req.headers.get(b"missing", marker) is marker
     assert list(req.headers) == [(b"Host", b"first"), (b"X-Test", b"a"), (b"X-Test", b"b")]
     assert req.headers.to_list() == list(req.headers)
+    assert req.headers.to_list(lowercase_names=True) == [
+        (b"host", b"first"),
+        (b"x-test", b"a"),
+        (b"x-test", b"b"),
+    ]
 
     # The view owns its packed bytes; a later receive/cycle cannot invalidate it.
     conn.next_event()

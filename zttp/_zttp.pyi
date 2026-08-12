@@ -48,8 +48,8 @@ class HeaderBlock(Sequence[tuple[bytes, bytes]]):
     def getall(self, name: bytes, /) -> list[bytes]:
         """Return every case-insensitive match in received order."""
 
-    def to_list(self) -> list[tuple[bytes, bytes]]:
-        """Materialize all fields as a list of byte pairs."""
+    def to_list(self, *, lowercase_names: bool = False) -> list[tuple[bytes, bytes]]:
+        """Materialize all fields, optionally with lowercase names."""
 
 @final
 class Request:
