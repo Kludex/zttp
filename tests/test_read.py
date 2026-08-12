@@ -197,6 +197,11 @@ def test_body_buffer_with_pipelined_bytes_keeps_copy_path() -> None:
     assert event.data == body
     assert event.data is not body
     assert isinstance(conn.next_event(), zttp.EndOfMessage)
+    conn.start_next_cycle()
+    next_request = conn.next_event()
+    assert isinstance(next_request, zttp.Request)
+    assert next_request.method == b"GET"
+    assert next_request.target == b"/next"
 
 
 def test_keep_alive_two_requests() -> None:

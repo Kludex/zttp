@@ -1,10 +1,12 @@
-"""Measure HTTP/1 request-body delivery across realistic read sizes.
+"""Measure Uvicorn-shaped HTTP/1 request-body delivery.
 
 The request head is delivered separately, as it normally is once an ASGI server
 starts an application after parsing the head. Body pieces are immutable ``bytes``
-objects like those passed by ``asyncio.Protocol.data_received``. Both parsers
-surface every body span and message completion; the benchmark verifies the same
-body length before timing.
+objects like those passed by ``asyncio.Protocol.data_received``. Like Uvicorn's
+httptools protocol, each parser accumulates callback/event bodies in a
+``bytearray`` and materializes ``bytes`` for ASGI delivery. This keeps the
+zero-copy parser improvement in a production-shaped path instead of timing a
+reference handoff against a body-sized copy in isolation.
 """
 
 from __future__ import annotations
@@ -58,14 +60,17 @@ def make_zttp(size: int, fragment: int | None) -> Runner:
             conn.receive_data(head)
             if not isinstance(conn.next_event(), Request):
                 raise AssertionError("missing request")
+            buffered = bytearray()
             for piece in pieces:
                 conn.receive_data(piece)
                 event = conn.next_event()
                 if not isinstance(event, Data):
                     raise AssertionError("missing data")
-                seen += len(event.data)
+                buffered += event.data
             if not isinstance(conn.next_event(), EndOfMessage):
                 raise AssertionError("missing end of message")
+            delivered = bytes(buffered)
+            seen += len(delivered)
         if seen != iterations * size:
             raise AssertionError("body length differs")
 
@@ -73,14 +78,14 @@ def make_zttp(size: int, fragment: int | None) -> Runner:
 
 
 class HttptoolsProtocol:
-    __slots__ = ("complete", "seen")
+    __slots__ = ("body", "complete")
 
     def __init__(self) -> None:
-        self.seen = 0
+        self.body = bytearray()
         self.complete = False
 
     def on_body(self, body: bytes) -> None:
-        self.seen += len(body)
+        self.body += body
 
     def on_message_complete(self) -> None:
         self.complete = True
@@ -98,9 +103,10 @@ def make_httptools(size: int, fragment: int | None) -> Runner:
             parser.feed_data(head)
             for piece in pieces:
                 parser.feed_data(piece)
-            if not protocol.complete or protocol.seen != size:
+            if not protocol.complete:
                 raise AssertionError("body differs")
-            seen += protocol.seen
+            delivered = bytes(protocol.body)
+            seen += len(delivered)
         if seen != iterations * size:
             raise AssertionError("body length differs")
 
@@ -123,8 +129,11 @@ def benchmark(name: str, size: int, fragment: int | None, iterations: int, repea
     samples = {label: [] for label in runners}
     for run in runners.values():
         run(max(1, iterations // 20))
-    for _ in range(repeats):
-        for label, run in runners.items():
+    labels = tuple(runners)
+    for repeat in range(repeats):
+        order = labels if repeat % 2 == 0 else labels[::-1]
+        for label in order:
+            run = runners[label]
             samples[label].append(timed(run, iterations))
 
     medians = {label: statistics.median(values) for label, values in samples.items()}
@@ -140,7 +149,7 @@ def main() -> None:
     parser.add_argument("--repeats", type=positive_int, default=11)
     args = parser.parse_args()
 
-    print(f"{'workload':<24} {'zttp req/s':>12} {'httptools':>12} {'ratio':>9}")
+    print(f"{'workload':<24} {'zttp ASGI/s':>12} {'httptools':>12} {'ratio':>9}")
     benchmark("64B body", 64, None, args.iterations, args.repeats)
     benchmark("1KiB body", 1024, None, args.iterations, args.repeats)
     benchmark("16KiB body", 16 * 1024, None, args.iterations, args.repeats)
