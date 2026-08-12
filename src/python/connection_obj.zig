@@ -211,6 +211,11 @@ const H1Engine = struct {
     /// itself when a sizeable body follows.
     const head_split_min_feed = 1024;
 
+    /// Retaining the caller's bytes object avoids a body-sized allocation and
+    /// copy, but an extra reference is marginally dearer for tiny spans. Keep
+    /// those on the existing copy path.
+    const retain_body_min = 512;
+
     fn receiveData(self: *H1Engine, data: []const u8, obj: py.Object) py.Object {
         if (!self.flushPending()) return null;
         if (data.len > 0 and self.reader.eofSeen()) return exceptions.raiseParse(error.ProtocolError);
@@ -1862,10 +1867,19 @@ fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
                 if (ev == .need_data and e.pending_obj != null) {
                     if (e.reader.backlogEmpty()) {
                         if (e.reader.bodyLengthRemaining()) |rem| {
-                            // Materialise body bytes straight from the stashed
-                            // buffer - the one copy - and account for them.
+                            // Deliver body bytes straight from the stashed
+                            // buffer and account for them.
                             const take: usize = @intCast(@min(rem, @as(u64, e.pending.len)));
-                            const out = events_obj.fromH1Event(.{ .data = .{ .data = e.pending[0..take] } });
+                            const can_retain = if (take >= H1Engine.retain_body_min) blk: {
+                                const owned = py.asBytes(e.pending_obj).?;
+                                break :blk take == e.pending.len and
+                                    e.pending.ptr == owned.ptr and
+                                    e.pending.len == owned.len;
+                            } else false;
+                            const out = if (can_retain)
+                                events_obj.makeH1DataFromBytes(e.pending_obj)
+                            else
+                                events_obj.fromH1Event(.{ .data = .{ .data = e.pending[0..take] } });
                             if (out == null) return null;
                             e.reader.skipBodyLength(take);
                             e.pending = e.pending[take..];

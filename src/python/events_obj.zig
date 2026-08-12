@@ -1099,6 +1099,18 @@ fn makeData(d: events.Data) py.Object {
     return o;
 }
 
+/// Build an HTTP/1 Data event by retaining the exact immutable bytes object the
+/// caller fed. The connection has already established that the whole object is
+/// the emitted body span, so no slice or copy is needed.
+pub fn makeH1DataFromBytes(data_obj: py.Object) py.Object {
+    const o = py.allocInstance(data_type);
+    if (o == null) return null;
+    const s: *DataObject = @ptrCast(o);
+    s.data = py.newRef(data_obj);
+    s.stream_id = 0;
+    return o;
+}
+
 fn makeEom(e: events.EndOfMessage) py.Object {
     const o = py.allocInstance(end_of_message_type);
     if (o == null) return null;
