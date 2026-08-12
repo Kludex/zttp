@@ -217,6 +217,10 @@ pub fn freeInstance(self: Object) void {
     const tp: [*c]c.PyTypeObject = c.Py_TYPE(self);
     const free = tp.*.tp_free.?;
     free(@ptrCast(self));
+    // PyType_FromSpec creates heap types. Their allocator holds one reference
+    // to the concrete type per instance, which a custom tp_dealloc must release
+    // after tp_free (and only after, because the instance memory is now gone).
+    decref(@as(Object, @ptrCast(tp)));
 }
 
 /// Create a new exception type `module.name` deriving from `base` (or Exception

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator
 from typing import Final, Literal, TypeVar, final, overload
 
 from typing_extensions import disjoint_base
@@ -31,10 +31,11 @@ def parse_datagram_header(datagram: bytes, /) -> DatagramHeader:
     """
 
 @final
-class HeaderBlock(Sequence[tuple[bytes, bytes]]):
+class HeaderBlock:
     """A packed, immutable view of HTTP/1 header fields with lazy access."""
 
     def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[tuple[bytes, bytes]]: ...
     @overload
     def __getitem__(self, index: int, /) -> tuple[bytes, bytes]: ...
     @overload

@@ -34,6 +34,13 @@ WORKLOADS = {
 Runner = Callable[[int], None]
 
 
+def positive_int(raw: str) -> int:
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def base_scope() -> dict[str, object]:
     return {
         "type": "http",
@@ -205,8 +212,8 @@ def benchmark(name: str, raw: bytes, iterations: int, repeats: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--iterations", type=int, default=50_000)
-    parser.add_argument("--repeats", type=int, default=11)
+    parser.add_argument("--iterations", type=positive_int, default=50_000)
+    parser.add_argument("--repeats", type=positive_int, default=11)
     parser.add_argument("--only", choices=WORKLOADS, default=None)
     args = parser.parse_args()
 

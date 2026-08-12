@@ -24,6 +24,13 @@ WORKLOADS = {
 }
 
 
+def positive_int(raw: str) -> int:
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 class FrameworkRequest:
     """Small stand-in for a framework request built from a parser event."""
 
@@ -57,6 +64,35 @@ def consume(event: zttp.Request, operation: str) -> object:
     if operation == "framework":
         return FrameworkRequest(event)
     raise AssertionError(operation)
+
+
+def comparable(result: object) -> object:
+    if isinstance(result, zttp.Request):
+        return (
+            result.method,
+            result.target,
+            result.path,
+            result.query,
+            result.http_version,
+            tuple(result.headers),
+        )
+    if isinstance(result, FrameworkRequest):
+        return (
+            result.method,
+            result.target,
+            result.path,
+            result.query,
+            result.http_version,
+            result.headers,
+        )
+    return result
+
+
+def result_once(raw: bytes, *, lazy: bool, operation: str) -> object:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(raw)
+    event = conn.next_event() if lazy else getattr(conn, "_next_event_eager_for_benchmark")()
+    return comparable(consume(event, operation))
 
 
 def make_runner(raw: bytes, *, lazy: bool, operation: str) -> Callable[[int], None]:
@@ -94,8 +130,8 @@ def measure(run: Callable[[int], None], iterations: int, repeats: int) -> list[f
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--iterations", type=int, default=100_000)
-    parser.add_argument("--repeats", type=int, default=11)
+    parser.add_argument("--iterations", type=positive_int, default=100_000)
+    parser.add_argument("--repeats", type=positive_int, default=11)
     parser.add_argument("--only", choices=WORKLOADS, default=None)
     args = parser.parse_args()
 
@@ -106,9 +142,10 @@ def main() -> None:
         for operation in operations:
             eager_run = make_runner(raw, lazy=False, operation=operation)
             lazy_run = make_runner(raw, lazy=True, operation=operation)
-            # Correctness guard outside the timed loop.
-            eager_run(1)
-            lazy_run(1)
+            eager_result = result_once(raw, lazy=False, operation=operation)
+            lazy_result = result_once(raw, lazy=True, operation=operation)
+            if eager_result != lazy_result:
+                raise AssertionError(f"{workload} {operation}: packed result differs from eager result")
             eager = statistics.median(measure(eager_run, args.iterations, args.repeats))
             lazy = statistics.median(measure(lazy_run, args.iterations, args.repeats))
             print(f"{workload:<9} {operation:<11} {eager:10.1f} {lazy:10.1f} {eager / lazy:8.2f}x")

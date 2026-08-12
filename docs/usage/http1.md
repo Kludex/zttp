@@ -75,8 +75,9 @@ print(request.headers)
 ### Headers
 
 HTTP/1 request and response headers are an immutable `HeaderBlock`. It preserves
-wire order and duplicate fields, supports normal sequence operations, and owns
-its bytes, so it remains valid after the connection advances:
+wire order and duplicate fields, supports `len()`, integer indexing, slicing,
+and iteration, and owns its bytes, so it remains valid after the connection
+advances:
 
 ```python
 request.headers[0]                 # (b"Host", b"example.com")
@@ -88,6 +89,8 @@ list(request.headers)              # materialize all (name, value) pairs
 Prefer `get()` / `getall()` when you only need selected fields. zttp keeps the
 block packed until accessed, avoiding a Python bytes object and tuple for every
 header. Use `to_list()` when an integration specifically needs a mutable list.
+`EndOfMessage.trailers` is unaffected and remains a plain list of `(name, value)`
+pairs.
 
 ### Chunked transfer encoding
 

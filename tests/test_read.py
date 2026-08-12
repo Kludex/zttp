@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import gc
+import sys
+
 import pytest
 
 import zttp
@@ -75,10 +78,17 @@ def test_headers_are_owned_and_sequence_compatible() -> None:
     assert req.headers[::-1] == [(b"X-Test", b"b"), (b"X-Test", b"a"), (b"Host", b"first")]
     assert req.headers.get(b"HOST") == b"first"
     assert req.headers.getall(b"x-test") == [b"a", b"b"]
+    assert req.headers.getall(b"absent") == []
     marker = object()
     assert req.headers.get(b"missing", marker) is marker
     assert list(req.headers) == [(b"Host", b"first"), (b"X-Test", b"a"), (b"X-Test", b"b")]
     assert req.headers.to_list() == list(req.headers)
+    assert req.headers == req.headers.to_list()
+    assert repr(req.headers) == repr(req.headers.to_list())
+    with pytest.raises(IndexError, match="header index out of range"):
+        req.headers[3]
+    with pytest.raises(TypeError, match="header indices must be integers or slices"):
+        req.headers[b"Host"]  # type: ignore[index]
     assert req.headers.to_list(lowercase_names=True) == [
         (b"host", b"first"),
         (b"x-test", b"a"),
@@ -91,6 +101,23 @@ def test_headers_are_owned_and_sequence_compatible() -> None:
     conn.receive_data(b"GET /two HTTP/1.1\r\nHost: second\r\n\r\n")
     conn.next_event()
     assert req.headers.get(b"host") == b"first"
+
+
+def test_header_block_releases_its_heap_type_reference() -> None:
+    def create_blocks() -> None:
+        for _ in range(100):
+            conn = zttp.Connection(zttp.SERVER)
+            conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            conn.next_event().headers
+
+    # Warm any interpreter-level caches before measuring the type reference.
+    create_blocks()
+    gc.collect()
+    before = sys.getrefcount(zttp.HeaderBlock)
+    create_blocks()
+    gc.collect()
+    after = sys.getrefcount(zttp.HeaderBlock)
+    assert after == before
 
 
 def test_h1_headers_are_immutable_by_default() -> None:

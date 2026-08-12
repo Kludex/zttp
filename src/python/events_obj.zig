@@ -674,6 +674,13 @@ fn headerNameEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+fn headerNameIsLowercase(name: []const u8) bool {
+    for (name) |ch| {
+        if (std.ascii.isUpper(ch)) return false;
+    }
+    return true;
+}
+
 fn headerRanges(self: *HeaderBlockObject) [*]HeaderRange {
     return @ptrFromInt(@intFromPtr(self) + @sizeOf(HeaderBlockObject));
 }
@@ -700,7 +707,7 @@ fn lowerHeaderName(name: []const u8) py.Object {
     switch (name.len) {
         inline 3...25 => |L| {
             inline for (INTERNED_NAMES, 0..) |candidate, i| {
-                if (comptime candidate.len == L and std.ascii.isLower(candidate[0])) {
+                if (comptime candidate.len == L and headerNameIsLowercase(candidate)) {
                     if (headerNameEql(name, candidate)) return py.newRef(interned[i]);
                 }
             }
@@ -806,6 +813,10 @@ fn headerBlockItem(obj: ?*c.PyObject, raw_idx: py.ssize) callconv(.c) py.Object 
         return null;
     }
     return headerPair(self, @intCast(idx), false);
+}
+
+fn headerBlockIter(obj: ?*c.PyObject) callconv(.c) py.Object {
+    return c.PySeqIter_New(obj);
 }
 
 fn headerBlockSubscript(obj: ?*c.PyObject, key: ?*c.PyObject) callconv(.c) py.Object {
@@ -941,6 +952,7 @@ var header_block_slots = [_]py.Slot{
     .{ .slot = c.Py_tp_richcompare, .pfunc = @ptrCast(@constCast(&headerBlockCmp)) },
     .{ .slot = c.Py_sq_length, .pfunc = @ptrCast(@constCast(&headerBlockLen)) },
     .{ .slot = c.Py_sq_item, .pfunc = @ptrCast(@constCast(&headerBlockItem)) },
+    .{ .slot = c.Py_tp_iter, .pfunc = @ptrCast(@constCast(&headerBlockIter)) },
     .{ .slot = c.Py_mp_subscript, .pfunc = @ptrCast(@constCast(&headerBlockSubscript)) },
     .{ .slot = 0, .pfunc = null },
 };
