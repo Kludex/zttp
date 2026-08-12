@@ -32,7 +32,7 @@ def parse_datagram_header(datagram: bytes, /) -> DatagramHeader:
 
 @final
 class HeaderBlock:
-    """A packed, immutable view of HTTP/1 header fields with lazy access."""
+    """An immutable view of HTTP/1 header fields with lazy access."""
 
     def __len__(self) -> int: ...
     def __iter__(self) -> Iterator[tuple[bytes, bytes]]: ...

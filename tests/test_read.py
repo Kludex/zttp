@@ -96,12 +96,42 @@ def test_headers_are_owned_and_sequence_compatible() -> None:
         (b"x-test", b"b"),
     ]
 
-    # The view owns its packed bytes; a later receive/cycle cannot invalidate it.
+    # The view owns its backing bytes; a later receive/cycle cannot invalidate it.
     conn.next_event()
     conn.start_next_cycle()
     conn.receive_data(b"GET /two HTTP/1.1\r\nHost: second\r\n\r\n")
     conn.next_event()
     assert req.headers.get(b"host") == b"first"
+
+
+def test_complete_request_head_backs_lazy_headers() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    raw = b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Test: value\r\n\r\n"
+    refs = sys.getrefcount(raw)
+
+    conn.receive_data(raw)
+    assert sys.getrefcount(raw) == refs + 1
+    request = conn.next_event()
+    assert request.headers == [(b"Host", b"example.com"), (b"X-Test", b"value")]
+    # The connection hands its retained reference to HeaderBlock rather than
+    # allocating and copying a separate packed header bytes object.
+    assert sys.getrefcount(raw) == refs + 1
+
+    del request
+    assert sys.getrefcount(raw) == refs
+
+
+def test_pipelined_input_is_not_retained_for_one_header_block() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    raw = b"GET /one HTTP/1.1\r\nHost: first\r\n\r\nGET /two HTTP/1.1\r\nHost: second\r\n\r\n"
+    refs = sys.getrefcount(raw)
+
+    conn.receive_data(raw)
+    request = conn.next_event()
+    assert request.headers.get(b"host") == b"first"
+    # Retaining this object would make the first HeaderBlock pin the following
+    # pipelined request as well, so this input remains on the packed-copy path.
+    assert sys.getrefcount(raw) == refs
 
 
 def test_header_block_releases_its_heap_type_reference() -> None:

@@ -1,8 +1,9 @@
 //! Python event objects mirroring the core's events: Request, Response, Data,
 //! EndOfMessage, plus the NEED_DATA / PAUSED singletons. Each is a small heap
 //! type whose attributes own copied data from the core's buffer slices, so they
-//! outlive the next receive_data call. HTTP/1 heads use one packed HeaderBlock;
-//! individual Python header pairs are materialised only when accessed.
+//! outlive the next receive_data call. HTTP/1 heads use one backing bytes object
+//! per HeaderBlock (the received object itself when possible); individual Python
+//! header pairs are materialised only when accessed.
 
 const std = @import("std");
 const py = @import("py.zig");
@@ -801,6 +802,43 @@ fn buildHeaderBlock(hdrs: []const events.Header) py.Object {
     return obj;
 }
 
+/// Build the lazy ranges over the Python bytes object that carried an exact,
+/// complete HTTP/1 request head. The core parsed a private copy, so
+/// `parsed_base` maps offsets in that copy back onto the byte-identical Python
+/// object without retaining the Reader's mutable buffer.
+fn buildBorrowedHeaderBlock(hdrs: []const events.Header, data_obj: py.Object, parsed_base: [*]const u8) py.Object {
+    const data = py.asBytes(data_obj) orelse return null;
+    const base = @intFromPtr(parsed_base);
+    const limit = base + data.len;
+    for (hdrs) |h| {
+        const name = @intFromPtr(h.name.ptr);
+        const value = @intFromPtr(h.value.ptr);
+        // Fall back defensively if a future Reader stores a transformed header
+        // outside the raw request-head span.
+        if (name < base or name + h.name.len > limit or value < base or value + h.value.len > limit) {
+            return buildHeaderBlock(hdrs);
+        }
+    }
+
+    const tp: [*c]c.PyTypeObject = @ptrCast(header_block_type);
+    const obj = tp.*.tp_alloc.?(tp, @intCast(hdrs.len));
+    if (obj == null) return null;
+    const self: *HeaderBlockObject = @ptrCast(obj);
+    self.data = py.newRef(data_obj);
+    self.count = hdrs.len;
+    const ranges = headerRanges(self);
+    for (hdrs, 0..) |h, i| {
+        ranges[i] = .{
+            .name_offset = @intCast(@intFromPtr(h.name.ptr) - base),
+            .name_len = @intCast(h.name.len),
+            .value_offset = @intCast(@intFromPtr(h.value.ptr) - base),
+            .value_len = @intCast(h.value.len),
+            .hash = headerHash(h.name),
+        };
+    }
+    return obj;
+}
+
 fn headerBlockLen(obj: ?*c.PyObject) callconv(.c) py.ssize {
     const self: *HeaderBlockObject = @ptrCast(obj.?);
     return @intCast(self.count);
@@ -985,10 +1023,16 @@ pub fn fromH1Event(ev: events.H1Event) py.Object {
 /// HeaderBlock while every other event keeps its normal shape.
 pub fn fromH1EventWithHeaderBlock(ev: events.H1Event) py.Object {
     return switch (ev) {
-        .request => |r| makeRequestImpl(r, true),
+        .request => |r| makeRequestImpl(r, true, null),
         .response => |r| makeResponseImpl(r, true),
         else => fromH1Event(ev),
     };
+}
+
+/// Complete HTTP/1 request-head fast path: the HeaderBlock retains the exact
+/// bytes passed to receive_data and indexes its fields in place.
+pub fn fromH1RequestWithBorrowedHeaderBlock(r: events.Request, data_obj: py.Object) py.Object {
+    return makeRequestImpl(r, true, data_obj);
 }
 
 pub fn fromH2Event(ev: events.H2Event) py.Object {
@@ -1041,10 +1085,10 @@ fn u32Obj(v: u32) py.Object {
 }
 
 fn makeRequest(r: events.Request) py.Object {
-    return makeRequestImpl(r, false);
+    return makeRequestImpl(r, false, null);
 }
 
-fn makeRequestImpl(r: events.Request, lazy_headers: bool) py.Object {
+fn makeRequestImpl(r: events.Request, lazy_headers: bool, borrowed_head: py.Object) py.Object {
     const o = py.allocInstance(request_type);
     if (o == null) return null;
     const s: *RequestObject = @ptrCast(o);
@@ -1058,7 +1102,12 @@ fn makeRequestImpl(r: events.Request, lazy_headers: bool) py.Object {
         py.fromBytes(r.path);
     s.query = if (r.query.len == 0) py.newRef(empty_bytes) else py.fromBytes(r.query);
     s.http_version = internFrom(&INTERNED_VERSIONS, &interned_versions, r.http_version) orelse py.fromBytes(r.http_version);
-    s.headers = if (lazy_headers) buildHeaderBlock(r.headers) else buildHeaders(r.headers);
+    s.headers = if (borrowed_head != null)
+        buildBorrowedHeaderBlock(r.headers, borrowed_head, r.method.ptr)
+    else if (lazy_headers)
+        buildHeaderBlock(r.headers)
+    else
+        buildHeaders(r.headers);
     s.stream_id = r.stream_id;
     s.expect_continue = @intFromBool(r.expect_continue);
     s.end_stream = @intFromBool(r.end_stream);

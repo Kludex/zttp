@@ -127,6 +127,7 @@ const H1Engine = struct {
     /// Embedded by value: the engine is one allocation, so constructing a
     /// Connection does not pay a separate heap allocation for the Reader.
     reader: Reader,
+    role: Role,
     /// Created on the first send_* call: server connections that only parse
     /// never pay the Writer's allocation.
     writer: ?*Writer = null,
@@ -153,6 +154,10 @@ const H1Engine = struct {
     /// events straight from it. `pending` is the not-yet-consumed remainder.
     pending_obj: py.Object = null,
     pending: []const u8 = &.{},
+    /// Exact Python bytes object for a complete request head received on an
+    /// otherwise-empty server parser. The resulting HeaderBlock retains it and
+    /// indexes header fields in place instead of packing a second bytes object.
+    head_obj: py.Object = null,
 
     fn rememberMethod(self: *H1Engine, m: []const u8) void {
         if (m.len > self.req_method.len) {
@@ -193,6 +198,16 @@ const H1Engine = struct {
         self.pending = &.{};
     }
 
+    fn retainHead(self: *H1Engine, obj: py.Object) void {
+        py.xdecref(self.head_obj);
+        self.head_obj = py.newRef(obj);
+    }
+
+    fn dropHead(self: *H1Engine) void {
+        py.xdecref(self.head_obj);
+        self.head_obj = null;
+    }
+
     /// Move the stashed remainder into the reader's own buffer (the slow path
     /// the stash bypassed). Returns false with a Python error set on failure.
     fn flushPending(self: *H1Engine) bool {
@@ -224,10 +239,24 @@ const H1Engine = struct {
                 self.stash(obj, data) catch |err| return exceptions.raiseParse(err);
                 return py.none();
             }
-            if (data.len >= head_split_min_feed and self.reader.atMessageStart()) {
+            if (self.reader.atMessageStart()) {
                 if (core.h1.reader.findHeadEnd(data)) |head_end| {
-                    self.reader.checkBufferLimit(data.len) catch |err| return exceptions.raiseParse(err);
-                    self.reader.feed(data[0..head_end]) catch |err| return exceptions.raiseParse(err);
+                    if (self.role == .server and head_end == data.len) self.retainHead(obj);
+                    if (data.len < head_split_min_feed) {
+                        self.reader.feed(data) catch |err| {
+                            self.dropHead();
+                            return exceptions.raiseParse(err);
+                        };
+                        return py.none();
+                    }
+                    self.reader.checkBufferLimit(data.len) catch |err| {
+                        self.dropHead();
+                        return exceptions.raiseParse(err);
+                    };
+                    self.reader.feed(data[0..head_end]) catch |err| {
+                        self.dropHead();
+                        return exceptions.raiseParse(err);
+                    };
                     if (head_end < data.len) self.stash(obj, data[head_end..]) catch |err| return exceptions.raiseParse(err);
                     return py.none();
                 }
@@ -245,6 +274,7 @@ const H1Engine = struct {
         }
         py.xdecref(self.upgrade_obj);
         py.xdecref(self.pending_obj);
+        py.xdecref(self.head_obj);
     }
 };
 
@@ -1768,7 +1798,7 @@ fn buildEngine(engine: *Engine, role: Role, protocol_val: c_long) bool {
         return true;
     }
 
-    engine.* = .{ .h1 = .{ .reader = Reader.init(gpa, role) } };
+    engine.* = .{ .h1 = .{ .reader = Reader.init(gpa, role), .role = role } };
     return true;
 }
 
@@ -1853,6 +1883,7 @@ fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
             while (true) {
                 const ev = e.reader.nextEvent() catch |err| {
                     e.dropPending();
+                    e.dropHead();
                     // req_method survives start_next_cycle by design. Clear it ONLY
                     // when the failure is on a fresh request head (no request
                     // surfaced this cycle): otherwise an error response the app sends
@@ -1915,10 +1946,14 @@ fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
                     // its response does not take that back.
                     e.should_close = e.should_close or e.reader.shouldClose();
                 }
-                return if (eager_headers)
+                const out = if (eager_headers)
                     events_obj.fromH1Event(ev)
+                else if (ev == .request and e.head_obj != null)
+                    events_obj.fromH1RequestWithBorrowedHeaderBlock(ev.request, e.head_obj)
                 else
                     events_obj.fromH1EventWithHeaderBlock(ev);
+                if (ev == .request) e.dropHead();
+                return out;
             }
         },
     }

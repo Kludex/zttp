@@ -95,9 +95,10 @@ request.headers.getall(b"x-tag")  # every matching value, in wire order
 list(request.headers)              # materialize all (name, value) pairs
 ```
 
-Prefer `get()` / `getall()` when you only need selected fields. zttp keeps the
-block packed until accessed, avoiding a Python bytes object and tuple for every
-header. Use `to_list()` when an integration specifically needs a mutable list.
+Prefer `get()` / `getall()` when you only need selected fields. zttp keeps one
+backing bytes object and borrows the exact received request head when possible,
+avoiding a Python bytes object and tuple for every header. Use `to_list()` when
+an integration specifically needs a mutable list.
 `EndOfMessage.trailers` is unaffected and remains a plain list of `(name, value)`
 pairs.
 
