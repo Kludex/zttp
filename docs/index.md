@@ -99,7 +99,7 @@ Run it:
 $ python parse.py
 
 b'GET' b'/hello?name=you'
-EndOfMessage(trailers=[])
+True
 ```
 
 That's it. The buffering, the header parsing, the body framing: all Zig. 🎉

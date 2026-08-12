@@ -941,9 +941,9 @@ pub const Connection = struct {
         };
 
         // The upgraded stream-1 request is surfaced as complete and bodyless (any
-        // body belonged to the H1 exchange, which is over). A non-zero declared
-        // A non-zero Content-Length would make this complete Request a smuggling
-        // lie, so reject it here.
+        // body belonged to the H1 exchange, which is over). A non-zero
+        // Content-Length would make this complete Request a smuggling lie, so
+        // reject it here.
         if (req.content_length) |cl| {
             if (cl != 0) return error.Malformed;
         }

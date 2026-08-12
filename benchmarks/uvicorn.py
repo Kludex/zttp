@@ -153,9 +153,12 @@ def make_zttp(raw: bytes, *, packed: bool) -> Runner:
                 event = getattr(conn, "_next_event_eager_for_benchmark")()
             scope = scope_from_zttp(event)
             if not getattr(event, "end_stream", False):
-                terminal = conn.next_event()
-                if not isinstance(terminal, zttp.EndOfMessage):
-                    raise AssertionError("incomplete request")
+                while True:
+                    terminal = conn.next_event()
+                    if isinstance(terminal, zttp.EndOfMessage):
+                        break
+                    if not isinstance(terminal, zttp.Data):
+                        raise AssertionError("incomplete request")
         if scope is None:
             raise AssertionError("missing scope")
 
@@ -173,9 +176,12 @@ def verify(raw: bytes) -> None:
     request = conn.next_event()
     packed_scope = scope_from_zttp(request)
     if not getattr(request, "end_stream", False):
-        terminal = conn.next_event()
-        if not isinstance(terminal, zttp.EndOfMessage):
-            raise AssertionError("zttp did not complete the request")
+        while True:
+            terminal = conn.next_event()
+            if isinstance(terminal, zttp.EndOfMessage):
+                break
+            if not isinstance(terminal, zttp.Data):
+                raise AssertionError("zttp did not complete the request")
     if packed_scope != protocol.scope:
         raise AssertionError(f"zttp scope differs from Uvicorn: {packed_scope!r} != {protocol.scope!r}")
 

@@ -171,7 +171,7 @@ def events(conn):
         if event is zttp.NEED_DATA:
             return
         yield event
-        if isinstance(event, zttp.EndOfMessage) or isinstance(event, zttp.Request) and event.end_stream:
+        if isinstance(event, zttp.EndOfMessage) or (isinstance(event, zttp.Request) and event.end_stream):
             return
 ```
 
