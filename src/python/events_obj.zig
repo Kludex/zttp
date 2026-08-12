@@ -1,7 +1,8 @@
 //! Python event objects mirroring the core's events: Request, Response, Data,
 //! EndOfMessage, plus the NEED_DATA / PAUSED singletons. Each is a small heap
-//! type whose attributes are plain Python objects materialised (copied) from the
-//! core's buffer slices, so they outlive the next receive_data call.
+//! type whose attributes own copied data from the core's buffer slices, so they
+//! outlive the next receive_data call. HTTP/1 heads use one packed HeaderBlock;
+//! individual Python header pairs are materialised only when accessed.
 
 const std = @import("std");
 const py = @import("py.zig");
@@ -47,6 +48,23 @@ const EndOfMessageObject = extern struct {
     stream_id: c_ulonglong,
 };
 
+/// Lazy header container. One Python bytes object owns all header bytes; compact
+/// native ranges describe the fields. Python bytes/tuples are created only for
+/// fields the caller actually touches.
+const HeaderBlockObject = extern struct {
+    ob_base: c.PyVarObject,
+    data: py.Object,
+    count: usize,
+};
+
+const HeaderRange = extern struct {
+    name_offset: u32,
+    name_len: u32,
+    value_offset: u32,
+    value_len: u32,
+    hash: u8,
+};
+
 // The five HTTP/2 control events. Each holds plain Python ints/bytes.
 
 const RstStreamObject = extern struct {
@@ -88,6 +106,7 @@ var goaway_type: py.Object = null;
 var settings_type: py.Object = null;
 var ping_type: py.Object = null;
 var window_update_type: py.Object = null;
+var header_block_type: py.Object = null;
 /// The two terminal sentinels: NEED_DATA (no event yet) and CONNECTION_CLOSED
 /// (the peer closed). Each is a unique instance compared with `is`; its bare
 /// type (NeedData / ConnectionClosed) is exposed so the Event union can name it.
@@ -421,7 +440,9 @@ var window_update_spec = spec("zttp.WindowUpdate", @sizeOf(WindowUpdateObject), 
 // header cost. The common request header names are a small, fixed set, so we
 // pre-build one PyBytes each at module init and hand back a new reference when a
 // parsed name matches EXACTLY (wire casing included - so observable output is
-// unchanged; a differently-cased name simply misses the cache and allocates).
+// unchanged). HTTP/1 clients commonly send either conventional casing or all
+// lowercase, so cache both spellings rather than making lowercase-heavy traffic
+// pay for a fresh bytes allocation on every request.
 const INTERNED_NAMES = [_][]const u8{
     "Host",
     "User-Agent",
@@ -450,6 +471,33 @@ const INTERNED_NAMES = [_][]const u8{
     "X-Forwarded-Proto",
     "X-Real-IP",
     "Transfer-Encoding",
+    "host",
+    "user-agent",
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "connection",
+    "content-type",
+    "content-length",
+    "cookie",
+    "authorization",
+    "referer",
+    "cache-control",
+    "origin",
+    "sec-fetch-site",
+    "sec-fetch-mode",
+    "sec-fetch-dest",
+    "upgrade-insecure-requests",
+    "if-none-match",
+    "if-modified-since",
+    "range",
+    "pragma",
+    "dnt",
+    "x-requested-with",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "transfer-encoding",
 };
 
 // The same trick for header values: the values of the connection-management
@@ -553,6 +601,7 @@ fn internFrom(comptime table: []const []const u8, cache: *const [table.len]py.Ob
 /// via a comptime switch, so each call compares only against the interned names
 /// that share `name`'s length - keeping both hit and miss paths cheap.
 fn internName(name: []const u8) ?py.Object {
+    @setEvalBranchQuota(3000);
     switch (name.len) {
         inline 3...25 => |L| {
             inline for (INTERNED_NAMES, 0..) |cand, i| {
@@ -609,6 +658,314 @@ fn buildHeaders(hdrs: []const events.Header) py.Object {
     return list;
 }
 
+// -- lazy header block -------------------------------------------------------
+
+fn headerHash(name: []const u8) u8 {
+    var hash: u8 = 0x9d;
+    for (name) |ch| hash = hash *% 33 +% std.ascii.toLower(ch);
+    return hash;
+}
+
+fn headerNameEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
+fn headerNameIsLowercase(name: []const u8) bool {
+    for (name) |ch| {
+        if (std.ascii.isUpper(ch)) return false;
+    }
+    return true;
+}
+
+fn headerRanges(self: *HeaderBlockObject) [*]HeaderRange {
+    return @ptrFromInt(@intFromPtr(self) + @sizeOf(HeaderBlockObject));
+}
+
+fn headerData(self: *HeaderBlockObject) ?[]const u8 {
+    return py.asBytes(self.data);
+}
+
+fn headerName(data: []const u8, range: HeaderRange) []const u8 {
+    const start: usize = range.name_offset;
+    return data[start .. start + range.name_len];
+}
+
+fn headerValue(data: []const u8, range: HeaderRange) []const u8 {
+    const start: usize = range.value_offset;
+    return data[start .. start + range.value_len];
+}
+
+fn lowerHeaderName(name: []const u8) py.Object {
+    // Reuse the lowercase half of the common-name cache where possible.  ASGI
+    // servers require lowercase names, so adapters can materialize their scope
+    // without a Python callback and bytes.lower() call for every header.
+    @setEvalBranchQuota(3000);
+    switch (name.len) {
+        inline 3...25 => |L| {
+            inline for (INTERNED_NAMES, 0..) |candidate, i| {
+                if (comptime candidate.len == L and headerNameIsLowercase(candidate)) {
+                    if (headerNameEql(name, candidate)) return py.newRef(interned[i]);
+                }
+            }
+        },
+        else => {},
+    }
+
+    const result = c.PyBytes_FromStringAndSize(null, @intCast(name.len));
+    if (result == null) return null;
+    const dst: [*]u8 = @ptrCast(c.PyBytes_AsString(result));
+    for (name, 0..) |ch, i| dst[i] = std.ascii.toLower(ch);
+    return result;
+}
+
+fn headerPair(self: *HeaderBlockObject, idx: usize, lowercase_name: bool) py.Object {
+    const data = headerData(self) orelse return null;
+    const range = headerRanges(self)[idx];
+    const name_bytes = headerName(data, range);
+    const value_bytes = headerValue(data, range);
+    const name = if (lowercase_name)
+        lowerHeaderName(name_bytes)
+    else
+        internName(name_bytes) orelse py.fromBytes(name_bytes);
+    const value = internValue(value_bytes) orelse py.fromBytes(value_bytes);
+    if (name == null or value == null) {
+        py.xdecref(name);
+        py.xdecref(value);
+        return null;
+    }
+    const pair = py.tupleNew(2);
+    if (pair == null) {
+        py.decref(name);
+        py.decref(value);
+        return null;
+    }
+    py.tupleSet(pair, 0, name);
+    py.tupleSet(pair, 1, value);
+    return pair;
+}
+
+fn materializeHeaderBlock(self: *HeaderBlockObject, lowercase_names: bool) py.Object {
+    const list = py.newList(@intCast(self.count));
+    if (list == null) return null;
+    for (0..self.count) |i| {
+        const pair = headerPair(self, i, lowercase_names);
+        if (pair == null) {
+            py.decref(list);
+            return null;
+        }
+        py.listSet(list, @intCast(i), pair);
+    }
+    return list;
+}
+
+fn buildHeaderBlock(hdrs: []const events.Header) py.Object {
+    const tp: [*c]c.PyTypeObject = @ptrCast(header_block_type);
+    const obj = tp.*.tp_alloc.?(tp, @intCast(hdrs.len));
+    if (obj == null) return null;
+    const self: *HeaderBlockObject = @ptrCast(obj);
+    self.data = null;
+    self.count = hdrs.len;
+
+    var total: usize = 0;
+    for (hdrs) |h| total += h.name.len + h.value.len;
+    const data_obj = c.PyBytes_FromStringAndSize(null, @intCast(total));
+    if (data_obj == null) {
+        py.decref(obj);
+        return null;
+    }
+    self.data = data_obj;
+    const dst: [*]u8 = @ptrCast(c.PyBytes_AsString(data_obj));
+    const ranges = headerRanges(self);
+    var offset: usize = 0;
+    for (hdrs, 0..) |h, i| {
+        const name_offset = offset;
+        @memcpy(dst[offset .. offset + h.name.len], h.name);
+        offset += h.name.len;
+        const value_offset = offset;
+        @memcpy(dst[offset .. offset + h.value.len], h.value);
+        offset += h.value.len;
+        ranges[i] = .{
+            .name_offset = @intCast(name_offset),
+            .name_len = @intCast(h.name.len),
+            .value_offset = @intCast(value_offset),
+            .value_len = @intCast(h.value.len),
+            .hash = headerHash(h.name),
+        };
+    }
+    return obj;
+}
+
+fn headerBlockLen(obj: ?*c.PyObject) callconv(.c) py.ssize {
+    const self: *HeaderBlockObject = @ptrCast(obj.?);
+    return @intCast(self.count);
+}
+
+fn headerBlockItem(obj: ?*c.PyObject, raw_idx: py.ssize) callconv(.c) py.Object {
+    const self: *HeaderBlockObject = @ptrCast(obj.?);
+    var idx = raw_idx;
+    if (idx < 0) idx += @intCast(self.count);
+    if (idx < 0 or idx >= self.count) {
+        c.PyErr_SetString(c.PyExc_IndexError, "header index out of range");
+        return null;
+    }
+    return headerPair(self, @intCast(idx), false);
+}
+
+fn headerBlockIter(obj: ?*c.PyObject) callconv(.c) py.Object {
+    return c.PySeqIter_New(obj);
+}
+
+fn headerBlockSubscript(obj: ?*c.PyObject, key: ?*c.PyObject) callconv(.c) py.Object {
+    if (c.PyIndex_Check(key) != 0) {
+        const index_obj = c.PyNumber_Index(key);
+        if (index_obj == null) return null;
+        defer py.decref(index_obj);
+        const idx = c.PyLong_AsSsize_t(index_obj);
+        if (idx == -1 and py.errOccurred()) return null;
+        return headerBlockItem(obj, idx);
+    }
+    // PySlice_Check expands through _PyObject_CAST_CONST on CPython 3.10;
+    // translate-c cannot lower that macro. Exact type comparison is sufficient
+    // because slice is final and keeps the extension buildable on 3.10.
+    if (@intFromPtr(c.Py_TYPE(key)) == @intFromPtr(&c.PySlice_Type)) {
+        const self: *HeaderBlockObject = @ptrCast(obj.?);
+        var start: py.ssize = 0;
+        var stop: py.ssize = 0;
+        var step: py.ssize = 0;
+        if (c.PySlice_Unpack(key, &start, &stop, &step) != 0) return null;
+        const slice_len = c.PySlice_AdjustIndices(@intCast(self.count), &start, &stop, step);
+        const list = py.newList(slice_len);
+        if (list == null) return null;
+        var idx = start;
+        for (0..@intCast(slice_len)) |out_idx| {
+            const pair = headerPair(self, @intCast(idx), false);
+            if (pair == null) {
+                py.decref(list);
+                return null;
+            }
+            py.listSet(list, @intCast(out_idx), pair);
+            idx += step;
+        }
+        return list;
+    }
+    return py.raiseType("header indices must be integers or slices");
+}
+
+fn headerBlockGet(obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *HeaderBlockObject = @ptrCast(obj.?);
+    var name_obj: py.Object = null;
+    var default_obj: py.Object = null;
+    if (c.PyArg_ParseTuple(args, "O|O", &name_obj, &default_obj) == 0) return null;
+    const wanted = py.asBytes(name_obj) orelse return null;
+    const wanted_hash = headerHash(wanted);
+    const data = headerData(self) orelse return null;
+    for (headerRanges(self)[0..self.count]) |range| {
+        if (range.hash == wanted_hash and headerNameEql(headerName(data, range), wanted)) {
+            const value = headerValue(data, range);
+            return internValue(value) orelse py.fromBytes(value);
+        }
+    }
+    return if (default_obj == null) py.none() else py.newRef(default_obj);
+}
+
+fn headerBlockGetAll(obj: ?*c.PyObject, name_obj: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *HeaderBlockObject = @ptrCast(obj.?);
+    const wanted = py.asBytes(name_obj) orelse return null;
+    const wanted_hash = headerHash(wanted);
+    const data = headerData(self) orelse return null;
+    var count: usize = 0;
+    for (headerRanges(self)[0..self.count]) |range| {
+        if (range.hash == wanted_hash and headerNameEql(headerName(data, range), wanted)) count += 1;
+    }
+    const list = py.newList(@intCast(count));
+    if (list == null) return null;
+    var out_idx: usize = 0;
+    for (headerRanges(self)[0..self.count]) |range| {
+        if (range.hash == wanted_hash and headerNameEql(headerName(data, range), wanted)) {
+            const value = headerValue(data, range);
+            const value_obj = internValue(value) orelse py.fromBytes(value);
+            if (value_obj == null) {
+                py.decref(list);
+                return null;
+            }
+            py.listSet(list, @intCast(out_idx), value_obj);
+            out_idx += 1;
+        }
+    }
+    return list;
+}
+
+fn headerBlockToList(obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) callconv(.c) py.Object {
+    var lowercase_names: c_int = 0;
+    var kwlist = [_][*c]u8{ @constCast("lowercase_names"), null };
+    if (c.PyArg_ParseTupleAndKeywords(args, kwargs, "|$p", @ptrCast(&kwlist), &lowercase_names) == 0) return null;
+    return materializeHeaderBlock(@ptrCast(obj.?), lowercase_names != 0);
+}
+
+fn headerBlockRepr(obj: ?*c.PyObject) callconv(.c) py.Object {
+    const list = materializeHeaderBlock(@ptrCast(obj.?), false);
+    if (list == null) return null;
+    defer py.decref(list);
+    return c.PyObject_Repr(list);
+}
+
+fn headerBlockCmp(a: ?*c.PyObject, b: ?*c.PyObject, op: c_int) callconv(.c) py.Object {
+    if (op != c.Py_EQ and op != c.Py_NE) return py.newRef(c.Py_NotImplemented());
+    const left = materializeHeaderBlock(@ptrCast(a.?), false);
+    if (left == null) return null;
+    defer py.decref(left);
+    if (c.Py_TYPE(b) == @as([*c]c.PyTypeObject, @ptrCast(header_block_type))) {
+        const right = materializeHeaderBlock(@ptrCast(b.?), false);
+        if (right == null) return null;
+        defer py.decref(right);
+        return c.PyObject_RichCompare(left, right, op);
+    }
+    return c.PyObject_RichCompare(left, b, op);
+}
+
+fn headerBlockDealloc(obj: ?*c.PyObject) callconv(.c) void {
+    const self: *HeaderBlockObject = @ptrCast(obj.?);
+    py.xdecref(self.data);
+    py.freeInstance(@ptrCast(self));
+}
+
+fn headerBlockNew(_: ?*c.PyTypeObject, _: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    return py.raiseType("zttp.HeaderBlock objects are created by HTTP/1 parsing");
+}
+
+var header_block_methods = [_]py.MethodDef{
+    .{ .ml_name = "get", .ml_meth = headerBlockGet, .ml_flags = c.METH_VARARGS, .ml_doc = "Return the first case-insensitive header value, or default." },
+    .{ .ml_name = "getall", .ml_meth = headerBlockGetAll, .ml_flags = c.METH_O, .ml_doc = "Return all values for a case-insensitive header name." },
+    .{ .ml_name = "to_list", .ml_meth = @ptrCast(&headerBlockToList), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Materialize the fields, optionally with lowercase names." },
+    .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
+};
+
+var header_block_slots = [_]py.Slot{
+    .{ .slot = c.Py_tp_new, .pfunc = @ptrCast(@constCast(&headerBlockNew)) },
+    .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&headerBlockDealloc)) },
+    .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&header_block_methods) },
+    .{ .slot = c.Py_tp_repr, .pfunc = @ptrCast(@constCast(&headerBlockRepr)) },
+    .{ .slot = c.Py_tp_richcompare, .pfunc = @ptrCast(@constCast(&headerBlockCmp)) },
+    .{ .slot = c.Py_sq_length, .pfunc = @ptrCast(@constCast(&headerBlockLen)) },
+    .{ .slot = c.Py_sq_item, .pfunc = @ptrCast(@constCast(&headerBlockItem)) },
+    .{ .slot = c.Py_tp_iter, .pfunc = @ptrCast(@constCast(&headerBlockIter)) },
+    .{ .slot = c.Py_mp_subscript, .pfunc = @ptrCast(@constCast(&headerBlockSubscript)) },
+    .{ .slot = 0, .pfunc = null },
+};
+
+var header_block_spec = py.Spec{
+    .name = "zttp.HeaderBlock",
+    .basicsize = @sizeOf(HeaderBlockObject),
+    .itemsize = @sizeOf(HeaderRange),
+    .flags = c.Py_TPFLAGS_DEFAULT |
+        (if (@hasDecl(c, "Py_TPFLAGS_ITEMS_AT_END")) c.Py_TPFLAGS_ITEMS_AT_END else 0),
+    .slots = &header_block_slots,
+};
+
 // -- constructors from core events --------------------------------------------
 
 pub fn fromH1Event(ev: events.H1Event) py.Object {
@@ -619,6 +976,16 @@ pub fn fromH1Event(ev: events.H1Event) py.Object {
         .end_of_message => |e| makeEom(e),
         .need_data => py.newRef(need_data),
         .connection_closed => py.newRef(connection_closed),
+    };
+}
+
+/// HTTP/1 conversion path: request/response headers use the packed lazy
+/// HeaderBlock while every other event keeps its normal shape.
+pub fn fromH1EventWithHeaderBlock(ev: events.H1Event) py.Object {
+    return switch (ev) {
+        .request => |r| makeRequestImpl(r, true),
+        .response => |r| makeResponseImpl(r, true),
+        else => fromH1Event(ev),
     };
 }
 
@@ -672,6 +1039,10 @@ fn u32Obj(v: u32) py.Object {
 }
 
 fn makeRequest(r: events.Request) py.Object {
+    return makeRequestImpl(r, false);
+}
+
+fn makeRequestImpl(r: events.Request, lazy_headers: bool) py.Object {
     const o = py.allocInstance(request_type);
     if (o == null) return null;
     const s: *RequestObject = @ptrCast(o);
@@ -685,7 +1056,7 @@ fn makeRequest(r: events.Request) py.Object {
         py.fromBytes(r.path);
     s.query = if (r.query.len == 0) py.newRef(empty_bytes) else py.fromBytes(r.query);
     s.http_version = internFrom(&INTERNED_VERSIONS, &interned_versions, r.http_version) orelse py.fromBytes(r.http_version);
-    s.headers = buildHeaders(r.headers);
+    s.headers = if (lazy_headers) buildHeaderBlock(r.headers) else buildHeaders(r.headers);
     s.stream_id = r.stream_id;
     s.expect_continue = @intFromBool(r.expect_continue);
     if (s.method == null or s.target == null or s.path == null or s.query == null or s.http_version == null or s.headers == null) {
@@ -696,13 +1067,17 @@ fn makeRequest(r: events.Request) py.Object {
 }
 
 fn makeResponse(r: events.Response) py.Object {
+    return makeResponseImpl(r, false);
+}
+
+fn makeResponseImpl(r: events.Response, lazy_headers: bool) py.Object {
     const o = py.allocInstance(response_type);
     if (o == null) return null;
     const s: *ResponseObject = @ptrCast(o);
     s.status_code = py.fromU16(r.status_code);
     s.reason = internFrom(&INTERNED_REASONS, &interned_reasons, r.reason) orelse py.fromBytes(r.reason);
     s.http_version = internFrom(&INTERNED_VERSIONS, &interned_versions, r.http_version) orelse py.fromBytes(r.http_version);
-    s.headers = buildHeaders(r.headers);
+    s.headers = if (lazy_headers) buildHeaderBlock(r.headers) else buildHeaders(r.headers);
     s.stream_id = r.stream_id;
     if (s.status_code == null or s.reason == null or s.http_version == null or s.headers == null) {
         py.decref(o);
@@ -822,6 +1197,7 @@ fn makeWindowUpdate(w: events.WindowUpdate) py.Object {
 // -- registration -------------------------------------------------------------
 
 pub fn register(module: py.Object) bool {
+    header_block_type = py.typeFromSpec(&header_block_spec);
     request_type = py.typeFromSpec(&request_spec);
     response_type = py.typeFromSpec(&response_spec);
     data_type = py.typeFromSpec(&data_spec);
@@ -831,7 +1207,7 @@ pub fn register(module: py.Object) bool {
     settings_type = py.typeFromSpec(&settings_spec);
     ping_type = py.typeFromSpec(&ping_spec);
     window_update_type = py.typeFromSpec(&window_update_spec);
-    if (request_type == null or response_type == null or data_type == null or end_of_message_type == null) {
+    if (header_block_type == null or request_type == null or response_type == null or data_type == null or end_of_message_type == null) {
         return false;
     }
     if (rst_stream_type == null or goaway_type == null or settings_type == null or ping_type == null or window_update_type == null) {
@@ -850,6 +1226,7 @@ pub fn register(module: py.Object) bool {
 
     if (!buildInternTable()) return false;
 
+    _ = c.PyModule_AddObjectRef(module, "HeaderBlock", header_block_type);
     _ = c.PyModule_AddObjectRef(module, "Request", request_type);
     _ = c.PyModule_AddObjectRef(module, "Response", response_type);
     _ = c.PyModule_AddObjectRef(module, "Data", data_type);

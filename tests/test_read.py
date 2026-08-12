@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import gc
+import sys
+
 import pytest
 
 import zttp
@@ -62,6 +65,72 @@ def test_multiple_headers_preserved_in_order() -> None:
     assert req.headers == [(b"A", b"1"), (b"B", b"2"), (b"A", b"3")]
 
 
+def test_headers_are_owned_and_sequence_compatible() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET /one HTTP/1.1\r\nHost: first\r\nX-Test: a\r\nX-Test: b\r\n\r\n")
+    req = conn.next_event()
+
+    assert isinstance(req.headers, zttp.HeaderBlock)
+    assert len(req.headers) == 3
+    assert req.headers[0] == (b"Host", b"first")
+    assert req.headers[-1] == (b"X-Test", b"b")
+    assert req.headers[1:] == [(b"X-Test", b"a"), (b"X-Test", b"b")]
+    assert req.headers[::-1] == [(b"X-Test", b"b"), (b"X-Test", b"a"), (b"Host", b"first")]
+    assert req.headers.get(b"HOST") == b"first"
+    assert req.headers.getall(b"x-test") == [b"a", b"b"]
+    assert req.headers.getall(b"absent") == []
+    marker = object()
+    assert req.headers.get(b"missing", marker) is marker
+    assert list(req.headers) == [(b"Host", b"first"), (b"X-Test", b"a"), (b"X-Test", b"b")]
+    assert req.headers.to_list() == list(req.headers)
+    assert req.headers == req.headers.to_list()
+    assert repr(req.headers) == repr(req.headers.to_list())
+    with pytest.raises(IndexError, match="header index out of range"):
+        req.headers[3]
+    with pytest.raises(TypeError, match="header indices must be integers or slices"):
+        req.headers[b"Host"]  # type: ignore[index]
+    assert req.headers.to_list(lowercase_names=True) == [
+        (b"host", b"first"),
+        (b"x-test", b"a"),
+        (b"x-test", b"b"),
+    ]
+
+    # The view owns its packed bytes; a later receive/cycle cannot invalidate it.
+    conn.next_event()
+    conn.start_next_cycle()
+    conn.receive_data(b"GET /two HTTP/1.1\r\nHost: second\r\n\r\n")
+    conn.next_event()
+    assert req.headers.get(b"host") == b"first"
+
+
+def test_header_block_releases_its_heap_type_reference() -> None:
+    def create_blocks() -> None:
+        for _ in range(100):
+            conn = zttp.Connection(zttp.SERVER)
+            conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            conn.next_event().headers
+
+    # Warm any interpreter-level caches before measuring the type reference.
+    create_blocks()
+    gc.collect()
+    before = sys.getrefcount(zttp.HeaderBlock)
+    create_blocks()
+    gc.collect()
+    after = sys.getrefcount(zttp.HeaderBlock)
+    assert after == before
+
+
+def test_h1_headers_are_immutable_by_default() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    req = conn.next_event()
+    assert isinstance(req.headers, zttp.HeaderBlock)
+    with pytest.raises(AttributeError):
+        req.headers.append((b"X", b"y"))  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="created by HTTP/1 parsing"):
+        zttp.HeaderBlock()  # type: ignore[call-arg]
+
+
 def test_header_value_whitespace_stripped() -> None:
     events = parse_request(b"GET / HTTP/1.1\r\nX:   spaced   \r\n\r\n")
     req = events[0]
@@ -107,6 +176,8 @@ def test_response_parsing() -> None:
     assert resp.status_code == 404
     assert resp.reason == b"Not Found"
     assert resp.http_version == b"1.1"
+    assert isinstance(resp.headers, zttp.HeaderBlock)
+    assert resp.headers.get(b"content-length") == b"3"
     assert conn.next_event().data == b"xyz"
 
 

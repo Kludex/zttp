@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Final, Literal, final, overload
+from collections.abc import Iterator
+from typing import Final, Literal, TypeVar, final, overload
 
 from typing_extensions import disjoint_base
 
@@ -16,6 +17,8 @@ HTTP1: Final = 1
 HTTP2: Final = 2
 HTTP3: Final = 3
 
+_DefaultT = TypeVar("_DefaultT")
+
 def parse_datagram_header(datagram: bytes, /) -> DatagramHeader:
     """Parse the routable prefix of a received QUIC datagram (RFC 9000 17).
 
@@ -26,6 +29,28 @@ def parse_datagram_header(datagram: bytes, /) -> DatagramHeader:
     and the ids are empty; match those against the connection ids you already track.
     Raises `RemoteProtocolError` on a truncated or malformed header.
     """
+
+@final
+class HeaderBlock:
+    """A packed, immutable view of HTTP/1 header fields with lazy access."""
+
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[tuple[bytes, bytes]]: ...
+    @overload
+    def __getitem__(self, index: int, /) -> tuple[bytes, bytes]: ...
+    @overload
+    def __getitem__(self, index: slice, /) -> list[tuple[bytes, bytes]]: ...
+    @overload
+    def get(self, name: bytes, /) -> bytes | None: ...
+    @overload
+    def get(self, name: bytes, default: _DefaultT, /) -> bytes | _DefaultT:
+        """Return the first case-insensitive match, or `default`."""
+
+    def getall(self, name: bytes, /) -> list[bytes]:
+        """Return every case-insensitive match in received order."""
+
+    def to_list(self, *, lowercase_names: bool = False) -> list[tuple[bytes, bytes]]:
+        """Materialize all fields, optionally with lowercase names."""
 
 @final
 class Request:
@@ -51,7 +76,7 @@ class Request:
     path: bytes
     query: bytes
     http_version: bytes
-    headers: list[tuple[bytes, bytes]]
+    headers: list[tuple[bytes, bytes]] | HeaderBlock
     stream_id: int
     expect_continue: bool
 
@@ -73,7 +98,7 @@ class Response:
     status_code: int
     reason: bytes
     http_version: bytes
-    headers: list[tuple[bytes, bytes]]
+    headers: list[tuple[bytes, bytes]] | HeaderBlock
     stream_id: int
 
 @final
