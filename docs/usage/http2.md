@@ -291,7 +291,8 @@ for event in drain(server):
 
 `event.stream_id` tells you which stream this `Request` arrived on. On HTTP/1.1
 it's `0`; on HTTP/2 it's the real id, and every `Data` / `EndOfMessage` for that
-request carries the same id.
+request carries the same id. When the HEADERS frame also carried `END_STREAM`,
+the `Request` has `end_stream=True` and no separate `EndOfMessage` follows.
 
 A **client** reads the mirror image (`Response` events instead of `Request`),
 again tagged with the `stream_id` of the request they answer.

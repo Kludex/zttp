@@ -83,13 +83,15 @@ event = conn.next_event()
 print(event.method, event.target)
 #> b'GET' b'/hello?name=you'
 
-print(conn.next_event())
-#> EndOfMessage(trailers=[])
+print(event.end_stream)
+#> True
 ```
 
 Feed `receive_data` whatever bytes you have - a whole request, half a request, or
-a single byte - and zttp buffers and resumes. Each `next_event` call returns the
-next complete event, or the `NEED_DATA` sentinel when it needs more bytes.
+a single byte - and zttp buffers and resumes. A request with `end_stream=True` is
+already complete; requests with a body continue with `Data` and `EndOfMessage`.
+Each `next_event` call returns the next complete event, or the `NEED_DATA`
+sentinel when it needs more bytes.
 
 Run it:
 

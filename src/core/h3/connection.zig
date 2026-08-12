@@ -64,6 +64,9 @@ const RequestStream = struct {
     blocked_headers: ?[]u8 = null,
     blocked_section: BlockedSection = .initial,
     trailers: ?[]Header = null,
+    /// The initial HEADERS frame was also the final bytes on this request
+    /// stream, so the Request event already represented message completion.
+    head_ended_stream: bool = false,
 
     fn deinit(self: *RequestStream, gpa: std.mem.Allocator) void {
         if (self.blocked_headers) |b| gpa.free(b);
@@ -429,7 +432,8 @@ pub const Connection = struct {
         while (consumed_total < ready.len) {
             const rest = ready[consumed_total..];
             const d = h3_frame.decode(rest) catch break; // NeedData: wait for more
-            self.onFrame(id, rs, d.frame) catch |e| switch (e) {
+            const frame_ends_stream = self.qc.streamFinished(id) and consumed_total + d.len == ready.len;
+            self.onFrame(id, rs, d.frame, frame_ends_stream) catch |e| switch (e) {
                 // A stream-level error (a malformed request): reset just this stream
                 // and stop processing it, rather than poisoning the whole connection.
                 error.StreamError => {
@@ -452,8 +456,10 @@ pub const Connection = struct {
             // Fewer body bytes than the declared Content-Length is malformed (RFC
             // 9114 4.1.2); the over-count is caught per-DATA above.
             if (rs.content_length) |cl| if (rs.body_received != cl) return self.rejectStream(id, .message_error);
-            const trailers = try self.materializeTrailers(rs);
-            try self.push(.{ .end_of_message = .{ .trailers = trailers, .stream_id = id } });
+            if (!rs.head_ended_stream) {
+                const trailers = try self.materializeTrailers(rs);
+                try self.push(.{ .end_of_message = .{ .trailers = trailers, .stream_id = id } });
+            }
             rs.state = .done;
         }
         // Consume BEFORE dropping: consuming the last byte of a finished stream is
@@ -870,7 +876,7 @@ pub const Connection = struct {
                     rs.state = .trailers_done;
                     return true;
                 }
-                const req = self.decodeRequest(id, block, rs) catch |e| switch (e) {
+                var req = self.decodeRequest(id, block, rs) catch |e| switch (e) {
                     error.Blocked => return false,
                     error.StreamError => {
                         const code = self.pending_reject orelse h3_error.ErrorCode.message_error;
@@ -892,6 +898,15 @@ pub const Connection = struct {
                         try self.rejectStream(id, .request_rejected);
                         return false;
                     }
+                }
+                const end_stream = self.qc.streamFinished(id) and self.qc.streamData(id).len == 0;
+                if (end_stream) {
+                    if (rs.content_length) |cl| if (cl != 0) {
+                        try self.rejectStream(id, .message_error);
+                        return false;
+                    };
+                    req.end_stream = true;
+                    rs.head_ended_stream = true;
                 }
                 try self.push(.{ .request = req });
                 rs.state = .headers_done;
@@ -935,18 +950,23 @@ pub const Connection = struct {
         }
     }
 
-    fn onFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame) Error!void {
+    fn onFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame, frame_ends_stream: bool) Error!void {
         if (h3_frame.isReservedHttp2(f.ftype)) return self.fail(.frame_unexpected, "HTTP/2-only frame type");
         switch (f.ftype) {
             .headers => {
                 if (rs.state == .idle) {
-                    const req = self.decodeRequest(id, f.payload, rs) catch |e| switch (e) {
+                    var req = self.decodeRequest(id, f.payload, rs) catch |e| switch (e) {
                         error.Blocked => {
                             try self.blockHeaders(rs, f.payload, .initial);
                             return;
                         },
                         else => return e,
                     };
+                    if (frame_ends_stream) {
+                        if (rs.content_length) |cl| if (cl != 0) return self.failStream(.message_error);
+                        req.end_stream = true;
+                        rs.head_ended_stream = true;
+                    }
                     try self.push(.{ .request = req });
                     rs.state = .headers_done;
                 } else if (rs.state == .headers_done) {
@@ -2305,8 +2325,10 @@ test "a completed request stream is dropped and a late frame does not resurrect 
     try qc.receiveDatagram(dgram, 1000);
     try h3.pump(0);
 
-    try testing.expect(h3.nextEvent() == .request);
-    try testing.expect(h3.nextEvent() == .end_of_message);
+    const request = h3.nextEvent();
+    try testing.expect(request == .request);
+    try testing.expect(request.request.end_stream);
+    try testing.expect(h3.nextEvent() == .need_data);
     // The fully-delivered stream is dropped from both maps.
     var ids: [4]u64 = undefined;
     try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
@@ -2340,8 +2362,9 @@ test "retiring a higher stream id does not block a new lower one" {
     defer gpa.free(on4);
     try qc.receiveDatagram(on4, 1000);
     try h3.pump(4);
-    try testing.expect(h3.nextEvent() == .request);
-    try testing.expect(h3.nextEvent() == .end_of_message);
+    const request4 = h3.nextEvent();
+    try testing.expect(request4 == .request);
+    try testing.expect(request4.request.end_stream);
 
     // A brand-new request on the lower stream 0 must still be delivered.
     const on0 = try buildRequestOnFin(gpa, &dcid, 0, 1, req.items);
@@ -2735,8 +2758,9 @@ test "HEAD response send path rejects DATA and trailers" {
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
     try h3.pump(0);
-    try testing.expect(h3.nextEvent() == .request);
-    try testing.expect(h3.nextEvent() == .end_of_message);
+    const request = h3.nextEvent();
+    try testing.expect(request == .request);
+    try testing.expect(request.request.end_stream);
 
     try h3.sendResponse(0, 200, &.{.{ .name = "content-length", .value = "5" }});
     try testing.expectError(error.H3Error, h3.sendData(0, "x"));
@@ -3059,10 +3083,8 @@ test "client sends an HTTP/3 request over the next request stream" {
     try testing.expectEqualStrings("example.test", req.request.headers[0].value);
     try testing.expectEqualStrings("accept", req.request.headers[1].name);
     try testing.expectEqualStrings("*/*", req.request.headers[1].value);
-
-    const eom = server_h3.nextEvent();
-    try testing.expect(eom == .end_of_message);
-    try testing.expectEqual(@as(u64, 0), eom.end_of_message.stream_id);
+    try testing.expect(req.request.end_stream);
+    try testing.expect(server_h3.nextEvent() == .need_data);
 }
 
 test "client sends CONNECT without scheme or path pseudo-headers" {
@@ -4468,7 +4490,8 @@ test "a QPACK encoder stream can feed a dynamic request header" {
     try testing.expect(ev == .request);
     try testing.expectEqualStrings("x", ev.request.headers[0].name);
     try testing.expectEqualStrings("y", ev.request.headers[0].value);
-    try testing.expect(h3.nextEvent() == .end_of_message);
+    try testing.expect(ev.request.end_stream);
+    try testing.expect(h3.nextEvent() == .need_data);
 
     try qc.flushSend(3000);
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
@@ -4513,7 +4536,8 @@ test "a request blocked on QPACK resumes when encoder inserts arrive" {
     try testing.expect(ev == .request);
     try testing.expectEqualStrings("x", ev.request.headers[0].name);
     try testing.expectEqualStrings("y", ev.request.headers[0].value);
-    try testing.expect(h3.nextEvent() == .end_of_message);
+    try testing.expect(ev.request.end_stream);
+    try testing.expect(h3.nextEvent() == .need_data);
 }
 
 test "a QPACK-blocked request cannot slip past a GOAWAY when it unblocks" {

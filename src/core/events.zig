@@ -34,6 +34,9 @@ pub const Request = struct {
     /// Whether the request carried `Expect: 100-continue`. Per-request (a stream
     /// property under HTTP/2), so it rides the event rather than the connection.
     expect_continue: bool = false,
+    /// The peer ended the request stream with this head. No Data or
+    /// EndOfMessage event follows when this is true.
+    end_stream: bool = false,
 };
 
 /// The start of a response (client role): status code, reason phrase, version,

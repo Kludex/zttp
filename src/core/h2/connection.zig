@@ -32,7 +32,8 @@ const Action = stream_mod.Action;
 const COMPACT_THRESHOLD: usize = 64 * 1024;
 
 /// Max events one frame can fan out into. A HEADERS(END_STREAM) yields Request +
-/// EndOfMessage = 2; no decode path exceeds this. Sized with headroom.
+/// Settings plus a request/control event can be queued by one feed. Sized with
+/// headroom.
 const PENDING_CAP: usize = 4;
 
 pub const Role = enum { server, client };
@@ -467,20 +468,20 @@ pub const Connection = struct {
         }
         if (content.len > 0) self.push(.{ .data = .{ .data = content, .stream_id = f.header.stream_id } });
         s.recvApply(.data, end_stream);
-        if (end_stream) try self.endMessage(s, f.header.stream_id, &.{});
+        if (end_stream) try self.endMessage(s, f.header.stream_id, &.{}, true);
     }
 
     /// Finalize a stream at END_STREAM: enforce the Content-Length vs body-seen
     /// guard (the h2->h1 smuggling defense) on EVERY end path - DATA, a bodyless
-    /// HEADERS, or trailers - then surface end_of_message. A mismatch is a stream
-    /// PROTOCOL_ERROR (RST_STREAM), so a request that lies about its body length
-    /// can never be downgraded to a smuggled HTTP/1.1 message.
-    fn endMessage(self: *Connection, s: *Stream, id: u32, trailers: []const events.Header) H2Error!void {
+    /// HEADERS, or trailers - then optionally surface end_of_message. A mismatch
+    /// is a stream PROTOCOL_ERROR (RST_STREAM), so a request that lies about its
+    /// body length can never be downgraded to a smuggled HTTP/1.1 message.
+    fn endMessage(self: *Connection, s: *Stream, id: u32, trailers: []const events.Header, emit: bool) H2Error!void {
         if (s.checkContentLength().action == .stream_error) {
             try self.resetStream(s, id, .protocol_error);
             return;
         }
-        self.push(.{ .end_of_message = .{ .trailers = trailers, .stream_id = id } });
+        if (emit) self.push(.{ .end_of_message = .{ .trailers = trailers, .stream_id = id } });
     }
 
     fn handleRstStream(self: *Connection, f: frame_mod.Frame) H2Error!void {
@@ -620,7 +621,7 @@ pub const Connection = struct {
                 return;
             }
             s.recvApply(.headers, true);
-            try self.endMessage(s, id, headers);
+            try self.endMessage(s, id, headers, true);
             return;
         }
 
@@ -653,13 +654,13 @@ pub const Connection = struct {
             self.push(.{ .response = resp.event });
             if (end_stream) {
                 s.recvApply(.headers, true); // open -> half_closed_remote
-                try self.endMessage(s, id, &.{});
+                try self.endMessage(s, id, &.{}, true);
             }
             return;
         }
 
         // Collapse pseudo-headers into the request line + regular headers.
-        const req = self.collapseRequest(headers, id) catch |e| switch (e) {
+        var req = self.collapseRequest(headers, id) catch |e| switch (e) {
             error.Malformed => {
                 try self.resetStream(s, id, .protocol_error);
                 return;
@@ -668,10 +669,19 @@ pub const Connection = struct {
         };
         s.headers_done = true;
         if (req.content_length) |cl| s.content_length = cl;
+        if (end_stream) {
+            // Reject a declared-but-missing body before a Request marked complete
+            // can escape to an h2->h1 adapter.
+            if (req.content_length) |cl| if (cl != 0) {
+                try self.resetStream(s, id, .protocol_error);
+                return;
+            };
+            req.event.end_stream = true;
+        }
         self.push(.{ .request = req.event });
         if (end_stream) {
             s.recvApply(.headers, true); // open -> half_closed_remote
-            try self.endMessage(s, id, &.{});
+            try self.endMessage(s, id, &.{}, false);
         }
     }
 
@@ -925,19 +935,19 @@ pub const Connection = struct {
             try self.upgrade_headers.append(self.gpa, .{ .name = name, .value = value });
         }
 
-        const req = self.collapseRequest(self.upgrade_headers.items, 1) catch |e| switch (e) {
+        var req = self.collapseRequest(self.upgrade_headers.items, 1) catch |e| switch (e) {
             error.Malformed => return error.Malformed,
             error.OutOfMemory => return error.OutOfMemory,
         };
 
         // The upgraded stream-1 request is surfaced as complete and bodyless (any
         // body belonged to the H1 exchange, which is over). A non-zero declared
-        // Content-Length would make the immediate end_of_message below a smuggling
-        // lie - it bypasses the stream content-length-vs-data guard endMessage runs
-        // on every other end path - so reject it here.
+        // A non-zero Content-Length would make this complete Request a smuggling
+        // lie, so reject it here.
         if (req.content_length) |cl| {
             if (cl != 0) return error.Malformed;
         }
+        req.event.end_stream = true;
 
         // The first stream can never trip the churn cap; OOM is the only failure.
         self.openPeerStream(1) catch return error.OutOfMemory;
@@ -947,7 +957,6 @@ pub const Connection = struct {
         if (req.content_length) |cl| s.content_length = cl;
         s.recvApply(.headers, true); // idle -> open -> half_closed_remote
         self.push(.{ .request = req.event });
-        self.push(.{ .end_of_message = .{ .stream_id = 1 } });
     }
 
     /// Account for a locally-initiated RST_STREAM: the stream is terminally closed,
@@ -1349,7 +1358,7 @@ test "a long run of no-event frames does not overflow the stack" {
 // :authority www.example.com.
 const GET_BLOCK = [_]u8{ 0x82, 0x86, 0x84, 0x41, 0x0f } ++ "www.example.com".*;
 
-test "HEADERS with END_STREAM yields a Request then EndOfMessage" {
+test "HEADERS with END_STREAM yields one complete Request" {
     var c = Connection.init(testing.allocator, .server);
     defer c.deinit();
     var hdr: std.ArrayList(u8) = .empty;
@@ -1361,11 +1370,11 @@ test "HEADERS with END_STREAM yields a Request then EndOfMessage" {
     try testing.expectEqualStrings("GET", req.request.method);
     try testing.expectEqualStrings("/", req.request.target);
     try testing.expectEqualStrings("2", req.request.http_version);
+    try testing.expect(req.request.end_stream);
     // :authority became a synthesized host header.
     try testing.expectEqualStrings("host", req.request.headers[req.request.headers.len - 1].name);
     try testing.expectEqualStrings("www.example.com", req.request.headers[req.request.headers.len - 1].value);
-    const eom = try c.nextEvent();
-    try testing.expectEqual(@as(u32, 1), eom.end_of_message.stream_id);
+    try testing.expectEqual(Event.need_data, try c.nextEvent());
 }
 
 test "HEADERS split across a CONTINUATION reassembles to one Request" {
@@ -1379,7 +1388,8 @@ test "HEADERS split across a CONTINUATION reassembles to one Request" {
     try handshook(&c, frames.items);
     const req = try c.nextEvent();
     try testing.expectEqualStrings("GET", req.request.method);
-    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    try testing.expect(req.request.end_stream);
+    try testing.expectEqual(Event.need_data, try c.nextEvent());
 }
 
 test "an interleaved frame during an open field block is a connection error" {
@@ -1518,7 +1528,6 @@ test "a bodyless request that declares content-length is reset (smuggling guard)
     defer hdr.deinit(testing.allocator);
     try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &block);
     try handshook(&c, hdr.items);
-    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
     const ev = try c.nextEvent();
     try testing.expectEqual(std.meta.Tag(Event).rst_stream, std.meta.activeTag(ev));
     try testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), ev.rst_stream.error_code);
@@ -1564,8 +1573,9 @@ test "a bodyless response that ends the stream stops counting toward concurrency
     defer frames.deinit(testing.allocator);
     try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK);
     try handshook(&c, frames.items);
-    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
-    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    const req = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
+    try testing.expect(req.request.end_stream);
     // The request half-closed remote; it still counts until the response ends.
     try testing.expectEqual(@as(u32, 1), c.liveStreamCount());
     // A bodyless response head with END_STREAM closes the local side too.
@@ -1586,6 +1596,7 @@ test "h2c upgrade surfaces the request as a complete stream 1" {
     try testing.expectEqualStrings("/upgrade", req.request.path);
     try testing.expectEqualStrings("x=1", req.request.query);
     try testing.expectEqual(@as(u32, 1), req.request.stream_id);
+    try testing.expect(req.request.end_stream);
     // :authority became a synthesized host header; the regular header survived.
     var saw_host = false;
     var saw_ua = false;
@@ -1595,9 +1606,7 @@ test "h2c upgrade surfaces the request as a complete stream 1" {
     }
     try testing.expect(saw_host and saw_ua);
 
-    const eom = try c.nextEvent();
-    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(eom));
-    try testing.expectEqual(@as(u32, 1), eom.end_of_message.stream_id);
+    try testing.expectEqual(Event.need_data, try c.nextEvent());
     try testing.expectEqual(@as(u32, 1), c.liveStreamCount());
 }
 
@@ -1605,8 +1614,9 @@ test "after an h2c upgrade the client preface and a later stream still parse" {
     var c = Connection.init(testing.allocator, .server);
     defer c.deinit();
     try c.initiateUpgradeConnection("GET", "/", "http", "example.com", &.{}, null);
-    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
-    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    const upgrade = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(upgrade));
+    try testing.expect(upgrade.request.end_stream);
 
     // The client still sends the connection preface after the 101 (RFC 7540 3.2),
     // then a normal request on stream 3.
@@ -1645,7 +1655,7 @@ test "an upgrade request's bytes survive a later stream's decode (drain discipli
         }
     }
     try testing.expect(saw_marker);
-    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    try testing.expect(req1.request.end_stream);
 }
 
 test "an h2c upgrade with many large headers does not dangle its slices" {
@@ -1929,8 +1939,9 @@ test "HEADERS after END_STREAM (not a trailer) is a connection error" {
     try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK); // ends the stream
     try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK); // illegal second HEADERS
     try handshook(&c, frames.items);
-    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
-    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    const req = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
+    try testing.expect(req.request.end_stream);
     try testing.expectError(error.ProtocolError, c.nextEvent());
 }
 
@@ -2189,8 +2200,9 @@ test "the live-stream count matches reality across read-completion and reset" {
     // Stream 3: open, no END_STREAM -> still receiving -> counts.
     try frameBytes(&frames, .headers, Flags.end_headers, 3, &GET_BLOCK);
     try handshook(&c, frames.items);
-    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent())); // 1 request
-    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent())); // 1 eom
+    const req1 = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req1)); // 1 request
+    try testing.expect(req1.request.end_stream);
     try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent())); // 3 request
     try testing.expectEqual(Event.need_data, try c.nextEvent());
     // Both count: stream 1 (half_closed_remote, awaiting response) and stream 3 (open).
@@ -2299,8 +2311,9 @@ test "a request+response cycle returns the live-stream count to zero" {
     // side finishes the response (RFC 9113 5.1).
     try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK);
     try handshook(&c, hdr.items);
-    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
-    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    const req = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
+    try testing.expect(req.request.end_stream);
     try testing.expectEqual(Event.need_data, try c.nextEvent());
     try testing.expectEqual(@as(u32, 1), c.liveStreamCount()); // still awaiting the response
     // The app responds: register the send, then a body with END_STREAM. Once the
@@ -2331,8 +2344,9 @@ test "many request+response cycles do not leak the concurrency budget" {
         defer hdr.deinit(testing.allocator);
         try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, id, &GET_BLOCK);
         try c.feed(hdr.items);
-        try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
-        try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+        const req = try c.nextEvent();
+        try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
+        try testing.expect(req.request.end_stream);
         try testing.expectEqual(Event.need_data, try c.nextEvent());
         try w.sendResponse(id, 200, &.{}, false);
         try c.sendStreamData(&w, id, "ok", true);
@@ -2353,8 +2367,9 @@ test "late DATA after a response is registered is a stream error STREAM_CLOSED" 
     defer hdr.deinit(testing.allocator);
     try frameBytes(&hdr, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK);
     try handshook(&c, hdr.items);
-    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
-    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    const req = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
+    try testing.expect(req.request.end_stream);
     try testing.expectEqual(Event.need_data, try c.nextEvent());
     try w.sendResponse(1, 200, &.{}, false); // register the response (re-creates stream 1 half_closed_remote)
     try c.registerSendStream(1);
@@ -2378,8 +2393,9 @@ test "a WINDOW_UPDATE on a half-closed-remote stream awaiting its response is ho
     try frameBytes(&frames, .headers, Flags.end_headers | Flags.end_stream, 1, &GET_BLOCK);
     try frameBytes(&frames, .window_update, 0, 1, &[_]u8{ 0x00, 0x00, 0x00, 0x10 });
     try handshook(&c, frames.items);
-    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try c.nextEvent()));
-    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    const req = try c.nextEvent();
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(req));
+    try testing.expect(req.request.end_stream);
     // The stream is still present, so the WINDOW_UPDATE is surfaced (not dropped).
     const wu = try c.nextEvent();
     try testing.expectEqual(@as(u32, 1), wu.window_update.stream_id);

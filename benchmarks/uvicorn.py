@@ -3,7 +3,8 @@
 Uvicorn builds the ASGI scope in ``on_message_begin``, lowercases and appends
 one header tuple per ``on_header`` callback, then fills the request-line fields
 in ``on_headers_complete``.  This benchmark performs that same work for
-httptools and constructs the equivalent scope from zttp's Request event.  It
+httptools and constructs the equivalent scope from zttp's Request event. Each
+iteration runs through request completion as Uvicorn must before dispatch. It
 also keeps the legacy eager zttp header-list path as an A/B control.
 
 Reference implementation:
@@ -58,13 +59,14 @@ def base_scope() -> dict[str, object]:
 class UvicornHttptoolsProtocol:
     """The request-head callbacks used by Uvicorn, without server machinery."""
 
-    __slots__ = ("expect_100_continue", "headers", "parser", "scope", "url")
+    __slots__ = ("complete", "expect_100_continue", "headers", "parser", "scope", "url")
 
     def __init__(self) -> None:
         self.url = b""
         self.expect_100_continue = False
         self.headers: list[tuple[bytes, bytes]] = []
         self.scope: dict[str, object] = {}
+        self.complete = False
         self.parser = httptools.HttpRequestParser(self)
 
     def on_message_begin(self) -> None:
@@ -72,6 +74,7 @@ class UvicornHttptoolsProtocol:
         self.expect_100_continue = False
         self.headers = []
         self.scope = base_scope()
+        self.complete = False
         self.scope["headers"] = self.headers
 
     def on_url(self, url: bytes) -> None:
@@ -98,7 +101,7 @@ class UvicornHttptoolsProtocol:
         self.scope["query_string"] = parsed_url.query or b""
 
     def on_message_complete(self) -> None:
-        pass
+        self.complete = True
 
 
 def make_httptools(raw: bytes) -> Runner:
@@ -107,6 +110,8 @@ def make_httptools(raw: bytes) -> Runner:
         for _ in range(iterations):
             protocol = UvicornHttptoolsProtocol()
             protocol.parser.feed_data(raw)
+            if not protocol.complete:
+                raise AssertionError("incomplete request")
             scope = protocol.scope
         if scope is None:
             raise AssertionError("missing scope")
@@ -147,6 +152,10 @@ def make_zttp(raw: bytes, *, packed: bool) -> Runner:
             else:
                 event = getattr(conn, "_next_event_eager_for_benchmark")()
             scope = scope_from_zttp(event)
+            if not getattr(event, "end_stream", False):
+                terminal = conn.next_event()
+                if not isinstance(terminal, zttp.EndOfMessage):
+                    raise AssertionError("incomplete request")
         if scope is None:
             raise AssertionError("missing scope")
 
@@ -156,10 +165,17 @@ def make_zttp(raw: bytes, *, packed: bool) -> Runner:
 def verify(raw: bytes) -> None:
     protocol = UvicornHttptoolsProtocol()
     protocol.parser.feed_data(raw)
+    if not protocol.complete:
+        raise AssertionError("httptools did not complete the request")
 
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(raw)
-    packed_scope = scope_from_zttp(conn.next_event())
+    request = conn.next_event()
+    packed_scope = scope_from_zttp(request)
+    if not getattr(request, "end_stream", False):
+        terminal = conn.next_event()
+        if not isinstance(terminal, zttp.EndOfMessage):
+            raise AssertionError("zttp did not complete the request")
     if packed_scope != protocol.scope:
         raise AssertionError(f"zttp scope differs from Uvicorn: {packed_scope!r} != {protocol.scope!r}")
 

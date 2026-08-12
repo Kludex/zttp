@@ -373,7 +373,8 @@ test "a written request round-trips through a Connection" {
         if (std.mem.eql(u8, h.name, "host") and std.mem.eql(u8, h.value, "example.com")) saw_host = true;
     }
     try testing.expect(saw_ua and saw_host);
-    try testing.expectEqual(std.meta.Tag(Event).end_of_message, std.meta.activeTag(try c.nextEvent()));
+    try testing.expect(req.request.end_stream);
+    try testing.expectEqual(Event.need_data, try c.nextEvent());
 }
 
 test "a HEADERS block larger than the peer max frame splits into CONTINUATION and round-trips" {

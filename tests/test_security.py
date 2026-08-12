@@ -114,7 +114,7 @@ def test_event_cycle_is_collectable() -> None:
 
     def make_cycle() -> None:
         c = zttp.Connection(zttp.SERVER)
-        c.receive_data(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+        c.receive_data(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
         c.next_event()  # Request
         # HeaderBlock is immutable and holds only bytes, so put the cycle
         # through the still-mutable EndOfMessage.trailers list.

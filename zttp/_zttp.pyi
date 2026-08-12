@@ -69,6 +69,8 @@ class Request:
         headers: The header fields as `(name, value)` byte pairs, in received order.
         stream_id: The stream the request arrived on (`0` on HTTP/1.1).
         expect_continue: Whether the client sent `Expect: 100-continue`.
+        end_stream: Whether this head also completes the request. When true, no
+            `Data` or `EndOfMessage` event follows.
     """
 
     method: bytes
@@ -79,6 +81,7 @@ class Request:
     headers: list[tuple[bytes, bytes]] | HeaderBlock
     stream_id: int
     expect_continue: bool
+    end_stream: bool
 
 @final
 class Response:

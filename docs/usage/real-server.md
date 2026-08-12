@@ -36,6 +36,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
                     continue
                 if isinstance(event, zttp.Request):
                     request = event
+                    if event.end_stream:
+                        break
                 elif isinstance(event, zttp.Data):
                     body += event.data
                 elif isinstance(event, zttp.EndOfMessage):
@@ -117,11 +119,18 @@ each time (quadratic); a `bytearray` grows in place:
 ```python
 if isinstance(event, zttp.Request):
     request = event
+    if event.end_stream:
+        break
 elif isinstance(event, zttp.Data):
     body += event.data
 elif isinstance(event, zttp.EndOfMessage):
     break
 ```
+
+Bodyless requests finish on the `Request` itself. This is the common GET/HEAD
+path and avoids allocating and pulling a redundant terminal event. Requests
+with a framed body have `end_stream=False`; their `Data` and `EndOfMessage`
+events follow normally, including any trailers.
 
 ## Writing the response
 

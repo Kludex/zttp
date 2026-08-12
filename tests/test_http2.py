@@ -102,16 +102,15 @@ def test_read_only_server_still_emits_its_preface() -> None:
 def test_simple_get_request() -> None:
     conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK))
     events = list(drain_h2(conn))
-    settings, req, eom = events
+    settings, req = events
     assert isinstance(settings, zttp.Settings)
     assert isinstance(req, zttp.Request)
     assert req.method == b"GET"
     assert req.target == b"/"
     assert req.http_version == b"2"
     assert req.stream_id == 1
+    assert req.end_stream is True
     assert (b"host", b"www.example.com") in req.headers
-    assert isinstance(eom, zttp.EndOfMessage)
-    assert eom.stream_id == 1
 
 
 def test_request_with_body() -> None:
@@ -122,6 +121,7 @@ def test_request_with_body() -> None:
     events = list(drain_h2(conn))
     req = next(e for e in events if isinstance(e, zttp.Request))
     assert req.stream_id == 1
+    assert req.end_stream is False
     data = next(e for e in events if isinstance(e, zttp.Data))
     assert data.data == b"hello"
     assert data.stream_id == 1
@@ -820,7 +820,8 @@ def test_h2c_seed_surfaces_the_upgraded_request() -> None:
     assert req.stream_id == 1
     assert (b"host", b"example.com") in req.headers
     assert (b"x-k", b"v") in req.headers
-    assert any(isinstance(e, zttp.EndOfMessage) for e in events)
+    assert req.end_stream is True
+    assert not any(isinstance(e, zttp.EndOfMessage) for e in events)
 
 
 def test_h2c_seed_then_respond_and_continue_with_the_preface() -> None:

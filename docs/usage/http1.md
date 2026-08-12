@@ -14,6 +14,15 @@ with the send API.
 The read side is `receive_data` + `next_event`. Once bodies, chunked encoding,
 and partial data enter the picture, here's what happens.
 
+### Request completion
+
+When framing proves a request has no body, the `Request` arrives with
+`end_stream=True` and is already complete. No separate `EndOfMessage` follows.
+Requests with a content-length or chunked body have `end_stream=False`; consume
+their `Data` events through `EndOfMessage` as usual. Chunked requests retain the
+terminal event even when their decoded body is empty because trailers may be
+present.
+
 ### Bodies
 
 A body shows up as one or more `Data` events between the head and `EndOfMessage`.
@@ -162,7 +171,7 @@ def events(conn):
         if event is zttp.NEED_DATA:
             return
         yield event
-        if isinstance(event, zttp.EndOfMessage):
+        if isinstance(event, zttp.EndOfMessage) or isinstance(event, zttp.Request) and event.end_stream:
             return
 ```
 
