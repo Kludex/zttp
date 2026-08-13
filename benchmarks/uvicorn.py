@@ -199,13 +199,13 @@ def verify(raw: bytes) -> None:
     if not protocol.complete:
         raise AssertionError("httptools did not complete the request")
 
-    for api in ("split", "combined"):
+    for api in ("eager", "split", "combined"):
         conn = zttp.Connection(zttp.SERVER)
         if api == "combined":
             request = conn.receive_event(raw)
         else:
             conn.receive_data(raw)
-            request = conn.next_event()
+            request = getattr(conn, "_next_event_eager_for_benchmark")() if api == "eager" else conn.next_event()
         if not isinstance(request, zttp.Request):
             raise AssertionError(f"zttp {api} API did not produce a request")
         scope = scope_from_zttp(request)

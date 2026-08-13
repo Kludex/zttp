@@ -12,7 +12,8 @@
 
 set -x
 
-HATCH_ZIG_BUILD_MODE=ReleaseSafe uv sync --all-groups
+export HATCH_ZIG_BUILD_MODE=ReleaseSafe
+uv sync --all-groups
 
 case "$1" in
     http1 | http2 | http3 | uvicorn)
