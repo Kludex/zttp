@@ -87,43 +87,62 @@ pub const FramingOptions = struct {
     until_close_default: bool = false,
 };
 
-/// Inspect the parsed headers and return the body framing. Enforces the
-/// CL/TE conflict and duplicate-Content-Length rules.
-pub fn determine(headers: []const Header, opts: FramingOptions) ParseError!Framing {
-    var te = TransferEncoding{};
-    var has_te = false;
-    var content_length: ?u64 = null;
+/// Incrementally collect the framing fields while the caller parses the header
+/// block. Keeping this state beside the header parser lets connection-level
+/// metadata share the same pass instead of repeatedly walking the completed
+/// header list.
+pub const Analyzer = struct {
+    transfer_encoding: TransferEncoding = .{},
+    has_transfer_encoding: bool = false,
+    content_length: ?u64 = null,
 
-    for (headers) |h| {
+    pub fn add(self: *Analyzer, h: Header) ParseError!void {
         if (eqIgnoreCase(h.name, "transfer-encoding")) {
-            has_te = true;
-            te.add(h.value);
+            self.has_transfer_encoding = true;
+            self.transfer_encoding.add(h.value);
         } else if (eqIgnoreCase(h.name, "content-length")) {
             const n = try parseContentLength(h.value);
-            if (content_length) |prev| {
-                if (prev != n) return error.InvalidFraming; // conflicting duplicates
+            if (self.content_length) |prev| {
+                if (prev != n) return error.InvalidFraming;
             }
-            content_length = n;
+            self.content_length = n;
         }
     }
 
-    // RFC 9112 6.1: if both are present, Transfer-Encoding overrides, but this
-    // is a smuggling vector - reject outright (what secure parsers do).
-    if (has_te and content_length != null) return error.InvalidFraming;
-    if (has_te and opts.forbid_transfer_encoding) return error.InvalidFraming;
-
-    if (opts.bodyless) return .none;
-
-    if (has_te) {
-        // chunked must be the sole/final coding across ALL field-lines; resolve
-        // rejects non-final or unframeable Transfer-Encodings to avoid smuggling.
-        _ = try te.resolve();
-        return .chunked;
+    /// Whether the head carries framing metadata at all. Informational
+    /// responses use this to reject Content-Length and Transfer-Encoding before
+    /// a final response is parsed.
+    pub fn hasFramingHeader(self: Analyzer) bool {
+        return self.has_transfer_encoding or self.content_length != null;
     }
-    if (content_length) |n| {
-        return if (n == 0) .none else .{ .content_length = n };
+
+    pub fn finish(self: Analyzer, opts: FramingOptions) ParseError!Framing {
+        // RFC 9112 6.1: if both are present, Transfer-Encoding overrides, but
+        // this is a smuggling vector - reject outright (what secure parsers do).
+        if (self.has_transfer_encoding and self.content_length != null) return error.InvalidFraming;
+        if (self.has_transfer_encoding and opts.forbid_transfer_encoding) return error.InvalidFraming;
+
+        if (opts.bodyless) return .none;
+
+        if (self.has_transfer_encoding) {
+            // chunked must be the sole/final coding across ALL field-lines;
+            // resolve rejects non-final or unframeable Transfer-Encodings.
+            _ = try self.transfer_encoding.resolve();
+            return .chunked;
+        }
+        if (self.content_length) |n| {
+            return if (n == 0) .none else .{ .content_length = n };
+        }
+        return if (opts.until_close_default) .until_close else .none;
     }
-    return if (opts.until_close_default) .until_close else .none;
+};
+
+/// Inspect the parsed headers and return the body framing. Enforces the
+/// CL/TE conflict and duplicate-Content-Length rules.
+pub fn determine(headers: []const Header, opts: FramingOptions) ParseError!Framing {
+    var analyzer = Analyzer{};
+    for (headers) |h| try analyzer.add(h);
+    return analyzer.finish(opts);
 }
 
 test "responseIsBodyless rule" {
