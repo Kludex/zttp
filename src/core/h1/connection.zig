@@ -53,7 +53,7 @@ pub const HeadSemantics = struct {
             }
         } else if (eqIgnoreCase(h.name, "upgrade")) {
             self.upgrade_value = h.value;
-        } else if (eqIgnoreCase(h.name, "expect") and eqIgnoreCase(trimOws(h.value), "100-continue")) {
+        } else if (eqIgnoreCase(h.name, "expect") and listContains(h.value, "100-continue")) {
             self.expect_continue = true;
         }
     }
@@ -114,7 +114,7 @@ pub fn upgrade(headers: []const Header) ?[]const u8 {
 /// Whether the request carries `Expect: 100-continue` (RFC 9110 10.1.1).
 pub fn expectsContinue(headers: []const Header) bool {
     for (headers) |h| {
-        if (eqIgnoreCase(h.name, "expect") and eqIgnoreCase(trimOws(h.value), "100-continue")) return true;
+        if (eqIgnoreCase(h.name, "expect") and listContains(h.value, "100-continue")) return true;
     }
     return false;
 }
@@ -169,8 +169,10 @@ test "expectsContinue" {
     try t.expect(expectsContinue(&h));
     const h2 = [_]Header{.{ .name = "Expect", .value = "100-Continue" }};
     try t.expect(expectsContinue(&h2));
-    const h3 = [_]Header{.{ .name = "Host", .value = "x" }};
-    try t.expect(!expectsContinue(&h3));
+    const h3 = [_]Header{.{ .name = "Expect", .value = "something, 100-Continue" }};
+    try t.expect(expectsContinue(&h3));
+    const h4 = [_]Header{.{ .name = "Host", .value = "x" }};
+    try t.expect(!expectsContinue(&h4));
 }
 
 test "head semantics collects framing and connection metadata in one pass" {
@@ -178,7 +180,7 @@ test "head semantics collects framing and connection metadata in one pass" {
         .{ .name = "Content-Length", .value = "5" },
         .{ .name = "Connection", .value = "keep-alive, Upgrade" },
         .{ .name = "Upgrade", .value = "websocket" },
-        .{ .name = "Expect", .value = "100-Continue" },
+        .{ .name = "Expect", .value = "something, 100-Continue" },
     };
     var semantics = HeadSemantics{};
     for (headers) |h| try semantics.add(h);
