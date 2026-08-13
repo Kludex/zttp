@@ -35,6 +35,17 @@ def test_receive_event_preserves_terminal_parse_errors() -> None:
         conn.next_event()
 
 
+@pytest.mark.parametrize("partial", [b"G", b"GET / HTTP/1.1\r\nHost: x\r\n"])
+def test_eof_during_an_incomplete_head_is_a_terminal_error(partial: bytes) -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    assert conn.receive_event(partial) is zttp.NEED_DATA
+    conn.receive_data(b"")
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
+
+
 def test_simple_get() -> None:
     events = parse_request(b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
     assert len(events) == 1
