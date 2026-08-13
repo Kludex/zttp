@@ -49,13 +49,13 @@ const EndOfMessageObject = extern struct {
     stream_id: c_ulonglong,
 };
 
-/// Lazy header container. One Python bytes object owns all header bytes; compact
-/// native ranges describe the fields. Python bytes/tuples are created only for
-/// fields the caller actually touches.
+/// Lazy header container. Compact native ranges and their bytes live together
+/// in the variable-sized tail of this one Python object. Python bytes/tuples
+/// are created only for fields the caller actually touches.
 const HeaderBlockObject = extern struct {
     ob_base: c.PyVarObject,
-    data: py.Object,
     count: usize,
+    data_len: usize,
 };
 
 const HeaderRange = extern struct {
@@ -687,8 +687,10 @@ fn headerRanges(self: *HeaderBlockObject) [*]HeaderRange {
     return @ptrFromInt(@intFromPtr(self) + @sizeOf(HeaderBlockObject));
 }
 
-fn headerData(self: *HeaderBlockObject) ?[]const u8 {
-    return py.asBytes(self.data);
+fn headerData(self: *HeaderBlockObject) []const u8 {
+    const start = @intFromPtr(headerRanges(self)) + self.count * @sizeOf(HeaderRange);
+    const ptr: [*]const u8 = @ptrFromInt(start);
+    return ptr[0..self.data_len];
 }
 
 fn headerName(data: []const u8, range: HeaderRange) []const u8 {
@@ -725,7 +727,7 @@ fn lowerHeaderName(name: []const u8) py.Object {
 }
 
 fn headerPair(self: *HeaderBlockObject, idx: usize, lowercase_name: bool) py.Object {
-    const data = headerData(self) orelse return null;
+    const data = headerData(self);
     const range = headerRanges(self)[idx];
     const name_bytes = headerName(data, range);
     const value_bytes = headerValue(data, range);
@@ -765,23 +767,24 @@ fn materializeHeaderBlock(self: *HeaderBlockObject, lowercase_names: bool) py.Ob
 }
 
 fn buildHeaderBlock(hdrs: []const events.Header) py.Object {
-    const tp: [*c]c.PyTypeObject = @ptrCast(header_block_type);
-    const obj = tp.*.tp_alloc.?(tp, @intCast(hdrs.len));
-    if (obj == null) return null;
-    const self: *HeaderBlockObject = @ptrCast(obj);
-    self.data = null;
-    self.count = hdrs.len;
-
     var total: usize = 0;
     for (hdrs) |h| total += h.name.len + h.value.len;
-    const data_obj = c.PyBytes_FromStringAndSize(null, @intCast(total));
-    if (data_obj == null) {
-        py.decref(obj);
-        return null;
-    }
-    self.data = data_obj;
-    const dst: [*]u8 = @ptrCast(c.PyBytes_AsString(data_obj));
+
+    // tp_alloc sizes variable objects in HeaderRange units. Reserve enough
+    // trailing units for the real ranges followed immediately by packed bytes;
+    // at most one range unit is padding.
+    const unit = @sizeOf(HeaderRange);
+    const data_units = (total + unit - 1) / unit;
+    const allocation_units = hdrs.len + data_units;
+    const tp: [*c]c.PyTypeObject = @ptrCast(header_block_type);
+    const obj = tp.*.tp_alloc.?(tp, @intCast(allocation_units));
+    if (obj == null) return null;
+    const self: *HeaderBlockObject = @ptrCast(obj);
+    self.count = hdrs.len;
+    self.data_len = total;
+
     const ranges = headerRanges(self);
+    const dst: [*]u8 = @ptrFromInt(@intFromPtr(ranges) + hdrs.len * unit);
     var offset: usize = 0;
     for (hdrs, 0..) |h, i| {
         const name_offset = offset;
@@ -864,7 +867,7 @@ fn headerBlockGet(obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object 
     if (c.PyArg_ParseTuple(args, "O|O", &name_obj, &default_obj) == 0) return null;
     const wanted = py.asBytes(name_obj) orelse return null;
     const wanted_hash = headerHash(wanted);
-    const data = headerData(self) orelse return null;
+    const data = headerData(self);
     for (headerRanges(self)[0..self.count]) |range| {
         if (range.hash == wanted_hash and headerNameEql(headerName(data, range), wanted)) {
             const value = headerValue(data, range);
@@ -878,7 +881,7 @@ fn headerBlockGetAll(obj: ?*c.PyObject, name_obj: ?*c.PyObject) callconv(.c) py.
     const self: *HeaderBlockObject = @ptrCast(obj.?);
     const wanted = py.asBytes(name_obj) orelse return null;
     const wanted_hash = headerHash(wanted);
-    const data = headerData(self) orelse return null;
+    const data = headerData(self);
     var count: usize = 0;
     for (headerRanges(self)[0..self.count]) |range| {
         if (range.hash == wanted_hash and headerNameEql(headerName(data, range), wanted)) count += 1;
@@ -930,9 +933,7 @@ fn headerBlockCmp(a: ?*c.PyObject, b: ?*c.PyObject, op: c_int) callconv(.c) py.O
 }
 
 fn headerBlockDealloc(obj: ?*c.PyObject) callconv(.c) void {
-    const self: *HeaderBlockObject = @ptrCast(obj.?);
-    py.xdecref(self.data);
-    py.freeInstance(@ptrCast(self));
+    py.freeInstance(obj.?);
 }
 
 fn headerBlockNew(_: ?*c.PyTypeObject, _: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
