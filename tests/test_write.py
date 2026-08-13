@@ -108,8 +108,8 @@ def test_send_response_header_scratch_falls_back_for_large_lists() -> None:
     conn.send_response(204, headers)
     conn.end_message()
     wire = conn.data_to_send()
-    assert wire.startswith(b"HTTP/1.1 204 No Content\r\nX-0: value\r\n")
-    assert wire.endswith(b"X-19: value\r\n\r\n")
+    expected = b"HTTP/1.1 204 No Content\r\n" + b"".join(b"X-%d: value\r\n" % i for i in range(20)) + b"\r\n"
+    assert wire == expected
 
 
 def test_chunked_response() -> None:

@@ -1930,6 +1930,9 @@ fn next_event_eager_for_benchmark(self_obj: ?*c.PyObject, _: ?*c.PyObject) callc
 /// pairs. Common ASGI lists fit in inline scratch storage. Exact tuple pairs of
 /// exact bytes only retain the pair when their outer list is mutable; custom
 /// sequences retain each synthesized name/value until the writer returns.
+/// Header slices are valid only until `deinit`; every consumer must serialize
+/// them synchronously before then. An exact outer tuple is immutable and remains
+/// reachable from the active Python call arguments for that whole interval.
 const BorrowedHeaders = struct {
     const inline_capacity = 16;
 
