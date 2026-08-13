@@ -97,7 +97,9 @@ pub fn shouldClose(http_version: []const u8, headers: []const Header) bool {
 
 /// The `Upgrade` header value iff the `Connection` header lists the `upgrade`
 /// token (RFC 9110 7.8); otherwise null. The integrator compares it to e.g.
-/// "websocket".
+/// "websocket". This standalone scan remains part of the public core API for
+/// integrations that receive an already-complete header slice instead of
+/// feeding fields through `HeadSemantics` while parsing.
 pub fn upgrade(headers: []const Header) ?[]const u8 {
     var has_upgrade_token = false;
     var upgrade_value: ?[]const u8 = null;
@@ -111,7 +113,9 @@ pub fn upgrade(headers: []const Header) ?[]const u8 {
     return if (has_upgrade_token) upgrade_value else null;
 }
 
-/// Whether the request carries `Expect: 100-continue` (RFC 9110 10.1.1).
+/// Whether the request carries `Expect: 100-continue` (RFC 9110 10.1.1). This
+/// standalone scan remains part of the public core API for integrations that
+/// did not build `HeadSemantics` incrementally.
 pub fn expectsContinue(headers: []const Header) bool {
     for (headers) |h| {
         if (eqIgnoreCase(h.name, "expect") and listContains(h.value, "100-continue")) return true;
