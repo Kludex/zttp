@@ -86,6 +86,32 @@ def test_send_request() -> None:
     assert conn.data_to_send() == b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [(b"X-One", b"1"), (b"X-Two", b"2")],
+        ((b"X-One", b"1"), (b"X-Two", b"2")),
+        [[b"X-One", b"1"], [b"X-Two", b"2"]],
+        ([b"X-One", b"1"], [b"X-Two", b"2"]),
+    ],
+)
+def test_send_response_accepts_common_header_sequence_shapes(headers: object) -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.send_response(204, headers)  # type: ignore[arg-type]
+    conn.end_message()
+    assert conn.data_to_send() == b"HTTP/1.1 204 No Content\r\nX-One: 1\r\nX-Two: 2\r\n\r\n"
+
+
+def test_send_response_header_scratch_falls_back_for_large_lists() -> None:
+    headers = [(f"X-{i}".encode(), b"value") for i in range(20)]
+    conn = zttp.Connection(zttp.SERVER)
+    conn.send_response(204, headers)
+    conn.end_message()
+    wire = conn.data_to_send()
+    assert wire.startswith(b"HTTP/1.1 204 No Content\r\nX-0: value\r\n")
+    assert wire.endswith(b"X-19: value\r\n\r\n")
+
+
 def test_chunked_response() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(200, [(b"Transfer-Encoding", b"chunked")])

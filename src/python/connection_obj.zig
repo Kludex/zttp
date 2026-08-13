@@ -1176,16 +1176,15 @@ fn stream_send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwds: ?*c.Py
     var kwlist = [_][*c]u8{ @constCast("status"), @constCast("headers"), @constCast("end_stream"), null };
     if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|Op", @ptrCast(&kwlist), &status, &hdrs_seq, &end_stream) == 0) return null;
     if (status < 0 or status > 999) return py.raiseValue("status code out of range");
-    var hdrs: ?BorrowedHeaders = null;
-    defer if (hdrs) |*h| h.deinit();
+    var hdrs = BorrowedHeaders{};
+    defer hdrs.deinit();
     if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
-        hdrs = borrowHeaders(hdrs_seq) orelse return null;
+        if (!hdrs.borrow(hdrs_seq)) return null;
     }
-    var h = hdrs orelse BorrowedHeaders{ .headers = &.{}, .refs = &.{} };
     return switch (e) {
-        .h2 => |x| x.sendResponse(@intCast(self.stream_id), @intCast(status), &h, end_stream != 0),
+        .h2 => |x| x.sendResponse(@intCast(self.stream_id), @intCast(status), &hdrs, end_stream != 0),
         .h3 => |x| blk: {
-            const r = x.sendResponse(self.stream_id, @intCast(status), h.headers);
+            const r = x.sendResponse(self.stream_id, @intCast(status), hdrs.headers);
             if (r == null or end_stream == 0) break :blk r;
             py.decref(r);
             break :blk x.endStream(self.stream_id);
@@ -1202,15 +1201,14 @@ fn stream_send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callcon
     if (status < 100 or status > 199) return py.raiseValue("informational status code must be in 100..199");
     // 101 Switching Protocols is an HTTP/1.1 mechanism; neither HTTP/2 nor HTTP/3 use it.
     if (status == 101) return py.raiseValue("HTTP/2 and HTTP/3 have no 101 Switching Protocols");
-    var hdrs: ?BorrowedHeaders = null;
-    defer if (hdrs) |*h| h.deinit();
+    var hdrs = BorrowedHeaders{};
+    defer hdrs.deinit();
     if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
-        hdrs = borrowHeaders(hdrs_seq) orelse return null;
+        if (!hdrs.borrow(hdrs_seq)) return null;
     }
-    var h = hdrs orelse BorrowedHeaders{ .headers = &.{}, .refs = &.{} };
     return switch (e) {
-        .h2 => |x| x.sendInformational(@intCast(self.stream_id), @intCast(status), &h),
-        .h3 => |x| x.sendInformational(self.stream_id, @intCast(status), h.headers),
+        .h2 => |x| x.sendInformational(@intCast(self.stream_id), @intCast(status), &hdrs),
+        .h3 => |x| x.sendInformational(self.stream_id, @intCast(status), hdrs.headers),
     };
 }
 
@@ -1261,22 +1259,18 @@ fn stream_end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     const e = self.engine() orelse return null;
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
-    var hdrs: ?BorrowedHeaders = null;
-    defer if (hdrs) |*h| h.deinit();
-    if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
-        hdrs = borrowHeaders(hdrs_seq) orelse return null;
-    }
+    const has_headers = hdrs_seq != null and !py.isNone(hdrs_seq);
+    var hdrs = BorrowedHeaders{};
+    defer hdrs.deinit();
+    if (has_headers and !hdrs.borrow(hdrs_seq)) return null;
     switch (e) {
         // HTTP/2 send-side trailers are still a follow-up; an empty/absent list is the
         // ordinary END_STREAM.
         .h2 => |x| {
-            if (hdrs != null) return py.raise(exceptions.LocalProtocolError, "HTTP/2 send-side trailers are not supported yet");
+            if (has_headers) return py.raise(exceptions.LocalProtocolError, "HTTP/2 send-side trailers are not supported yet");
             return x.endStream(@intCast(self.stream_id));
         },
-        .h3 => |x| {
-            const t = if (hdrs) |h| h.headers else &[_]events.Header{};
-            return x.endMessage(self.stream_id, t);
-        },
+        .h3 => |x| return x.endMessage(self.stream_id, hdrs.headers),
     }
 }
 
@@ -1933,72 +1927,151 @@ fn next_event_eager_for_benchmark(self_obj: ?*c.PyObject, _: ?*c.PyObject) callc
 }
 
 /// Headers borrowed (zero-copy) from a Python sequence of (name, value) bytes
-/// pairs. The Header slices point into the name/value bytes objects, whose
-/// references are HELD in `refs` until `deinit` - so they cannot be freed out
-/// from under the writer even if the sequence synthesizes fresh bytes per
-/// __getitem__ (the borrowed-pointer use-after-free guard).
+/// pairs. Common ASGI lists fit in inline scratch storage. Exact tuple pairs of
+/// exact bytes only retain the pair when their outer list is mutable; custom
+/// sequences retain each synthesized name/value until the writer returns.
 const BorrowedHeaders = struct {
-    headers: []events.Header,
-    refs: []py.Object, // owned: 2 per header (name, value), decref'd on deinit
+    const inline_capacity = 16;
+
+    inline_headers: [inline_capacity]events.Header = undefined,
+    inline_refs: [inline_capacity * 2]py.Object = undefined,
+    headers: []events.Header = &.{},
+    refs: []py.Object = &.{},
+    ref_count: usize = 0,
+    heap_headers: ?[]events.Header = null,
+    heap_refs: ?[]py.Object = null,
+
+    fn exactType(obj: py.Object, tp: *c.PyTypeObject) bool {
+        return @intFromPtr(c.Py_TYPE(obj)) == @intFromPtr(tp);
+    }
+
+    fn prepare(self: *BorrowedHeaders, count: usize) bool {
+        if (count > std.math.maxInt(usize) / 2) {
+            _ = c.PyErr_NoMemory();
+            return false;
+        }
+        if (count <= inline_capacity) {
+            self.headers = self.inline_headers[0..count];
+            self.refs = self.inline_refs[0 .. count * 2];
+            return true;
+        }
+        const headers = gpa.alloc(events.Header, count) catch {
+            _ = c.PyErr_NoMemory();
+            return false;
+        };
+        const refs = gpa.alloc(py.Object, count * 2) catch {
+            gpa.free(headers);
+            _ = c.PyErr_NoMemory();
+            return false;
+        };
+        self.heap_headers = headers;
+        self.heap_refs = refs;
+        self.headers = headers;
+        self.refs = refs;
+        return true;
+    }
+
+    fn releaseRefs(self: *BorrowedHeaders) void {
+        while (self.ref_count > 0) {
+            self.ref_count -= 1;
+            py.decref(self.refs[self.ref_count]);
+        }
+    }
+
+    const ExactResult = enum { success, fallback, failure };
+
+    /// Fast path for the list/tuple of bytes tuples emitted by ASGI apps. A
+    /// mutable outer list yields owned pair references; an outer tuple and its
+    /// inner tuples are immutable and already held by the call argument.
+    fn borrowExact(self: *BorrowedHeaders, seq: py.Object, outer_tuple: bool) ExactResult {
+        for (0..self.headers.len) |i| {
+            const pair = if (outer_tuple)
+                c.PyTuple_GetItem(seq, @intCast(i))
+            else
+                c.PySequence_GetItem(seq, @intCast(i));
+            if (pair == null) return .failure;
+            const pair_owned = !outer_tuple;
+            if (!exactType(pair, &c.PyTuple_Type) or c.PyTuple_Size(pair) < 2) {
+                if (pair_owned) py.decref(pair);
+                self.releaseRefs();
+                return .fallback;
+            }
+
+            const name = c.PyTuple_GetItem(pair, 0);
+            const value = c.PyTuple_GetItem(pair, 1);
+            if (!exactType(name, &c.PyBytes_Type) or !exactType(value, &c.PyBytes_Type)) {
+                if (pair_owned) py.decref(pair);
+                self.releaseRefs();
+                return .fallback;
+            }
+            if (pair_owned) {
+                self.refs[self.ref_count] = pair;
+                self.ref_count += 1;
+            }
+            self.headers[i] = .{
+                .name = py.asBytes(name).?,
+                .value = py.asBytes(value).?,
+            };
+        }
+        return .success;
+    }
+
+    fn borrowGeneric(self: *BorrowedHeaders, seq: py.Object) bool {
+        for (0..self.headers.len) |i| {
+            const pair = c.PySequence_GetItem(seq, @intCast(i));
+            if (pair == null) return false;
+            const name = c.PySequence_GetItem(pair, 0);
+            const value = c.PySequence_GetItem(pair, 1);
+            py.decref(pair);
+            if (name == null or value == null) {
+                py.xdecref(name);
+                py.xdecref(value);
+                _ = py.raiseType("each header must be a (name, value) pair");
+                return false;
+            }
+            const name_bytes = py.asBytes(name) orelse {
+                py.decref(name);
+                py.decref(value);
+                return false;
+            };
+            const value_bytes = py.asBytes(value) orelse {
+                py.decref(name);
+                py.decref(value);
+                return false;
+            };
+            self.refs[self.ref_count] = name;
+            self.refs[self.ref_count + 1] = value;
+            self.ref_count += 2;
+            self.headers[i] = .{ .name = name_bytes, .value = value_bytes };
+        }
+        return true;
+    }
+
+    fn borrow(self: *BorrowedHeaders, seq: py.Object) bool {
+        const n = c.PySequence_Size(seq);
+        if (n < 0) {
+            _ = py.raiseType("headers must be a sequence of (name, value) pairs");
+            return false;
+        }
+        if (!self.prepare(@intCast(n))) return false;
+
+        const outer_tuple = exactType(seq, &c.PyTuple_Type);
+        if (outer_tuple or exactType(seq, &c.PyList_Type)) {
+            switch (self.borrowExact(seq, outer_tuple)) {
+                .success => return true,
+                .failure => return false,
+                .fallback => {},
+            }
+        }
+        return self.borrowGeneric(seq);
+    }
 
     fn deinit(self: *BorrowedHeaders) void {
-        for (self.refs) |r| py.xdecref(r);
-        gpa.free(self.refs);
-        gpa.free(self.headers);
+        self.releaseRefs();
+        if (self.heap_refs) |refs| gpa.free(refs);
+        if (self.heap_headers) |headers| gpa.free(headers);
     }
 };
-
-/// Borrow a list/tuple of (name, value) bytes pairs. On failure sets a Python
-/// error and returns null. The caller MUST call deinit() after the writer call
-/// that consumes the slices returns.
-fn borrowHeaders(seq: py.Object) ?BorrowedHeaders {
-    const n = c.PySequence_Size(seq);
-    if (n < 0) {
-        _ = py.raiseType("headers must be a sequence of (name, value) pairs");
-        return null;
-    }
-    const count: usize = @intCast(n);
-    const slice = gpa.alloc(events.Header, count) catch {
-        _ = c.PyErr_NoMemory();
-        return null;
-    };
-    const refs = gpa.alloc(py.Object, count * 2) catch {
-        gpa.free(slice);
-        _ = c.PyErr_NoMemory();
-        return null;
-    };
-    @memset(refs, null);
-    var result = BorrowedHeaders{ .headers = slice, .refs = refs };
-
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        const item = c.PySequence_GetItem(seq, @intCast(i)); // new ref
-        if (item == null) {
-            result.deinit();
-            return null;
-        }
-        const name = c.PySequence_GetItem(item, 0);
-        const value = c.PySequence_GetItem(item, 1);
-        py.decref(item);
-        refs[i * 2] = name; // held (may be null; xdecref-safe) so the buffer survives
-        refs[i * 2 + 1] = value;
-        if (name == null or value == null) {
-            _ = py.raiseType("each header must be a (name, value) pair");
-            result.deinit();
-            return null;
-        }
-        const nb = py.asBytes(name) orelse {
-            result.deinit();
-            return null;
-        };
-        const vb = py.asBytes(value) orelse {
-            result.deinit();
-            return null;
-        };
-        slice[i] = .{ .name = nb, .value = vb };
-    }
-    return result;
-}
 
 // HTTP/2 send helpers -------------------------------------------------------
 
@@ -2055,8 +2128,9 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
     const mb = py.asBytes(method) orelse return null;
     const tb = py.asBytes(target) orelse return null;
     const vb = py.asBytes(version) orelse return null;
-    var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+    var hdrs = BorrowedHeaders{};
     defer hdrs.deinit();
+    if (!hdrs.borrow(hdrs_seq)) return null;
     switch (engine.*) {
         .h2 => |*e| {
             // HTTP/2: the version arg is ignored (always "2"); :authority is
@@ -2099,8 +2173,9 @@ fn initiate_upgrade_connection(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwds:
     if (settings_obj != null and !py.isNone(settings_obj)) {
         settings_header = py.asBytes(settings_obj) orelse return null;
     }
-    var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+    var hdrs = BorrowedHeaders{};
     defer hdrs.deinit();
+    if (!hdrs.borrow(hdrs_seq)) return null;
     if (!e.initiateUpgrade(mb, tb, &hdrs, settings_header)) return null;
     return makeStream(self_obj, 1);
 }
@@ -2113,12 +2188,12 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     if (c.PyArg_ParseTuple(args, "l|O", &status, &hdrs_seq) == 0) return null;
     if (status < 0 or status > 999) return py.raiseValue("status code out of range");
 
-    var hdrs: ?BorrowedHeaders = null;
-    defer if (hdrs) |*h| h.deinit();
+    var hdrs = BorrowedHeaders{};
+    defer hdrs.deinit();
     if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
-        hdrs = borrowHeaders(hdrs_seq) orelse return null;
+        if (!hdrs.borrow(hdrs_seq)) return null;
     }
-    const header_slice = if (hdrs) |h| h.headers else &.{};
+    const header_slice = hdrs.headers;
 
     const rb = core.h1.writer.reasonPhrase(@intCast(status));
     const w = e.ensureWriter() orelse return null;
@@ -2139,8 +2214,9 @@ fn send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
         w.sendInformational(@intCast(status), &.{}) catch |err| return raiseWrite(err);
     } else {
-        var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+        var hdrs = BorrowedHeaders{};
         defer hdrs.deinit();
+        if (!hdrs.borrow(hdrs_seq)) return null;
         w.sendInformational(@intCast(status), hdrs.headers) catch |err| return raiseWrite(err);
     }
     return py.none();
@@ -2164,8 +2240,9 @@ fn end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Objec
     if (hdrs_seq == null or py.isNone(hdrs_seq)) {
         w.endMessage(&.{}) catch |err| return raiseWrite(err);
     } else {
-        var hdrs = borrowHeaders(hdrs_seq) orelse return null;
+        var hdrs = BorrowedHeaders{};
         defer hdrs.deinit();
+        if (!hdrs.borrow(hdrs_seq)) return null;
         w.endMessage(hdrs.headers) catch |err| return raiseWrite(err);
     }
     return py.none();
