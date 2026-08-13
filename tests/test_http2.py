@@ -276,8 +276,10 @@ def test_server_sends_a_response_a_client_reads() -> None:
 def test_h2_send_side_trailers_rejected() -> None:
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
     stream = client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
-    with pytest.raises(zttp.LocalProtocolError):
+    with pytest.raises(zttp.LocalProtocolError, match="HTTP/2 send-side trailers are not supported yet"):
         stream.end_message([(b"x-trailer", b"v")])
+    with pytest.raises(zttp.LocalProtocolError, match="HTTP/2 send-side trailers are not supported yet"):
+        stream.end_message([(b"malformed",)])  # type: ignore[list-item]
 
 
 def test_h2_concurrent_responses_route_by_their_stream() -> None:
