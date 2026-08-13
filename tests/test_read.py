@@ -9,6 +9,32 @@ import zttp
 from tests.conftest import drain, drain_all, parse_request
 
 
+def test_receive_event_feeds_and_returns_first_available_http1_event() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    event = conn.receive_event(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+
+    assert isinstance(event, zttp.Request)
+    data = conn.next_event()
+    assert isinstance(data, zttp.Data)
+    assert data.data == b"hello"
+    assert isinstance(conn.next_event(), zttp.EndOfMessage)
+
+
+def test_receive_event_returns_need_data_for_partial_http1_input() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    assert conn.receive_event(b"GET / HTTP/1.1\r\nHost:") is zttp.NEED_DATA
+    event = conn.receive_event(b" example.com\r\n\r\n")
+    assert isinstance(event, zttp.Request)
+
+
+def test_receive_event_preserves_terminal_parse_errors() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.receive_event(b"GET / HTTP/1.1\nBad header\n\n")
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
+
+
 def test_simple_get() -> None:
     events = parse_request(b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
     assert len(events) == 1

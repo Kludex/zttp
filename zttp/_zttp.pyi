@@ -316,6 +316,9 @@ class H1Connection(Connection):
     def receive_data(self, data: bytes, /) -> None:
         """Append received bytes to the parse buffer (empty bytes signals EOF)."""
 
+    def receive_event(self, data: bytes, /) -> Request | Response | Data | EndOfMessage | NeedData | ConnectionClosed:
+        """Feed received bytes and return the first available event, or `NEED_DATA`."""
+
     def data_to_send(self) -> bytes:
         """Return and clear the bytes queued to send."""
 

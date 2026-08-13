@@ -14,6 +14,25 @@ with the send API.
 The read side is `receive_data` + `next_event`. Once bodies, chunked encoding,
 and partial data enter the picture, here's what happens.
 
+An event loop that immediately pulls after every socket read can combine those
+two extension calls with `receive_event(data)`. It returns the first event made
+available by `data`, or `NEED_DATA`; continue with `next_event()` to drain any
+additional events:
+
+```python
+import zttp
+
+
+def events_from(conn: zttp.H1Connection, data: bytes):
+    event = conn.receive_event(data)
+    while event is not zttp.NEED_DATA:
+        yield event
+        event = conn.next_event()
+```
+
+This is an HTTP/1 integration fast path. `receive_data()` and `next_event()`
+remain the general pull API and keep their existing behavior.
+
 ### Request completion
 
 When framing proves a request has no body, the `Request` arrives with
