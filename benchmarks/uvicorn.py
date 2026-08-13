@@ -5,7 +5,10 @@ one header tuple per ``on_header`` callback, then fills the request-line fields
 in ``on_headers_complete``.  This benchmark performs that same work for
 httptools and constructs the equivalent scope from zttp's Request event. Each
 iteration runs through request completion as Uvicorn must before dispatch. It
-also keeps the legacy eager zttp header-list path as an A/B control.
+compares zttp's split ``receive_data`` + ``next_event`` API with the combined
+``receive_event`` fast path, and keeps the legacy eager header-list path as an
+A/B control. Both fresh-connection and persistent keep-alive lifecycles are
+available.
 
 Reference implementation:
 https://github.com/Kludex/uvicorn/blob/main/uvicorn/protocols/http/httptools_impl.py
@@ -15,10 +18,15 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
+import platform
 import statistics
+import subprocess
+import sys
 import time
 import urllib.parse
 from collections.abc import Callable
+from importlib.metadata import version
 
 import httptools
 
@@ -104,15 +112,19 @@ class UvicornHttptoolsProtocol:
         self.complete = True
 
 
-def make_httptools(raw: bytes) -> Runner:
+def make_httptools(raw: bytes, *, persistent: bool) -> Runner:
     def run(iterations: int) -> None:
         scope: dict[str, object] | None = None
+        protocol = UvicornHttptoolsProtocol() if persistent else None
         for _ in range(iterations):
-            protocol = UvicornHttptoolsProtocol()
+            if protocol is None:
+                protocol = UvicornHttptoolsProtocol()
             protocol.parser.feed_data(raw)
             if not protocol.complete:
                 raise AssertionError("incomplete request")
             scope = protocol.scope
+            if not persistent:
+                protocol = None
         if scope is None:
             raise AssertionError("missing scope")
 
@@ -139,26 +151,42 @@ def scope_from_zttp(event: zttp.Request) -> dict[str, object]:
     return scope
 
 
-def make_zttp(raw: bytes, *, packed: bool) -> Runner:
+def drain_request(conn: zttp.H1Connection, event: zttp.Request) -> None:
+    if event.end_stream:
+        return
+    while True:
+        terminal = conn.next_event()
+        if isinstance(terminal, zttp.EndOfMessage):
+            return
+        if not isinstance(terminal, zttp.Data):
+            raise AssertionError("incomplete request")
+
+
+def make_zttp(raw: bytes, *, api: str, persistent: bool) -> Runner:
     Connection, SERVER = zttp.Connection, zttp.SERVER
 
     def run(iterations: int) -> None:
         scope: dict[str, object] | None = None
+        conn = Connection(SERVER) if persistent else None
         for _ in range(iterations):
-            conn = Connection(SERVER)
-            conn.receive_data(raw)
-            if packed:
-                event = conn.next_event()
+            if conn is None:
+                conn = Connection(SERVER)
+            if api == "combined":
+                event = conn.receive_event(raw)
             else:
+                conn.receive_data(raw)
+            if api == "split":
+                event = conn.next_event()
+            elif api == "eager":
                 event = getattr(conn, "_next_event_eager_for_benchmark")()
+            if not isinstance(event, zttp.Request):
+                raise AssertionError("missing request")
             scope = scope_from_zttp(event)
-            if not getattr(event, "end_stream", False):
-                while True:
-                    terminal = conn.next_event()
-                    if isinstance(terminal, zttp.EndOfMessage):
-                        break
-                    if not isinstance(terminal, zttp.Data):
-                        raise AssertionError("incomplete request")
+            drain_request(conn, event)
+            if persistent:
+                conn.start_next_cycle()
+            else:
+                conn = None
         if scope is None:
             raise AssertionError("missing scope")
 
@@ -171,19 +199,19 @@ def verify(raw: bytes) -> None:
     if not protocol.complete:
         raise AssertionError("httptools did not complete the request")
 
-    conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(raw)
-    request = conn.next_event()
-    packed_scope = scope_from_zttp(request)
-    if not getattr(request, "end_stream", False):
-        while True:
-            terminal = conn.next_event()
-            if isinstance(terminal, zttp.EndOfMessage):
-                break
-            if not isinstance(terminal, zttp.Data):
-                raise AssertionError("zttp did not complete the request")
-    if packed_scope != protocol.scope:
-        raise AssertionError(f"zttp scope differs from Uvicorn: {packed_scope!r} != {protocol.scope!r}")
+    for api in ("split", "combined"):
+        conn = zttp.Connection(zttp.SERVER)
+        if api == "combined":
+            request = conn.receive_event(raw)
+        else:
+            conn.receive_data(raw)
+            request = conn.next_event()
+        if not isinstance(request, zttp.Request):
+            raise AssertionError(f"zttp {api} API did not produce a request")
+        scope = scope_from_zttp(request)
+        drain_request(conn, request)
+        if scope != protocol.scope:
+            raise AssertionError(f"zttp {api} scope differs from Uvicorn: {scope!r} != {protocol.scope!r}")
 
 
 def timed(run: Runner, iterations: int) -> float:
@@ -205,31 +233,49 @@ def quartiles(values: list[float]) -> tuple[float, float, float]:
     return q1, median, q3
 
 
-def benchmark(name: str, raw: bytes, iterations: int, repeats: int) -> None:
+def benchmark(name: str, raw: bytes, iterations: int, repeats: int, lifecycle: str) -> None:
     verify(raw)
+    persistent = lifecycle == "keep-alive"
     runners = {
-        "httptools": make_httptools(raw),
-        "zttp eager": make_zttp(raw, packed=False),
-        "zttp packed": make_zttp(raw, packed=True),
+        "httptools": make_httptools(raw, persistent=persistent),
+        "zttp eager": make_zttp(raw, api="eager", persistent=persistent),
+        "zttp split": make_zttp(raw, api="split", persistent=persistent),
+        "zttp combined": make_zttp(raw, api="combined", persistent=persistent),
     }
     for run in runners.values():
         run(max(1, iterations // 10))
 
     samples = {label: [] for label in runners}
-    for _ in range(repeats):
-        for label, run in runners.items():
+    ordered = list(runners.items())
+    for repeat in range(repeats):
+        # Rotate the first runner so thermal/scheduler drift does not always
+        # favour the same implementation.
+        rotated = ordered[repeat % len(ordered) :] + ordered[: repeat % len(ordered)]
+        for label, run in rotated:
             samples[label].append(iterations / timed(run, iterations))
 
     rates: dict[str, float] = {}
-    print(f"\n== {name} ({len(raw)}B, {repeats} batches of {iterations:,}) ==")
+    print(f"\n== {name} / {lifecycle} ({len(raw)}B, {repeats} batches of {iterations:,}) ==")
     for label, values in samples.items():
         p25, median, p75 = quartiles(values)
         rates[label] = median
-        print(f"  {label:>11}: {median:10,.0f} scope/s  (p25-p75 {p25:,.0f}-{p75:,.0f})")
+        print(f"  {label:>13}: {median:10,.0f} scope/s  (p25-p75 {p25:,.0f}-{p75:,.0f})")
     print(
-        f"  -> packed/eager {rates['zttp packed'] / rates['zttp eager']:.2f}x; "
-        f"packed/httptools {rates['zttp packed'] / rates['httptools']:.2f}x"
+        f"  -> combined/split {rates['zttp combined'] / rates['zttp split']:.2f}x; "
+        f"combined/httptools {rates['zttp combined'] / rates['httptools']:.2f}x; "
+        f"split/eager {rates['zttp split'] / rates['zttp eager']:.2f}x"
     )
+
+
+def git_revision() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(__file__),
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 def main() -> None:
@@ -237,11 +283,19 @@ def main() -> None:
     parser.add_argument("--iterations", type=positive_int, default=50_000)
     parser.add_argument("--repeats", type=positive_int, default=11)
     parser.add_argument("--only", choices=WORKLOADS, default=None)
+    parser.add_argument("--lifecycle", choices=("isolated", "keep-alive", "both"), default="both")
     args = parser.parse_args()
 
+    print(
+        f"CPython {sys.version.split()[0]}, zttp {version('zttp')}, httptools {version('httptools')}, "
+        f"{platform.machine()} {platform.system()}, commit {git_revision()}, "
+        f"build {os.environ.get('HATCH_ZIG_BUILD_MODE', 'unknown')}"
+    )
     workloads = WORKLOADS.items() if args.only is None else [(args.only, WORKLOADS[args.only])]
-    for name, raw in workloads:
-        benchmark(name, raw, args.iterations, args.repeats)
+    lifecycles = ("isolated", "keep-alive") if args.lifecycle == "both" else (args.lifecycle,)
+    for lifecycle in lifecycles:
+        for name, raw in workloads:
+            benchmark(name, raw, args.iterations, args.repeats, lifecycle)
 
 
 if __name__ == "__main__":

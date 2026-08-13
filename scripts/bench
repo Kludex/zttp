@@ -8,13 +8,14 @@
 # No args runs all three with their defaults. To pass flags (e.g. --batch,
 # --repeats, or --only), target one protocol:
 #   scripts/bench http2 --only GET
+#   scripts/bench uvicorn --only api --lifecycle keep-alive
 
 set -x
 
 HATCH_ZIG_BUILD_MODE=ReleaseSafe uv sync --all-groups
 
 case "$1" in
-    http1 | http2 | http3)
+    http1 | http2 | http3 | uvicorn)
         proto="$1"
         shift
         uv run --no-sync python "benchmarks/$proto.py" "$@"
@@ -25,7 +26,7 @@ case "$1" in
         uv run --no-sync python benchmarks/http3.py
         ;;
     *)
-        echo "usage: scripts/bench [http1|http2|http3] [args...]" >&2
+        echo "usage: scripts/bench [http1|http2|http3|uvicorn] [args...]" >&2
         exit 2
         ;;
 esac
