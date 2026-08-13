@@ -27,6 +27,58 @@ pub const Role = enum { server, client };
 
 const TrailerRange = struct { off: usize, len: usize };
 
+const HeadScan = struct {
+    len: usize,
+    header_count: usize,
+};
+
+/// Incrementally locates the blank line terminating an HTTP head while also
+/// enforcing its line/count/byte limits. `scanned` and `line_start` are offsets
+/// from the current message start, so appending another receive buffer resumes
+/// at the first new byte instead of re-reading the whole partial head.
+const HeadScanner = struct {
+    scanned: usize = 0,
+    line_start: usize = 0,
+    completed_lines: usize = 0,
+
+    fn reset(self: *HeadScanner) void {
+        self.* = .{};
+    }
+
+    fn scan(self: *HeadScanner, region: []const u8, limits: Limits) ParseError!?HeadScan {
+        std.debug.assert(self.scanned <= region.len);
+        while (std.mem.findScalarPos(u8, region, self.scanned, '\n')) |lf| {
+            const has_cr = lf > self.line_start and region[lf - 1] == '\r';
+            const line_len = lf - self.line_start - @intFromBool(has_cr);
+            if (line_len > limits.max_line) return error.MessageTooLong;
+
+            const next = lf + 1;
+            if (next > limits.max_header_bytes) return error.MessageTooLong;
+
+            // A blank line terminates a head only after the request/status line.
+            // This preserves the old delimiter search for malformed leading CRLF.
+            if (line_len == 0 and self.completed_lines > 0) {
+                const header_count = self.completed_lines - 1;
+                if (header_count > limits.max_headers) return error.MessageTooLong;
+                return .{ .len = next, .header_count = header_count };
+            }
+
+            self.completed_lines += 1;
+            if (self.completed_lines > 1 and self.completed_lines - 1 > limits.max_headers) {
+                return error.MessageTooLong;
+            }
+            self.scanned = next;
+            self.line_start = next;
+        }
+
+        self.scanned = region.len;
+        if (region.len > limits.max_header_bytes or region.len - self.line_start > limits.max_line) {
+            return error.MessageTooLong;
+        }
+        return null;
+    }
+};
+
 const State = enum {
     /// Waiting for the request/status line + headers of a new message.
     head,
@@ -73,6 +125,7 @@ pub const Reader = struct {
     consumed: usize = 0,
 
     state: State = .head,
+    head_scanner: HeadScanner = .{},
     /// Header storage for the message currently being reported. Cleared on reset.
     headers: std.ArrayList(Header) = .empty,
     trailers: std.ArrayList(Header) = .empty,
@@ -164,6 +217,7 @@ pub const Reader = struct {
     pub fn reset(self: *Reader) void {
         if (self.state == .failed) return;
         self.state = .head;
+        self.head_scanner.reset();
         self.headers.clearRetainingCapacity();
         self.trailers.clearRetainingCapacity();
         self.trailer_store.clearRetainingCapacity();
@@ -269,22 +323,18 @@ pub const Reader = struct {
 
     fn readHead(self: *Reader) ParseError!Event {
         // Find the blank line that ends the header block before committing, so a
-        // partial head leaves the buffer untouched.
+        // partial head leaves the buffer untouched. The scanner resumes where a
+        // previous call stopped and combines the terminator and limit scans.
         const region = self.avail();
-        const maybe_head_end = findHeadEnd(region);
-        // Enforce the head-size cap on BOTH the complete- and incomplete-head
-        // branches, before committing to the head, so an oversized but complete
-        // head cannot be buffered without bound before the limit fires.
-        const candidate_len = maybe_head_end orelse region.len;
-        if (candidate_len > self.limits.max_header_bytes) return error.MessageTooLong;
-        try enforceLineLimit(region[0..candidate_len], self.limits.max_line);
-        const head_len = maybe_head_end orelse {
+        const scan = (try self.head_scanner.scan(region, self.limits)) orelse {
             if (self.eof_seen and region.len == 0) {
                 self.state = .closed;
                 return .connection_closed;
             }
             return .need_data;
         };
+        self.head_scanner.reset();
+        const head_len = scan.len;
 
         // Parse the head in place, borrowing slices directly from the input
         // buffer - no copy. This is safe because the produced request/response
@@ -303,6 +353,7 @@ pub const Reader = struct {
         }).?;
 
         self.headers.clearRetainingCapacity();
+        self.headers.ensureTotalCapacity(self.gpa, scan.header_count) catch return error.MessageTooLong;
         var semantics = connection_mod.HeadSemantics{};
         var header_bytes: usize = 0;
         while (sc.line(self.limits.max_line, strict) catch |e| switch (e) {
@@ -473,32 +524,18 @@ pub const Reader = struct {
     }
 };
 
-/// Find the byte offset just past the blank line terminating the header block,
-/// i.e. the length of the head. Recognizes both CRLFCRLF and bare LFLF.
-fn enforceLineLimit(region: []const u8, max_line: usize) ParseError!void {
-    var start: usize = 0;
-    while (start < region.len) {
-        const lf = std.mem.indexOfScalarPos(u8, region, start, '\n') orelse break;
-        const has_cr = lf > start and region[lf - 1] == '\r';
-        const line_len = lf - start - @intFromBool(has_cr);
-        if (line_len > max_line) return error.MessageTooLong;
-        start = lf + 1;
-    }
-    if (region.len - start > max_line) return error.MessageTooLong;
-}
-
+/// Find the byte offset just past the blank line terminating a complete head.
+/// The Python adapter uses this stateless helper only for large feeds where it
+/// splits an immediately-following body into its zero-copy retention path.
 pub fn findHeadEnd(region: []const u8) ?usize {
     var i: usize = 0;
-    while (i < region.len) {
-        // Look for LF, then test what precedes/follows for the blank line.
-        const lf = std.mem.indexOfScalarPos(u8, region, i, '\n') orelse return null;
-        // Is the line ending at `lf` empty (i.e. immediately another CRLF/LF)?
+    while (std.mem.findScalarPos(u8, region, i, '\n')) |lf| {
         const next = lf + 1;
         if (next < region.len) {
             if (region[next] == '\n') return next + 1;
             if (region[next] == '\r' and next + 1 < region.len and region[next + 1] == '\n') return next + 2;
         }
-        i = lf + 1;
+        i = next;
     }
     return null;
 }
@@ -536,16 +573,23 @@ fn expectTag(comptime tag: std.meta.Tag(Event), e: Event) !void {
     try t.expectEqual(tag, std.meta.activeTag(e));
 }
 
-test "findHeadEnd crlf" {
-    try t.expectEqual(@as(?usize, 18), findHeadEnd("GET / HTTP/1.1\r\n\r\nX"));
+test "head scanner finds CRLF and bare-LF terminators" {
+    var scanner = HeadScanner{};
+    try t.expectEqual(@as(?HeadScan, .{ .len = 18, .header_count = 0 }), try scanner.scan("GET / HTTP/1.1\r\n\r\nX", .{}));
+    scanner.reset();
+    try t.expectEqual(@as(?HeadScan, .{ .len = 16, .header_count = 0 }), try scanner.scan("GET / HTTP/1.1\n\nX", .{}));
 }
 
-test "findHeadEnd lf" {
-    try t.expectEqual(@as(?usize, 16), findHeadEnd("GET / HTTP/1.1\n\nX"));
-}
-
-test "findHeadEnd partial" {
-    try t.expectEqual(@as(?usize, null), findHeadEnd("GET / HTTP/1.1\r\nHost: x\r\n"));
+test "head scanner resumes partial heads without rescanning" {
+    var scanner = HeadScanner{};
+    const partial = "GET / HTTP/1.1\r\nHost: x\r\n";
+    try t.expectEqual(@as(?HeadScan, null), try scanner.scan(partial, .{}));
+    try t.expectEqual(partial.len, scanner.scanned);
+    try t.expectEqual(@as(usize, 2), scanner.completed_lines);
+    try t.expectEqual(
+        @as(?HeadScan, .{ .len = partial.len + 2, .header_count = 1 }),
+        try scanner.scan(partial ++ "\r\nbody", .{}),
+    );
 }
 
 test "simple GET no body" {
