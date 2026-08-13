@@ -10,7 +10,6 @@
 
 const std = @import("std");
 const events = @import("../events.zig");
-const ascii = @import("../ascii.zig");
 const headers_mod = @import("headers.zig");
 const framing_mod = @import("framing.zig");
 const connection_mod = @import("connection.zig");
@@ -304,6 +303,7 @@ pub const Reader = struct {
         }).?;
 
         self.headers.clearRetainingCapacity();
+        var semantics = connection_mod.HeadSemantics{};
         var header_bytes: usize = 0;
         while (sc.line(self.limits.max_line, strict) catch |e| switch (e) {
             error.MessageTooLong => return error.MessageTooLong,
@@ -315,12 +315,13 @@ pub const Reader = struct {
                 return error.MessageTooLong;
             }
             const h = try headers_mod.parseHeaderLine(hl);
+            try semantics.add(h);
             self.headers.append(self.gpa, h) catch return error.MessageTooLong;
         }
 
         if (self.role == .server) {
             const rl = try headers_mod.parseRequestLine(first);
-            const framing = try framing_mod.determine(self.headers.items, .{ .until_close_default = false });
+            const framing = try semantics.framing.finish(.{ .until_close_default = false });
             const end_stream = framing == .none;
             if (end_stream) {
                 // The Request event itself completes a bodyless request. Avoid
@@ -330,8 +331,8 @@ pub const Reader = struct {
             } else {
                 self.enterBody(framing);
             }
-            self.conn_should_close = connection_mod.shouldClose(rl.http_version, self.headers.items);
-            self.conn_upgrade = connection_mod.upgrade(self.headers.items);
+            self.conn_should_close = semantics.shouldClose(rl.http_version);
+            self.conn_upgrade = semantics.upgrade();
             return .{ .request = .{
                 .method = rl.method,
                 .target = rl.target,
@@ -339,7 +340,7 @@ pub const Reader = struct {
                 .query = rl.query,
                 .http_version = rl.http_version,
                 .headers = self.headers.items,
-                .expect_continue = connection_mod.expectsContinue(self.headers.items),
+                .expect_continue = semantics.expect_continue,
                 .end_stream = end_stream,
             } };
         }
@@ -351,11 +352,7 @@ pub const Reader = struct {
             // requiring reset() or clearing the remembered request method. 1xx
             // responses cannot carry body framing fields; reject them before the
             // interim head is surfaced as trusted metadata.
-            for (self.headers.items) |h| {
-                if (ascii.eqIgnoreCase(h.name, "content-length") or ascii.eqIgnoreCase(h.name, "transfer-encoding")) {
-                    return error.InvalidFraming;
-                }
-            }
+            if (semantics.framing.hasFramingHeader()) return error.InvalidFraming;
             self.state = .head;
             return .{ .response = .{
                 .status_code = st.status_code,
@@ -365,24 +362,19 @@ pub const Reader = struct {
             } };
         }
         const method = self.request_method[0..self.request_method_len];
-        const framing = try self.frameBody(.{
+        const framing = try semantics.framing.finish(.{
             .bodyless = framing_mod.responseIsBodyless(method, st.status_code),
             .forbid_transfer_encoding = framing_mod.responseForbidsTransferEncoding(method, st.status_code),
             .until_close_default = true,
         });
-        self.conn_should_close = connection_mod.shouldClose(st.http_version, self.headers.items) or framing == .until_close;
+        self.enterBody(framing);
+        self.conn_should_close = semantics.shouldClose(st.http_version) or framing == .until_close;
         return .{ .response = .{
             .status_code = st.status_code,
             .reason = st.reason,
             .http_version = st.http_version,
             .headers = self.headers.items,
         } };
-    }
-
-    fn frameBody(self: *Reader, opts: framing_mod.FramingOptions) ParseError!Framing {
-        const framing = try framing_mod.determine(self.headers.items, opts);
-        self.enterBody(framing);
-        return framing;
     }
 
     fn enterBody(self: *Reader, f: Framing) void {

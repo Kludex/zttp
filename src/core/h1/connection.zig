@@ -8,6 +8,8 @@
 const std = @import("std");
 const ascii = @import("../ascii.zig");
 const events = @import("../events.zig");
+const framing = @import("framing.zig");
+const ParseError = @import("../errors.zig").ParseError;
 
 const Header = events.Header;
 const eqIgnoreCase = ascii.eqIgnoreCase;
@@ -22,6 +24,49 @@ fn listContains(value: []const u8, token: []const u8) bool {
     }
     return false;
 }
+
+/// All semantics derived from an HTTP/1 head while its fields are parsed. The
+/// reader feeds each header exactly once, then finalizes framing and connection
+/// state after parsing the request/status line.
+pub const HeadSemantics = struct {
+    framing: framing.Analyzer = .{},
+    has_close: bool = false,
+    has_keep_alive: bool = false,
+    has_upgrade_token: bool = false,
+    upgrade_value: ?[]const u8 = null,
+    expect_continue: bool = false,
+
+    pub fn add(self: *HeadSemantics, h: Header) ParseError!void {
+        try self.framing.add(h);
+
+        if (eqIgnoreCase(h.name, "connection")) {
+            var it = std.mem.splitScalar(u8, h.value, ',');
+            while (it.next()) |raw| {
+                const token = trimOws(raw);
+                if (eqIgnoreCase(token, "close")) {
+                    self.has_close = true;
+                } else if (eqIgnoreCase(token, "keep-alive")) {
+                    self.has_keep_alive = true;
+                } else if (eqIgnoreCase(token, "upgrade")) {
+                    self.has_upgrade_token = true;
+                }
+            }
+        } else if (eqIgnoreCase(h.name, "upgrade")) {
+            self.upgrade_value = h.value;
+        } else if (eqIgnoreCase(h.name, "expect") and listContains(h.value, "100-continue")) {
+            self.expect_continue = true;
+        }
+    }
+
+    pub fn shouldClose(self: HeadSemantics, http_version: []const u8) bool {
+        if (self.has_close) return true;
+        return eqIgnoreCase(http_version, "1.0") and !self.has_keep_alive;
+    }
+
+    pub fn upgrade(self: HeadSemantics) ?[]const u8 {
+        return if (self.has_upgrade_token) self.upgrade_value else null;
+    }
+};
 
 /// Whether a `Connection` header carries the `close` token, across any number of
 /// `Connection` field-lines. Applies to a head in either direction: a peer's, or
@@ -52,7 +97,9 @@ pub fn shouldClose(http_version: []const u8, headers: []const Header) bool {
 
 /// The `Upgrade` header value iff the `Connection` header lists the `upgrade`
 /// token (RFC 9110 7.8); otherwise null. The integrator compares it to e.g.
-/// "websocket".
+/// "websocket". This standalone scan remains part of the public core API for
+/// integrations that receive an already-complete header slice instead of
+/// feeding fields through `HeadSemantics` while parsing.
 pub fn upgrade(headers: []const Header) ?[]const u8 {
     var has_upgrade_token = false;
     var upgrade_value: ?[]const u8 = null;
@@ -66,10 +113,12 @@ pub fn upgrade(headers: []const Header) ?[]const u8 {
     return if (has_upgrade_token) upgrade_value else null;
 }
 
-/// Whether the request carries `Expect: 100-continue` (RFC 9110 10.1.1).
+/// Whether the request carries `Expect: 100-continue` (RFC 9110 10.1.1). This
+/// standalone scan remains part of the public core API for integrations that
+/// did not build `HeadSemantics` incrementally.
 pub fn expectsContinue(headers: []const Header) bool {
     for (headers) |h| {
-        if (eqIgnoreCase(h.name, "expect") and eqIgnoreCase(trimOws(h.value), "100-continue")) return true;
+        if (eqIgnoreCase(h.name, "expect") and listContains(h.value, "100-continue")) return true;
     }
     return false;
 }
@@ -124,6 +173,24 @@ test "expectsContinue" {
     try t.expect(expectsContinue(&h));
     const h2 = [_]Header{.{ .name = "Expect", .value = "100-Continue" }};
     try t.expect(expectsContinue(&h2));
-    const h3 = [_]Header{.{ .name = "Host", .value = "x" }};
-    try t.expect(!expectsContinue(&h3));
+    const h3 = [_]Header{.{ .name = "Expect", .value = "something, 100-Continue" }};
+    try t.expect(expectsContinue(&h3));
+    const h4 = [_]Header{.{ .name = "Host", .value = "x" }};
+    try t.expect(!expectsContinue(&h4));
+}
+
+test "head semantics collects framing and connection metadata in one pass" {
+    const headers = [_]Header{
+        .{ .name = "Content-Length", .value = "5" },
+        .{ .name = "Connection", .value = "keep-alive, Upgrade" },
+        .{ .name = "Upgrade", .value = "websocket" },
+        .{ .name = "Expect", .value = "something, 100-Continue" },
+    };
+    var semantics = HeadSemantics{};
+    for (headers) |h| try semantics.add(h);
+
+    try t.expectEqual(@as(u64, 5), (try semantics.framing.finish(.{})).content_length);
+    try t.expect(!semantics.shouldClose("1.0"));
+    try t.expectEqualStrings("websocket", semantics.upgrade().?);
+    try t.expect(semantics.expect_continue);
 }
