@@ -216,25 +216,47 @@ const H1Engine = struct {
     /// those on the existing copy path.
     const retain_body_min = 512;
 
-    fn receiveData(self: *H1Engine, data: []const u8, obj: py.Object) py.Object {
-        if (!self.flushPending()) return null;
-        if (data.len > 0 and self.reader.eofSeen()) return exceptions.raiseParse(error.ProtocolError);
+    fn feedData(self: *H1Engine, data: []const u8, obj: py.Object) bool {
+        if (!self.flushPending()) return false;
+        if (data.len > 0 and self.reader.eofSeen()) {
+            _ = exceptions.raiseParse(error.ProtocolError);
+            return false;
+        }
         if (data.len > 0 and self.reader.backlogEmpty()) {
             if (self.reader.bodyLengthRemaining() != null) {
-                self.stash(obj, data) catch |err| return exceptions.raiseParse(err);
-                return py.none();
+                self.stash(obj, data) catch |err| {
+                    _ = exceptions.raiseParse(err);
+                    return false;
+                };
+                return true;
             }
             if (data.len >= head_split_min_feed and self.reader.atMessageStart()) {
                 if (core.h1.reader.findHeadEnd(data)) |head_end| {
-                    self.reader.checkBufferLimit(data.len) catch |err| return exceptions.raiseParse(err);
-                    self.reader.feed(data[0..head_end]) catch |err| return exceptions.raiseParse(err);
-                    if (head_end < data.len) self.stash(obj, data[head_end..]) catch |err| return exceptions.raiseParse(err);
-                    return py.none();
+                    self.reader.checkBufferLimit(data.len) catch |err| {
+                        _ = exceptions.raiseParse(err);
+                        return false;
+                    };
+                    self.reader.feed(data[0..head_end]) catch |err| {
+                        _ = exceptions.raiseParse(err);
+                        return false;
+                    };
+                    if (head_end < data.len) self.stash(obj, data[head_end..]) catch |err| {
+                        _ = exceptions.raiseParse(err);
+                        return false;
+                    };
+                    return true;
                 }
             }
         }
-        self.reader.feed(data) catch |err| return exceptions.raiseParse(err);
-        return py.none();
+        self.reader.feed(data) catch |err| {
+            _ = exceptions.raiseParse(err);
+            return false;
+        };
+        return true;
+    }
+
+    fn receiveData(self: *H1Engine, data: []const u8, obj: py.Object) py.Object {
+        return if (self.feedData(data, obj)) py.none() else null;
     }
 
     fn deinit(self: *H1Engine) void {
@@ -1928,6 +1950,17 @@ fn next_event_eager_for_benchmark(self_obj: ?*c.PyObject, _: ?*c.PyObject) callc
     return nextEventImpl(self_obj, true);
 }
 
+/// Feed one HTTP/1 byte span and return its first available event in the same
+/// extension call. Callers can continue with next_event() when this did not
+/// return NEED_DATA, avoiding a container allocation on the one-event hot path.
+fn receive_event(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const bytes = py.asBytes(arg) orelse return null;
+    const engine = h1(self) orelse return null;
+    if (!engine.feedData(bytes, arg)) return null;
+    return nextEventImpl(self_obj, false);
+}
+
 /// Headers borrowed (zero-copy) from a Python sequence of (name, value) bytes
 /// pairs. Common ASGI lists fit in inline scratch storage. Exact tuple pairs of
 /// exact bytes only retain the pair when their outer list is mutable; custom
@@ -2582,6 +2615,7 @@ var base_methods = [_]py.MethodDef{
 // keep-alive / upgrade signals.
 var h1_methods = [_]py.MethodDef{
     .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
+    .{ .ml_name = "receive_event", .ml_meth = receive_event, .ml_flags = c.METH_O, .ml_doc = "Feed received bytes and return the first available event, or NEED_DATA." },
     .{ .ml_name = "_next_event_eager_for_benchmark", .ml_meth = next_event_eager_for_benchmark, .ml_flags = c.METH_NOARGS, .ml_doc = "Private benchmark control for comparing the legacy eager header list." },
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
     .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },

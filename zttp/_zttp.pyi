@@ -113,8 +113,8 @@ class Data:
 
     Attributes:
         data: Owned body bytes that are safe to keep. Qualifying HTTP/1 spans
-            reuse the immutable `bytes` supplied to `receive_data()`; other
-            paths copy out of the parse buffer.
+            reuse the immutable `bytes` supplied to `receive_data()` or
+            `receive_event()`; other paths copy out of the parse buffer.
         stream_id: The stream the body belongs to (`0` on HTTP/1.1).
     """
 
@@ -315,6 +315,9 @@ class H1Connection(Connection):
 
     def receive_data(self, data: bytes, /) -> None:
         """Append received bytes to the parse buffer (empty bytes signals EOF)."""
+
+    def receive_event(self, data: bytes, /) -> Request | Response | Data | EndOfMessage | NeedData | ConnectionClosed:
+        """Feed received bytes and return the first available event, or `NEED_DATA`."""
 
     def data_to_send(self) -> bytes:
         """Return and clear the bytes queued to send."""
