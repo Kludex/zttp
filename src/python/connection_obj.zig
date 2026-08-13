@@ -51,6 +51,86 @@ const DEFAULT_CLIENT_TRANSPORT_PARAMS = [_]u8{
 
 var server_ticket_store: std.ArrayListUnmanaged(ResumptionCredential) = .empty;
 
+/// A Python-owned receive span retained outside the pure-Zig reader. Keeping
+/// the owner and slice behind one adapter state centralises every reference
+/// transition without adding a union tag to each connection.
+const PendingInput = struct {
+    owner: py.Object = null,
+    bytes: []const u8 = &.{},
+
+    const retain_body_min = 512;
+
+    inline fn retain(self: *PendingInput, reader: *Reader, owner: py.Object, bytes: []const u8) core.errors.ParseError!void {
+        std.debug.assert(bytes.len > 0);
+        std.debug.assert(self.owner == null);
+        std.debug.assert(self.bytes.len == 0);
+        try reader.checkBufferLimit(bytes.len);
+        py.incref(owner);
+        self.owner = owner;
+        self.bytes = bytes;
+    }
+
+    inline fn clear(self: *PendingInput) void {
+        std.debug.assert((self.owner != null) == (self.bytes.len != 0));
+        py.xdecref(self.owner);
+        self.owner = null;
+        self.bytes = &.{};
+    }
+
+    inline fn hasData(self: *const PendingInput) bool {
+        std.debug.assert((self.owner != null) == (self.bytes.len != 0));
+        return self.owner != null;
+    }
+
+    /// Move the retained span into the reader's owned buffer. The reference is
+    /// released whether the feed succeeds or fails.
+    inline fn flushInto(self: *PendingInput, reader: *Reader) core.errors.ParseError!void {
+        if (self.owner == null) return;
+        defer self.clear();
+        try reader.feed(self.bytes);
+    }
+
+    /// Emit the next Content-Length body span directly from its Python owner.
+    /// The caller has established that the reader backlog is empty and a body
+    /// remainder exists.
+    inline fn emitBody(self: *PendingInput, reader: *Reader) py.Object {
+        std.debug.assert(self.owner != null);
+        std.debug.assert(self.bytes.len != 0);
+        const rem = reader.bodyLengthRemaining().?;
+        const take: usize = @intCast(@min(rem, @as(u64, self.bytes.len)));
+        const can_retain = if (take >= retain_body_min) blk: {
+            const owned = py.asBytes(self.owner).?;
+            break :blk take == self.bytes.len and
+                self.bytes.ptr == owned.ptr and
+                self.bytes.len == owned.len;
+        } else false;
+        const out = if (can_retain)
+            events_obj.makeH1DataFromBytes(self.owner)
+        else
+            events_obj.fromH1Event(.{ .data = .{ .data = self.bytes[0..take] } });
+        if (out == null) return null;
+
+        reader.skipBodyLength(take);
+        if (take == self.bytes.len) {
+            self.clear();
+        } else {
+            self.bytes = self.bytes[take..];
+        }
+        if (self.owner != null and reader.bodyLengthRemaining() == null) {
+            // The remainder belongs to the next pipelined message.
+            self.flushInto(reader) catch |err| {
+                py.decref(out);
+                return exceptions.raiseParse(err);
+            };
+        }
+        return out;
+    }
+
+    inline fn deinit(self: *PendingInput) void {
+        self.clear();
+    }
+};
+
 fn randomBytes(comptime len: usize) ?[len]u8 {
     var out: [len]u8 = undefined;
     const os = c.PyImport_ImportModule("os") orelse return null;
@@ -147,12 +227,9 @@ const H1Engine = struct {
     /// request-only and is held as Python bytes (or null).
     should_close: bool = false,
     upgrade_obj: py.Object = null,
-    /// Single-copy body path: when a fed buffer's prefix is a Content-Length
-    /// body, the bytes object is held here (incref'd, its memory stable)
-    /// instead of being copied into the reader; next_event materialises Data
-    /// events straight from it. `pending` is the not-yet-consumed remainder.
-    pending_obj: py.Object = null,
-    pending: []const u8 = &.{},
+    /// Single-copy body path: retains a Python-owned Content-Length body span
+    /// outside the reader until next_event can materialise it directly.
+    pending: PendingInput = .{},
 
     fn rememberMethod(self: *H1Engine, m: []const u8) void {
         if (m.len > self.req_method.len) {
@@ -180,51 +257,23 @@ const H1Engine = struct {
         return w;
     }
 
-    fn stash(self: *H1Engine, obj: py.Object, rest: []const u8) core.errors.ParseError!void {
-        try self.reader.checkBufferLimit(rest.len);
-        py.incref(obj);
-        self.pending_obj = obj;
-        self.pending = rest;
-    }
-
-    fn dropPending(self: *H1Engine) void {
-        py.xdecref(self.pending_obj);
-        self.pending_obj = null;
-        self.pending = &.{};
-    }
-
-    /// Move the stashed remainder into the reader's own buffer (the slow path
-    /// the stash bypassed). Returns false with a Python error set on failure.
-    fn flushPending(self: *H1Engine) bool {
-        if (self.pending_obj == null) return true;
-        const rest = self.pending;
-        defer self.dropPending();
-        self.reader.feed(rest) catch |err| {
-            _ = exceptions.raiseParse(err);
-            return false;
-        };
-        return true;
-    }
-
     /// Feeds smaller than this take the plain buffered path: the head-split
     /// scan below costs one extra pass over the head, which only pays for
     /// itself when a sizeable body follows.
     const head_split_min_feed = 1024;
 
-    /// Retaining the caller's bytes object avoids a body-sized allocation and
-    /// copy, but an extra reference is marginally dearer for tiny spans. Keep
-    /// those on the existing copy path.
-    const retain_body_min = 512;
-
     fn feedData(self: *H1Engine, data: []const u8, obj: py.Object) bool {
-        if (!self.flushPending()) return false;
+        self.pending.flushInto(&self.reader) catch |err| {
+            _ = exceptions.raiseParse(err);
+            return false;
+        };
         if (data.len > 0 and self.reader.eofSeen()) {
             _ = exceptions.raiseParse(error.ProtocolError);
             return false;
         }
         if (data.len > 0 and self.reader.backlogEmpty()) {
             if (self.reader.bodyLengthRemaining() != null) {
-                self.stash(obj, data) catch |err| {
+                self.pending.retain(&self.reader, obj, data) catch |err| {
                     _ = exceptions.raiseParse(err);
                     return false;
                 };
@@ -240,7 +289,7 @@ const H1Engine = struct {
                         _ = exceptions.raiseParse(err);
                         return false;
                     };
-                    if (head_end < data.len) self.stash(obj, data[head_end..]) catch |err| {
+                    if (head_end < data.len) self.pending.retain(&self.reader, obj, data[head_end..]) catch |err| {
                         _ = exceptions.raiseParse(err);
                         return false;
                     };
@@ -266,7 +315,7 @@ const H1Engine = struct {
             gpa.destroy(w);
         }
         py.xdecref(self.upgrade_obj);
-        py.xdecref(self.pending_obj);
+        self.pending.deinit();
     }
 };
 
@@ -1870,7 +1919,7 @@ fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
         .h1 => |*e| {
             while (true) {
                 const ev = e.reader.nextEvent() catch |err| {
-                    e.dropPending();
+                    e.pending.clear();
                     // req_method survives start_next_cycle by design. Clear it ONLY
                     // when the failure is on a fresh request head (no request
                     // surfaced this cycle): otherwise an error response the app sends
@@ -1882,41 +1931,14 @@ fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
                     if (!e.request_surfaced) e.req_method_len = 0;
                     return exceptions.raiseParse(err);
                 };
-                if (ev == .need_data and e.pending_obj != null) {
+                if (ev == .need_data and e.pending.hasData()) {
                     if (e.reader.backlogEmpty()) {
-                        if (e.reader.bodyLengthRemaining()) |rem| {
-                            // Deliver body bytes straight from the stashed
-                            // buffer and account for them.
-                            const take: usize = @intCast(@min(rem, @as(u64, e.pending.len)));
-                            const can_retain = if (take >= H1Engine.retain_body_min) blk: {
-                                const owned = py.asBytes(e.pending_obj).?;
-                                break :blk take == e.pending.len and
-                                    e.pending.ptr == owned.ptr and
-                                    e.pending.len == owned.len;
-                            } else false;
-                            const out = if (can_retain)
-                                events_obj.makeH1DataFromBytes(e.pending_obj)
-                            else
-                                events_obj.fromH1Event(.{ .data = .{ .data = e.pending[0..take] } });
-                            if (out == null) return null;
-                            e.reader.skipBodyLength(take);
-                            e.pending = e.pending[take..];
-                            if (e.pending.len == 0) {
-                                e.dropPending();
-                            } else if (e.reader.bodyLengthRemaining() == null) {
-                                // The remainder is the next pipelined message.
-                                if (!e.flushPending()) {
-                                    py.decref(out);
-                                    return null;
-                                }
-                            }
-                            return out;
-                        }
+                        if (e.reader.bodyLengthRemaining() != null) return e.pending.emitBody(&e.reader);
                     }
                     // The stash cannot be consumed in place (chunked body,
                     // message done, or buffered bytes precede it): buffer it
                     // and ask the reader again.
-                    if (!e.flushPending()) return null;
+                    e.pending.flushInto(&e.reader) catch |err| return exceptions.raiseParse(err);
                     continue;
                 }
                 if (ev == .request) {
