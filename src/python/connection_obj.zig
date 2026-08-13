@@ -1260,9 +1260,6 @@ fn stream_end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
     const has_headers = hdrs_seq != null and !py.isNone(hdrs_seq);
-    var hdrs = BorrowedHeaders{};
-    defer hdrs.deinit();
-    if (has_headers and !hdrs.borrow(hdrs_seq)) return null;
     switch (e) {
         // HTTP/2 send-side trailers are still a follow-up; an empty/absent list is the
         // ordinary END_STREAM.
@@ -1270,7 +1267,12 @@ fn stream_end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
             if (has_headers) return py.raise(exceptions.LocalProtocolError, "HTTP/2 send-side trailers are not supported yet");
             return x.endStream(@intCast(self.stream_id));
         },
-        .h3 => |x| return x.endMessage(self.stream_id, hdrs.headers),
+        .h3 => |x| {
+            var hdrs = BorrowedHeaders{};
+            defer hdrs.deinit();
+            if (has_headers and !hdrs.borrow(hdrs_seq)) return null;
+            return x.endMessage(self.stream_id, hdrs.headers);
+        },
     }
 }
 
