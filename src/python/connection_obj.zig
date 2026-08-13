@@ -131,6 +131,64 @@ const PendingInput = struct {
     }
 };
 
+/// Per-message HTTP/1 adapter state. The request method is retained across an
+/// early start_next_cycle so a delayed response still gets HEAD/CONNECT
+/// framing, while `active_this_cycle` distinguishes that owed response from a
+/// stale method when the next request head fails. Connection signals are copied
+/// here at head-event time because the reader's snapshot borrows its buffer.
+const H1MessageContext = struct {
+    response_method: [16]u8 = undefined,
+    response_method_len: usize = 0,
+    active_this_cycle: bool = false,
+    should_close: bool = false,
+    upgrade_obj: py.Object = null,
+
+    inline fn rememberRequest(self: *H1MessageContext, method: []const u8) void {
+        self.active_this_cycle = true;
+        if (method.len > self.response_method.len) {
+            self.response_method_len = 0;
+            return;
+        }
+        @memcpy(self.response_method[0..method.len], method);
+        self.response_method_len = method.len;
+    }
+
+    inline fn framingMethod(self: *const H1MessageContext) []const u8 {
+        return self.response_method[0..self.response_method_len];
+    }
+
+    inline fn captureRequest(self: *H1MessageContext, method: []const u8, info: core.h1.reader.HeadInfo) bool {
+        self.rememberRequest(method);
+        self.should_close = info.should_close;
+        py.xdecref(self.upgrade_obj);
+        self.upgrade_obj = if (info.upgrade) |value| py.fromBytes(value) else null;
+        return info.upgrade == null or self.upgrade_obj != null;
+    }
+
+    inline fn captureResponse(self: *H1MessageContext, info: core.h1.reader.HeadInfo) void {
+        // A client that asked to close already set the flag when it serialized
+        // the request; an omitted response token does not take that back.
+        self.should_close = self.should_close or info.should_close;
+    }
+
+    inline fn parseFailed(self: *H1MessageContext) void {
+        if (!self.active_this_cycle) self.response_method_len = 0;
+    }
+
+    fn startNextCycle(self: *H1MessageContext) void {
+        self.active_this_cycle = false;
+        // Keep response_method: callers may start the next read cycle before
+        // serializing the response to the request they just received.
+        self.should_close = false;
+        py.xdecref(self.upgrade_obj);
+        self.upgrade_obj = null;
+    }
+
+    fn deinit(self: *H1MessageContext) void {
+        py.xdecref(self.upgrade_obj);
+    }
+};
+
 fn randomBytes(comptime len: usize) ?[len]u8 {
     var out: [len]u8 = undefined;
     const os = c.PyImport_ImportModule("os") orelse return null;
@@ -210,40 +268,10 @@ const H1Engine = struct {
     /// Created on the first send_* call: server connections that only parse
     /// never pay the Writer's allocation.
     writer: ?*Writer = null,
-    /// The method of the message the next response answers (server: the parsed
-    /// request; client: the request we sent), so the connection auto-derives
-    /// bodyless framing. NOT cleared by start_next_cycle - it is overwritten when
-    /// the next request is parsed, so send_response can read it before the previous
-    /// response is serialized (see next_message).
-    req_method: [16]u8 = undefined,
-    req_method_len: usize = 0,
-    /// Whether the remembered method belongs to a request already surfaced (server)
-    /// or sent (client) in the current read cycle. Reset by start_next_cycle. Used
-    /// to decide, on a parse failure, whether the method is stale (fresh-head
-    /// failure -> clear) or still owed a response (mid-body failure -> keep).
-    request_surfaced: bool = false,
-    /// Connection close signal for the last parsed request/response, captured at
-    /// event time so it outlives the head buffer. `upgrade_obj` remains
-    /// request-only and is held as Python bytes (or null).
-    should_close: bool = false,
-    upgrade_obj: py.Object = null,
+    message: H1MessageContext = .{},
     /// Single-copy body path: retains a Python-owned Content-Length body span
     /// outside the reader until next_event can materialise it directly.
     pending: PendingInput = .{},
-
-    fn rememberMethod(self: *H1Engine, m: []const u8) void {
-        if (m.len > self.req_method.len) {
-            self.req_method_len = 0;
-            return;
-        }
-        @memcpy(self.req_method[0..m.len], m);
-        self.req_method_len = m.len;
-        self.request_surfaced = true;
-    }
-
-    fn method(self: *const H1Engine) []const u8 {
-        return self.req_method[0..self.req_method_len];
-    }
 
     /// The writer, created on first use, or null with a Python error set.
     fn ensureWriter(self: *H1Engine) ?*Writer {
@@ -314,7 +342,7 @@ const H1Engine = struct {
             w.deinit();
             gpa.destroy(w);
         }
-        py.xdecref(self.upgrade_obj);
+        self.message.deinit();
         self.pending.deinit();
     }
 };
@@ -1920,7 +1948,7 @@ fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
             while (true) {
                 const ev = e.reader.nextEvent() catch |err| {
                     e.pending.clear();
-                    // req_method survives start_next_cycle by design. Clear it ONLY
+                    // The response method survives start_next_cycle by design. Clear it ONLY
                     // when the failure is on a fresh request head (no request
                     // surfaced this cycle): otherwise an error response the app sends
                     // (e.g. send_response(400, content-length: ...)) would be framed
@@ -1928,7 +1956,7 @@ fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
                     // if a request WAS already surfaced and its body then fails, the
                     // response to THAT request (a HEAD stays bodyless regardless of
                     // headers) still needs the method - keep it.
-                    if (!e.request_surfaced) e.req_method_len = 0;
+                    e.message.parseFailed();
                     return exceptions.raiseParse(err);
                 };
                 if (ev == .need_data and e.pending.hasData()) {
@@ -1942,18 +1970,9 @@ fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
                     continue;
                 }
                 if (ev == .request) {
-                    e.rememberMethod(ev.request.method);
-                    e.should_close = e.reader.shouldClose();
-                    py.xdecref(e.upgrade_obj);
-                    if (e.reader.upgrade()) |u| {
-                        e.upgrade_obj = py.fromBytes(u);
-                        if (e.upgrade_obj == null) return null; // propagate the pending MemoryError
-                    } else e.upgrade_obj = null;
+                    if (!e.message.captureRequest(ev.request.method, e.reader.takeHeadInfo())) return null;
                 } else if (ev == .response) {
-                    // A client that asked to close already set the flag when it
-                    // serialized the request; the peer omitting the token from
-                    // its response does not take that back.
-                    e.should_close = e.should_close or e.reader.shouldClose();
+                    e.message.captureResponse(e.reader.takeHeadInfo());
                 }
                 return if (eager_headers)
                     events_obj.fromH1Event(ev)
@@ -2200,9 +2219,9 @@ fn send_request(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obje
         .h1 => |*e| {
             const w = e.ensureWriter() orelse return null;
             w.sendRequest(mb, tb, vb, hdrs.headers) catch |err| return raiseWrite(err);
-            e.rememberMethod(mb);
+            e.message.rememberRequest(mb);
             e.reader.setRequestMethod(mb);
-            if (core.h1.connection.shouldClose(vb, hdrs.headers)) e.should_close = true;
+            if (core.h1.connection.shouldClose(vb, hdrs.headers)) e.message.should_close = true;
             return py.none();
         },
         .h3 => |*e| {
@@ -2255,8 +2274,8 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
 
     const rb = core.h1.writer.reasonPhrase(@intCast(status));
     const w = e.ensureWriter() orelse return null;
-    w.sendResponse("1.1", @intCast(status), rb, header_slice, e.method()) catch |err| return raiseWrite(err);
-    if (core.h1.connection.connectionHasClose(header_slice)) e.should_close = true;
+    w.sendResponse("1.1", @intCast(status), rb, header_slice, e.message.framingMethod()) catch |err| return raiseWrite(err);
+    if (core.h1.connection.connectionHasClose(header_slice)) e.message.should_close = true;
     return py.none();
 }
 
@@ -2408,30 +2427,20 @@ fn next_message(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const e = h1(self) orelse return null;
     e.reader.reset();
-    // A new read cycle: the remembered method now belongs to the previous request,
-    // no longer one surfaced this cycle (so a parse failure on the next head clears
-    // it - see next_event).
-    e.request_surfaced = false;
-    // req_method is intentionally NOT cleared: a caller may call start_next_cycle()
-    // before serializing the previous response (e.g. pipelined keep-alive reads),
-    // and send_response reads it to frame HEAD / CONNECT responses as bodyless. It
-    // is overwritten when the next request is parsed, so a stale value is never seen.
-    e.should_close = false;
-    py.xdecref(e.upgrade_obj);
-    e.upgrade_obj = null;
+    e.message.startNextCycle();
     return py.none();
 }
 
 fn should_close(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const e = h1(self) orelse return null;
-    return py.boolean(e.should_close);
+    return py.boolean(e.message.should_close);
 }
 
 fn upgrade(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const e = h1(self) orelse return null;
-    const obj = e.upgrade_obj orelse return py.none();
+    const obj = e.message.upgrade_obj orelse return py.none();
     py.incref(obj);
     return obj;
 }

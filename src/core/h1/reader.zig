@@ -116,6 +116,14 @@ pub const Limits = struct {
     strict_crlf: bool = true,
 };
 
+/// Connection semantics derived from one parsed request or response head.
+/// `upgrade` borrows from the reader buffer, so adapters must consume this
+/// snapshot immediately after receiving the corresponding head event.
+pub const HeadInfo = struct {
+    should_close: bool = false,
+    upgrade: ?[]const u8 = null,
+};
+
 pub const Reader = struct {
     gpa: std.mem.Allocator,
     role: Role,
@@ -144,11 +152,9 @@ pub const Reader = struct {
     /// CONNECT 2xx, RFC 9112 6.3). Empty when unknown. Server-side unused.
     request_method: [16]u8 = undefined,
     request_method_len: usize = 0,
-    /// Connection-scoped signals for the most recently parsed head, valid until
-    /// the next reset. `conn_upgrade` slices into the head buffer, so it is only
-    /// valid until the next feed/nextEvent - read it right after the event.
-    conn_should_close: bool = false,
-    conn_upgrade: ?[]const u8 = null,
+    /// One-shot connection semantics for the most recently parsed head.
+    head_info: HeadInfo = .{},
+    head_info_pending: bool = false,
     eof_seen: bool = false,
     /// The error that poisoned the connection, re-raised on every later call.
     failed_with: ParseError = error.ProtocolError,
@@ -226,15 +232,16 @@ pub const Reader = struct {
         self.body_remaining = 0;
         self.chunk = .{};
         self.request_method_len = 0;
-        self.conn_should_close = false;
-        self.conn_upgrade = null;
+        self.head_info_pending = false;
     }
 
-    /// Whether the connection must close after the most recently parsed
-    /// request/response (RFC 9112 9.3, plus close-delimited responses). Valid
-    /// after a Request/Response event, until the next reset.
-    pub fn shouldClose(self: *const Reader) bool {
-        return self.conn_should_close;
+    /// Consume the connection semantics attached to the head event that was
+    /// just returned. A second call yields an empty snapshot, which prevents an
+    /// adapter from accidentally applying stale metadata to another message.
+    pub inline fn takeHeadInfo(self: *Reader) HeadInfo {
+        if (!self.head_info_pending) return .{};
+        self.head_info_pending = false;
+        return self.head_info;
     }
 
     /// True when every buffered byte has been consumed.
@@ -266,13 +273,6 @@ pub const Reader = struct {
         std.debug.assert(self.state == .body_length and n <= self.body_remaining);
         self.body_remaining -= n;
         if (self.body_remaining == 0) self.state = .eom_pending;
-    }
-
-    /// The `Upgrade` value of the most recently parsed request iff its
-    /// `Connection` header listed the `upgrade` token; else null. The slice is
-    /// borrowed from the head buffer - read it right after the Request event.
-    pub fn upgrade(self: *const Reader) ?[]const u8 {
-        return self.conn_upgrade;
     }
 
     fn compact(self: *Reader) void {
@@ -385,8 +385,11 @@ pub const Reader = struct {
             } else {
                 self.enterBody(framing);
             }
-            self.conn_should_close = semantics.shouldClose(rl.http_version);
-            self.conn_upgrade = semantics.upgrade();
+            self.head_info = .{
+                .should_close = semantics.shouldClose(rl.http_version),
+                .upgrade = semantics.upgrade(),
+            };
+            self.head_info_pending = true;
             return .{ .request = .{
                 .method = rl.method,
                 .target = rl.target,
@@ -422,7 +425,8 @@ pub const Reader = struct {
             .until_close_default = true,
         });
         self.enterBody(framing);
-        self.conn_should_close = semantics.shouldClose(st.http_version) or framing == .until_close;
+        self.head_info = .{ .should_close = semantics.shouldClose(st.http_version) or framing == .until_close };
+        self.head_info_pending = true;
         return .{ .response = .{
             .status_code = st.status_code,
             .reason = st.reason,
@@ -803,7 +807,23 @@ test "client exposes response connection close signal" {
     defer r.deinit();
     try r.feed("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
     try expectTag(.response, try r.nextEvent());
-    try t.expect(r.shouldClose());
+    try t.expect(r.takeHeadInfo().should_close);
+    try t.expectEqual(HeadInfo{}, r.takeHeadInfo());
+}
+
+test "server head info is an immediate one-shot snapshot" {
+    var r = Reader.init(t.allocator, .server);
+    defer r.deinit();
+    try r.feed("GET / HTTP/1.1\r\nConnection: close, Upgrade\r\nUpgrade: websocket\r\n\r\n");
+    try expectTag(.request, try r.nextEvent());
+
+    const info = r.takeHeadInfo();
+    try t.expect(info.should_close);
+    try t.expectEqualStrings("websocket", info.upgrade.?);
+
+    const consumed = r.takeHeadInfo();
+    try t.expect(!consumed.should_close);
+    try t.expect(consumed.upgrade == null);
 }
 
 test "client treats HTTP/1.0 response as close unless keep-alive" {
@@ -811,7 +831,7 @@ test "client treats HTTP/1.0 response as close unless keep-alive" {
     defer r.deinit();
     try r.feed("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
     try expectTag(.response, try r.nextEvent());
-    try t.expect(r.shouldClose());
+    try t.expect(r.takeHeadInfo().should_close);
 }
 
 test "client marks close-delimited response as closing" {
@@ -819,7 +839,7 @@ test "client marks close-delimited response as closing" {
     defer r.deinit();
     try r.feed("HTTP/1.1 200 OK\r\n\r\nbody");
     try expectTag(.response, try r.nextEvent());
-    try t.expect(r.shouldClose());
+    try t.expect(r.takeHeadInfo().should_close);
 }
 
 test "truncated content-length body errors at EOF" {
