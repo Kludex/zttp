@@ -327,9 +327,12 @@ pub const Reader = struct {
         // previous call stopped and combines the terminator and limit scans.
         const region = self.avail();
         const scan = (try self.head_scanner.scan(region, self.limits)) orelse {
-            if (self.eof_seen and region.len == 0) {
-                self.state = .closed;
-                return .connection_closed;
+            if (self.eof_seen) {
+                if (region.len == 0) {
+                    self.state = .closed;
+                    return .connection_closed;
+                }
+                return error.ProtocolError;
             }
             return .need_data;
         };
@@ -637,6 +640,22 @@ test "partial head then complete" {
     const e = try r.nextEvent();
     try t.expectEqualStrings("GET", e.request.method);
     try t.expectEqualStrings("x", e.request.headers[0].value);
+}
+
+test "EOF during an incomplete head is a terminal protocol error" {
+    const partials = [_][]const u8{
+        "G",
+        "GET / HTTP/1.1\r\nHost: x\r\n",
+    };
+    for (partials) |partial| {
+        var r = Reader.init(t.allocator, .server);
+        defer r.deinit();
+        try r.feed(partial);
+        try expectTag(.need_data, try r.nextEvent());
+        try r.feed("");
+        try t.expectError(error.ProtocolError, r.nextEvent());
+        try t.expectError(error.ProtocolError, r.nextEvent());
+    }
 }
 
 test "split body across feeds" {
