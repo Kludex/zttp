@@ -93,6 +93,8 @@ def test_send_request() -> None:
         ((b"X-One", b"1"), (b"X-Two", b"2")),
         [[b"X-One", b"1"], [b"X-Two", b"2"]],
         ([b"X-One", b"1"], [b"X-Two", b"2"]),
+        [(b"X-One", b"1"), [b"X-Two", b"2"]],
+        ((b"X-One", b"1"), [b"X-Two", b"2"]),
     ],
 )
 def test_send_response_accepts_common_header_sequence_shapes(headers: object) -> None:

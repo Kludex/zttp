@@ -1981,7 +1981,7 @@ const BorrowedHeaders = struct {
         }
     }
 
-    const ExactResult = enum { success, fallback, failure };
+    const ExactResult = union(enum) { success, fallback: usize, failure };
 
     /// Fast path for the list/tuple of bytes tuples emitted by ASGI apps. A
     /// mutable outer list yields owned pair references; an outer tuple and its
@@ -1996,16 +1996,14 @@ const BorrowedHeaders = struct {
             const pair_owned = !outer_tuple;
             if (!exactType(pair, &c.PyTuple_Type) or c.PyTuple_Size(pair) < 2) {
                 if (pair_owned) py.decref(pair);
-                self.releaseRefs();
-                return .fallback;
+                return .{ .fallback = i };
             }
 
             const name = c.PyTuple_GetItem(pair, 0);
             const value = c.PyTuple_GetItem(pair, 1);
             if (!exactType(name, &c.PyBytes_Type) or !exactType(value, &c.PyBytes_Type)) {
                 if (pair_owned) py.decref(pair);
-                self.releaseRefs();
-                return .fallback;
+                return .{ .fallback = i };
             }
             if (pair_owned) {
                 self.refs[self.ref_count] = pair;
@@ -2019,8 +2017,8 @@ const BorrowedHeaders = struct {
         return .success;
     }
 
-    fn borrowGeneric(self: *BorrowedHeaders, seq: py.Object) bool {
-        for (0..self.headers.len) |i| {
+    fn borrowGeneric(self: *BorrowedHeaders, seq: py.Object, start: usize) bool {
+        for (start..self.headers.len) |i| {
             const pair = c.PySequence_GetItem(seq, @intCast(i));
             if (pair == null) return false;
             const name = c.PySequence_GetItem(pair, 0);
@@ -2063,10 +2061,10 @@ const BorrowedHeaders = struct {
             switch (self.borrowExact(seq, outer_tuple)) {
                 .success => return true,
                 .failure => return false,
-                .fallback => {},
+                .fallback => |start| return self.borrowGeneric(seq, start),
             }
         }
-        return self.borrowGeneric(seq);
+        return self.borrowGeneric(seq, 0);
     }
 
     fn deinit(self: *BorrowedHeaders) void {
