@@ -77,9 +77,10 @@ print(bytes(body))
 ```
 
 !!! tip
-    Each `Data` event's `.data` is a real `bytes` object, copied out of the parse
-    buffer, so it's safe to keep. You're never handed a view that the next
-    `receive_data` will overwrite.
+    Each `Data` event owns a real, immutable `bytes` object, so it's safe to
+    keep. For qualifying HTTP/1 body spans, zttp may reuse the exact `bytes`
+    passed to `receive_data()` or `receive_event()`; other paths copy out of the
+    parse buffer. You're never handed a view that a later feed will overwrite.
 
 ### Partial data
 

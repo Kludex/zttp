@@ -113,8 +113,8 @@ class Data:
 
     Attributes:
         data: Owned body bytes that are safe to keep. Qualifying HTTP/1 spans
-            reuse the immutable `bytes` supplied to `receive_data()`; other
-            paths copy out of the parse buffer.
+            reuse the immutable `bytes` supplied to `receive_data()` or
+            `receive_event()`; other paths copy out of the parse buffer.
         stream_id: The stream the body belongs to (`0` on HTTP/1.1).
     """
 
