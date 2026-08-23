@@ -143,14 +143,14 @@ import time
 import zttp
 
 endpoint = zttp.QuicEndpoint(retry=True, token_secret=b"replace-with-at-least-32-secret-bytes")
+outbound: list[zttp.OutboundDatagram] = []
 
 
-def receive(
-    datagram: bytes, peer_address: bytes
-) -> tuple[zttp.H3Connection | None, list[tuple[bytes, bytes]]]:
+def receive(datagram: bytes, peer_address: bytes) -> zttp.H3Connection | None:
     now = time.monotonic_ns() // 1000
     connection = endpoint.receive_datagram(datagram, peer_address, now)
-    return connection, endpoint.data_to_send()
+    outbound.extend(endpoint.data_to_send())
+    return connection
 ```
 
 `QuicEndpoint` maps destination connection IDs to `H3Connection` instances. It
@@ -175,6 +175,8 @@ a timer. Call `next_timeout()` and `handle_timeout(now)` from your event loop.
 ::: zttp.QuicEndpoint
 
 ::: zttp.ConnectionIDFactory
+
+::: zttp.OutboundDatagram
 
 `parse_datagram_header` remains available when you need the lower-level routing
 prefix directly.

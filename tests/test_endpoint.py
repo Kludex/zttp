@@ -55,7 +55,7 @@ def test_quic_endpoint_accepts_without_retry_and_manages_the_connection(initial:
 
     outgoing = endpoint.data_to_send()
     assert outgoing
-    assert all(address == b"address" for _, address in outgoing)
+    assert all(datagram.peer_address == b"address" for datagram in outgoing)
     deadline = endpoint.next_timeout()
     assert deadline is not None
     endpoint.handle_timeout(deadline - 1)
@@ -67,7 +67,7 @@ def test_quic_endpoint_accepts_without_retry_and_manages_the_connection(initial:
     with pytest.raises(ValueError, match="does not belong"):
         other.discard(server)
     endpoint.discard(server)
-    assert endpoint.connections() == ()
+    assert endpoint.connections() == []
     assert endpoint.next_timeout() is None
 
 
@@ -79,7 +79,7 @@ def test_quic_endpoint_does_not_retain_an_unauthenticated_initial(initial: bytes
     )
 
     assert endpoint.receive_datagram(corrupted, b"address", 0) is None
-    assert endpoint.connections() == ()
+    assert endpoint.connections() == []
     assert endpoint.receive_datagram(initial, b"address", 0) is not None
 
 
@@ -90,9 +90,9 @@ def test_quic_endpoint_sends_version_negotiation() -> None:
     assert endpoint.receive_datagram(header, b"address", 0) is None
     assert endpoint.data_to_send() == []
     assert endpoint.receive_datagram(header.ljust(1200, b"\x00"), b"address", 1) is None
-    [(response, address)] = endpoint.data_to_send()
-    header = zttp.parse_datagram_header(response)
-    assert address == b"address"
+    [response] = endpoint.data_to_send()
+    header = zttp.parse_datagram_header(response.data)
+    assert response.peer_address == b"address"
     assert header.version == 0
     assert header.destination_connection_id == b"peer"
     assert header.source_connection_id == b"original"

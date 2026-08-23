@@ -852,6 +852,7 @@ const H3Engine = struct {
     /// QUIC datagram so integrators can route migration/path-validation traffic.
     fn dataToSendWithAddresses(self: *H3Engine) py.Object {
         const q = self.qc orelse return py.newList(0);
+        const result_type = resultType(&outbound_datagram_type, "OutboundDatagram") orelse return null;
         const flat = q.datagramsToSend();
         const lengths = q.datagramLengths();
         const tokens = q.datagramPathTokens();
@@ -859,33 +860,39 @@ const H3Engine = struct {
         if (list == null) return null;
         var off: usize = 0;
         for (lengths, 0..) |len, i| {
-            const tuple = py.tupleNew(2);
-            if (tuple == null) {
+            const args = py.tupleNew(2);
+            if (args == null) {
                 py.decref(list);
                 return null;
             }
-            const item = py.fromBytes(flat[off .. off + len]);
-            if (item == null) {
-                py.decref(tuple);
+            const data = py.fromBytes(flat[off .. off + len]);
+            if (data == null) {
+                py.decref(args);
                 py.decref(list);
                 return null;
             }
-            const addr = if (tokens.len > i) blk: {
-                if (tokens[i]) |tok| {
-                    const bytes = q.pathAddress(tok) orelse break :blk py.none();
-                    break :blk py.fromBytes(bytes);
+            const peer_address = if (tokens.len > i) blk: {
+                if (tokens[i]) |token| {
+                    const address = q.pathAddress(token) orelse break :blk py.none();
+                    break :blk py.fromBytes(address);
                 }
                 break :blk py.none();
             } else py.none();
-            if (addr == null) {
-                py.decref(item);
-                py.decref(tuple);
+            if (peer_address == null) {
+                py.decref(data);
+                py.decref(args);
                 py.decref(list);
                 return null;
             }
-            py.tupleSet(tuple, 0, item);
-            py.tupleSet(tuple, 1, addr);
-            py.listSet(list, @intCast(i), tuple);
+            py.tupleSet(args, 0, data);
+            py.tupleSet(args, 1, peer_address);
+            const result = c.PyObject_CallObject(result_type, args);
+            py.decref(args);
+            if (result == null) {
+                py.decref(list);
+                return null;
+            }
+            py.listSet(list, @intCast(i), result);
             off += len;
         }
         q.clearSend();
@@ -1375,6 +1382,7 @@ var session_ticket_type: py.Object = null;
 var close_info_type: py.Object = null;
 var datagram_header_type: py.Object = null;
 var local_connection_id_type: py.Object = null;
+var outbound_datagram_type: py.Object = null;
 
 /// Module-level `parse_datagram_header(datagram) -> DatagramHeader`: the routable
 /// prefix of a received QUIC datagram, for demultiplexing a shared UDP socket onto
@@ -3073,7 +3081,7 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "receive_datagram", .ml_meth = receive_datagram, .ml_flags = c.METH_VARARGS, .ml_doc = "Feed one received UDP datagram: receive_datagram(datagram, now=0, peer_address=None). peer_address is an optional opaque bytes key for QUIC path validation and migration." },
     .{ .ml_name = "consume_data", .ml_meth = h3_consume_data, .ml_flags = c.METH_VARARGS, .ml_doc = "Acknowledge HTTP/3 DATA payload bytes after the application consumes them: consume_data(stream_id, length)." },
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing UDP datagrams as a list of bytes (one per datagram - QUIC datagram boundaries are semantic)." },
-    .{ .ml_name = "data_to_send_with_addresses", .ml_meth = h3_data_to_send_with_addresses, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams as (datagram, peer_address) pairs. peer_address is None when no address key is known." },
+    .{ .ml_name = "data_to_send_with_addresses", .ml_meth = h3_data_to_send_with_addresses, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams with their destination address keys." },
     .{ .ml_name = "_set_endpoint_context", .ml_meth = h3_set_endpoint_context, .ml_flags = c.METH_VARARGS, .ml_doc = "Configure endpoint-selected connection IDs before receiving the first Initial." },
     .{ .ml_name = "_endpoint_ready", .ml_meth = h3_endpoint_ready, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the endpoint connection authenticated its first Initial." },
     .{ .ml_name = "challenge_path", .ml_meth = h3_challenge_path, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC PATH_CHALLENGE for a peer address: challenge_path(peer_address, data). data must be 8 unpredictable bytes. Drain with data_to_send_with_addresses." },

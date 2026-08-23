@@ -13,6 +13,7 @@ __all__ = [
     "CloseInfo",
     "DatagramHeader",
     "LocalConnectionId",
+    "OutboundDatagram",
     "SessionTicket",
 ]
 
@@ -45,6 +46,14 @@ class LocalConnectionId:
 
     sequence_number: int
     connection_id: bytes
+
+
+@dataclass(frozen=True)
+class OutboundDatagram:
+    """One QUIC datagram and its opaque destination address key."""
+
+    data: bytes
+    peer_address: bytes | None
 
 
 @dataclass(frozen=True)

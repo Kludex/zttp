@@ -213,7 +213,8 @@ collapses its pseudo-headers into the same shape the other protocols use, and
 
     Use [`data_to_send_with_addresses()`](../reference/api.md#zttp.H3Connection.data_to_send_with_addresses)
     instead if the peer may have migrated and you need the address to send each
-    one to.
+    one to. It returns `OutboundDatagram` objects with `data` and `peer_address`
+    attributes.
 
 ## Sending a response
 
@@ -367,24 +368,25 @@ endpoint = zttp.QuicEndpoint(
     retry=True,
     token_secret=b"replace-with-at-least-32-secret-bytes",
 )
+outbound: list[zttp.OutboundDatagram] = []
 
 
-def receive(
-    datagram: bytes, peer_address: bytes
-) -> tuple[zttp.H3Connection | None, list[tuple[bytes, bytes]]]:
+def receive(datagram: bytes, peer_address: bytes) -> zttp.H3Connection | None:
     connection = endpoint.receive_datagram(
         datagram,
         peer_address,
         time.monotonic_ns() // 1000,
     )
-    return connection, endpoint.data_to_send()
+    outbound.extend(endpoint.data_to_send())
+    return connection
 ```
 
 `QuicEndpoint` routes long and short headers by destination connection ID. It
 retains an `H3Connection` only after the QUIC core authenticates the first Initial.
 It sends Version Negotiation for unsupported versions. The returned connection
 owns the HTTP event queue, so call `next_event()` on it after `receive()` returns.
-Send each tuple from `endpoint.data_to_send()` to its accompanying peer address.
+Each `OutboundDatagram` from `endpoint.data_to_send()` exposes its payload as
+`data` and its opaque destination key as `peer_address`.
 
 Call `endpoint.issue_connection_id(connection, sequence_number)` instead of
 `connection.issue_connection_id()` for endpoint-managed connections. The endpoint

@@ -8,7 +8,7 @@ from typing import Final, Literal, TypeVar, final, overload
 from typing_extensions import disjoint_base
 
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
-from zttp.results import CloseInfo, DatagramHeader, LocalConnectionId, SessionTicket
+from zttp.results import CloseInfo, DatagramHeader, LocalConnectionId, OutboundDatagram, SessionTicket
 
 SERVER: Final[Literal[1]] = 1
 CLIENT: Final[Literal[2]] = 2
@@ -425,8 +425,8 @@ class H3Connection(Connection):
     def receive_datagram(self, datagram: bytes, now: int = ..., peer_address: bytes | None = ..., /) -> None:
         """Feed one received UDP datagram. `peer_address` is an opaque key for path validation."""
 
-    def data_to_send_with_addresses(self) -> list[tuple[bytes, bytes | None]]:
-        """Like `data_to_send`, but as `(datagram, peer_address)` pairs."""
+    def data_to_send_with_addresses(self) -> list[OutboundDatagram]:
+        """Return queued datagrams with their opaque destination address keys."""
 
     def _set_endpoint_context(
         self,

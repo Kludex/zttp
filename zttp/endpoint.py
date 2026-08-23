@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import secrets
 from dataclasses import dataclass, field
-from typing import cast
 
 from typing_extensions import Protocol, TypedDict
 
@@ -18,6 +17,7 @@ from zttp._zttp import (
     parse_datagram_header,
 )
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
+from zttp.results import OutboundDatagram
 
 
 class ConnectionIDFactory(Protocol):
@@ -81,7 +81,7 @@ class QuicEndpoint:
         self._long_routes: dict[bytes, _ConnectionState] = {}
         self._short_routes: dict[bytes, _ConnectionState] = {}
         self._connections: list[_ConnectionState] = []
-        self._outgoing: list[tuple[bytes, bytes]] = []
+        self._outgoing: list[OutboundDatagram] = []
 
     def receive_datagram(self, datagram: bytes, peer_address: bytes, now: int) -> H3Connection | None:
         """Route a datagram and return its connection, or `None` when dropped."""
@@ -111,7 +111,7 @@ class QuicEndpoint:
                 header.destination_connection_id,
                 header.source_connection_id,
             )
-            self._outgoing.append((packet, peer_address))
+            self._outgoing.append(OutboundDatagram(packet, peer_address))
             return None
         if not header.is_initial or len(self._connections) >= self._max_connections:
             return None
@@ -152,7 +152,7 @@ class QuicEndpoint:
                 server_source_connection_id=retry_scid,
                 token=token,
             )
-            self._outgoing.append((packet, peer_address))
+            self._outgoing.append(OutboundDatagram(packet, peer_address))
             return None
 
         if (
@@ -196,18 +196,17 @@ class QuicEndpoint:
             raise ValueError("connection does not belong to this endpoint")
         connection.send_new_token(self._token_codec.create_address_token(state.peer_address, now))
 
-    def data_to_send(self) -> list[tuple[bytes, bytes]]:
-        """Return and clear outbound `(datagram, peer_address)` pairs."""
+    def data_to_send(self) -> list[OutboundDatagram]:
+        """Return and clear outbound QUIC datagrams."""
         outgoing = self._outgoing
         self._outgoing = []
         for state in self._connections:
-            for datagram, peer_address in state.connection.data_to_send_with_addresses():
-                outgoing.append((datagram, cast(bytes, peer_address)))
+            outgoing.extend(state.connection.data_to_send_with_addresses())
         return outgoing
 
-    def connections(self) -> tuple[H3Connection, ...]:
+    def connections(self) -> list[H3Connection]:
         """Return the accepted HTTP/3 connections."""
-        return tuple(state.connection for state in self._connections)
+        return [state.connection for state in self._connections]
 
     def discard(self, connection: H3Connection) -> None:
         """Remove a closed connection and all of its routes."""

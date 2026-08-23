@@ -388,8 +388,8 @@ def assert_aioquic_client_to_zttp_retry_endpoint() -> None:
             routed = endpoint.receive_datagram(datagram, b"client", round_idx * 1000)
             if routed is not None:
                 server = routed
-        for datagram, _addr in endpoint.data_to_send():
-            client.receive_datagram(datagram, ("server", 4433), now + 0.0005)
+        for outbound in endpoint.data_to_send():
+            client.receive_datagram(outbound.data, ("server", 4433), now + 0.0005)
         drain_quic_to_h3(client, h3)
 
     if server is None:
@@ -450,9 +450,9 @@ def assert_aioquic_client_to_zttp_server() -> None:
         for datagram, _addr in client.datagrams_to_send(now):
             progressed = True
             server.receive_datagram(datagram, round_idx * 1000, b"client")
-        for datagram, _addr in server.data_to_send_with_addresses():
+        for outbound in server.data_to_send_with_addresses():
             progressed = True
-            client.receive_datagram(datagram, ("server", 4433), now + 0.0005)
+            client.receive_datagram(outbound.data, ("server", 4433), now + 0.0005)
         while True:
             event = client.next_event()
             if event is None:
@@ -463,8 +463,8 @@ def assert_aioquic_client_to_zttp_server() -> None:
             break
 
     server.issue_connection_id(1, b"server-cid-1", b"\x5a" * 16)
-    for datagram, _addr in server.data_to_send_with_addresses():
-        client.receive_datagram(datagram, ("server", 4433), 0.011)
+    for outbound in server.data_to_send_with_addresses():
+        client.receive_datagram(outbound.data, ("server", 4433), 0.011)
         drain_quic_to_h3(client, h3)
     if not any(
         cid.sequence_number == 1 and cid.cid == b"server-cid-1"
@@ -499,10 +499,10 @@ def assert_aioquic_client_to_zttp_server() -> None:
     challenges = server.data_to_send_with_addresses()
     if not challenges:
         raise SystemExit("zttp did not challenge the migrated aioquic client path")
-    if any(addr != migrated_client for _datagram, addr in challenges):
+    if any(datagram.peer_address != migrated_client for datagram in challenges):
         raise SystemExit(f"zttp challenged the wrong migrated path: {challenges!r}")
-    for datagram, _addr in challenges:
-        client.receive_datagram(datagram, ("server", 4433), 0.021)
+    for datagram in challenges:
+        client.receive_datagram(datagram.data, ("server", 4433), 0.021)
         drain_quic_to_h3(client, h3)
     responses = client.datagrams_to_send(0.022)
     if not responses:
@@ -534,10 +534,10 @@ def assert_aioquic_client_to_zttp_server() -> None:
     stream.send_data(b"ok")
     stream.end_message([(b"x-zttp-trailer", b"done")])
     response_events: list[object] = []
-    for datagram, addr in server.data_to_send_with_addresses():
-        if addr != migrated_client:
-            raise SystemExit(f"zttp response was not routed to the validated migrated path: {addr!r}")
-        client.receive_datagram(datagram, ("server", 4433), 0.03)
+    for outbound in server.data_to_send_with_addresses():
+        if outbound.peer_address != migrated_client:
+            raise SystemExit(f"zttp response was not routed to the validated migrated path: {outbound.peer_address!r}")
+        client.receive_datagram(outbound.data, ("server", 4433), 0.03)
         response_events.extend(drain_quic_to_h3(client, h3))
 
     response_headers = [event for event in response_events if isinstance(event, HeadersReceived)]
@@ -557,10 +557,10 @@ def assert_aioquic_client_to_zttp_server() -> None:
         ZTTP_SERVER_TICKET_EXTENSIONS,
         MAX_EARLY_DATA,
     )
-    for datagram, addr in server.data_to_send_with_addresses():
-        if addr != migrated_client:
-            raise SystemExit(f"zttp NewSessionTicket was not routed to the validated migrated path: {addr!r}")
-        client.receive_datagram(datagram, ("server", 4433), 0.0303)
+    for outbound in server.data_to_send_with_addresses():
+        if outbound.peer_address != migrated_client:
+            raise SystemExit(f"zttp NewSessionTicket was not routed to the validated migrated path: {outbound.peer_address!r}")
+        client.receive_datagram(outbound.data, ("server", 4433), 0.0303)
         drain_quic_to_h3(client, h3)
     if (
         len(received_tickets) != 1
@@ -626,10 +626,10 @@ def assert_aioquic_client_to_zttp_server() -> None:
         raise SystemExit(f"zttp did not receive aioquic's 0-RTT request before handshake completion: {early_events!r}")
 
     server.send_new_token(b"zttp-validation-token")
-    for datagram, addr in server.data_to_send_with_addresses():
-        if addr != migrated_client:
-            raise SystemExit(f"zttp NEW_TOKEN was not routed to the validated migrated path: {addr!r}")
-        client.receive_datagram(datagram, ("server", 4433), 0.0305)
+    for outbound in server.data_to_send_with_addresses():
+        if outbound.peer_address != migrated_client:
+            raise SystemExit(f"zttp NEW_TOKEN was not routed to the validated migrated path: {outbound.peer_address!r}")
+        client.receive_datagram(outbound.data, ("server", 4433), 0.0305)
         drain_quic_to_h3(client, h3)
     peer_token = getattr(client, "_peer_token", None)
     if QUIC_BACKEND == "aioquic":
@@ -896,19 +896,21 @@ def assert_udp_loopback_aioquic_client_to_zttp_server(drop_first_server_datagram
 
         def flush_server() -> None:
             nonlocal dropped_server_datagram
-            for datagram, key in server.data_to_send_with_addresses():
-                if key is None:
+            for outbound in server.data_to_send_with_addresses():
+                if outbound.peer_address is None:
                     if len(peer_by_key) != 1:
                         raise SystemExit("zttp UDP loopback emitted an unroutable datagram")
                     addr = next(iter(peer_by_key.values()))
                 else:
-                    addr = peer_by_key.get(key)
+                    addr = peer_by_key.get(outbound.peer_address)
                     if addr is None:
-                        raise SystemExit(f"zttp UDP loopback emitted a datagram for an unknown peer key: {key!r}")
+                        raise SystemExit(
+                            f"zttp UDP loopback emitted a datagram for an unknown peer key: {outbound.peer_address!r}"
+                        )
                 if drop_first_server_datagram and not dropped_server_datagram:
                     dropped_server_datagram = True
                     continue
-                server_sock.sendto(datagram, addr)
+                server_sock.sendto(outbound.data, addr)
 
         def pump_server_events() -> None:
             nonlocal request_seen, response_sent, migrated_request_seen, migrated_response_sent
