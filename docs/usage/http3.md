@@ -98,23 +98,8 @@ So when a packet is lost, QUIC only holds back the stream or streams whose bytes
 were in that packet. Every other stream keeps flowing, delivered, not waiting on
 anybody. That is the entire payoff.
 
-```mermaid
-flowchart TB
-    subgraph H2["HTTP/2 over TCP - one ordered byte stream"]
-        direction TB
-        L2["Segment for stream 1 is LOST"]
-        L2 --> B2["TCP must wait for retransmission"]
-        B2 --> S1x["stream 1 - blocked"]
-        B2 --> S3x["stream 3 - blocked too (it was just waiting in line)"]
-    end
-
-    subgraph H3["HTTP/3 over QUIC - independent streams"]
-        direction TB
-        L3["Packet carrying stream 1 is LOST"]
-        L3 --> Q1x["stream 1 - blocked, waits for its retransmission"]
-        L3 --> Q3ok["stream 3 - delivered now, it never needed those bytes"]
-    end
-```
+![A lost TCP segment blocks both HTTP/2 streams. A lost QUIC packet blocks only
+the HTTP/3 streams whose data it contains.](../assets/diagrams/http3-streams.svg)
 
 The difference is the second column. On TCP, losing stream 1's data freezes
 stream 3 for no reason. On QUIC, stream 3 sails right past. Same lost packet,
@@ -165,7 +150,8 @@ It just works.
 
 ### QPACK
 
-HTTP/2 compressed headers with HPACK. HTTP/3 uses **QPACK**, its successor.
+HTTP/2 compressed headers with [HPACK](http2.md#header-compression-hpack).
+HTTP/3 uses **QPACK**, its successor.
 Same good ideas - a static table, a dynamic table, Huffman coding - redesigned
 for one specific reason: HPACK assumed a single, totally ordered stream of
 header blocks, and over QUIC's independent streams that assumption breaks. QPACK

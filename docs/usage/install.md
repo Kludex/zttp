@@ -41,7 +41,7 @@ compiles in an isolated build environment.
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)
-conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-assert type(conn.next_event()).__name__ == "Request"
+event = conn.receive_event(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+assert type(event).__name__ == "Request"
 print("zttp works 🎉")
 ```

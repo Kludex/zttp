@@ -18,51 +18,52 @@ role when you create it:
 * `zttp.SERVER`: you receive **requests** and send **responses**.
 * `zttp.CLIENT`: you send **requests** and receive **responses**.
 
-The whole read side is just two calls.
+The HTTP/1.1 read side starts with `receive_event` and continues with
+`next_event`.
 
-## Feed bytes in
+## Feed bytes and receive an event
 
-When bytes arrive off the wire, hand them to `receive_data`:
-
-```python
-conn.receive_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
-```
-
-You can feed a whole message, or a fragment, or a single byte. zttp buffers what
-it has and resumes where it left off, so the network can chop your data up
-however it likes.
+When bytes arrive off the wire, pass them to `receive_event`:
 
 ```python
-conn.receive_data(b"GET / HT")   # half a request line
-conn.receive_data(b"TP/1.1\r\n") # the rest of it
+event = conn.receive_event(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 ```
 
-## Pull events out
+It returns the first complete event, or `NEED_DATA` when the input is partial.
+You can pass a whole message, a fragment, or a single byte. zttp buffers what it
+has and resumes where it left off, so the network can chop your data up however
+it likes.
 
-Then call `next_event()` to get the next thing that happened:
+```python
+assert conn.receive_event(b"GET / HT") is zttp.NEED_DATA  # half a request line
+event = conn.receive_event(b"TP/1.1\r\n\r\n")              # the completed Request
+```
+
+## Pull additional events
+
+Call `next_event()` after `receive_event` to pull any events that followed the
+first one in the same input:
 
 ```python title="echo.py"
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)
-conn.receive_data(
+event = conn.receive_event(
     b"POST /submit HTTP/1.1\r\n"
     b"Content-Length: 5\r\n"
     b"\r\n"
     b"hello"
 )
 
-while True:
-    event = conn.next_event()
-    if event is zttp.NEED_DATA:
-        break
+while event is not zttp.NEED_DATA:
     print(type(event).__name__, getattr(event, "data", ""))
     if isinstance(event, zttp.EndOfMessage) or isinstance(event, zttp.Request) and event.end_stream:
         break
+    event = conn.next_event()
 ```
 
-When there isn't a complete event yet, `next_event()` returns the `NEED_DATA`
-sentinel - your cue to `receive_data` more bytes (or stop the loop).
+When there isn't a complete event, either call returns the `NEED_DATA` sentinel.
+That is your cue to pass more bytes to `receive_event` or stop the loop.
 
 Run it:
 
