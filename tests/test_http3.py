@@ -761,13 +761,6 @@ def test_http3_server_defaults_transport_settings_and_credentials() -> None:
     assert type(conn) is zttp.H3Connection
 
 
-def test_http3_server_custom_credentials_must_include_a_key_and_certificate() -> None:
-    with pytest.raises(TypeError):
-        zttp.TlsCredentials(certificate=b"\xcc" * 48)  # type: ignore[call-arg]
-    with pytest.raises(ValueError):
-        zttp.TlsCredentials(private_key=b"\x42" * 32)
-
-
 def test_http3_server_accepts_a_certificate_chain() -> None:
     config = dict(SERVER_CONFIG)
     config["credentials"] = zttp.TlsCredentials(

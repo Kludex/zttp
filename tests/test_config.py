@@ -7,48 +7,46 @@ import pytest
 import zttp
 
 
-def test_value_objects_are_frozen() -> None:
-    creds = zttp.TlsCredentials(certificate=b"CERT", private_key=b"KEY")
+def test_tls_credentials_is_a_typed_dictionary() -> None:
+    credentials = zttp.TlsCredentials(certificate=b"CERT", private_key=b"KEY")
+
+    assert credentials == {"certificate": b"CERT", "private_key": b"KEY"}
+
+
+def test_session_resumption_is_frozen() -> None:
     resumption = zttp.SessionResumption(identity=b"id", psk=b"\x00" * 32)
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        creds.certificate = b"other"  # type: ignore[misc]
+
     with pytest.raises(dataclasses.FrozenInstanceError):
         resumption.psk = b"other"  # type: ignore[misc]
 
 
-def test_credentials_and_resumption_need_both_halves() -> None:
-    # Naming both fields is the whole point: neither can be built half-formed, so a
-    # certificate/key (or identity/psk) swap has nowhere to hide.
-    with pytest.raises(TypeError):
-        zttp.TlsCredentials(certificate=b"CERT")  # type: ignore[call-arg]
+def test_session_resumption_needs_both_halves() -> None:
     with pytest.raises(TypeError):
         zttp.SessionResumption(identity=b"id")  # type: ignore[call-arg]
 
 
-def test_tls_credentials_accept_an_ordered_certificate_chain() -> None:
-    source = [b"leaf", b"intermediate"]
-    credentials = zttp.TlsCredentials(
-        certificates=source,  # type: ignore[arg-type]
-        private_key=b"key",
-    )
-    source.append(b"other")
-    assert credentials.certificate_chain == (b"leaf", b"intermediate")
-    assert credentials.certificate is None
-
-
 @pytest.mark.parametrize(
-    "kwargs",
+    ("credentials", "exception"),
     [
-        {"certificates": ()},
-        {"certificates": (b"",)},
-        {"certificates": b"single-certificate"},
-        {"certificates": ("not-bytes",)},
-        {"certificate": b"leaf", "certificates": (b"intermediate",)},
+        (object(), TypeError),
+        ({"certificate": b"leaf"}, TypeError),
+        ({"private_key": b"\x42" * 32}, ValueError),
+        ({"certificate": b"leaf", "certificates": (b"intermediate",), "private_key": b"\x42" * 32}, ValueError),
+        ({"certificate": b"leaf", "private_key": b"\x42" * 32, "unknown": b"value"}, ValueError),
+        ({"certificate": b"", "private_key": b"\x42" * 32}, ValueError),
+        ({"certificates": (), "private_key": b"\x42" * 32}, ValueError),
+        ({"certificates": (b"",), "private_key": b"\x42" * 32}, ValueError),
+        ({"certificates": b"single-certificate", "private_key": b"\x42" * 32}, TypeError),
+        ({"certificates": ("not-bytes",), "private_key": b"\x42" * 32}, TypeError),
     ],
 )
-def test_tls_credentials_reject_invalid_certificate_chains(kwargs: dict[str, object]) -> None:
-    with pytest.raises(ValueError):
-        zttp.TlsCredentials(private_key=b"key", **kwargs)  # type: ignore[arg-type]
+def test_h3_constructor_validates_tls_credentials(credentials: object, exception: type[Exception]) -> None:
+    with pytest.raises(exception):
+        zttp.Connection(
+            zttp.SERVER,
+            zttp.HTTP3,
+            credentials=credentials,  # type: ignore[arg-type]
+        )
 
 
 def test_h3_constructor_takes_value_objects() -> None:
@@ -70,13 +68,6 @@ def test_h3_constructor_rejects_the_old_raw_kwargs() -> None:
             zttp.Connection(zttp.SERVER, zttp.HTTP3, **bad)  # type: ignore[call-overload]
 
 
-def test_value_objects_are_keyword_only() -> None:
-    # Positional construction is where a same-typed swap could still hide, so the
-    # fields are keyword-only: TlsCredentials(key, cert) is a TypeError, not a silent
-    # transposition.
-    with pytest.raises(TypeError):
-        zttp.TlsCredentials(b"cert", b"key")  # type: ignore[misc]
+def test_session_resumption_is_keyword_only() -> None:
     with pytest.raises(TypeError):
         zttp.SessionResumption(b"id", b"psk")  # type: ignore[misc]
-    # Keyword construction is unaffected.
-    assert zttp.TlsCredentials(certificate=b"c", private_key=b"k").private_key == b"k"

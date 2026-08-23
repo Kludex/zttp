@@ -219,6 +219,43 @@ fn optionalBytes32(obj: ?*c.PyObject, msg: [*c]const u8) ?[32]u8 {
     return src[0..32].*;
 }
 
+const TlsCredentialObjects = struct {
+    certificate: ?*c.PyObject = null,
+    certificates: ?*c.PyObject = null,
+    private_key: ?*c.PyObject = null,
+};
+
+fn parseTlsCredentials(obj: ?*c.PyObject) ?TlsCredentialObjects {
+    if (obj == null or py.isNone(obj)) return .{};
+    const is_dict = c.PyObject_IsInstance(obj, @ptrCast(&c.PyDict_Type));
+    if (is_dict < 0) return null;
+    if (is_dict == 0) {
+        _ = py.raiseType("credentials must be a TlsCredentials dictionary");
+        return null;
+    }
+
+    const certificate = c.PyDict_GetItemString(obj, "certificate");
+    const certificates = c.PyDict_GetItemString(obj, "certificates");
+    const private_key = c.PyDict_GetItemString(obj, "private_key");
+    if (private_key == null) {
+        _ = py.raiseType("credentials must include private_key");
+        return null;
+    }
+    if (certificate != null and certificates != null) {
+        _ = py.raiseValue("pass either certificate or certificates, not both");
+        return null;
+    }
+    if (certificate == null and certificates == null) {
+        _ = py.raiseValue("credentials must include certificate or certificates");
+        return null;
+    }
+    if (c.PyDict_Size(obj) != 2) {
+        _ = py.raiseValue("credentials contains an unknown field");
+        return null;
+    }
+    return .{ .certificate = certificate, .certificates = certificates, .private_key = private_key };
+}
+
 fn randomSigner() ?Signer {
     var attempts: u8 = 0;
     while (attempts < 16) : (attempts += 1) {
@@ -1602,22 +1639,11 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$OOOOOOOOOOOO", @ptrCast(&kwlist), &role_val, &protocol_val, &credentials_obj, &tp_obj, &random_obj, &ephemeral_obj, &alpn_obj, &cid_obj, &sni_obj, &resumption_obj, &obfuscated_ticket_age_obj, &early_data_obj, &remembered_tp_obj, &validation_token_obj) == 0) return null;
     if (protocol_val != HTTP3) return py.raiseValue("protocol does not match this Connection subclass; construct zttp.Connection to choose by protocol");
 
-    // Unpack the credential / resumption value objects into the raw byte objects the
-    // builders consume. TlsCredentials(certificate_chain, private_key) and
-    // SessionResumption(identity, psk) name the same-typed byte pairs so a caller
-    // cannot transpose them. The GetAttr results are owned refs; free them on return.
-    var certificates_obj: ?*c.PyObject = null;
-    var key_obj: ?*c.PyObject = null;
+    const credentials = parseTlsCredentials(credentials_obj) orelse return null;
     var resumption_identity_obj: ?*c.PyObject = null;
     var resumption_psk_obj: ?*c.PyObject = null;
-    defer py.xdecref(certificates_obj);
-    defer py.xdecref(key_obj);
     defer py.xdecref(resumption_identity_obj);
     defer py.xdecref(resumption_psk_obj);
-    if (credentials_obj != null and !py.isNone(credentials_obj)) {
-        certificates_obj = c.PyObject_GetAttrString(credentials_obj, "certificate_chain") orelse return null;
-        key_obj = c.PyObject_GetAttrString(credentials_obj, "private_key") orelse return null;
-    }
     if (resumption_obj != null and !py.isNone(resumption_obj)) {
         resumption_identity_obj = c.PyObject_GetAttrString(resumption_obj, "identity") orelse return null;
         resumption_psk_obj = c.PyObject_GetAttrString(resumption_obj, "psk") orelse return null;
@@ -1630,12 +1656,6 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     self.engine = null;
     const engine: *Engine = @ptrCast(@alignCast(&self.engine_storage));
     if (role_val == SERVER) {
-        if ((certificates_obj != null and !py.isNone(certificates_obj) and (key_obj == null or py.isNone(key_obj))) or
-            (key_obj != null and !py.isNone(key_obj) and (certificates_obj == null or py.isNone(certificates_obj))))
-        {
-            py.decref(obj);
-            return py.raiseType("HTTP/3 server custom credentials require both certificates and private_key");
-        }
         if (obfuscated_ticket_age_obj != null and !py.isNone(obfuscated_ticket_age_obj)) {
             py.decref(obj);
             return py.raiseValue("obfuscated_ticket_age is only valid for HTTP/3 clients");
@@ -1659,7 +1679,7 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
             py.decref(obj);
             return py.raiseValue("validation_token is only valid for HTTP/3 clients");
         }
-        const config = buildServerConfig(certificates_obj, key_obj, tp_obj, random_obj, ephemeral_obj, alpn_obj, resumption_identity_obj, resumption_psk_obj) orelse {
+        const config = buildServerConfig(credentials, tp_obj, random_obj, ephemeral_obj, alpn_obj, resumption_identity_obj, resumption_psk_obj) orelse {
             py.decref(obj);
             return null;
         };
@@ -1763,8 +1783,26 @@ fn freeCertificateChain(certificates: [][]u8) void {
     gpa.free(certificates);
 }
 
-fn copyCertificateChain(certificates_obj: ?*c.PyObject, default_certificate: []const u8) ?[][]u8 {
-    if (certificates_obj == null or py.isNone(certificates_obj)) {
+fn copyCertificateChain(credentials: TlsCredentialObjects, default_certificate: []const u8) ?[][]u8 {
+    if (credentials.certificate) |certificate_obj| {
+        const source = py.asBytes(certificate_obj) orelse return null;
+        if (source.len == 0) {
+            _ = py.raiseValue("every certificate must be non-empty bytes");
+            return null;
+        }
+        const certificates = gpa.alloc([]u8, 1) catch {
+            _ = c.PyErr_NoMemory();
+            return null;
+        };
+        certificates[0] = gpa.dupe(u8, source) catch {
+            gpa.free(certificates);
+            _ = c.PyErr_NoMemory();
+            return null;
+        };
+        return certificates;
+    }
+
+    const certificates_obj = credentials.certificates orelse {
         const certificates = gpa.alloc([]u8, 1) catch {
             _ = c.PyErr_NoMemory();
             return null;
@@ -1775,9 +1813,8 @@ fn copyCertificateChain(certificates_obj: ?*c.PyObject, default_certificate: []c
             return null;
         };
         return certificates;
-    }
-
-    const sequence = c.PySequence_Fast(certificates_obj, "certificate_chain must be a sequence") orelse return null;
+    };
+    const sequence = c.PySequence_Fast(certificates_obj, "certificates must be a sequence") orelse return null;
     defer py.decref(sequence);
     const count = c.PySequence_Size(sequence);
     if (count <= 0) {
@@ -1815,8 +1852,7 @@ fn copyCertificateChain(certificates_obj: ?*c.PyObject, default_certificate: []c
 // the fixed-size seeds and deriving the Signer up front. On any failure sets a Python
 // error, frees whatever was already copied, and returns null.
 fn buildServerConfig(
-    certificates_obj: ?*c.PyObject,
-    key_obj: ?*c.PyObject,
+    credentials: TlsCredentialObjects,
     tp_obj: ?*c.PyObject,
     random_obj: ?*c.PyObject,
     ephemeral_obj: ?*c.PyObject,
@@ -1829,7 +1865,7 @@ fn buildServerConfig(
     const ephemeral_seed = optionalBytes32(ephemeral_obj, "ephemeral_seed must be exactly 32 bytes") orelse return null;
     var signer: Signer = undefined;
     var default_cert: [tls_sign.PUBLIC_SEC1_LEN]u8 = undefined;
-    if (key_obj != null and !py.isNone(key_obj)) {
+    if (credentials.private_key) |key_obj| {
         const key_src = py.asBytes(key_obj) orelse return null;
         if (key_src.len != 32) {
             _ = py.raiseValue("private_key must be 32 bytes (the signing key seed)");
@@ -1846,7 +1882,7 @@ fn buildServerConfig(
     const resumption = parseResumptionCredential(resumption_identity_obj, resumption_psk_obj, null, null);
     if (resumption == null and c.PyErr_Occurred() != null) return null;
 
-    const certificates = copyCertificateChain(certificates_obj, &default_cert) orelse return null;
+    const certificates = copyCertificateChain(credentials, &default_cert) orelse return null;
     const tp_copy = gpa.dupe(u8, tp_src) catch {
         freeCertificateChain(certificates);
         _ = c.PyErr_NoMemory();
