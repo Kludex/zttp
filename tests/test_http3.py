@@ -1059,7 +1059,6 @@ def test_local_connection_ids_track_issue_and_peer_retirement() -> None:
     transfer(server, client, 4000)
     transfer(client, server, 5000)
 
-    client.use_peer_connection_id(1)
     server.issue_connection_id(2, b"server-cid-2", b"\x6a" * 16, 1)
     transfer(server, client, 6000)
     client.initiate_connection()
@@ -1084,8 +1083,8 @@ def test_local_connection_ids_route_two_connections_on_one_endpoint() -> None:
         transfer(client, server, index * 1000 + 200)
         rotated = f"server-cid-{index}".encode()
         server.issue_connection_id(1, rotated, bytes((index,)) * 16)
-        for item in server.local_connection_ids():
-            routes[item.connection_id] = server
+        issued = next(item for item in server.local_connection_ids() if item.sequence_number == 1)
+        routes[issued.connection_id] = server
         transfer(server, client, index * 1000 + 300)
         transfer(client, server, index * 1000 + 400)
         client.use_peer_connection_id(1)
@@ -1094,7 +1093,9 @@ def test_local_connection_ids_route_two_connections_on_one_endpoint() -> None:
     for index, (client, _server, _rotated) in enumerate(pairs, start=1):
         client.send_request(b"GET", f"/connection-{index}".encode(), b"3", [(b"host", b"example.test")])
         for datagram in client.data_to_send():
-            destination = next(connection_id for connection_id in routes if datagram[1:].startswith(connection_id))
+            connection_id_length = len(rotated)
+            destination = datagram[1 : 1 + connection_id_length]
+            assert destination in routes
             routes[destination].receive_datagram(datagram, 5000 + index)
 
     for index, (_client, server, rotated) in enumerate(pairs, start=1):

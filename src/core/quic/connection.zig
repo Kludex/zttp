@@ -243,6 +243,7 @@ pub const Connection = struct {
     peer_scid: []u8, // the peer's scid: the dcid of everything we send (owned)
     retry_scid: ?[]u8 = null, // client only: SCID received in Retry, for TP validation
     peer_cids: std.AutoHashMapUnmanaged(u64, PeerCid) = .empty,
+    peer_cid_seq: u64 = 0,
     peer_retire_prior_to: u64 = 0,
     local_cids: std.AutoHashMapUnmanaged(u64, LocalCid) = .empty,
     local_cid_max_seq: u64 = 0,
@@ -819,6 +820,7 @@ pub const Connection = struct {
         const owned = self.gpa.dupe(u8, peer_cid.cid) catch return error.OutOfMemory;
         self.gpa.free(self.peer_scid);
         self.peer_scid = owned;
+        self.peer_cid_seq = seq;
     }
 
     /// Issue a replacement local connection id to the peer (RFC 9000 5.1/19.15).
@@ -2555,7 +2557,7 @@ pub const Connection = struct {
     }
 
     fn onNewConnectionId(self: *Connection, seq: u64, retire_prior_to: u64, cid: []const u8, token: []const u8) Error!void {
-        if (token.len != 16) return error.ProtocolViolation;
+        if (token.len != 16 or retire_prior_to > seq) return error.ProtocolViolation;
         if (retire_prior_to > self.peer_retire_prior_to) {
             const previous_retire_prior_to = self.peer_retire_prior_to;
             self.peer_retire_prior_to = retire_prior_to;
@@ -2582,6 +2584,7 @@ pub const Connection = struct {
         const token_array = token[0..16].*;
         if (self.peer_cids.get(seq)) |existing| {
             if (!std.mem.eql(u8, existing.cid, cid) or !std.mem.eql(u8, &existing.token, &token_array)) return error.ProtocolViolation;
+            if (self.peer_cid_seq < self.peer_retire_prior_to) try self.usePeerConnectionId(seq);
             return;
         }
         if (std.mem.eql(u8, cid, self.peer_scid) or self.peerCidValueExists(cid)) return error.ProtocolViolation;
@@ -2593,6 +2596,7 @@ pub const Connection = struct {
         const owned = self.gpa.dupe(u8, cid) catch return error.OutOfMemory;
         errdefer self.gpa.free(owned);
         self.peer_cids.put(self.gpa, seq, .{ .cid = owned, .token = token_array }) catch return error.OutOfMemory;
+        if (self.peer_cid_seq < self.peer_retire_prior_to) try self.usePeerConnectionId(seq);
     }
 
     /// RFC 9002 2: every frame except ACK, PADDING, and CONNECTION_CLOSE makes its
@@ -4555,18 +4559,18 @@ test "NEW_CONNECTION_ID retire_prior_to queues RETIRE_CONNECTION_ID" {
 
     var second: std.ArrayListUnmanaged(u8) = .empty;
     defer second.deinit(gpa);
-    try frame.encodeNewConnectionId(&second, gpa, 2, 2, &[_]u8{ 5, 6, 7, 8 }, token);
+    try frame.encodeNewConnectionId(&second, gpa, 2, 1, &[_]u8{ 5, 6, 7, 8 }, token);
     const d2 = try testBuildApp(gpa, &dcid, 1, second.items);
     defer gpa.free(d2);
     try conn.receiveDatagram(d2, 2000);
-    try testing.expect(conn.pending_retire_cids.contains(1));
+    try testing.expect(conn.pending_retire_cids.contains(0));
 
     conn.clearSend();
     try conn.flushSend(3000);
 
     const dgram = conn.datagramsToSend()[0..conn.datagramLengths()[0]];
     const keys = testAppKeys();
-    const hdr = try packet.parseShort(dgram, dcid.len);
+    const hdr = try packet.parseShort(dgram, conn.peer_scid.len);
     const work = try gpa.dupe(u8, dgram);
     defer gpa.free(work);
     const pn_len = try crypto.unprotectHeader(keys.hp, work, hdr.pn_offset, false);
@@ -4578,7 +4582,7 @@ test "NEW_CONNECTION_ID retire_prior_to queues RETIRE_CONNECTION_ID" {
     defer gpa.free(plaintext);
     const payload = try crypto.open(keys, truncated, header, ciphertext, plaintext);
     const decoded = try frame.decode(payload);
-    try testing.expectEqual(frame.Frame{ .retire_connection_id = 1 }, decoded.frame);
+    try testing.expectEqual(frame.Frame{ .retire_connection_id = 0 }, decoded.frame);
 }
 
 test "RETIRE_CONNECTION_ID can retire the initial local cid" {
