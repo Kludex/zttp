@@ -4,6 +4,7 @@ import dataclasses
 import pickle
 
 import pytest
+from typing_extensions import TypedDict
 
 import zttp
 
@@ -23,7 +24,36 @@ SERVER_TRANSPORT_PARAMS = (
     b"\x06\x04\x80\x04\x00\x00"  # initial_max_stream_data_bidi_remote = 262144
     b"\x07\x04\x80\x04\x00\x00"  # initial_max_stream_data_uni = 262144
 )
-SERVER_CONFIG = {
+
+
+class ServerConfig(TypedDict):
+    credentials: zttp.TlsCredentials
+    transport_params: zttp.QuicTransportParameters
+    random: bytes
+    ephemeral_seed: bytes
+
+
+class ClientConfig(TypedDict):
+    transport_params: zttp.QuicTransportParameters
+    random: bytes
+    ephemeral_seed: bytes
+    connection_id: bytes
+    alpn: bytes
+    server_name: bytes
+
+
+class ResumedClientConfig(ClientConfig, total=False):
+    resumption: zttp.SessionResumption
+    obfuscated_ticket_age: int
+    early_data: bool
+    remembered_transport_params: bytes
+
+
+class ResumedServerConfig(ServerConfig, total=False):
+    resumption: zttp.SessionResumption
+
+
+SERVER_CONFIG: ResumedServerConfig = {
     "credentials": zttp.TlsCredentials(certificate=SERVER_PUBLIC_KEY, private_key=b"\x42" * 32),
     "transport_params": zttp.QuicTransportParameters(
         initial_max_data=1048576,
@@ -36,7 +66,7 @@ SERVER_CONFIG = {
     "ephemeral_seed": b"\x33" * 32,
 }
 
-CLIENT_CONFIG = {
+CLIENT_CONFIG: ResumedClientConfig = {
     "transport_params": zttp.QuicTransportParameters(
         initial_max_data=65536,
         initial_max_stream_data_bidi_local=262144,
@@ -243,7 +273,7 @@ def test_parse_datagram_header_does_not_trust_an_unsupported_version() -> None:
 def test_parse_datagram_header_result_is_frozen() -> None:
     header = zttp.parse_datagram_header(b"\x40\x00")
     with pytest.raises(dataclasses.FrozenInstanceError):
-        header.version = 9  # type: ignore[misc]
+        header.version = 9  # ty: ignore[invalid-assignment]
 
 
 def test_http3_client_construction_emits_an_initial() -> None:
@@ -257,7 +287,7 @@ def test_http3_client_construction_emits_an_initial() -> None:
 
 
 def test_http3_client_initial_can_carry_validation_token() -> None:
-    config = dict(CLIENT_CONFIG)
+    config = CLIENT_CONFIG.copy()
     config["connection_id"] = b"\x11\x22\x33\x4d"
     conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config, validation_token=b"validated-earlier")
     [initial] = conn.data_to_send()
@@ -270,14 +300,16 @@ def test_http3_validation_tokens_starts_empty() -> None:
 
 
 def test_http3_validation_token_must_not_be_empty() -> None:
-    config = dict(CLIENT_CONFIG)
+    config = CLIENT_CONFIG.copy()
     with pytest.raises(ValueError):
         zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config, validation_token=b"")
 
 
 def test_http3_validation_token_is_client_only() -> None:
     with pytest.raises(ValueError):
-        zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **SERVER_CONFIG, validation_token=b"token")
+        zttp.Connection(  # ty: ignore[no-matching-overload]
+            zttp.SERVER, protocol=zttp.HTTP3, **SERVER_CONFIG, validation_token=b"token"
+        )
 
 
 def test_http3_client_defaults_transport_settings_and_connection_id() -> None:
@@ -307,7 +339,7 @@ def test_http3_default_client_and_server_exchange_request() -> None:
 
 
 def test_http3_client_rejects_unverifiable_server_certificate() -> None:
-    config = dict(SERVER_CONFIG)
+    config = SERVER_CONFIG.copy()
     config["credentials"] = zttp.TlsCredentials(certificate=b"\xcc" * 48, private_key=b"\x42" * 32)
     client = make_client()
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
@@ -423,7 +455,7 @@ def test_http3_received_session_ticket_psk_resumes_later_connection() -> None:
     assert len(psk) == 32
     assert psk == issued_psk
 
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x47",
@@ -470,8 +502,9 @@ def test_http3_ticket_age_mismatch_does_not_accept_zero_rtt() -> None:
     assert transfer(first_server, first_client, 5000)
     [ticket] = first_client.session_tickets()
     identity, psk = ticket.ticket, ticket.psk
+    assert isinstance(psk, bytes)
 
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x48",
@@ -512,9 +545,10 @@ def test_http3_expired_ticket_does_not_accept_zero_rtt() -> None:
     assert transfer(first_server, first_client, 5000)
     [ticket] = first_client.session_tickets()
     age_add, identity, psk = ticket.age_add, ticket.ticket, ticket.psk
+    assert isinstance(psk, bytes)
 
     resume_at = 2_500_000
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x49",
@@ -555,9 +589,10 @@ def test_http3_ticket_without_early_data_extension_does_not_accept_zero_rtt() ->
     assert transfer(first_server, first_client, 5000)
     [ticket] = first_client.session_tickets()
     age_add, identity, psk = ticket.age_add, ticket.ticket, ticket.psk
+    assert isinstance(psk, bytes)
     assert ticket.max_early_data_size is None
 
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x4a",
@@ -598,9 +633,10 @@ def test_http3_zero_rtt_ticket_is_single_use() -> None:
     assert transfer(first_server, first_client, 5000)
     [ticket] = first_client.session_tickets()
     age_add, identity, psk = ticket.age_add, ticket.ticket, ticket.psk
+    assert isinstance(psk, bytes)
 
     def make_early_client(connection_id: bytes, now: int) -> zttp.H3Connection:
-        client_config = dict(CLIENT_CONFIG)
+        client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
         client_config.update(
             {
                 "connection_id": connection_id,
@@ -633,7 +669,7 @@ def test_http3_zero_rtt_ticket_is_single_use() -> None:
 
 def test_http3_client_server_resumed_handshake() -> None:
     psk = b"\x7b" * 32
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x45",
@@ -641,7 +677,7 @@ def test_http3_client_server_resumed_handshake() -> None:
             "obfuscated_ticket_age": 0x01020304,
         }
     )
-    server_config = dict(SERVER_CONFIG)
+    server_config: ResumedServerConfig = SERVER_CONFIG.copy()
     server_config.update(
         {
             "resumption": zttp.SessionResumption(identity=b"ticket-identity", psk=psk),
@@ -668,7 +704,7 @@ def test_http3_client_server_resumed_handshake() -> None:
 
 def test_http3_static_resumption_credentials_do_not_accept_zero_rtt() -> None:
     psk = b"\x7b" * 32
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x46",
@@ -678,7 +714,7 @@ def test_http3_static_resumption_credentials_do_not_accept_zero_rtt() -> None:
             "remembered_transport_params": SERVER_TRANSPORT_PARAMS,
         }
     )
-    server_config = dict(SERVER_CONFIG)
+    server_config: ResumedServerConfig = SERVER_CONFIG.copy()
     server_config.update(
         {
             "resumption": zttp.SessionResumption(identity=b"ticket-identity", psk=psk),
@@ -852,7 +888,7 @@ def test_http3_server_defaults_transport_settings_and_credentials() -> None:
 
 
 def test_http3_accepts_typed_transport_parameters() -> None:
-    client_config = dict(CLIENT_CONFIG)
+    client_config = CLIENT_CONFIG.copy()
     client_config["transport_params"] = zttp.QuicTransportParameters(
         initial_max_data=65536,
         initial_max_stream_data_bidi_local=4096,
@@ -864,7 +900,7 @@ def test_http3_accepts_typed_transport_parameters() -> None:
         max_udp_payload_size=1200,
         disable_active_migration=True,
     )
-    server_config = dict(SERVER_CONFIG)
+    server_config = SERVER_CONFIG.copy()
     server_config["transport_params"] = zttp.QuicTransportParameters(
         initial_max_data=1048576,
         initial_max_stream_data_bidi_remote=262144,
@@ -890,7 +926,7 @@ def test_http3_accepts_typed_transport_parameters() -> None:
 
 
 def test_http3_typed_transport_parameters_preserve_role_defaults() -> None:
-    config = dict(SERVER_CONFIG)
+    config = SERVER_CONFIG.copy()
     config["transport_params"] = zttp.QuicTransportParameters(max_idle_timeout=30_000)
     client = make_client()
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
@@ -906,9 +942,15 @@ def test_http3_typed_transport_parameters_preserve_role_defaults() -> None:
 
 def test_http3_typed_transport_parameters_validate_in_the_extension() -> None:
     with pytest.raises(TypeError):
-        zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params=b"raw")  # type: ignore[arg-type]
+        zttp.Connection(  # ty: ignore[no-matching-overload]
+            zttp.CLIENT, zttp.HTTP3, transport_params=b"raw"
+        )
     with pytest.raises(ValueError, match="unknown field"):
-        zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params={"unknown": 1})  # type: ignore[typeddict-unknown-key]
+        zttp.Connection(  # ty: ignore[no-matching-overload]
+            zttp.CLIENT,
+            zttp.HTTP3,
+            transport_params={"unknown": 1},  # ty: ignore[invalid-key]
+        )
     with pytest.raises(ValueError, match="outside the QUIC range"):
         zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params={"max_udp_payload_size": 1199})
     with pytest.raises(ValueError, match="only valid for HTTP/3 servers"):
@@ -922,9 +964,9 @@ def test_http3_typed_transport_parameters_validate_in_the_extension() -> None:
 def test_http3_server_custom_credentials_must_be_a_pair() -> None:
     # TlsCredentials names both halves, so a lone certificate or key cannot be built.
     with pytest.raises(TypeError):
-        zttp.TlsCredentials(certificate=b"\xcc" * 48)  # type: ignore[call-arg]
+        zttp.TlsCredentials(certificate=b"\xcc" * 48)  # ty: ignore[missing-argument]
     with pytest.raises(TypeError):
-        zttp.TlsCredentials(private_key=b"\x42" * 32)  # type: ignore[call-arg]
+        zttp.TlsCredentials(private_key=b"\x42" * 32)  # ty: ignore[missing-argument]
 
 
 def test_http3_rejects_a_wrong_size_key() -> None:
@@ -964,7 +1006,7 @@ def test_first_datagram_must_be_an_initial() -> None:
 
 def test_a_non_conformant_client_hello_is_rejected() -> None:
     # Wrong ALPN - the server requires HTTP/3 clients to negotiate "h3".
-    config = dict(CLIENT_CONFIG)
+    config = CLIENT_CONFIG.copy()
     config["alpn"] = b"http/1.1"
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
     conn = make_server()
@@ -1222,7 +1264,7 @@ def test_issue_connection_id_validates_inputs() -> None:
     with pytest.raises(ValueError):
         server.issue_connection_id(1, b"server-cid-1", b"short")
     with pytest.raises(TypeError):
-        server.issue_connection_id(1, object(), b"\x5a" * 16)  # type: ignore[arg-type]
+        server.issue_connection_id(1, object(), b"\x5a" * 16)  # ty: ignore[invalid-argument-type]
 
 
 def test_request_key_update_requires_application_keys() -> None:
@@ -1248,8 +1290,8 @@ def test_request_key_update_applies_to_next_http3_packet() -> None:
 
 def test_disable_active_migration_rejects_new_peer_address_after_handshake() -> None:
     client = make_client()
-    config = dict(SERVER_CONFIG)
-    transport_params = dict(SERVER_CONFIG["transport_params"])
+    config = SERVER_CONFIG.copy()
+    transport_params = SERVER_CONFIG["transport_params"].copy()
     transport_params["disable_active_migration"] = True
     config["transport_params"] = transport_params
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
@@ -1274,7 +1316,7 @@ def test_disable_active_migration_rejects_new_peer_address_after_handshake() -> 
 def test_receive_datagram_peer_address_must_be_bytes() -> None:
     conn = make_server()
     with pytest.raises(TypeError):
-        conn.receive_datagram(CLIENT_HELLO, 1000, object())
+        conn.receive_datagram(CLIENT_HELLO, 1000, object())  # ty: ignore[invalid-argument-type]
 
 
 def test_http3_reads_a_get_request_after_a_real_handshake() -> None:
@@ -1609,7 +1651,7 @@ def test_next_timeout_arms_after_the_handshake_flight() -> None:
 
 
 def test_idle_timeout_closes_http3_connection() -> None:
-    config = dict(SERVER_CONFIG)
+    config = SERVER_CONFIG.copy()
     config["transport_params"] = zttp.QuicTransportParameters(max_idle_timeout=5)
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
 
@@ -1651,7 +1693,7 @@ def test_h3_result_rows_are_frozen_dataclasses() -> None:
     assert row.lifetime == 1
     assert row.max_early_data_size is None
     with pytest.raises(dataclasses.FrozenInstanceError):
-        row.lifetime = 2  # type: ignore[misc]
+        row.lifetime = 2  # ty: ignore[invalid-assignment]
 
 
 def test_h3_result_rows_are_picklable() -> None:
