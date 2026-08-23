@@ -45,7 +45,8 @@ pub const Config = struct {
     random: [32]u8, // ServerHello.random; injected entropy (sans-IO)
     ephemeral_seed: [32]u8, // feeds keyshare.ephemeral
     signer: sign.Signer,
-    cert_chain: []const u8, // DER cert_data the Certificate message carries
+    cert_chain: []const u8, // leaf DER cert_data; retained for single-certificate callers
+    certificates: []const []const u8 = &.{}, // ordered leaf and intermediate DER entries
     /// The server's application protocol. When set, the ClientHello must offer it
     /// (RFC 9001 8.1 makes ALPN mandatory) and it is echoed into
     /// EncryptedExtensions; null skips negotiation - a transport-test affordance.
@@ -184,14 +185,22 @@ const Certificate = struct {
     fn emit(self: Certificate, w: wire.Writer) !void {
         try w.u8v(0x00); // certificate_request_context: empty for server auth
         const list = try w.open(3); // certificate_list<0..2^24-1>
-        const cert = try w.open(3); // cert_data<1..2^24-1>
-        try w.bytes(self.cfg.cert_chain);
-        try w.close(cert);
-        const ext = try w.open(2); // per-entry extensions: none
-        try w.close(ext);
+        if (self.cfg.certificates.len > 0) {
+            for (self.cfg.certificates) |certificate| try emitCertificateEntry(w, certificate);
+        } else {
+            try emitCertificateEntry(w, self.cfg.cert_chain);
+        }
         try w.close(list);
     }
 };
+
+fn emitCertificateEntry(w: wire.Writer, certificate: []const u8) !void {
+    const cert = try w.open(3); // cert_data<1..2^24-1>
+    try w.bytes(certificate);
+    try w.close(cert);
+    const ext = try w.open(2); // per-entry extensions: none
+    try w.close(ext);
+}
 
 const CertificateVerify = struct {
     cfg: Config,
@@ -215,3 +224,46 @@ const Finished = struct {
         try w.bytes(&finished.build(self.secret, self.th));
     }
 };
+
+const testing = std.testing;
+
+test "server flight serializes every certificate as an ordered CertificateEntry" {
+    const gpa = testing.allocator;
+    const client_keys = try keyshare.KeyShare.ephemeral([_]u8{0x11} ** 32);
+    const leaf = [_]u8{ 0x30, 0x01, 0xaa };
+    const intermediate = [_]u8{ 0x30, 0x01, 0xbb };
+    const certificates = [_][]const u8{ &leaf, &intermediate };
+    var transcript = tr.Transcript{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+
+    _ = try build(&out, gpa, &transcript, .{
+        .legacy_session_id = &.{},
+        .client_key_share = client_keys.public_key,
+    }, .{
+        .random = [_]u8{0x22} ** 32,
+        .ephemeral_seed = [_]u8{0x33} ** 32,
+        .signer = try sign.Signer.fromSeed([_]u8{0x42} ** 32),
+        .cert_chain = &leaf,
+        .certificates = &certificates,
+        .transport_params = &.{},
+    });
+
+    var messages = wire.Reader{ .buf = out.items };
+    try testing.expectEqual(@as(u8, 0x02), try messages.byte());
+    _ = try messages.vector(3);
+    try testing.expectEqual(@as(u8, 0x08), try messages.byte());
+    _ = try messages.vector(3);
+    try testing.expectEqual(@as(u8, 0x0b), try messages.byte());
+    var certificate_message = try messages.vector(3);
+    try testing.expectEqual(@as(usize, 0), (try certificate_message.vector(1)).buf.len);
+    var list = try certificate_message.vector(3);
+    const first = try list.vector(3);
+    try testing.expectEqualSlices(u8, &leaf, first.buf);
+    try testing.expectEqual(@as(usize, 0), (try list.vector(2)).buf.len);
+    const second = try list.vector(3);
+    try testing.expectEqualSlices(u8, &intermediate, second.buf);
+    try testing.expectEqual(@as(usize, 0), (try list.vector(2)).buf.len);
+    try list.expectEnd();
+    try certificate_message.expectEnd();
+}

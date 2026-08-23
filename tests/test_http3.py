@@ -761,12 +761,29 @@ def test_http3_server_defaults_transport_settings_and_credentials() -> None:
     assert type(conn) is zttp.H3Connection
 
 
-def test_http3_server_custom_credentials_must_be_a_pair() -> None:
-    # TlsCredentials names both halves, so a lone certificate or key cannot be built.
+def test_http3_server_custom_credentials_must_include_a_key_and_certificate() -> None:
     with pytest.raises(TypeError):
         zttp.TlsCredentials(certificate=b"\xcc" * 48)  # type: ignore[call-arg]
-    with pytest.raises(TypeError):
-        zttp.TlsCredentials(private_key=b"\x42" * 32)  # type: ignore[call-arg]
+    with pytest.raises(ValueError):
+        zttp.TlsCredentials(private_key=b"\x42" * 32)
+
+
+def test_http3_server_accepts_a_certificate_chain() -> None:
+    config = dict(SERVER_CONFIG)
+    config["credentials"] = zttp.TlsCredentials(
+        certificates=(SERVER_PUBLIC_KEY, b"intermediate-certificate"),
+        private_key=b"\x42" * 32,
+    )
+    client = make_client()
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
+
+    transfer(client, server, 1000)
+    transfer(server, client, 2000)
+    transfer(client, server, 3000)
+    client.send_request(b"GET", b"/chain", b"3", [(b"host", b"example.test")])
+    transfer(client, server, 4000)
+
+    assert any(isinstance(event, zttp.Request) for event in drain_events(server))
 
 
 def test_http3_rejects_a_wrong_size_key() -> None:

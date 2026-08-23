@@ -25,6 +25,29 @@ def test_credentials_and_resumption_need_both_halves() -> None:
         zttp.SessionResumption(identity=b"id")  # type: ignore[call-arg]
 
 
+def test_tls_credentials_accept_an_ordered_certificate_chain() -> None:
+    credentials = zttp.TlsCredentials(
+        certificates=(b"leaf", b"intermediate"),
+        private_key=b"key",
+    )
+    assert credentials.certificate_chain == (b"leaf", b"intermediate")
+    assert credentials.certificate is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"certificates": ()},
+        {"certificates": (b"",)},
+        {"certificates": ("not-bytes",)},
+        {"certificate": b"leaf", "certificates": (b"intermediate",)},
+    ],
+)
+def test_tls_credentials_reject_invalid_certificate_chains(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        zttp.TlsCredentials(private_key=b"key", **kwargs)  # type: ignore[arg-type]
+
+
 def test_h3_constructor_takes_value_objects() -> None:
     client = zttp.Connection(
         zttp.CLIENT,
