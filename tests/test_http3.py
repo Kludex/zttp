@@ -142,6 +142,7 @@ def test_build_retry_makes_a_client_retransmit_its_initial() -> None:
     assert retry_header.source_connection_id == b"retry-server-cid"
     client.receive_datagram(retry, 1000)
     retried_initial = client.data_to_send()[0]
+    assert b"opaque-address-token" in retried_initial
     assert zttp.parse_datagram_header(retried_initial).destination_connection_id == b"retry-server-cid"
 
 
