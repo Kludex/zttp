@@ -765,7 +765,7 @@ def test_http3_accepts_typed_transport_parameters() -> None:
     client_config = dict(CLIENT_CONFIG)
     client_config["transport_params"] = zttp.QuicTransportParameters(
         initial_max_data=65536,
-        initial_max_stream_data_bidi_local=262144,
+        initial_max_stream_data_bidi_local=4096,
         initial_max_stream_data_bidi_remote=262144,
         initial_max_stream_data_uni=262144,
         initial_max_streams_bidi=16,
@@ -792,7 +792,11 @@ def test_http3_accepts_typed_transport_parameters() -> None:
     client.send_request(b"GET", b"/typed", b"3", [(b"host", b"example.test")])
     transfer(client, server, 4000)
 
-    assert any(isinstance(event, zttp.Request) for event in drain_events(server))
+    request = next(event for event in drain_events(server) if isinstance(event, zttp.Request))
+    stream = server.stream(request.stream_id)
+    stream.send_response(200, [(b"content-length", b"0")])
+    assert stream.send_window is not None
+    assert 0 <= stream.send_window < 4096
 
 
 def test_http3_server_custom_credentials_must_be_a_pair() -> None:
