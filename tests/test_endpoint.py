@@ -19,19 +19,19 @@ def make_initial(connection_id: bytes, validation_token: bytes | None = None) ->
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    ("kwargs", "match"),
     [
-        {"connection_id_length": 7},
-        {"connection_id_length": 21},
-        {"max_connections": 0},
-        {"retry_secret": b"s" * 32},
-        {"retry": True, "retry_secret": b""},
-        {"retry": True, "retry_secret": b"short"},
-        {"retry": True, "retry_token_ttl": 0},
+        ({"connection_id_length": 7}, "connection_id_length"),
+        ({"connection_id_length": 21}, "connection_id_length"),
+        ({"max_connections": 0}, "max_connections"),
+        ({"retry_secret": b"s" * 32}, "retry_secret requires retry=True"),
+        ({"retry": True, "retry_secret": b""}, "retry_secret must contain at least 32 bytes"),
+        ({"retry": True, "retry_secret": b"short"}, "retry_secret must contain at least 32 bytes"),
+        ({"retry": True, "retry_token_ttl": 0}, "retry_token_ttl must be positive"),
     ],
 )
-def test_quic_endpoint_rejects_invalid_configuration(kwargs: dict[str, Any]) -> None:
-    with pytest.raises(ValueError):
+def test_quic_endpoint_rejects_invalid_configuration(kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
         zttp.QuicEndpoint(**kwargs)
 
 

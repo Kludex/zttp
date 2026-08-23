@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass
 from typing import cast
 
 from typing_extensions import Protocol
 
+from zttp._retry import _RetryTokenCodec
 from zttp._zttp import (
     HTTP3,
     SERVER,
@@ -16,7 +16,6 @@ from zttp._zttp import (
     parse_datagram_header,
 )
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
-from zttp.retry import _RetryTokenCodec
 
 
 class ConnectionIdFactory(Protocol):
@@ -27,11 +26,6 @@ class ConnectionIdFactory(Protocol):
 
 def _random_connection_id(length: int) -> bytes:
     return secrets.token_bytes(length)
-
-
-@dataclass(frozen=True)
-class _ConnectionState:
-    connection: H3Connection
 
 
 class QuicEndpoint:
@@ -61,7 +55,6 @@ class QuicEndpoint:
         self._transport_params = transport_params
         self._alpn = alpn
         self._resumption = resumption
-        self._retry = retry
         self._connection_id_length = connection_id_length
         self._connection_id_factory = connection_id_factory
         self._max_connections = max_connections
@@ -70,9 +63,9 @@ class QuicEndpoint:
             if retry
             else None
         )
-        self._long_routes: dict[bytes, _ConnectionState] = {}
-        self._short_routes: dict[bytes, _ConnectionState] = {}
-        self._connections: list[_ConnectionState] = []
+        self._long_routes: dict[bytes, H3Connection] = {}
+        self._short_routes: dict[bytes, H3Connection] = {}
+        self._connections: list[H3Connection] = []
         self._outgoing: list[tuple[bytes, bytes]] = []
 
     def receive_datagram(self, datagram: bytes, peer_address: bytes, now: int = 0) -> H3Connection | None:
@@ -86,81 +79,87 @@ class QuicEndpoint:
         except RemoteProtocolError:
             return None
         if header.is_long_header:
-            state = self._long_routes.get(header.destination_connection_id)
+            connection = self._long_routes.get(header.destination_connection_id)
         else:
             cid_end = 1 + self._connection_id_length
-            state = self._short_routes.get(datagram[1:cid_end]) if len(datagram) >= cid_end else None
-        if state is not None:
-            state.connection.receive_datagram(datagram, now, peer_address)
-            return state.connection
+            connection = self._short_routes.get(datagram[1:cid_end]) if len(datagram) >= cid_end else None
+
+        if connection is not None:
+            connection.receive_datagram(datagram, now, peer_address)
+            return connection
         if not header.is_initial or len(self._connections) >= self._max_connections:
             return None
-        if self._retry and len(header.destination_connection_id) < 8:
-            return None
-        if self._retry:
-            codec = self._token_codec
-            if codec is None:
-                raise RuntimeError("Retry token codec is not configured")  # pragma: no cover - constructor invariant
-            if not header.token:
-                retry_scid = self._new_connection_id()
-                token = codec.create(peer_address, header.destination_connection_id, retry_scid, now)
-                packet = _build_retry(
-                    original_destination_connection_id=header.destination_connection_id,
-                    client_source_connection_id=header.source_connection_id,
-                    server_source_connection_id=retry_scid,
-                    token=token,
-                )
-                self._outgoing.append((packet, peer_address))
-                return None
-            context = codec.validate(peer_address, header.token, now)
-            if context is None or context.retry_source_connection_id != header.destination_connection_id:
-                return None
+
+        codec = self._token_codec
+        if codec is None:
             return self._accept(
                 datagram,
                 peer_address,
                 now,
                 header.destination_connection_id,
-                header.destination_connection_id,
-                context.original_destination_connection_id,
+                self._new_connection_id(),
+                None,
             )
-        server_cid = self._new_connection_id()
-        return self._accept(datagram, peer_address, now, header.destination_connection_id, server_cid, None)
+        if len(header.destination_connection_id) < 8:
+            return None
+        if not header.token:
+            retry_scid = self._new_connection_id()
+            token = codec.create(peer_address, header.destination_connection_id, retry_scid, now)
+            packet = _build_retry(
+                original_destination_connection_id=header.destination_connection_id,
+                client_source_connection_id=header.source_connection_id,
+                server_source_connection_id=retry_scid,
+                token=token,
+            )
+            self._outgoing.append((packet, peer_address))
+            return None
+
+        context = codec.validate(peer_address, header.token, now)
+        if context is None or context.retry_source_connection_id != header.destination_connection_id:
+            return None
+        return self._accept(
+            datagram,
+            peer_address,
+            now,
+            header.destination_connection_id,
+            header.destination_connection_id,
+            context.original_destination_connection_id,
+        )
 
     def data_to_send(self) -> list[tuple[bytes, bytes]]:
         """Return and clear outbound `(datagram, peer_address)` pairs."""
         outgoing = self._outgoing
         self._outgoing = []
-        for state in self._connections:
-            for datagram, peer_address in state.connection.data_to_send_with_addresses():
+        for connection in self._connections:
+            for datagram, peer_address in connection.data_to_send_with_addresses():
                 outgoing.append((datagram, cast(bytes, peer_address)))
         return outgoing
 
     def connections(self) -> tuple[H3Connection, ...]:
         """Return the accepted HTTP/3 connections."""
-        return tuple(state.connection for state in self._connections)
+        return tuple(self._connections)
 
     def discard(self, connection: H3Connection) -> None:
         """Remove a closed connection and all of its routes."""
-        state = next((item for item in self._connections if item.connection is connection), None)
-        if state is None:
+        if not any(item is connection for item in self._connections):
             raise ValueError("connection does not belong to this endpoint")
-        self._connections.remove(state)
-        self._long_routes = {cid: item for cid, item in self._long_routes.items() if item is not state}
-        self._short_routes = {cid: item for cid, item in self._short_routes.items() if item is not state}
+        self._connections.remove(connection)
+        self._long_routes = {cid: item for cid, item in self._long_routes.items() if item is not connection}
+        self._short_routes = {cid: item for cid, item in self._short_routes.items() if item is not connection}
 
     def next_timeout(self) -> int | None:
         """Return the earliest connection deadline, or `None`."""
         deadlines = [
-            deadline for state in self._connections if (deadline := state.connection.next_timeout()) is not None
+            deadline for connection in self._connections if (deadline := connection.next_timeout()) is not None
         ]
         return min(deadlines, default=None)
 
     def handle_timeout(self, now: int) -> None:
         """Fire every connection timer due at `now`."""
-        for state in self._connections:
-            deadline = state.connection.next_timeout()
+        for connection in self._connections:
+            deadline = connection.next_timeout()
             if deadline is not None and deadline <= now:
-                state.connection.handle_timeout(now)
+                connection.handle_timeout(now)
 
     def _new_connection_id(self) -> bytes:
         connection_id = self._connection_id_factory(self._connection_id_length)
@@ -189,9 +188,8 @@ class QuicEndpoint:
         )
         connection._set_endpoint_context(server_cid, original_dcid)
         connection.receive_datagram(datagram, now, peer_address)
-        state = _ConnectionState(connection)
-        self._connections.append(state)
-        self._long_routes[initial_dcid] = state
-        self._long_routes[server_cid] = state
-        self._short_routes[server_cid] = state
+        self._connections.append(connection)
+        self._long_routes[initial_dcid] = connection
+        self._long_routes[server_cid] = connection
+        self._short_routes[server_cid] = connection
         return connection
