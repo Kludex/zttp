@@ -41,6 +41,7 @@ def test_tls_credentials_accept_an_ordered_certificate_chain() -> None:
     [
         {"certificates": ()},
         {"certificates": (b"",)},
+        {"certificates": b"single-certificate"},
         {"certificates": ("not-bytes",)},
         {"certificate": b"leaf", "certificates": (b"intermediate",)},
     ],

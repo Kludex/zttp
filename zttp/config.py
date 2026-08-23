@@ -29,6 +29,8 @@ class TlsCredentials:
     def __post_init__(self) -> None:
         if self.certificate is not None and self.certificates is not None:
             raise ValueError("pass either certificate or certificates, not both")
+        if isinstance(self.certificates, (bytes, bytearray, memoryview)):
+            raise ValueError("certificates must be a sequence of certificate bytes")
         if self.certificates is not None:
             object.__setattr__(self, "certificates", tuple(self.certificates))
         chain = self.certificate_chain
