@@ -123,57 +123,94 @@ def test_parse_datagram_header_routes_a_client_initial() -> None:
     assert header.is_initial
     assert header.version == 1
     assert header.destination_connection_id == b"\xaa\xbb\xcc\xdd"
+    assert header.token == b""
 
 
-def test_build_retry_makes_a_client_retransmit_its_initial() -> None:
+def test_quic_endpoint_completes_retry_and_routes_the_connection() -> None:
+    endpoint = zttp.QuicEndpoint(
+        credentials=zttp.TlsCredentials(certificate=SERVER_PUBLIC_KEY, private_key=b"\x42" * 32),
+        transport_params=zttp.QuicTransportParameters(
+            initial_max_data=1048576,
+            initial_max_streams_bidi=8,
+            initial_max_streams_uni=8,
+            initial_max_stream_data_bidi_remote=262144,
+            initial_max_stream_data_uni=262144,
+        ),
+        retry=True,
+        retry_secret=b"s" * 32,
+        connection_id_factory=lambda length: b"r" * length,
+    )
     config = dict(CLIENT_CONFIG)
     config["connection_id"] = b"original"
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
-    initial = client.data_to_send()[0]
-    header = zttp.parse_datagram_header(initial)
-    retry = zttp.build_retry(
-        header.destination_connection_id,
-        header.source_connection_id,
-        b"retry-server-cid",
-        b"opaque-address-token",
-    )
+    [initial] = client.data_to_send()
 
+    assert endpoint.receive_datagram(initial, b"client-address", 1000) is None
+    [(retry, address)] = endpoint.data_to_send()
+    assert address == b"client-address"
     retry_header = zttp.parse_datagram_header(retry)
-    assert retry_header.destination_connection_id == header.source_connection_id
-    assert retry_header.source_connection_id == b"retry-server-cid"
-    client.receive_datagram(retry, 1000)
-    retried_initial = client.data_to_send()[0]
-    assert b"opaque-address-token" in retried_initial
-    assert zttp.parse_datagram_header(retried_initial).destination_connection_id == b"retry-server-cid"
+    assert retry_header.source_connection_id == b"r" * 16
+
+    client.receive_datagram(retry, 2000)
+    [retried_initial] = client.data_to_send()
+    retried_header = zttp.parse_datagram_header(retried_initial)
+    assert retried_header.destination_connection_id == b"r" * 16
+    assert retried_header.token
+
+    server = endpoint.receive_datagram(retried_initial, b"client-address", 3000)
+    assert server is not None
+    assert endpoint.connections() == (server,)
+    for datagram, peer_address in endpoint.data_to_send():
+        assert peer_address == b"client-address"
+        client.receive_datagram(datagram, 4000)
+    for datagram in client.data_to_send():
+        assert endpoint.receive_datagram(datagram, b"client-address", 5000) is server
+    for datagram, _ in endpoint.data_to_send():
+        client.receive_datagram(datagram, 6000)
+    client.send_request(b"GET", b"/", b"3", [(b"host", b"example.test")])
+    for datagram in client.data_to_send():
+        assert endpoint.receive_datagram(datagram, b"client-address", 7000) is server
+    assert any(isinstance(event, zttp.Request) for event in drain_events(server))
+    assert endpoint.next_timeout() is None
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"original_destination_connection_id": b"short"},
-        {"original_destination_connection_id": b"x" * 21},
-        {"client_source_connection_id": b"x" * 21},
-        {"server_source_connection_id": b""},
-        {"server_source_connection_id": b"x" * 21},
-        {"token": b""},
-        {"version": 2},
-    ],
-)
-def test_build_retry_rejects_invalid_inputs(kwargs: dict[str, object]) -> None:
-    values: dict[str, object] = {
-        "original_destination_connection_id": b"original",
-        "client_source_connection_id": b"client",
-        "server_source_connection_id": b"server",
-        "token": b"token",
-    }
-    values.update(kwargs)
-    with pytest.raises(ValueError):
-        zttp.build_retry(**values)  # type: ignore[arg-type]
-
-
-def test_build_retry_requires_bytes() -> None:
-    with pytest.raises(TypeError):
-        zttp.build_retry(b"original", b"client", b"server", object())  # type: ignore[arg-type]
+@pytest.mark.parametrize("token_change", ["address", "expired", "future", "tampered", "short", "destination"])
+def test_quic_endpoint_rejects_invalid_retry_tokens(token_change: str) -> None:
+    endpoint = zttp.QuicEndpoint(
+        retry=True,
+        retry_secret=b"s" * 32,
+        retry_token_ttl=10,
+        connection_id_factory=lambda length: b"r" * length,
+    )
+    client = zttp.Connection(
+        zttp.CLIENT,
+        protocol=zttp.HTTP3,
+        connection_id=b"original",
+        server_name=b"localhost",
+    )
+    [initial] = client.data_to_send()
+    endpoint.receive_datagram(initial, b"address", 1000)
+    [(retry, _)] = endpoint.data_to_send()
+    client.receive_datagram(retry, 1001)
+    [retried_initial] = client.data_to_send()
+    address = b"other" if token_change == "address" else b"address"
+    now = 1011 if token_change == "expired" else 999 if token_change == "future" else 1002
+    if token_change == "tampered":
+        token = zttp.parse_datagram_header(retried_initial).token
+        tampered = token[:-1] + bytes((token[-1] ^ 1,))
+        retried_initial = retried_initial.replace(token, tampered, 1)
+    elif token_change in {"short", "destination"}:
+        token = b"short" if token_change == "short" else zttp.parse_datagram_header(retried_initial).token
+        other = zttp.Connection(
+            zttp.CLIENT,
+            protocol=zttp.HTTP3,
+            connection_id=b"different" if token_change == "destination" else b"r" * 16,
+            server_name=b"localhost",
+            validation_token=token,
+        )
+        [retried_initial] = other.data_to_send()
+    assert endpoint.receive_datagram(retried_initial, address, now) is None
+    assert endpoint.connections() == ()
 
 
 def test_parse_datagram_header_reports_a_short_header() -> None:
@@ -182,6 +219,7 @@ def test_parse_datagram_header_reports_a_short_header() -> None:
     assert not header.is_initial
     assert header.destination_connection_id == b""
     assert header.source_connection_id == b""
+    assert header.token == b""
 
 
 def test_parse_datagram_header_rejects_a_malformed_datagram() -> None:

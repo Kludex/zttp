@@ -444,6 +444,46 @@ pub const Connection = struct {
         return conn;
     }
 
+    /// A server connection that derives Initial keys from the client's destination
+    /// ID but advertises an endpoint-selected source connection ID.
+    pub fn initServerWithCid(
+        gpa: std.mem.Allocator,
+        client_dcid: []const u8,
+        server_scid: []const u8,
+        tls_config: tls.flight.Config,
+    ) Error!Connection {
+        if (server_scid.len == 0 or server_scid.len > constants.MAX_CID_LEN) return error.ProtocolViolation;
+        var conn = try initServer(gpa, client_dcid, tls_config);
+        errdefer conn.deinit();
+        const owned_scid = gpa.dupe(u8, server_scid) catch return error.OutOfMemory;
+        gpa.free(conn.scid);
+        conn.scid = owned_scid;
+        return conn;
+    }
+
+    /// A server connection for an Initial whose address-validation token proves a
+    /// preceding Retry. Initial keys use the Retry source ID while transport
+    /// parameters retain the client's original destination ID.
+    pub fn initServerAfterRetry(
+        gpa: std.mem.Allocator,
+        original_dcid: []const u8,
+        retry_scid: []const u8,
+        tls_config: tls.flight.Config,
+    ) Error!Connection {
+        if (original_dcid.len < 8 or original_dcid.len > constants.MAX_CID_LEN) return error.ProtocolViolation;
+        var conn = try initServerWithCid(gpa, retry_scid, retry_scid, tls_config);
+        errdefer conn.deinit();
+        const owned_dcid = gpa.dupe(u8, original_dcid) catch return error.OutOfMemory;
+        errdefer gpa.free(owned_dcid);
+        const owned_retry_scid = gpa.dupe(u8, retry_scid) catch return error.OutOfMemory;
+        gpa.free(conn.dcid);
+        conn.dcid = owned_dcid;
+        conn.retry_scid = owned_retry_scid;
+        conn.retried = true;
+        conn.address_validated = true;
+        return conn;
+    }
+
     /// A client connection that has emitted its first Initial carrying a TLS
     /// ClientHello. The server-flight processing is a follow-up; this starts the
     /// real QUIC/TLS handshake without relying on preinstalled test application keys.
@@ -1969,6 +2009,11 @@ pub const Connection = struct {
             var frames: std.ArrayListUnmanaged(u8) = .empty;
             defer frames.deinit(self.gpa);
             frame.encodeCrypto(&frames, self.gpa, chunk.offset, chunk.data) catch return error.OutOfMemory;
+            if (self.role == .client and space == .initial) {
+                while (frames.items.len < constants.MIN_INITIAL_DATAGRAM) {
+                    frames.append(self.gpa, 0x00) catch return error.OutOfMemory;
+                }
+            }
             st.crypto_sent.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
             const pn = self.buildPacket(space, frames.items, true, now) catch |e| switch (e) {
                 error.AmplificationLimited => return, // budget exhausted: keep the rest retained
@@ -2097,7 +2142,10 @@ pub const Connection = struct {
             }
             const new_peer_path = self.default_path_token != null and self.default_path_token.? != pt;
             self.current_path_token = pt;
-            if (self.default_path_token == null) self.default_path_token = pt;
+            if (self.default_path_token == null) {
+                self.default_path_token = pt;
+                if (self.address_validated) self.paths.getPtr(pt).?.validated = true;
+            }
             if (self.paths.getPtr(pt)) |p| {
                 p.recv_bytes += datagram.len;
                 if (self.handshake_confirmed and new_peer_path and !p.validated) {
@@ -5245,6 +5293,39 @@ test "client processes Retry and resends Initial with token and new dcid" {
     try testing.expectEqual(constants.LongType.initial, h.ltype);
     try testing.expectEqualSlices(u8, &retry_scid, h.dcid);
     try testing.expectEqualStrings("retry-token", h.token);
+}
+
+test "server accepts a token-bearing Initial after Retry" {
+    const gpa = testing.allocator;
+    const original_dcid = "original";
+    const client_tp = [_]u8{
+        0x04, 0x04, 0x80, 0x01, 0x00, 0x00,
+        0x05, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x06, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x07, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x08, 0x01, 0x10, 0x09, 0x01, 0x10,
+    };
+    var client = try Connection.initClient(gpa, original_dcid, .{
+        .transport_params = &client_tp,
+        .random = [_]u8{0x44} ** 32,
+        .ephemeral_seed = [_]u8{0x55} ** 32,
+        .alpn = "h3",
+        .server_name = "example.test",
+    }, 1000);
+    defer client.deinit();
+    client.clearSend();
+
+    const retry_scid = "retry-server-cid";
+    var retry: std.ArrayListUnmanaged(u8) = .empty;
+    defer retry.deinit(gpa);
+    try packet.writeRetry(&retry, gpa, client.scid, retry_scid, "retry-token", original_dcid);
+    try client.receiveDatagram(retry.items, 2000);
+
+    var server = try Connection.initServerAfterRetry(gpa, original_dcid, retry_scid, testServerConfig());
+    defer server.deinit();
+    try server.receiveDatagramFrom(client.datagramsToSend(), 3000, "peer-address");
+    try testing.expect(server.datagramsToSend().len > 0);
+    try testing.expect(server.paths.get(std.hash.Wyhash.hash(0, "peer-address")).?.validated);
 }
 
 test "server answers an unsupported long-header version with Version Negotiation" {

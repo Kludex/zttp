@@ -28,10 +28,10 @@ from zttp._zttp import (
     Settings,
     Stream,
     WindowUpdate,
-    build_retry,
     parse_datagram_header,
 )
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
+from zttp.endpoint import ConnectionIdFactory, QuicEndpoint
 from zttp.results import CloseInfo, DatagramHeader, SessionTicket
 from zttp.settings import H2Settings
 
@@ -60,6 +60,7 @@ __all__ = [
     "CloseInfo",
     "Connection",
     "ConnectionClosed",
+    "ConnectionIdFactory",
     "Data",
     "DatagramHeader",
     "EndOfMessage",
@@ -74,6 +75,7 @@ __all__ = [
     "NeedData",
     "Ping",
     "ProtocolError",
+    "QuicEndpoint",
     "QuicTransportParameters",
     "RemoteProtocolError",
     "Request",
@@ -85,6 +87,5 @@ __all__ = [
     "Stream",
     "TlsCredentials",
     "WindowUpdate",
-    "build_retry",
     "parse_datagram_header",
 ]

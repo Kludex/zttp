@@ -372,22 +372,50 @@ actually send it.
 
 ## Serving many connections on one socket
 
-A server has one UDP socket and many connections on it, so it has to route each
-datagram to the right `H3Connection` before feeding it. Use
-[`parse_datagram_header`](../reference/api.md#zttp.parse_datagram_header), which reads the routable
-prefix without decrypting anything:
-
 ```python
+import time
+
 import zttp
 
-header = zttp.parse_datagram_header(datagram)
-if header.is_initial:
-    ...  # a new connection: create an H3Connection for header.destination_connection_id
+endpoint = zttp.QuicEndpoint(
+    retry=True,
+    retry_secret=b"replace-with-at-least-32-secret-bytes",
+)
+
+
+def receive(
+    datagram: bytes, peer_address: bytes
+) -> tuple[zttp.H3Connection | None, list[tuple[bytes, bytes]]]:
+    connection = endpoint.receive_datagram(
+        datagram,
+        peer_address,
+        time.monotonic_ns() // 1000,
+    )
+    return connection, endpoint.data_to_send()
 ```
 
+`QuicEndpoint` routes long and short headers by destination connection ID. It
+creates an `H3Connection` only for a new Initial packet. The returned connection
+owns the HTTP event queue, so call `next_event()` on it after `receive()` returns.
+Send each tuple from `endpoint.data_to_send()` to its accompanying peer address.
+
+With `retry=True`, the first Initial produces a Retry packet but no connection.
+The endpoint binds its authenticated token to `peer_address`. It allocates the
+connection only after the client echoes a valid token in its next Initial. This
+prevents a spoofed source address from making the server allocate handshake
+state.
+
+!!! warning "Share the Retry secret between workers"
+    Every worker receiving datagrams for the same UDP address must use the same
+    `retry_secret`. A client can receive Retry from one worker and return its next
+    Initial to another. That worker must be able to authenticate the token.
+
+Call `endpoint.next_timeout()` to get the earliest deadline across all
+connections. Call `endpoint.handle_timeout(now)` when it expires. The endpoint
+still does no I/O: your event loop owns the socket, clock, and timer scheduling.
+
 See the [API reference](../reference/api.md#demultiplexing-a-shared-udp-socket)
-for the full picture, including short-header datagrams, which don't encode the
-connection id's length.
+for every endpoint method and the lower-level `parse_datagram_header` API.
 
 ## The transport is inside
 

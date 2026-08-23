@@ -361,6 +361,59 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
         raise SystemExit(f"aioquic did not receive zttp's CONNECTION_CLOSE: {close_event!r}")
 
 
+def assert_aioquic_client_to_zttp_retry_endpoint() -> None:
+    endpoint = zttp.QuicEndpoint(
+        credentials=zttp.TlsCredentials(
+            certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
+        ),
+        transport_params=ZTTP_SERVER_TRANSPORT_PARAMS,
+        alpn=b"h3",
+        retry=True,
+        retry_secret=b"interop-retry-secret" * 2,
+    )
+    client_config = QuicConfiguration(
+        is_client=True,
+        alpn_protocols=["h3"],
+        server_name="localhost",
+        verify_mode=ssl.CERT_NONE,
+    )
+    client = QuicConnection(configuration=client_config)
+    h3 = H3Connection(client)
+    client.connect(("server", 4433), now=0.0)
+    server = None
+
+    for round_idx in range(20):
+        now = round_idx / 1000
+        for datagram, _addr in client.datagrams_to_send(now):
+            routed = endpoint.receive_datagram(datagram, b"client", round_idx * 1000)
+            if routed is not None:
+                server = routed
+        for datagram, _addr in endpoint.data_to_send():
+            client.receive_datagram(datagram, ("server", 4433), now + 0.0005)
+        drain_quic_to_h3(client, h3)
+
+    if server is None:
+        raise SystemExit(f"{QUIC_BACKEND} did not complete zttp's Retry exchange")
+    stream_id = client.get_next_available_stream_id()
+    h3.send_headers(
+        stream_id,
+        [
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":authority", b"localhost"),
+            (b":path", b"/retry-interop"),
+        ],
+        end_stream=True,
+    )
+    for datagram, _addr in client.datagrams_to_send(0.021):
+        endpoint.receive_datagram(datagram, b"client", 21_000)
+    events = []
+    while (event := server.next_event()) is not zttp.NEED_DATA:
+        events.append(event)
+    if not any(isinstance(event, zttp.Request) and event.path == b"/retry-interop" for event in events):
+        raise SystemExit(f"zttp did not receive {QUIC_BACKEND}'s request after Retry: {events!r}")
+
+
 def assert_aioquic_client_to_zttp_server() -> None:
     server = zttp.Connection(
         zttp.SERVER,
@@ -997,23 +1050,25 @@ def main() -> None:
         tmp = Path(raw_tmp)
         if QUIC_BACKEND == "qh3":
             assert_zttp_client_to_aioquic_server(tmp)
+            assert_aioquic_client_to_zttp_retry_endpoint()
             assert_aioquic_client_to_zttp_server()
             assert_udp_loopback_zttp_client_to_aioquic_server(tmp, drop_first_server_datagram=True)
             assert_udp_loopback_aioquic_client_to_zttp_server(drop_first_server_datagram=True)
             print(
                 "zttp <-> qh3 HTTP/3 request/response/trailers + "
-                "1xx/goaway + bidirectional NewSessionTicket/0-RTT + key update + "
+                "Retry + 1xx/goaway + bidirectional NewSessionTicket/0-RTT + key update + "
                 "migration/CID rotation + close + bidirectional UDP loopback/loss interop smoke passed"
             )
             return
 
         assert_zttp_client_to_aioquic_server(tmp)
+        assert_aioquic_client_to_zttp_retry_endpoint()
         assert_aioquic_client_to_zttp_server()
         assert_udp_loopback_zttp_client_to_aioquic_server(tmp, drop_first_server_datagram=True)
         assert_udp_loopback_aioquic_client_to_zttp_server(drop_first_server_datagram=True)
         print(
             "zttp <-> aioquic HTTP/3 request/response/trailers + "
-            "1xx/goaway + bidirectional NewSessionTicket/0-RTT + NEW_TOKEN + key update + "
+            "Retry + 1xx/goaway + bidirectional NewSessionTicket/0-RTT + NEW_TOKEN + key update + "
             "migration/CID rotation + close + bidirectional UDP loopback/loss interop smoke passed"
         )
 
