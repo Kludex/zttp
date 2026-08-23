@@ -37,6 +37,7 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 dynamic = ["version"]
+dependencies = ["typing-extensions>=4.0"]
 
 [project.urls]
 Homepage = "https://github.com/Kludex/zttp"
