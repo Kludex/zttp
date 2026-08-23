@@ -210,6 +210,13 @@ const LocalCid = struct {
     retired: bool = false,
 };
 
+/// One active destination connection ID the integrator must route to this
+/// connection. The borrowed ID remains valid until the next connection operation.
+pub const LocalConnectionId = struct {
+    sequence_number: u64,
+    connection_id: []const u8,
+};
+
 const ParsedShortForLocalCid = struct {
     hdr: packet.ShortHeader,
     local_cid_seq: u64,
@@ -236,6 +243,7 @@ pub const Connection = struct {
     peer_scid: []u8, // the peer's scid: the dcid of everything we send (owned)
     retry_scid: ?[]u8 = null, // client only: SCID received in Retry, for TP validation
     peer_cids: std.AutoHashMapUnmanaged(u64, PeerCid) = .empty,
+    peer_cid_seq: u64 = 0,
     peer_retire_prior_to: u64 = 0,
     local_cids: std.AutoHashMapUnmanaged(u64, LocalCid) = .empty,
     local_cid_max_seq: u64 = 0,
@@ -812,6 +820,7 @@ pub const Connection = struct {
         const owned = self.gpa.dupe(u8, peer_cid.cid) catch return error.OutOfMemory;
         self.gpa.free(self.peer_scid);
         self.peer_scid = owned;
+        self.peer_cid_seq = seq;
     }
 
     /// Issue a replacement local connection id to the peer (RFC 9000 5.1/19.15).
@@ -835,6 +844,34 @@ pub const Connection = struct {
         const gop = self.pending_new_cids.getOrPut(self.gpa, seq) catch return error.OutOfMemory;
         gop.value_ptr.* = .{ .retire_prior_to = retire_prior_to };
         self.local_cid_max_seq = seq;
+    }
+
+    /// Copy the active local connection IDs into `out`. A newly issued ID appears
+    /// immediately, before its `NEW_CONNECTION_ID` can be drained and sent. An ID
+    /// disappears after the peer's `RETIRE_CONNECTION_ID` is processed.
+    pub fn localConnectionIds(self: *const Connection, out: []LocalConnectionId) usize {
+        var count: usize = 0;
+        if (!self.local_initial_cid_retired and count < out.len) {
+            out[count] = .{ .sequence_number = 0, .connection_id = self.scid };
+            count += 1;
+        }
+        var iterator = self.local_cids.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.retired or count >= out.len) continue;
+            out[count] = .{ .sequence_number = entry.key_ptr.*, .connection_id = entry.value_ptr.cid };
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Return the number of active local connection IDs.
+    pub fn localConnectionIdCount(self: *const Connection) usize {
+        var count: usize = if (self.local_initial_cid_retired) 0 else 1;
+        var iterator = self.local_cids.valueIterator();
+        while (iterator.next()) |local| if (!local.retired) {
+            count += 1;
+        };
+        return count;
     }
 
     /// Drop the drained datagrams (the integrator has sent them).
@@ -2520,9 +2557,14 @@ pub const Connection = struct {
     }
 
     fn onNewConnectionId(self: *Connection, seq: u64, retire_prior_to: u64, cid: []const u8, token: []const u8) Error!void {
-        if (token.len != 16) return error.ProtocolViolation;
+        if (token.len != 16 or retire_prior_to > seq) return error.ProtocolViolation;
         if (retire_prior_to > self.peer_retire_prior_to) {
+            const previous_retire_prior_to = self.peer_retire_prior_to;
             self.peer_retire_prior_to = retire_prior_to;
+            if (previous_retire_prior_to == 0 and retire_prior_to > 0) {
+                const initial = self.pending_retire_cids.getOrPut(self.gpa, 0) catch return error.OutOfMemory;
+                if (!initial.found_existing) initial.value_ptr.* = .{};
+            }
             var retire: std.ArrayListUnmanaged(u64) = .empty;
             defer retire.deinit(self.gpa);
             var it = self.peer_cids.keyIterator();
@@ -2542,14 +2584,19 @@ pub const Connection = struct {
         const token_array = token[0..16].*;
         if (self.peer_cids.get(seq)) |existing| {
             if (!std.mem.eql(u8, existing.cid, cid) or !std.mem.eql(u8, &existing.token, &token_array)) return error.ProtocolViolation;
+            if (self.peer_cid_seq < self.peer_retire_prior_to) try self.usePeerConnectionId(seq);
             return;
         }
         if (std.mem.eql(u8, cid, self.peer_scid) or self.peerCidValueExists(cid)) return error.ProtocolViolation;
 
-        if (self.peer_cids.count() + 2 > self.local_tp.active_connection_id_limit) return error.ProtocolViolation;
+        const active_initial: usize = if (self.peer_retire_prior_to == 0) 1 else 0;
+        if (self.peer_cids.count() + active_initial + 1 > self.local_tp.active_connection_id_limit) {
+            return error.ProtocolViolation;
+        }
         const owned = self.gpa.dupe(u8, cid) catch return error.OutOfMemory;
         errdefer self.gpa.free(owned);
         self.peer_cids.put(self.gpa, seq, .{ .cid = owned, .token = token_array }) catch return error.OutOfMemory;
+        if (self.peer_cid_seq < self.peer_retire_prior_to) try self.usePeerConnectionId(seq);
     }
 
     /// RFC 9002 2: every frame except ACK, PADDING, and CONNECTION_CLOSE makes its
@@ -4529,18 +4576,18 @@ test "NEW_CONNECTION_ID retire_prior_to queues RETIRE_CONNECTION_ID" {
 
     var second: std.ArrayListUnmanaged(u8) = .empty;
     defer second.deinit(gpa);
-    try frame.encodeNewConnectionId(&second, gpa, 2, 2, &[_]u8{ 5, 6, 7, 8 }, token);
+    try frame.encodeNewConnectionId(&second, gpa, 2, 1, &[_]u8{ 5, 6, 7, 8 }, token);
     const d2 = try testBuildApp(gpa, &dcid, 1, second.items);
     defer gpa.free(d2);
     try conn.receiveDatagram(d2, 2000);
-    try testing.expect(conn.pending_retire_cids.contains(1));
+    try testing.expect(conn.pending_retire_cids.contains(0));
 
     conn.clearSend();
     try conn.flushSend(3000);
 
     const dgram = conn.datagramsToSend()[0..conn.datagramLengths()[0]];
     const keys = testAppKeys();
-    const hdr = try packet.parseShort(dgram, dcid.len);
+    const hdr = try packet.parseShort(dgram, conn.peer_scid.len);
     const work = try gpa.dupe(u8, dgram);
     defer gpa.free(work);
     const pn_len = try crypto.unprotectHeader(keys.hp, work, hdr.pn_offset, false);
@@ -4552,7 +4599,7 @@ test "NEW_CONNECTION_ID retire_prior_to queues RETIRE_CONNECTION_ID" {
     defer gpa.free(plaintext);
     const payload = try crypto.open(keys, truncated, header, ciphertext, plaintext);
     const decoded = try frame.decode(payload);
-    try testing.expectEqual(frame.Frame{ .retire_connection_id = 1 }, decoded.frame);
+    try testing.expectEqual(frame.Frame{ .retire_connection_id = 0 }, decoded.frame);
 }
 
 test "RETIRE_CONNECTION_ID can retire the initial local cid" {

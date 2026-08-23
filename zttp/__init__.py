@@ -31,7 +31,7 @@ from zttp._zttp import (
     parse_datagram_header,
 )
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
-from zttp.results import CloseInfo, DatagramHeader, SessionTicket
+from zttp.results import CloseInfo, DatagramHeader, LocalConnectionId, SessionTicket
 from zttp.settings import H2Settings
 
 Event = (
@@ -69,6 +69,7 @@ __all__ = [
     "H1Connection",
     "H2Connection",
     "H3Connection",
+    "LocalConnectionId",
     "LocalProtocolError",
     "NeedData",
     "Ping",
