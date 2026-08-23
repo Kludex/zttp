@@ -761,6 +761,40 @@ def test_http3_server_defaults_transport_settings_and_credentials() -> None:
     assert type(conn) is zttp.H3Connection
 
 
+def test_http3_accepts_typed_transport_parameters() -> None:
+    client_config = dict(CLIENT_CONFIG)
+    client_config["transport_params"] = zttp.QuicTransportParameters(
+        initial_max_data=65536,
+        initial_max_stream_data_bidi_local=262144,
+        initial_max_stream_data_bidi_remote=262144,
+        initial_max_stream_data_uni=262144,
+        initial_max_streams_bidi=16,
+        initial_max_streams_uni=16,
+        max_idle_timeout=30_000,
+        max_udp_payload_size=1200,
+        disable_active_migration=True,
+    )
+    server_config = dict(SERVER_CONFIG)
+    server_config["transport_params"] = zttp.QuicTransportParameters(
+        initial_max_data=1048576,
+        initial_max_stream_data_bidi_remote=262144,
+        initial_max_stream_data_uni=262144,
+        initial_max_streams_bidi=8,
+        initial_max_streams_uni=8,
+        active_connection_id_limit=2,
+    )
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **server_config)
+
+    transfer(client, server, 1000)
+    transfer(server, client, 2000)
+    transfer(client, server, 3000)
+    client.send_request(b"GET", b"/typed", b"3", [(b"host", b"example.test")])
+    transfer(client, server, 4000)
+
+    assert any(isinstance(event, zttp.Request) for event in drain_events(server))
+
+
 def test_http3_server_custom_credentials_must_be_a_pair() -> None:
     # TlsCredentials names both halves, so a lone certificate or key cannot be built.
     with pytest.raises(TypeError):

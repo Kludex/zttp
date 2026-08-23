@@ -1600,6 +1600,17 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$OOOOOOOOOOOO", @ptrCast(&kwlist), &role_val, &protocol_val, &credentials_obj, &tp_obj, &random_obj, &ephemeral_obj, &alpn_obj, &cid_obj, &sni_obj, &resumption_obj, &obfuscated_ticket_age_obj, &early_data_obj, &remembered_tp_obj, &validation_token_obj) == 0) return null;
     if (protocol_val != HTTP3) return py.raiseValue("protocol does not match this Connection subclass; construct zttp.Connection to choose by protocol");
 
+    var encoded_tp_obj: ?*c.PyObject = null;
+    defer py.xdecref(encoded_tp_obj);
+    if (tp_obj != null and !py.isNone(tp_obj)) {
+        const is_bytes = c.PyObject_IsInstance(tp_obj, @ptrCast(&c.PyBytes_Type));
+        if (is_bytes < 0) return null;
+        if (is_bytes == 0) {
+            encoded_tp_obj = c.PyObject_GetAttrString(tp_obj, "encoded") orelse return null;
+            tp_obj = encoded_tp_obj;
+        }
+    }
+
     // Unpack the credential / resumption value objects into the raw byte objects the
     // builders consume. TlsCredentials(certificate, private_key) and
     // SessionResumption(identity, psk) name the same-typed byte pairs so a caller
