@@ -335,6 +335,7 @@ pub const Connection = struct {
     peer_tp: transport_params.TransportParameters = .{},
     remembered_peer_tp: ?transport_params.TransportParameters = null,
     peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
+    initial_authenticated: bool = false,
     handshake_confirmed: bool = false, // the client Finished verified; HANDSHAKE_DONE sent
     /// The connection-level recv window grew enough to advertise a new MAX_DATA
     /// (RFC 9000 4.1); flushSend emits it so the peer is not stalled at its grant.
@@ -818,6 +819,29 @@ pub const Connection = struct {
         // silently rejecting all future receives with no CLOSE ever sent.
         _ = try self.buildPacket(space, frames.items, false, 0);
         self.closed = true;
+    }
+
+    /// Mark the peer address as validated before processing its token-bearing Initial.
+    pub fn markAddressValidated(self: *Connection) void {
+        self.address_validated = true;
+    }
+
+    /// Whether this connection has authenticated an Initial packet.
+    pub fn hasAuthenticatedInitial(self: *const Connection) bool {
+        return self.initial_authenticated;
+    }
+
+    /// Append every active local connection ID that can route packets here.
+    pub fn appendActiveLocalConnectionIds(
+        self: *const Connection,
+        out: *std.ArrayListUnmanaged([]const u8),
+        gpa: std.mem.Allocator,
+    ) Error!void {
+        if (!self.local_initial_cid_retired) out.append(gpa, self.scid) catch return error.OutOfMemory;
+        var it = self.local_cids.valueIterator();
+        while (it.next()) |entry| {
+            if (!entry.retired) out.append(gpa, entry.cid) catch return error.OutOfMemory;
+        }
     }
 
     /// The built datagrams as one contiguous buffer; pair with `datagramLengths`.
@@ -2388,6 +2412,7 @@ pub const Connection = struct {
             try self.openPacket(pkt, pn_offset, space, long, st.recv_keys orelse return error.Dropped, null);
         defer self.gpa.free(opened.work);
         defer self.gpa.free(opened.plaintext);
+        if (space == .initial) self.initial_authenticated = true;
 
         // A decryptable Handshake packet proves the peer received our Initial/
         // handshake keys, so its address is validated and the 3x send limit lifts

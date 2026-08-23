@@ -157,6 +157,7 @@ def test_parse_datagram_header_routes_a_client_initial() -> None:
 
 
 def test_quic_endpoint_completes_retry_and_routes_the_connection() -> None:
+    connection_ids = iter((b"r" * 16, b"n" * 16))
     endpoint = zttp.QuicEndpoint(
         credentials=zttp.TlsCredentials(certificate=SERVER_PUBLIC_KEY, private_key=b"\x42" * 32),
         transport_params=zttp.QuicTransportParameters(
@@ -167,8 +168,8 @@ def test_quic_endpoint_completes_retry_and_routes_the_connection() -> None:
             initial_max_stream_data_uni=262144,
         ),
         retry=True,
-        retry_secret=b"s" * 32,
-        connection_id_factory=lambda length: b"r" * length,
+        token_secret=b"s" * 32,
+        connection_id_factory=lambda length: next(connection_ids),
     )
     config: ResumedClientConfig = CLIENT_CONFIG.copy()
     config["connection_id"] = b"original"
@@ -201,15 +202,49 @@ def test_quic_endpoint_completes_retry_and_routes_the_connection() -> None:
     for datagram in client.data_to_send():
         assert endpoint.receive_datagram(datagram, b"client-address", 7000) is server
     assert any(isinstance(event, zttp.Request) for event in drain_events(server))
-    assert endpoint.next_timeout() is None
+
+    replacement_connection_id = endpoint.issue_connection_id(server, 1)
+    assert replacement_connection_id == b"n" * 16
+    for datagram, _ in endpoint.data_to_send():
+        client.receive_datagram(datagram, 8000)
+    for datagram in client.data_to_send():
+        assert endpoint.receive_datagram(datagram, b"client-address", 9000) is server
+    endpoint.data_to_send()
+
+    client.use_peer_connection_id(1)
+    client.send_request(b"GET", b"/rotated", b"3", [(b"host", b"example.test")])
+    routed = [endpoint.receive_datagram(datagram, b"client-address", 11_000) for datagram in client.data_to_send()]
+    assert routed
+    assert all(connection is server for connection in routed)
+
+    endpoint.issue_token(server, 12_000)
+    for datagram, _ in endpoint.data_to_send():
+        client.receive_datagram(datagram, 13_000)
+    [validation_token] = client.validation_tokens()
+    returning_client = zttp.Connection(
+        zttp.CLIENT,
+        zttp.HTTP3,
+        connection_id=b"returning",
+        server_name=b"localhost",
+        validation_token=validation_token,
+    )
+    returning_endpoint = zttp.QuicEndpoint(
+        retry=True,
+        token_secret=b"s" * 32,
+        connection_id_factory=lambda length: b"v" * length,
+    )
+    assert (
+        returning_endpoint.receive_datagram(returning_client.data_to_send()[0], b"client-address", 14_000) is not None
+    )
+    assert endpoint.next_timeout() is not None
 
 
 @pytest.mark.parametrize("token_change", ["address", "expired", "future", "tampered", "short", "destination"])
 def test_quic_endpoint_rejects_invalid_retry_tokens(token_change: str) -> None:
     endpoint = zttp.QuicEndpoint(
         retry=True,
-        retry_secret=b"s" * 32,
-        retry_token_ttl=10,
+        token_secret=b"s" * 32,
+        token_ttl=10,
         connection_id_factory=lambda length: b"r" * length,
     )
     client = zttp.Connection(

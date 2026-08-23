@@ -31,7 +31,7 @@ from zttp._zttp import (
     parse_datagram_header,
 )
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
-from zttp.endpoint import ConnectionIdFactory, QuicEndpoint
+from zttp.endpoint import ConnectionIDFactory, QuicEndpoint
 from zttp.results import CloseInfo, DatagramHeader, SessionTicket
 from zttp.settings import H2Settings
 
@@ -60,7 +60,7 @@ __all__ = [
     "CloseInfo",
     "Connection",
     "ConnectionClosed",
-    "ConnectionIdFactory",
+    "ConnectionIDFactory",
     "Data",
     "DatagramHeader",
     "EndOfMessage",

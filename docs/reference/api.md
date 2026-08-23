@@ -141,7 +141,7 @@ import time
 
 import zttp
 
-endpoint = zttp.QuicEndpoint(retry=True, retry_secret=b"replace-with-at-least-32-secret-bytes")
+endpoint = zttp.QuicEndpoint(retry=True, token_secret=b"replace-with-at-least-32-secret-bytes")
 
 
 def receive(
@@ -153,22 +153,27 @@ def receive(
 ```
 
 `QuicEndpoint` maps destination connection IDs to `H3Connection` instances. It
-creates state only for valid Initial packets. Unknown short, Handshake, and 0-RTT
-packets are dropped. The endpoint returns the routed connection so you can drain
-its HTTP events with `next_event()`.
+retains state only after the QUIC core authenticates an Initial packet. Unknown
+short, Handshake, and 0-RTT packets are dropped. Unsupported versions receive a
+Version Negotiation packet. The endpoint returns the routed connection so you can
+drain its HTTP events with `next_event()`.
 
 Retry remains stateless. The endpoint sends a Retry before allocating a
 connection, authenticates the token with HMAC-SHA256, binds it to `peer_address`,
-and allocates the connection only when the client returns a valid token. Use the
-same `retry_secret` in every worker that can receive packets for the same UDP
-address.
+and retains the connection only when the client returns a valid token. Use the
+same `token_secret` in every worker that can receive packets for the same UDP
+address. `issue_token()` sends a compatible `NEW_TOKEN` so a later connection can
+validate its address without Retry.
+
+Use `issue_connection_id()` on the endpoint for connection ID rotation. It keeps
+routing synchronized with active and retired IDs in the QUIC core.
 
 The endpoint does not own `udp_socket`, call `sendto`, read the clock, or schedule
 a timer. Call `next_timeout()` and `handle_timeout(now)` from your event loop.
 
 ::: zttp.QuicEndpoint
 
-::: zttp.ConnectionIdFactory
+::: zttp.ConnectionIDFactory
 
 `parse_datagram_header` remains available when you need the lower-level routing
 prefix directly.

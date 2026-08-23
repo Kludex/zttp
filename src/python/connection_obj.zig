@@ -724,6 +724,7 @@ const H3Engine = struct {
     h3: ?*H3Connection = null,
     endpoint_server_cid: ?[]u8 = null,
     retry_original_dcid: ?[]u8 = null,
+    endpoint_address_validated: bool = false,
     /// The integrator's clock at the last receive_datagram / handle_timeout. A Stream
     /// send does not carry its own `now` (the API matches H2's, which has no clock),
     /// so it packetises against the most recent time the caller gave us.
@@ -762,6 +763,7 @@ const H3Engine = struct {
                 gpa.destroy(q);
                 return c.PyErr_NoMemory();
             };
+            if (self.endpoint_address_validated) q.markAddressValidated();
             h.* = H3Connection.init(gpa, q);
             self.qc = q;
             self.h3 = h;
@@ -776,7 +778,12 @@ const H3Engine = struct {
         return py.none();
     }
 
-    fn setEndpointContext(self: *H3Engine, server_cid: []const u8, original_dcid: ?[]const u8) py.Object {
+    fn setEndpointContext(
+        self: *H3Engine,
+        server_cid: []const u8,
+        original_dcid: ?[]const u8,
+        address_validated: bool,
+    ) py.Object {
         if (self.config == null or self.qc != null or self.endpoint_server_cid != null) {
             return py.raise(exceptions.LocalProtocolError, "endpoint context requires a fresh HTTP/3 server connection");
         }
@@ -796,7 +803,30 @@ const H3Engine = struct {
             null;
         self.endpoint_server_cid = owned_server_cid;
         self.retry_original_dcid = owned_original_dcid;
+        self.endpoint_address_validated = address_validated;
         return py.none();
+    }
+
+    fn endpointReady(self: *const H3Engine) py.Object {
+        return py.boolean(if (self.qc) |q| q.hasAuthenticatedInitial() else false);
+    }
+
+    fn endpointConnectionIds(self: *const H3Engine) py.Object {
+        const q = self.qc orelse return py.newList(0);
+        var connection_ids: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer connection_ids.deinit(gpa);
+        q.appendActiveLocalConnectionIds(&connection_ids, gpa) catch return c.PyErr_NoMemory();
+        const list = py.newList(@intCast(connection_ids.items.len));
+        if (list == null) return null;
+        for (connection_ids.items, 0..) |connection_id, index| {
+            const item = py.fromBytes(connection_id);
+            if (item == null) {
+                py.decref(list);
+                return null;
+            }
+            py.listSet(list, @intCast(index), item);
+        }
+        return list;
     }
 
     fn nextEvent(self: *H3Engine) py.Object {
@@ -1356,6 +1386,25 @@ fn parse_datagram_header(_: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Obj
     return row;
 }
 
+fn build_version_negotiation(_: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    var client_destination_obj: ?*c.PyObject = null;
+    var client_source_obj: ?*c.PyObject = null;
+    if (c.PyArg_ParseTuple(args, "OO", &client_destination_obj, &client_source_obj) == 0) return null;
+    const client_destination = py.asBytes(client_destination_obj) orelse return null;
+    const client_source = py.asBytes(client_source_obj) orelse return null;
+    if (client_destination.len > core.quic.constants.MAX_CID_LEN or
+        client_source.len > core.quic.constants.MAX_CID_LEN)
+    {
+        return py.raiseValue("connection IDs must be at most 20 bytes");
+    }
+
+    var packet: std.ArrayListUnmanaged(u8) = .empty;
+    defer packet.deinit(gpa);
+    core.quic.packet.writeVersionNegotiation(&packet, gpa, client_source, client_destination) catch
+        return c.PyErr_NoMemory();
+    return py.fromBytes(packet.items);
+}
+
 /// Build a QUIC v1 Retry packet without allocating connection state. The caller
 /// creates and validates the opaque token, including any client-address binding.
 fn build_retry(_: ?*c.PyObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
@@ -1408,6 +1457,7 @@ fn build_retry(_: ?*c.PyObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
 
 pub var module_methods = [_]c.PyMethodDef{
     .{ .ml_name = "parse_datagram_header", .ml_meth = parse_datagram_header, .ml_flags = c.METH_O, .ml_doc = "Parse the routable prefix of a received QUIC datagram: parse_datagram_header(datagram) -> DatagramHeader. Reads no connection state; for demultiplexing a shared UDP socket by connection id." },
+    .{ .ml_name = "_build_version_negotiation", .ml_meth = build_version_negotiation, .ml_flags = c.METH_VARARGS, .ml_doc = "Build a stateless QUIC Version Negotiation packet for QuicEndpoint." },
     .{ .ml_name = "_build_retry", .ml_meth = @ptrCast(&build_retry), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Build a stateless QUIC v1 Retry packet for QuicEndpoint." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
@@ -2622,15 +2672,34 @@ fn h3_set_endpoint_context(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
     var server_obj: ?*c.PyObject = null;
     var original_obj: ?*c.PyObject = null;
-    if (c.PyArg_ParseTuple(args, "O|O", &server_obj, &original_obj) == 0) return null;
+    var address_validated: c_int = 0;
+    if (c.PyArg_ParseTuple(args, "O|Op", &server_obj, &original_obj, &address_validated) == 0) return null;
     const server_cid = py.asBytes(server_obj) orelse return null;
     const original_dcid = if (original_obj != null and !py.isNone(original_obj))
         py.asBytes(original_obj) orelse return null
     else
         null;
     return switch (engine.*) {
-        .h3 => |*e| e.setEndpointContext(server_cid, original_dcid),
+        .h3 => |*e| e.setEndpointContext(server_cid, original_dcid, address_validated != 0),
         else => py.raiseRuntime("endpoint context is only valid for an HTTP/3 connection"),
+    };
+}
+
+fn h3_endpoint_ready(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    return switch (engine.*) {
+        .h3 => |*e| e.endpointReady(),
+        else => py.raiseRuntime("endpoint readiness is only valid for an HTTP/3 connection"),
+    };
+}
+
+fn h3_endpoint_connection_ids(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    return switch (engine.*) {
+        .h3 => |*e| e.endpointConnectionIds(),
+        else => py.raiseRuntime("endpoint connection IDs are only valid for an HTTP/3 connection"),
     };
 }
 
@@ -2974,6 +3043,8 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing UDP datagrams as a list of bytes (one per datagram - QUIC datagram boundaries are semantic)." },
     .{ .ml_name = "data_to_send_with_addresses", .ml_meth = h3_data_to_send_with_addresses, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams as (datagram, peer_address) pairs. peer_address is None when no address key is known." },
     .{ .ml_name = "_set_endpoint_context", .ml_meth = h3_set_endpoint_context, .ml_flags = c.METH_VARARGS, .ml_doc = "Configure endpoint-selected connection IDs before receiving the first Initial." },
+    .{ .ml_name = "_endpoint_ready", .ml_meth = h3_endpoint_ready, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the endpoint connection authenticated its first Initial." },
+    .{ .ml_name = "_endpoint_connection_ids", .ml_meth = h3_endpoint_connection_ids, .ml_flags = c.METH_NOARGS, .ml_doc = "Return active local connection IDs for endpoint routing." },
     .{ .ml_name = "challenge_path", .ml_meth = h3_challenge_path, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC PATH_CHALLENGE for a peer address: challenge_path(peer_address, data). data must be 8 unpredictable bytes. Drain with data_to_send_with_addresses." },
     .{ .ml_name = "use_peer_connection_id", .ml_meth = h3_use_peer_connection_id, .ml_flags = c.METH_O, .ml_doc = "Switch future QUIC packets to a peer-issued NEW_CONNECTION_ID sequence: use_peer_connection_id(sequence_number)." },
     .{ .ml_name = "issue_connection_id", .ml_meth = h3_issue_connection_id, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC NEW_CONNECTION_ID for a local CID: issue_connection_id(sequence_number, connection_id, stateless_reset_token, retire_prior_to=0). Drain with data_to_send." },

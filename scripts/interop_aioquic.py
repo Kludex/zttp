@@ -369,7 +369,7 @@ def assert_aioquic_client_to_zttp_retry_endpoint() -> None:
         transport_params=ZTTP_SERVER_TRANSPORT_PARAMS,
         alpn=b"h3",
         retry=True,
-        retry_secret=b"interop-retry-secret" * 2,
+        token_secret=b"interop-retry-secret" * 2,
     )
     client_config = QuicConfiguration(
         is_client=True,

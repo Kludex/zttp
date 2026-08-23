@@ -379,7 +379,7 @@ import zttp
 
 endpoint = zttp.QuicEndpoint(
     retry=True,
-    retry_secret=b"replace-with-at-least-32-secret-bytes",
+    token_secret=b"replace-with-at-least-32-secret-bytes",
 )
 
 
@@ -395,9 +395,16 @@ def receive(
 ```
 
 `QuicEndpoint` routes long and short headers by destination connection ID. It
-creates an `H3Connection` only for a new Initial packet. The returned connection
+retains an `H3Connection` only after the QUIC core authenticates the first Initial.
+It sends Version Negotiation for unsupported versions. The returned connection
 owns the HTTP event queue, so call `next_event()` on it after `receive()` returns.
 Send each tuple from `endpoint.data_to_send()` to its accompanying peer address.
+
+Call `endpoint.issue_connection_id(connection, sequence_number)` instead of
+`connection.issue_connection_id()` for endpoint-managed connections. The endpoint
+generates the connection ID and stateless reset token, sends `NEW_CONNECTION_ID`,
+and updates its long-header and short-header routes. It also removes retired IDs
+from those routes after processing `RETIRE_CONNECTION_ID`.
 
 With `retry=True`, the first Initial produces a Retry packet but no connection.
 The endpoint binds its authenticated token to `peer_address`. It allocates the
@@ -405,10 +412,14 @@ connection only after the client echoes a valid token in its next Initial. This
 prevents a spoofed source address from making the server allocate handshake
 state.
 
-!!! warning "Share the Retry secret between workers"
+After the handshake, call `endpoint.issue_token(connection, now)` to send a
+`NEW_TOKEN` bound to the connection's current peer address. A later connection can
+use that token to validate its address without a Retry round trip.
+
+!!! warning "Share the token secret between workers"
     Every worker receiving datagrams for the same UDP address must use the same
-    `retry_secret`. A client can receive Retry from one worker and return its next
-    Initial to another. That worker must be able to authenticate the token.
+    `token_secret`. A client can receive Retry or `NEW_TOKEN` from one worker and
+    return the token to another. That worker must be able to authenticate it.
 
 Call `endpoint.next_timeout()` to get the earliest deadline across all
 connections. Call `endpoint.handle_timeout(now)` when it expires. The endpoint

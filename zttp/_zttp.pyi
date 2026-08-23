@@ -19,6 +19,9 @@ HTTP3: Final[Literal[3]] = 3
 
 _DefaultT = TypeVar("_DefaultT")
 
+def _build_version_negotiation(client_destination_connection_id: bytes, client_source_connection_id: bytes, /) -> bytes:
+    """Build a stateless QUIC Version Negotiation packet for `QuicEndpoint`."""
+
 def _build_retry(
     original_destination_connection_id: bytes,
     client_source_connection_id: bytes,
@@ -416,9 +419,18 @@ class H3Connection(Connection):
         """Like `data_to_send`, but as `(datagram, peer_address)` pairs."""
 
     def _set_endpoint_context(
-        self, server_connection_id: bytes, original_destination_connection_id: bytes | None = ...
+        self,
+        server_connection_id: bytes,
+        original_destination_connection_id: bytes | None = ...,
+        address_validated: bool = ...,
     ) -> None:
         """Configure endpoint-selected connection IDs before the first Initial."""
+
+    def _endpoint_ready(self) -> bool:
+        """Return whether the first Initial was authenticated."""
+
+    def _endpoint_connection_ids(self) -> list[bytes]:
+        """Return active local connection IDs for endpoint routing."""
 
     def challenge_path(self, peer_address: bytes, data: bytes, /) -> None:
         """Queue a QUIC `PATH_CHALLENGE` to a peer address (`data` must be 8 unpredictable bytes)."""
