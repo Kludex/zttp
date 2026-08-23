@@ -31,7 +31,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
                 if event is zttp.NEED_DATA:
                     data = await reader.read(65536)
                     event = conn.receive_event(data)  # b"" signals EOF
-                    if not data:
+                    if not data and event is zttp.NEED_DATA:
                         return
                     if event is zttp.NEED_DATA:
                         continue
@@ -103,7 +103,7 @@ event = conn.next_event()
 if event is zttp.NEED_DATA:
     data = await reader.read(65536)
     event = conn.receive_event(data)
-    if not data:
+    if not data and event is zttp.NEED_DATA:
         return          # the client closed; nothing more is coming
     if event is zttp.NEED_DATA:
         continue

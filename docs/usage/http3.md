@@ -98,7 +98,8 @@ So when a packet is lost, QUIC only holds back the stream or streams whose bytes
 were in that packet. Every other stream keeps flowing, delivered, not waiting on
 anybody. That is the entire payoff.
 
-![A lost TCP segment blocks both HTTP/2 streams, while a lost QUIC packet blocks only its HTTP/3 stream.](../assets/diagrams/http3-streams.svg)
+![A lost TCP segment blocks both HTTP/2 streams. A lost QUIC packet blocks only
+the HTTP/3 streams whose data it contains.](../assets/diagrams/http3-streams.svg)
 
 The difference is the second column. On TCP, losing stream 1's data freezes
 stream 3 for no reason. On QUIC, stream 3 sails right past. Same lost packet,
