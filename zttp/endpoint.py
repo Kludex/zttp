@@ -5,7 +5,7 @@ from typing import cast
 
 from typing_extensions import Protocol
 
-from zttp._retry import _RetryTokenCodec
+from zttp._retry import RetryTokenCodec
 from zttp._zttp import (
     HTTP3,
     SERVER,
@@ -59,7 +59,7 @@ class QuicEndpoint:
         self._connection_id_factory = connection_id_factory
         self._max_connections = max_connections
         self._token_codec = (
-            _RetryTokenCodec(retry_secret if retry_secret is not None else secrets.token_bytes(32), retry_token_ttl)
+            RetryTokenCodec(retry_secret if retry_secret is not None else secrets.token_bytes(32), retry_token_ttl)
             if retry
             else None
         )

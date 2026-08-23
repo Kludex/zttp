@@ -170,7 +170,7 @@ def test_quic_endpoint_completes_retry_and_routes_the_connection() -> None:
         retry_secret=b"s" * 32,
         connection_id_factory=lambda length: b"r" * length,
     )
-    config = dict(CLIENT_CONFIG)
+    config: ResumedClientConfig = CLIENT_CONFIG.copy()
     config["connection_id"] = b"original"
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
     [initial] = client.data_to_send()

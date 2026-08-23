@@ -5,12 +5,12 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class _RetryContext:
+class RetryContext:
     original_destination_connection_id: bytes
     retry_source_connection_id: bytes
 
 
-class _RetryTokenCodec:
+class RetryTokenCodec:
     def __init__(self, secret: bytes, ttl: int) -> None:
         if len(secret) < 32:
             raise ValueError("retry_secret must contain at least 32 bytes")
@@ -36,7 +36,7 @@ class _RetryTokenCodec:
         )
         return payload + hmac.digest(self._secret, payload, "sha256")
 
-    def validate(self, peer_address: bytes, token: bytes, now: int) -> _RetryContext | None:
+    def validate(self, peer_address: bytes, token: bytes, now: int) -> RetryContext | None:
         if len(token) < 53:
             return None
         payload = token[:-32]
@@ -69,4 +69,4 @@ class _RetryTokenCodec:
             retry_length == 0 or retry_length > 20 or retry_end != len(payload)
         ):  # pragma: no cover - authenticated token shape
             return None
-        return _RetryContext(original_dcid, payload[offset:retry_end])
+        return RetryContext(original_dcid, payload[offset:retry_end])
