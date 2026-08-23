@@ -19,6 +19,7 @@ const H2Role = core.h2.connection.Role;
 const H2Writer = core.h2.writer.Writer;
 
 const QuicConnection = core.quic.connection.Connection;
+const TransportParameterConfiguration = core.quic.transport_params.Configuration;
 const H3Connection = core.h3.connection.Connection;
 const FlightConfig = core.quic.tls.flight.Config;
 const ResumptionCredential = core.quic.tls.flight.ResumptionCredential;
@@ -207,6 +208,124 @@ fn randomBytes(comptime len: usize) ?[len]u8 {
 fn optionalBytes(obj: ?*c.PyObject, default: []const u8) ?[]const u8 {
     if (obj == null or py.isNone(obj)) return default;
     return py.asBytes(obj);
+}
+
+fn readTransportInteger(dict: py.Object, key: [*c]const u8, target: *?u64, found: *usize) bool {
+    const value = c.PyDict_GetItemString(dict, key) orelse return true;
+    found.* += 1;
+    if (@intFromPtr(c.Py_TYPE(value)) != @intFromPtr(&c.PyLong_Type)) {
+        _ = py.raiseValue("transport parameter integer values must be non-negative integers");
+        return false;
+    }
+    const parsed = c.PyLong_AsUnsignedLongLong(value);
+    if (parsed == std.math.maxInt(c_ulonglong) and c.PyErr_Occurred() != null) {
+        c.PyErr_Clear();
+        _ = py.raiseValue("transport parameter integer values must fit in an unsigned 64-bit integer");
+        return false;
+    }
+    target.* = @intCast(parsed);
+    return true;
+}
+
+fn transportParameters(
+    obj: ?*c.PyObject,
+    raw_obj: ?*c.PyObject,
+    default: []const u8,
+    encoded: *std.ArrayListUnmanaged(u8),
+) ?[]const u8 {
+    const has_typed = obj != null and !py.isNone(obj);
+    const has_raw = raw_obj != null and !py.isNone(raw_obj);
+    if (has_typed and has_raw) {
+        _ = py.raiseValue("transport_params and raw_transport_params are mutually exclusive");
+        return null;
+    }
+    if (has_raw) return py.asBytes(raw_obj);
+    if (!has_typed) return default;
+
+    const is_dict = c.PyObject_IsInstance(obj, @ptrCast(&c.PyDict_Type));
+    if (is_dict < 0) return null;
+    if (is_dict == 0) {
+        _ = py.raiseType("transport_params must be a QuicTransportParameters dictionary");
+        return null;
+    }
+
+    var configuration = TransportParameterConfiguration{};
+    var found: usize = 0;
+    if (!readTransportInteger(obj, "max_idle_timeout", &configuration.max_idle_timeout, &found)) return null;
+    if (!readTransportInteger(obj, "max_udp_payload_size", &configuration.max_udp_payload_size, &found)) return null;
+    if (!readTransportInteger(obj, "initial_max_data", &configuration.initial_max_data, &found)) return null;
+    if (!readTransportInteger(
+        obj,
+        "initial_max_stream_data_bidi_local",
+        &configuration.initial_max_stream_data_bidi_local,
+        &found,
+    )) return null;
+    if (!readTransportInteger(
+        obj,
+        "initial_max_stream_data_bidi_remote",
+        &configuration.initial_max_stream_data_bidi_remote,
+        &found,
+    )) return null;
+    if (!readTransportInteger(
+        obj,
+        "initial_max_stream_data_uni",
+        &configuration.initial_max_stream_data_uni,
+        &found,
+    )) return null;
+    if (!readTransportInteger(
+        obj,
+        "initial_max_streams_bidi",
+        &configuration.initial_max_streams_bidi,
+        &found,
+    )) return null;
+    if (!readTransportInteger(
+        obj,
+        "initial_max_streams_uni",
+        &configuration.initial_max_streams_uni,
+        &found,
+    )) return null;
+    if (!readTransportInteger(obj, "ack_delay_exponent", &configuration.ack_delay_exponent, &found)) return null;
+    if (!readTransportInteger(obj, "max_ack_delay", &configuration.max_ack_delay, &found)) return null;
+    if (!readTransportInteger(
+        obj,
+        "active_connection_id_limit",
+        &configuration.active_connection_id_limit,
+        &found,
+    )) return null;
+
+    if (c.PyDict_GetItemString(obj, "stateless_reset_token")) |value| {
+        found += 1;
+        const token = py.asBytes(value) orelse return null;
+        if (token.len != 16) {
+            _ = py.raiseValue("stateless_reset_token must be exactly 16 bytes");
+            return null;
+        }
+        configuration.stateless_reset_token = token[0..16].*;
+    }
+    if (c.PyDict_GetItemString(obj, "disable_active_migration")) |value| {
+        found += 1;
+        if (value != c.Py_True() and value != c.Py_False()) {
+            _ = py.raiseValue("disable_active_migration must be a bool");
+            return null;
+        }
+        configuration.disable_active_migration = value == c.Py_True();
+    }
+    if (found != @as(usize, @intCast(c.PyDict_Size(obj)))) {
+        _ = py.raiseValue("transport_params contains an unknown field");
+        return null;
+    }
+
+    core.quic.transport_params.encodeConfiguration(encoded, gpa, configuration) catch |err| switch (err) {
+        error.OutOfMemory => {
+            _ = c.PyErr_NoMemory();
+            return null;
+        },
+        error.Malformed => {
+            _ = py.raiseValue("transport_params contains a value outside the QUIC range");
+            return null;
+        },
+    };
+    return encoded.items;
 }
 
 fn optionalBytes32(obj: ?*c.PyObject, msg: [*c]const u8) ?[32]u8 {
@@ -1566,8 +1685,8 @@ fn new_h2(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     return allocAndBuild(tp, role, HTTP2);
 }
 
-// H3Connection(role, protocol=HTTP3, *, certificate=None, private_key=None,
-// transport_params=None, random=None, ephemeral_seed=None, alpn=None,
+// H3Connection(role, protocol=HTTP3, *, credentials=None, transport_params=None,
+// raw_transport_params=None, random=None, ephemeral_seed=None, alpn=None,
 // connection_id=None, server_name=None, resumption_identity=None,
 // resumption_psk=None, obfuscated_ticket_age=0, early_data=False,
 // remembered_transport_params=None, validation_token=None).
@@ -1580,6 +1699,7 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     var protocol_val: c_long = HTTP3;
     var credentials_obj: ?*c.PyObject = null;
     var tp_obj: ?*c.PyObject = null;
+    var raw_tp_obj: ?*c.PyObject = null;
     var random_obj: ?*c.PyObject = null;
     var ephemeral_obj: ?*c.PyObject = null;
     var alpn_obj: ?*c.PyObject = null;
@@ -1591,25 +1711,43 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     var remembered_tp_obj: ?*c.PyObject = null;
     var validation_token_obj: ?*c.PyObject = null;
     var kwlist = [_][*c]u8{
-        @constCast("role"),                        @constCast("protocol"),              @constCast("credentials"),
-        @constCast("transport_params"),            @constCast("random"),                @constCast("ephemeral_seed"),
-        @constCast("alpn"),                        @constCast("connection_id"),         @constCast("server_name"),
-        @constCast("resumption"),                  @constCast("obfuscated_ticket_age"), @constCast("early_data"),
-        @constCast("remembered_transport_params"), @constCast("validation_token"),      null,
+        @constCast("role"),             @constCast("protocol"),                    @constCast("credentials"),
+        @constCast("transport_params"), @constCast("raw_transport_params"),        @constCast("random"),
+        @constCast("ephemeral_seed"),   @constCast("alpn"),                        @constCast("connection_id"),
+        @constCast("server_name"),      @constCast("resumption"),                  @constCast("obfuscated_ticket_age"),
+        @constCast("early_data"),       @constCast("remembered_transport_params"), @constCast("validation_token"),
+        null,
     };
-    if (c.PyArg_ParseTupleAndKeywords(args, kwds, "l|l$OOOOOOOOOOOO", @ptrCast(&kwlist), &role_val, &protocol_val, &credentials_obj, &tp_obj, &random_obj, &ephemeral_obj, &alpn_obj, &cid_obj, &sni_obj, &resumption_obj, &obfuscated_ticket_age_obj, &early_data_obj, &remembered_tp_obj, &validation_token_obj) == 0) return null;
+    if (c.PyArg_ParseTupleAndKeywords(
+        args,
+        kwds,
+        "l|l$OOOOOOOOOOOOO",
+        @ptrCast(&kwlist),
+        &role_val,
+        &protocol_val,
+        &credentials_obj,
+        &tp_obj,
+        &raw_tp_obj,
+        &random_obj,
+        &ephemeral_obj,
+        &alpn_obj,
+        &cid_obj,
+        &sni_obj,
+        &resumption_obj,
+        &obfuscated_ticket_age_obj,
+        &early_data_obj,
+        &remembered_tp_obj,
+        &validation_token_obj,
+    ) == 0) return null;
     if (protocol_val != HTTP3) return py.raiseValue("protocol does not match this Connection subclass; construct zttp.Connection to choose by protocol");
 
-    var encoded_tp_obj: ?*c.PyObject = null;
-    defer py.xdecref(encoded_tp_obj);
-    if (tp_obj != null and !py.isNone(tp_obj)) {
-        const is_bytes = c.PyObject_IsInstance(tp_obj, @ptrCast(&c.PyBytes_Type));
-        if (is_bytes < 0) return null;
-        if (is_bytes == 0) {
-            encoded_tp_obj = c.PyObject_GetAttrString(tp_obj, "encoded") orelse return null;
-            tp_obj = encoded_tp_obj;
-        }
-    }
+    var encoded_tp: std.ArrayListUnmanaged(u8) = .empty;
+    defer encoded_tp.deinit(gpa);
+    const default_tp: []const u8 = if (role_val == SERVER)
+        &DEFAULT_SERVER_TRANSPORT_PARAMS
+    else
+        &DEFAULT_CLIENT_TRANSPORT_PARAMS;
+    const tp_src = transportParameters(tp_obj, raw_tp_obj, default_tp, &encoded_tp) orelse return null;
 
     // Unpack the credential / resumption value objects into the raw byte objects the
     // builders consume. TlsCredentials(certificate, private_key) and
@@ -1668,13 +1806,36 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
             py.decref(obj);
             return py.raiseValue("validation_token is only valid for HTTP/3 clients");
         }
-        const config = buildServerConfig(cert_obj, key_obj, tp_obj, random_obj, ephemeral_obj, alpn_obj, resumption_identity_obj, resumption_psk_obj) orelse {
+        const config = buildServerConfig(
+            cert_obj,
+            key_obj,
+            tp_src,
+            random_obj,
+            ephemeral_obj,
+            alpn_obj,
+            resumption_identity_obj,
+            resumption_psk_obj,
+        ) orelse {
             py.decref(obj);
             return null;
         };
         engine.* = .{ .h3 = .{ .config = config } };
     } else if (role_val == CLIENT) {
-        engine.* = .{ .h3 = buildClientH3(tp, tp_obj, random_obj, ephemeral_obj, alpn_obj, cid_obj, sni_obj, resumption_identity_obj, resumption_psk_obj, obfuscated_ticket_age_obj, early_data_obj, remembered_tp_obj, validation_token_obj) orelse {
+        engine.* = .{ .h3 = buildClientH3(
+            tp,
+            tp_src,
+            random_obj,
+            ephemeral_obj,
+            alpn_obj,
+            cid_obj,
+            sni_obj,
+            resumption_identity_obj,
+            resumption_psk_obj,
+            obfuscated_ticket_age_obj,
+            early_data_obj,
+            remembered_tp_obj,
+            validation_token_obj,
+        ) orelse {
             py.decref(obj);
             return null;
         } };
@@ -1688,7 +1849,7 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
 
 fn buildClientH3(
     _: ?*c.PyTypeObject,
-    tp_obj: ?*c.PyObject,
+    tp_src: []const u8,
     random_obj: ?*c.PyObject,
     ephemeral_obj: ?*c.PyObject,
     alpn_obj: ?*c.PyObject,
@@ -1701,7 +1862,6 @@ fn buildClientH3(
     remembered_tp_obj: ?*c.PyObject,
     validation_token_obj: ?*c.PyObject,
 ) ?H3Engine {
-    const tp_src = optionalBytes(tp_obj, &DEFAULT_CLIENT_TRANSPORT_PARAMS) orelse return null;
     const random = optionalBytes32(random_obj, "random must be exactly 32 bytes") orelse return null;
     const ephemeral_seed = optionalBytes32(ephemeral_obj, "ephemeral_seed must be exactly 32 bytes") orelse return null;
     const default_cid = randomBytes(8) orelse return null;
@@ -1773,14 +1933,13 @@ fn buildClientH3(
 fn buildServerConfig(
     cert_obj: ?*c.PyObject,
     key_obj: ?*c.PyObject,
-    tp_obj: ?*c.PyObject,
+    tp_src: []const u8,
     random_obj: ?*c.PyObject,
     ephemeral_obj: ?*c.PyObject,
     alpn_obj: ?*c.PyObject,
     resumption_identity_obj: ?*c.PyObject,
     resumption_psk_obj: ?*c.PyObject,
 ) ?ServerConfig {
-    const tp_src = optionalBytes(tp_obj, &DEFAULT_SERVER_TRANSPORT_PARAMS) orelse return null;
     const random = optionalBytes32(random_obj, "random must be exactly 32 bytes") orelse return null;
     const ephemeral_seed = optionalBytes32(ephemeral_obj, "ephemeral_seed must be exactly 32 bytes") orelse return null;
     var signer: Signer = undefined;
