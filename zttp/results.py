@@ -1,7 +1,7 @@
 """Value objects returned by HTTP/3 introspection methods.
 
-`H3Connection.session_tickets()` and `H3Connection.close_info()` return these frozen
-dataclasses. Read them by field name (`info.error_code`, `ticket.psk`) - they are not
+HTTP/3 introspection methods return these frozen dataclasses. Read them by field
+name (`info.error_code`, `ticket.psk`, `connection_id.sequence_number`) - they are not
 tuples, so there is no positional access to get wrong.
 """
 
@@ -12,6 +12,7 @@ from dataclasses import dataclass
 __all__ = [
     "CloseInfo",
     "DatagramHeader",
+    "LocalConnectionId",
     "SessionTicket",
 ]
 
@@ -36,6 +37,14 @@ class CloseInfo:
     error_code: int
     reason: bytes
     is_application: bool
+
+
+@dataclass(frozen=True)
+class LocalConnectionId:
+    """An active destination connection ID routed to one HTTP/3 connection."""
+
+    sequence_number: int
+    connection_id: bytes
 
 
 @dataclass(frozen=True)

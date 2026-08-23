@@ -48,6 +48,8 @@ const RequestStream = struct {
     /// Content-Length was sent. Reconciled against the DATA bytes at the FIN.
     content_length: ?u64 = null,
     body_received: u64 = 0,
+    /// DATA payload bytes parsed but not yet acknowledged by the application.
+    body_unconsumed: u64 = 0,
     /// Responses to HEAD, 204, and 304 carry no body regardless of Content-Length.
     expects_bodyless: bool = false,
     /// Client-side only: responses to a locally-sent HEAD request carry no body
@@ -216,6 +218,11 @@ pub const Connection = struct {
         _ = self.streams.remove(id);
     }
 
+    fn releaseStreamCredit(self: *Connection, id: u64, rs: *RequestStream) void {
+        self.qc.releaseStreamCredit(id);
+        rs.body_unconsumed = 0;
+    }
+
     /// Reset request stream `id` with `code` and drop its state: RESET_STREAM the
     /// response, STOP_SENDING the request, drain and reclaim. Used both for a
     /// malformed request (failStream) and a request covered by our GOAWAY.
@@ -224,6 +231,7 @@ pub const Connection = struct {
         _ = self.send_bodyless.remove(id);
         self.qc.resetStream(id, @intFromEnum(code)) catch return error.H3Error;
         self.qc.stopSending(id, @intFromEnum(code)) catch return error.H3Error;
+        if (self.streams.getPtr(id)) |rs| self.releaseStreamCredit(id, rs);
         const pending = self.qc.streamData(id).len;
         if (pending > 0) self.qc.consumeStream(id, pending);
         // Drop the stream if the transport can (recv terminal); otherwise mark it
@@ -415,6 +423,7 @@ pub const Connection = struct {
         if (rs.blocked_headers != null) {
             if (self.qc.streamReset(id) and !rs.rst_emitted) {
                 try self.cancelQpackSectionIfPending(id, rs);
+                self.releaseStreamCredit(id, rs);
                 try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = self.qc.streamResetCode(id) orelse 0 } });
                 rs.rst_emitted = true;
             }
@@ -426,9 +435,10 @@ pub const Connection = struct {
         // every fully-decoded frame is consumed (removed from the QUIC stream)
         // before this returns, so the next pump always begins at offset 0 with the
         // not-yet-consumed tail (a partial frame plus any newer bytes). Tracking a
-        // persistent offset here would desync once consumeStream slides the buffer.
+        // persistent offset here would desync once the transport slides the buffer.
         const ready = self.qc.streamData(id);
         var consumed_total: usize = 0;
+        var credited_total: usize = 0;
         while (consumed_total < ready.len) {
             const rest = ready[consumed_total..];
             const d = h3_frame.decode(rest) catch break; // NeedData: wait for more
@@ -444,6 +454,7 @@ pub const Connection = struct {
                 else => return e,
             };
             consumed_total += d.len;
+            credited_total += if (d.frame.ftype == .data) d.len - d.frame.payload.len else d.len;
             if (rs.blocked_headers != null) break;
         }
         if (self.qc.streamFinished(id) and rs.blocked_headers == null and consumed_total < ready.len) {
@@ -467,7 +478,8 @@ pub const Connection = struct {
         // A FIN-only completion (the FIN arrived as a zero-length STREAM frame) still
         // needs the consume, or the stream never reaches terminal and cannot be dropped.
         if (consumed_total > 0 or (self.qc.streamFinished(id) and rs.state == .done)) {
-            self.qc.consumeStream(id, consumed_total);
+            self.qc.advanceStream(id, consumed_total);
+            self.qc.creditStream(id, credited_total);
         }
         // A peer RESET_STREAM cancels the request: surface it as an event (with the
         // peer's error code) once, before the stream is dropped, so the integrator is
@@ -475,6 +487,7 @@ pub const Connection = struct {
         // a re-fire if the stream cannot be dropped yet (e.g. an allocator failure).
         if (self.qc.streamReset(id) and !rs.rst_emitted) {
             try self.cancelQpackSectionIfPending(id, rs);
+            self.releaseStreamCredit(id, rs);
             try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = self.qc.streamResetCode(id) orelse 0 } });
             rs.rst_emitted = true;
         }
@@ -483,7 +496,7 @@ pub const Connection = struct {
         // cannot grow the maps (the memory half of the Rapid-Reset class). The QUIC
         // send half is retained until its bytes are acked, so a still-in-flight
         // response is not freed from under recovery.
-        if (rs.state == .done or self.qc.streamReset(id)) {
+        if ((rs.state == .done and rs.body_unconsumed == 0) or self.qc.streamReset(id)) {
             if (self.qc.dropStream(id)) self.removeStreamState(id); // rs dangles after this
         }
     }
@@ -505,6 +518,7 @@ pub const Connection = struct {
         if (rs.blocked_headers != null) {
             if (self.qc.streamReset(id) and !rs.rst_emitted) {
                 try self.cancelQpackSectionIfPending(id, rs);
+                self.releaseStreamCredit(id, rs);
                 try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = self.qc.streamResetCode(id) orelse 0 } });
                 rs.rst_emitted = true;
             }
@@ -514,6 +528,7 @@ pub const Connection = struct {
 
         const ready = self.qc.streamData(id);
         var consumed_total: usize = 0;
+        var credited_total: usize = 0;
         while (consumed_total < ready.len) {
             const rest = ready[consumed_total..];
             const d = h3_frame.decode(rest) catch break;
@@ -526,6 +541,7 @@ pub const Connection = struct {
                 else => return e,
             };
             consumed_total += d.len;
+            credited_total += if (d.frame.ftype == .data) d.len - d.frame.payload.len else d.len;
             if (rs.blocked_headers != null) break;
         }
         if (self.qc.streamFinished(id) and rs.blocked_headers == null and consumed_total < ready.len) {
@@ -545,14 +561,16 @@ pub const Connection = struct {
         // state, so dropStream below reclaims a finished stream instead of leaving it
         // for pumpAll to revisit on every datagram.
         if (consumed_total > 0 or (self.qc.streamFinished(id) and rs.state == .done)) {
-            self.qc.consumeStream(id, consumed_total);
+            self.qc.advanceStream(id, consumed_total);
+            self.qc.creditStream(id, credited_total);
         }
         if (self.qc.streamReset(id) and !rs.rst_emitted) {
             try self.cancelQpackSectionIfPending(id, rs);
+            self.releaseStreamCredit(id, rs);
             try self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = self.qc.streamResetCode(id) orelse 0 } });
             rs.rst_emitted = true;
         }
-        if (rs.state == .done or self.qc.streamReset(id)) {
+        if ((rs.state == .done and rs.body_unconsumed == 0) or self.qc.streamReset(id)) {
             if (self.qc.dropStream(id)) self.removeStreamState(id);
         }
     }
@@ -982,11 +1000,13 @@ pub const Connection = struct {
             },
             .data => {
                 if (rs.state != .headers_done) return self.fail(.frame_unexpected, "DATA before HEADERS"); // RFC 9114 4.1
-                rs.body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return self.failStream(.message_error);
+                const body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return self.failStream(.message_error);
                 // More body than the declared Content-Length is malformed (RFC 9114 4.1.2).
-                if (rs.content_length) |cl| if (rs.body_received > cl) return self.failStream(.message_error);
+                if (rs.content_length) |cl| if (body_received > cl) return self.failStream(.message_error);
                 const body = try self.dupe(f.payload);
                 try self.push(.{ .data = .{ .data = body, .stream_id = id } });
+                rs.body_received = body_received;
+                rs.body_unconsumed += f.payload.len;
             },
             // Control-stream frames are not allowed on a request stream (RFC 9114
             // 7.1): H3_FRAME_UNEXPECTED.
@@ -1032,12 +1052,14 @@ pub const Connection = struct {
             .data => {
                 if (rs.state != .headers_done) return self.fail(.frame_unexpected, "DATA before response HEADERS");
                 if (rs.expects_bodyless and f.payload.len > 0) return self.failStream(.message_error);
-                rs.body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return self.failStream(.message_error);
-                if (rs.content_length) |cl| if (rs.body_received > cl) return self.failStream(.message_error);
+                const body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return self.failStream(.message_error);
+                if (rs.content_length) |cl| if (body_received > cl) return self.failStream(.message_error);
                 if (f.payload.len > 0) {
                     const body = try self.dupe(f.payload);
                     try self.push(.{ .data = .{ .data = body, .stream_id = id } });
                 }
+                rs.body_received = body_received;
+                rs.body_unconsumed += f.payload.len;
             },
             .push_promise => {
                 _ = varint.decode(f.payload) catch return self.fail(.frame_error, "malformed PUSH_PROMISE");
@@ -1255,6 +1277,17 @@ pub const Connection = struct {
 
     fn push(self: *Connection, ev: H3Event) Error!void {
         self.queue.append(self.gpa, ev) catch return error.OutOfMemory;
+    }
+
+    /// Return DATA payload credit after the application has consumed it.
+    pub fn consumeData(self: *Connection, id: u64, length: u64) Error!void {
+        const rs = self.streams.getPtr(id) orelse return error.H3Error;
+        if (length > rs.body_unconsumed) return error.H3Error;
+        self.qc.creditStream(id, length);
+        rs.body_unconsumed -= length;
+        if (rs.state == .done and rs.body_unconsumed == 0) {
+            if (self.qc.dropStream(id)) self.removeStreamState(id);
+        }
     }
 
     /// Pull the next ready event, or `need_data` when the queue is drained. Mirrors
@@ -1500,6 +1533,11 @@ pub const Connection = struct {
         if (self.peekSendState(id) == .fin_sent) return;
         self.qc.resetStream(id, error_code) catch return error.H3Error;
         self.qc.stopSending(id, error_code) catch return error.H3Error;
+        if (self.streams.getPtr(id)) |rs| {
+            try self.cancelQpackSectionIfPending(id, rs);
+            self.releaseStreamCredit(id, rs);
+            rs.state = .rejected;
+        }
         try self.setSendState(id, .fin_sent);
     }
 

@@ -87,20 +87,7 @@ frames from different streams as they are ready.
 This is **multiplexing**. One connection, many conversations, all in
 flight together.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as Server
-    Note over C,S: one TCP connection, frames tagged by stream_id
-    C->>S: HEADERS (stream 1)
-    C->>S: HEADERS (stream 3)
-    S->>C: HEADERS (stream 1)
-    S->>C: DATA (stream 3)
-    S->>C: DATA (stream 1)
-    S->>C: DATA (stream 3)
-    S->>C: DATA (stream 1, END_STREAM)
-    S->>C: DATA (stream 3, END_STREAM)
-```
+![HTTP/2 frames from streams 1 and 3 interleaved on one connection.](../assets/diagrams/http2-streams.svg)
 
 See how stream `1` and stream `3` are mixed together? A slow response on
 stream `1` no longer blocks stream `3`. They share the road, but they no

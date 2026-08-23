@@ -877,9 +877,68 @@ def test_http3_client_request_trailers() -> None:
         events.append(ev)
 
     assert any(isinstance(e, zttp.Request) for e in events)
-    assert any(isinstance(e, zttp.Data) and e.data == b"body" for e in events)
+    data = next(e for e in events if isinstance(e, zttp.Data))
+    assert data.data == b"body"
     eom = next(e for e in events if isinstance(e, zttp.EndOfMessage))
     assert eom.trailers == [(b"x-checksum", b"abc")]
+    server.consume_data(data.stream_id, len(data.data))
+    with pytest.raises(ValueError):
+        server.consume_data(data.stream_id, 1)
+
+
+def test_http3_receive_credit_waits_for_application_consumption() -> None:
+    config = dict(SERVER_CONFIG)
+    config["transport_params"] = (
+        b"\x04\x02\x42\x00"  # initial_max_data = 512
+        b"\x06\x02\x42\x00"  # initial_max_stream_data_bidi_remote = 512
+        b"\x07\x04\x80\x04\x00\x00"  # initial_max_stream_data_uni = 262144
+        b"\x08\x01\x08"  # initial_max_streams_bidi = 8
+        b"\x09\x01\x08"  # initial_max_streams_uni = 8
+    )
+    client = make_client()
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
+    transfer(client, server, 1000)
+    transfer(server, client, 2000)
+    transfer(client, server, 3000)
+
+    stream = client.send_request(
+        b"POST",
+        b"/slow",
+        b"3",
+        [(b"host", b"example.test"), (b"content-length", b"1024")],
+    )
+    for _ in range(4):
+        stream.send_data(b"x" * 256)
+    stream.end_message()
+    assert stream.pending_bytes is not None
+    assert stream.pending_bytes > 0
+    transfer(client, server, 4000)
+    events = drain_events(server)
+    request = next(event for event in events if isinstance(event, zttp.Request))
+    server.initiate_connection()
+    transfer(server, client, 5000)
+    client.initiate_connection()
+    transfer(client, server, 6000)
+    events.extend(drain_events(server))
+    data = b"".join(event.data for event in events if isinstance(event, zttp.Data))
+    assert data
+    assert len(data) < 1024
+
+    pending = stream.pending_bytes
+    server.initiate_connection()
+    transfer(server, client, 7000)
+    client.initiate_connection()
+    transfer(client, server, 8000)
+    assert stream.pending_bytes == pending
+
+    with pytest.raises(ValueError):
+        server.consume_data(request.stream_id, len(data) + 1)
+    server.consume_data(request.stream_id, len(data))
+    transfer(server, client, 9000)
+    client.initiate_connection()
+    transfer(client, server, 10_000)
+    assert stream.pending_bytes is not None
+    assert stream.pending_bytes < pending
 
 
 def test_http3_stream_send_window_and_pending_bytes_track_backpressure() -> None:
@@ -1280,6 +1339,70 @@ def test_use_peer_connection_id_rejects_unknown_sequence() -> None:
         conn.use_peer_connection_id(1)
 
 
+def test_local_connection_ids_track_issue_and_peer_retirement() -> None:
+    client, server = handshake_pair()
+    initial = server.local_connection_ids()
+    assert len(initial) == 1
+    assert initial[0].sequence_number == 0
+
+    server.issue_connection_id(1, b"server-cid-1", b"\x5a" * 16)
+    assert {(item.sequence_number, item.connection_id) for item in server.local_connection_ids()} == {
+        (0, initial[0].connection_id),
+        (1, b"server-cid-1"),
+    }
+    transfer(server, client, 4000)
+    transfer(client, server, 5000)
+
+    server.issue_connection_id(2, b"server-cid-2", b"\x6a" * 16, 1)
+    transfer(server, client, 6000)
+    client.initiate_connection()
+    transfer(client, server, 7000)
+
+    assert {(item.sequence_number, item.connection_id) for item in server.local_connection_ids()} == {
+        (1, b"server-cid-1"),
+        (2, b"server-cid-2"),
+    }
+
+
+def test_local_connection_ids_route_two_connections_on_one_endpoint() -> None:
+    pairs: list[tuple[zttp.H3Connection, zttp.H3Connection, bytes]] = []
+    routes: dict[bytes, zttp.H3Connection] = {}
+    for index, original in enumerate((b"client-a", b"client-b"), start=1):
+        config = dict(CLIENT_CONFIG)
+        config["connection_id"] = original
+        client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
+        server = make_server()
+        transfer(client, server, index * 1000)
+        transfer(server, client, index * 1000 + 100)
+        transfer(client, server, index * 1000 + 200)
+        rotated = f"server-cid-{index}".encode()
+        server.issue_connection_id(1, rotated, bytes((index,)) * 16)
+        issued = next(item for item in server.local_connection_ids() if item.sequence_number == 1)
+        routes[issued.connection_id] = server
+        transfer(server, client, index * 1000 + 300)
+        transfer(client, server, index * 1000 + 400)
+        client.use_peer_connection_id(1)
+        pairs.append((client, server, rotated))
+
+    for index, (client, _server, _rotated) in enumerate(pairs, start=1):
+        client.send_request(b"GET", f"/connection-{index}".encode(), b"3", [(b"host", b"example.test")])
+        for datagram in client.data_to_send():
+            connection_id_length = len(rotated)
+            destination = datagram[1 : 1 + connection_id_length]
+            assert destination in routes
+            routes[destination].receive_datagram(datagram, 5000 + index)
+
+    for index, (_client, server, rotated) in enumerate(pairs, start=1):
+        assert routes[rotated] is server
+        requests = [event for event in drain_events(server) if isinstance(event, zttp.Request)]
+        assert requests[-1].path == f"/connection-{index}".encode()
+
+
+def test_local_connection_ids_require_an_established_connection() -> None:
+    with pytest.raises(zttp.LocalProtocolError):
+        make_server().local_connection_ids()
+
+
 def test_issue_connection_id_queues_new_connection_id_datagram() -> None:
     _client, server = handshake_pair()
 
@@ -1483,6 +1606,19 @@ def test_http3_stream_reset() -> None:
     # An error code past the 62-bit QUIC range is rejected.
     with pytest.raises(ValueError):
         conn.stream(4).reset(1 << 62)
+
+
+def test_http3_reset_reclaims_unconsumed_data() -> None:
+    client, server = handshake_pair()
+    stream = client.send_request(b"POST", b"/cancel", b"3", [(b"host", b"example.test")])
+    stream.send_data(b"body")
+    transfer(client, server, 4000)
+    data = next(event for event in drain_events(server) if isinstance(event, zttp.Data))
+
+    server.stream(data.stream_id).reset()
+
+    with pytest.raises(ValueError):
+        server.consume_data(data.stream_id, 1)
 
 
 def test_http3_initiate_connection_sends_the_control_stream() -> None:
