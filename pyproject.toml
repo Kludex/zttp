@@ -49,7 +49,9 @@ dev = [
     "coverage>=7.0",
     "inline-snapshot>=0.13",
     "ruff",
+    # Keep mypy for stubtest, which verifies the native extension against its stub.
     "mypy",
+    "ty",
 ]
 bench = [
     "httptools",
@@ -181,13 +183,3 @@ select = ["E", "F", "I", "FA", "UP", "RUF100"]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
-
-[tool.mypy]
-strict = true
-warn_unused_ignores = true
-show_error_codes = true
-files = ["zttp"]
-
-[[tool.mypy.overrides]]
-module = "atheris"
-ignore_missing_imports = true
