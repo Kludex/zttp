@@ -137,7 +137,7 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
     client = zttp.Connection(
         zttp.CLIENT,
         protocol=zttp.HTTP3,
-        raw_transport_params=CLIENT_TP,
+        transport_params=CLIENT_TP,
         random=b"\x44" * 32,
         ephemeral_seed=b"\x55" * 32,
         connection_id=dcid,
@@ -180,7 +180,7 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
     resumed = zttp.Connection(
         zttp.CLIENT,
         protocol=zttp.HTTP3,
-        raw_transport_params=CLIENT_TP,
+        transport_params=CLIENT_TP,
         random=b"\x66" * 32,
         ephemeral_seed=b"\x77" * 32,
         connection_id=b"\x11\x22\x33\x45",
@@ -361,7 +361,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
         credentials=zttp.TlsCredentials(
             certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
         ),
-        raw_transport_params=ZTTP_SERVER_TP,
+        transport_params=ZTTP_SERVER_TP,
         random=b"\xab" * 32,
         ephemeral_seed=b"\x33" * 32,
         alpn=b"h3",
@@ -517,7 +517,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
         credentials=zttp.TlsCredentials(
             certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
         ),
-        raw_transport_params=ZTTP_SERVER_TP,
+        transport_params=ZTTP_SERVER_TP,
         random=b"\xac" * 32,
         ephemeral_seed=b"\x34" * 32,
         alpn=b"h3",
@@ -626,7 +626,7 @@ def assert_udp_loopback_zttp_client_to_aioquic_server(tmp: Path, drop_first_serv
     client = zttp.Connection(
         zttp.CLIENT,
         protocol=zttp.HTTP3,
-        raw_transport_params=CLIENT_TP,
+        transport_params=CLIENT_TP,
         random=b"\xae" * 32,
         ephemeral_seed=b"\x36" * 32,
         connection_id=b"\x11\x22\x33\x46",
@@ -768,7 +768,7 @@ def assert_udp_loopback_aioquic_client_to_zttp_server(drop_first_server_datagram
         credentials=zttp.TlsCredentials(
             certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
         ),
-        raw_transport_params=ZTTP_SERVER_TP,
+        transport_params=ZTTP_SERVER_TP,
         random=b"\xad" * 32,
         ephemeral_seed=b"\x35" * 32,
         alpn=b"h3",

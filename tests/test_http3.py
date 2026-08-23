@@ -18,7 +18,7 @@ SERVER_PUBLIC_KEY = bytes.fromhex(
 )
 SERVER_CONFIG = {
     "credentials": zttp.TlsCredentials(certificate=SERVER_PUBLIC_KEY, private_key=b"\x42" * 32),
-    "raw_transport_params": (
+    "transport_params": (
         b"\x04\x04\x80\x10\x00\x00"  # initial_max_data = 1048576
         b"\x08\x01\x08"  # initial_max_streams_bidi = 8
         b"\x09\x01\x08"  # initial_max_streams_uni = 8
@@ -30,7 +30,7 @@ SERVER_CONFIG = {
 }
 
 CLIENT_CONFIG = {
-    "raw_transport_params": (
+    "transport_params": (
         b"\x04\x04\x80\x01\x00\x00"  # initial_max_data = 65536
         b"\x05\x04\x80\x04\x00\x00"  # initial_max_stream_data_bidi_local = 262144
         b"\x06\x04\x80\x04\x00\x00"  # initial_max_stream_data_bidi_remote = 262144
@@ -75,7 +75,7 @@ def make_client() -> zttp.H3Connection:
 
 def make_server_with_transport_params(extra: bytes) -> zttp.H3Connection:
     config = dict(SERVER_CONFIG)
-    config["raw_transport_params"] = SERVER_CONFIG["raw_transport_params"] + extra
+    config["transport_params"] = SERVER_CONFIG["transport_params"] + extra
     return zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
 
 
@@ -388,7 +388,7 @@ def test_http3_ticket_age_mismatch_does_not_accept_zero_rtt() -> None:
             "resumption": zttp.SessionResumption(identity=identity, psk=psk),
             "obfuscated_ticket_age": 0,
             "early_data": True,
-            "remembered_transport_params": SERVER_CONFIG["raw_transport_params"],
+            "remembered_transport_params": SERVER_CONFIG["transport_params"],
         }
     )
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
@@ -431,7 +431,7 @@ def test_http3_expired_ticket_does_not_accept_zero_rtt() -> None:
             "resumption": zttp.SessionResumption(identity=identity, psk=psk),
             "obfuscated_ticket_age": obfuscated_ticket_age(age_add, 3000, resume_at),
             "early_data": True,
-            "remembered_transport_params": SERVER_CONFIG["raw_transport_params"],
+            "remembered_transport_params": SERVER_CONFIG["transport_params"],
         }
     )
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
@@ -474,7 +474,7 @@ def test_http3_ticket_without_early_data_extension_does_not_accept_zero_rtt() ->
             "resumption": zttp.SessionResumption(identity=identity, psk=psk),
             "obfuscated_ticket_age": obfuscated_ticket_age(age_add, 3000, 6000),
             "early_data": True,
-            "remembered_transport_params": SERVER_CONFIG["raw_transport_params"],
+            "remembered_transport_params": SERVER_CONFIG["transport_params"],
         }
     )
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
@@ -517,7 +517,7 @@ def test_http3_zero_rtt_ticket_is_single_use() -> None:
                 "resumption": zttp.SessionResumption(identity=identity, psk=psk),
                 "obfuscated_ticket_age": obfuscated_ticket_age(age_add, 3000, now),
                 "early_data": True,
-                "remembered_transport_params": SERVER_CONFIG["raw_transport_params"],
+                "remembered_transport_params": SERVER_CONFIG["transport_params"],
             }
         )
         return zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
@@ -585,7 +585,7 @@ def test_http3_static_resumption_credentials_do_not_accept_zero_rtt() -> None:
             "resumption": zttp.SessionResumption(identity=b"ticket-identity", psk=psk),
             "obfuscated_ticket_age": 0x01020304,
             "early_data": True,
-            "remembered_transport_params": SERVER_CONFIG["raw_transport_params"],
+            "remembered_transport_params": SERVER_CONFIG["transport_params"],
         }
     )
     server_config = dict(SERVER_CONFIG)
@@ -763,7 +763,6 @@ def test_http3_server_defaults_transport_settings_and_credentials() -> None:
 
 def test_http3_accepts_typed_transport_parameters() -> None:
     client_config = dict(CLIENT_CONFIG)
-    client_config.pop("raw_transport_params")
     client_config["transport_params"] = {
         "initial_max_data": 65536,
         "initial_max_stream_data_bidi_local": 4096,
@@ -776,7 +775,6 @@ def test_http3_accepts_typed_transport_parameters() -> None:
         "disable_active_migration": True,
     }
     server_config = dict(SERVER_CONFIG)
-    server_config.pop("raw_transport_params")
     server_config["transport_params"] = {
         "initial_max_data": 1048576,
         "initial_max_stream_data_bidi_remote": 262144,
@@ -802,19 +800,10 @@ def test_http3_accepts_typed_transport_parameters() -> None:
 
 
 def test_http3_typed_transport_parameters_validate_in_the_extension() -> None:
-    with pytest.raises(TypeError):
-        zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params=b"raw")  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params={"unknown": 1})  # type: ignore[typeddict-unknown-key]
     with pytest.raises(ValueError):
         zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params={"max_udp_payload_size": 1199})
-    with pytest.raises(ValueError):
-        zttp.Connection(
-            zttp.CLIENT,
-            zttp.HTTP3,
-            transport_params={"initial_max_data": 1},
-            raw_transport_params=b"\x04\x01\x01",
-        )
 
 
 def test_http3_server_custom_credentials_must_be_a_pair() -> None:
@@ -831,7 +820,7 @@ def test_http3_rejects_a_wrong_size_key() -> None:
             zttp.SERVER,
             protocol=zttp.HTTP3,
             credentials=zttp.TlsCredentials(certificate=b"\xcc" * 48, private_key=b"\x42" * 16),
-            raw_transport_params=b"\x00\x01",
+            transport_params=b"\x00\x01",
             random=b"\xab" * 32,
             ephemeral_seed=b"\x33" * 32,
         )
@@ -1504,7 +1493,7 @@ def test_next_timeout_arms_after_the_handshake_flight() -> None:
 
 def test_idle_timeout_closes_http3_connection() -> None:
     config = dict(SERVER_CONFIG)
-    config["raw_transport_params"] = SERVER_CONFIG["raw_transport_params"] + b"\x01\x01\x05"  # max_idle_timeout = 5ms
+    config["transport_params"] = SERVER_CONFIG["transport_params"] + b"\x01\x01\x05"  # max_idle_timeout = 5ms
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
 
     conn.receive_datagram(CLIENT_HELLO, 1000)

@@ -229,25 +229,14 @@ fn readTransportInteger(dict: py.Object, key: [*c]const u8, target: *?u64, found
 
 fn transportParameters(
     obj: ?*c.PyObject,
-    raw_obj: ?*c.PyObject,
     default: []const u8,
     encoded: *std.ArrayListUnmanaged(u8),
 ) ?[]const u8 {
-    const has_typed = obj != null and !py.isNone(obj);
-    const has_raw = raw_obj != null and !py.isNone(raw_obj);
-    if (has_typed and has_raw) {
-        _ = py.raiseValue("transport_params and raw_transport_params are mutually exclusive");
-        return null;
-    }
-    if (has_raw) return py.asBytes(raw_obj);
-    if (!has_typed) return default;
+    if (obj == null or py.isNone(obj)) return default;
 
     const is_dict = c.PyObject_IsInstance(obj, @ptrCast(&c.PyDict_Type));
     if (is_dict < 0) return null;
-    if (is_dict == 0) {
-        _ = py.raiseType("transport_params must be a QuicTransportParameters dictionary");
-        return null;
-    }
+    if (is_dict == 0) return py.asBytes(obj);
 
     var configuration = TransportParameterConfiguration{};
     var found: usize = 0;
@@ -1686,7 +1675,7 @@ fn new_h2(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
 }
 
 // H3Connection(role, protocol=HTTP3, *, credentials=None, transport_params=None,
-// raw_transport_params=None, random=None, ephemeral_seed=None, alpn=None,
+// random=None, ephemeral_seed=None, alpn=None,
 // connection_id=None, server_name=None, resumption_identity=None,
 // resumption_psk=None, obfuscated_ticket_age=0, early_data=False,
 // remembered_transport_params=None, validation_token=None).
@@ -1699,7 +1688,6 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     var protocol_val: c_long = HTTP3;
     var credentials_obj: ?*c.PyObject = null;
     var tp_obj: ?*c.PyObject = null;
-    var raw_tp_obj: ?*c.PyObject = null;
     var random_obj: ?*c.PyObject = null;
     var ephemeral_obj: ?*c.PyObject = null;
     var alpn_obj: ?*c.PyObject = null;
@@ -1711,23 +1699,21 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     var remembered_tp_obj: ?*c.PyObject = null;
     var validation_token_obj: ?*c.PyObject = null;
     var kwlist = [_][*c]u8{
-        @constCast("role"),             @constCast("protocol"),                    @constCast("credentials"),
-        @constCast("transport_params"), @constCast("raw_transport_params"),        @constCast("random"),
-        @constCast("ephemeral_seed"),   @constCast("alpn"),                        @constCast("connection_id"),
-        @constCast("server_name"),      @constCast("resumption"),                  @constCast("obfuscated_ticket_age"),
-        @constCast("early_data"),       @constCast("remembered_transport_params"), @constCast("validation_token"),
-        null,
+        @constCast("role"),                        @constCast("protocol"),              @constCast("credentials"),
+        @constCast("transport_params"),            @constCast("random"),                @constCast("ephemeral_seed"),
+        @constCast("alpn"),                        @constCast("connection_id"),         @constCast("server_name"),
+        @constCast("resumption"),                  @constCast("obfuscated_ticket_age"), @constCast("early_data"),
+        @constCast("remembered_transport_params"), @constCast("validation_token"),      null,
     };
     if (c.PyArg_ParseTupleAndKeywords(
         args,
         kwds,
-        "l|l$OOOOOOOOOOOOO",
+        "l|l$OOOOOOOOOOOO",
         @ptrCast(&kwlist),
         &role_val,
         &protocol_val,
         &credentials_obj,
         &tp_obj,
-        &raw_tp_obj,
         &random_obj,
         &ephemeral_obj,
         &alpn_obj,
@@ -1747,7 +1733,7 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
         &DEFAULT_SERVER_TRANSPORT_PARAMS
     else
         &DEFAULT_CLIENT_TRANSPORT_PARAMS;
-    const tp_src = transportParameters(tp_obj, raw_tp_obj, default_tp, &encoded_tp) orelse return null;
+    const tp_src = transportParameters(tp_obj, default_tp, &encoded_tp) orelse return null;
 
     // Unpack the credential / resumption value objects into the raw byte objects the
     // builders consume. TlsCredentials(certificate, private_key) and
