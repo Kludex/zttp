@@ -8,7 +8,7 @@ from typing import Final, Literal, TypeVar, final, overload
 from typing_extensions import disjoint_base
 
 from zttp.config import SessionResumption, TlsCredentials
-from zttp.results import CloseInfo, DatagramHeader, SessionTicket
+from zttp.results import CloseInfo, DatagramHeader, LocalConnectionId, SessionTicket
 
 SERVER: Final = 1
 CLIENT: Final = 2
@@ -411,6 +411,14 @@ class H3Connection(Connection):
 
     def use_peer_connection_id(self, sequence_number: int, /) -> None:
         """Switch outgoing packets to a peer-issued `NEW_CONNECTION_ID` sequence."""
+
+    def local_connection_ids(self) -> list[LocalConnectionId]:
+        """Return a snapshot of every active local destination connection ID.
+
+        A newly issued ID appears before `issue_connection_id()` returns. An ID is
+        removed after `receive_datagram()` processes the peer's
+        `RETIRE_CONNECTION_ID`.
+        """
 
     def issue_connection_id(
         self,

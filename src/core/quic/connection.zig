@@ -210,6 +210,13 @@ const LocalCid = struct {
     retired: bool = false,
 };
 
+/// One active destination connection ID the integrator must route to this
+/// connection. The borrowed ID remains valid until the next connection operation.
+pub const LocalConnectionId = struct {
+    sequence_number: u64,
+    connection_id: []const u8,
+};
+
 const ParsedShortForLocalCid = struct {
     hdr: packet.ShortHeader,
     local_cid_seq: u64,
@@ -835,6 +842,34 @@ pub const Connection = struct {
         const gop = self.pending_new_cids.getOrPut(self.gpa, seq) catch return error.OutOfMemory;
         gop.value_ptr.* = .{ .retire_prior_to = retire_prior_to };
         self.local_cid_max_seq = seq;
+    }
+
+    /// Copy the active local connection IDs into `out`. A newly issued ID appears
+    /// immediately, before its `NEW_CONNECTION_ID` can be drained and sent. An ID
+    /// disappears after the peer's `RETIRE_CONNECTION_ID` is processed.
+    pub fn localConnectionIds(self: *const Connection, out: []LocalConnectionId) usize {
+        var count: usize = 0;
+        if (!self.local_initial_cid_retired and count < out.len) {
+            out[count] = .{ .sequence_number = 0, .connection_id = self.scid };
+            count += 1;
+        }
+        var iterator = self.local_cids.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.retired or count >= out.len) continue;
+            out[count] = .{ .sequence_number = entry.key_ptr.*, .connection_id = entry.value_ptr.cid };
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Return the number of active local connection IDs.
+    pub fn localConnectionIdCount(self: *const Connection) usize {
+        var count: usize = if (self.local_initial_cid_retired) 0 else 1;
+        var iterator = self.local_cids.valueIterator();
+        while (iterator.next()) |local| if (!local.retired) {
+            count += 1;
+        };
+        return count;
     }
 
     /// Drop the drained datagrams (the integrator has sent them).
@@ -2522,7 +2557,12 @@ pub const Connection = struct {
     fn onNewConnectionId(self: *Connection, seq: u64, retire_prior_to: u64, cid: []const u8, token: []const u8) Error!void {
         if (token.len != 16) return error.ProtocolViolation;
         if (retire_prior_to > self.peer_retire_prior_to) {
+            const previous_retire_prior_to = self.peer_retire_prior_to;
             self.peer_retire_prior_to = retire_prior_to;
+            if (previous_retire_prior_to == 0 and retire_prior_to > 0) {
+                const initial = self.pending_retire_cids.getOrPut(self.gpa, 0) catch return error.OutOfMemory;
+                if (!initial.found_existing) initial.value_ptr.* = .{};
+            }
             var retire: std.ArrayListUnmanaged(u64) = .empty;
             defer retire.deinit(self.gpa);
             var it = self.peer_cids.keyIterator();
@@ -2546,7 +2586,10 @@ pub const Connection = struct {
         }
         if (std.mem.eql(u8, cid, self.peer_scid) or self.peerCidValueExists(cid)) return error.ProtocolViolation;
 
-        if (self.peer_cids.count() + 2 > self.local_tp.active_connection_id_limit) return error.ProtocolViolation;
+        const active_initial: usize = if (self.peer_retire_prior_to == 0) 1 else 0;
+        if (self.peer_cids.count() + active_initial + 1 > self.local_tp.active_connection_id_limit) {
+            return error.ProtocolViolation;
+        }
         const owned = self.gpa.dupe(u8, cid) catch return error.OutOfMemory;
         errdefer self.gpa.free(owned);
         self.peer_cids.put(self.gpa, seq, .{ .cid = owned, .token = token_array }) catch return error.OutOfMemory;

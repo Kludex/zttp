@@ -1045,6 +1045,69 @@ def test_use_peer_connection_id_rejects_unknown_sequence() -> None:
         conn.use_peer_connection_id(1)
 
 
+def test_local_connection_ids_track_issue_and_peer_retirement() -> None:
+    client, server = handshake_pair()
+    initial = server.local_connection_ids()
+    assert len(initial) == 1
+    assert initial[0].sequence_number == 0
+
+    server.issue_connection_id(1, b"server-cid-1", b"\x5a" * 16)
+    assert {(item.sequence_number, item.connection_id) for item in server.local_connection_ids()} == {
+        (0, initial[0].connection_id),
+        (1, b"server-cid-1"),
+    }
+    transfer(server, client, 4000)
+    transfer(client, server, 5000)
+
+    client.use_peer_connection_id(1)
+    server.issue_connection_id(2, b"server-cid-2", b"\x6a" * 16, 1)
+    transfer(server, client, 6000)
+    client.initiate_connection()
+    transfer(client, server, 7000)
+
+    assert {(item.sequence_number, item.connection_id) for item in server.local_connection_ids()} == {
+        (1, b"server-cid-1"),
+        (2, b"server-cid-2"),
+    }
+
+
+def test_local_connection_ids_route_two_connections_on_one_endpoint() -> None:
+    pairs: list[tuple[zttp.H3Connection, zttp.H3Connection, bytes]] = []
+    routes: dict[bytes, zttp.H3Connection] = {}
+    for index, original in enumerate((b"client-a", b"client-b"), start=1):
+        config = dict(CLIENT_CONFIG)
+        config["connection_id"] = original
+        client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
+        server = make_server()
+        transfer(client, server, index * 1000)
+        transfer(server, client, index * 1000 + 100)
+        transfer(client, server, index * 1000 + 200)
+        rotated = f"server-cid-{index}".encode()
+        server.issue_connection_id(1, rotated, bytes((index,)) * 16)
+        for item in server.local_connection_ids():
+            routes[item.connection_id] = server
+        transfer(server, client, index * 1000 + 300)
+        transfer(client, server, index * 1000 + 400)
+        client.use_peer_connection_id(1)
+        pairs.append((client, server, rotated))
+
+    for index, (client, _server, _rotated) in enumerate(pairs, start=1):
+        client.send_request(b"GET", f"/connection-{index}".encode(), b"3", [(b"host", b"example.test")])
+        for datagram in client.data_to_send():
+            destination = next(connection_id for connection_id in routes if datagram[1:].startswith(connection_id))
+            routes[destination].receive_datagram(datagram, 5000 + index)
+
+    for index, (_client, server, rotated) in enumerate(pairs, start=1):
+        assert routes[rotated] is server
+        requests = [event for event in drain_events(server) if isinstance(event, zttp.Request)]
+        assert requests[-1].path == f"/connection-{index}".encode()
+
+
+def test_local_connection_ids_require_an_established_connection() -> None:
+    with pytest.raises(zttp.LocalProtocolError):
+        make_server().local_connection_ids()
+
+
 def test_issue_connection_id_queues_new_connection_id_datagram() -> None:
     _client, server = handshake_pair()
 
