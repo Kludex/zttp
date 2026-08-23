@@ -26,10 +26,12 @@ def test_credentials_and_resumption_need_both_halves() -> None:
 
 
 def test_tls_credentials_accept_an_ordered_certificate_chain() -> None:
+    source = [b"leaf", b"intermediate"]
     credentials = zttp.TlsCredentials(
-        certificates=(b"leaf", b"intermediate"),
+        certificates=source,  # type: ignore[arg-type]
         private_key=b"key",
     )
+    source.append(b"other")
     assert credentials.certificate_chain == (b"leaf", b"intermediate")
     assert credentials.certificate is None
 
