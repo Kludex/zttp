@@ -27,7 +27,6 @@ nav = [
   { "Reference" = [
     "reference/performance.md",
     "reference/api.md",
-    "reference/glossary.md",
   ] },
 ]
 
