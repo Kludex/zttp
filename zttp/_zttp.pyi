@@ -19,6 +19,20 @@ HTTP3: Final = 3
 
 _DefaultT = TypeVar("_DefaultT")
 
+def build_retry(
+    original_destination_connection_id: bytes,
+    client_source_connection_id: bytes,
+    server_source_connection_id: bytes,
+    token: bytes,
+    version: int = ...,
+) -> bytes:
+    """Build a stateless QUIC v1 Retry packet.
+
+    Pass the destination and source connection IDs from the client's Initial, a
+    new server source connection ID, and your opaque address-validation token.
+    The result includes the RFC 9001 Retry integrity tag.
+    """
+
 def parse_datagram_header(datagram: bytes, /) -> DatagramHeader:
     """Parse the routable prefix of a received QUIC datagram (RFC 9000 17).
 

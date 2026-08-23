@@ -1187,8 +1187,59 @@ fn parse_datagram_header(_: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Obj
     return row;
 }
 
+/// Build a QUIC v1 Retry packet without allocating connection state. The caller
+/// creates and validates the opaque token, including any client-address binding.
+fn build_retry(_: ?*c.PyObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    var original_obj: ?*c.PyObject = null;
+    var client_obj: ?*c.PyObject = null;
+    var server_obj: ?*c.PyObject = null;
+    var token_obj: ?*c.PyObject = null;
+    var version: c_uint = core.quic.constants.VERSION_1;
+    var kwlist = [_][*c]u8{
+        @constCast("original_destination_connection_id"),
+        @constCast("client_source_connection_id"),
+        @constCast("server_source_connection_id"),
+        @constCast("token"),
+        @constCast("version"),
+        null,
+    };
+    if (c.PyArg_ParseTupleAndKeywords(
+        args,
+        kwds,
+        "OOOO|I",
+        @ptrCast(&kwlist),
+        &original_obj,
+        &client_obj,
+        &server_obj,
+        &token_obj,
+        &version,
+    ) == 0) return null;
+
+    const original = py.asBytes(original_obj) orelse return null;
+    const client = py.asBytes(client_obj) orelse return null;
+    const server = py.asBytes(server_obj) orelse return null;
+    const token = py.asBytes(token_obj) orelse return null;
+    if (version != core.quic.constants.VERSION_1) return py.raiseValue("only QUIC version 1 Retry packets are supported");
+    if (original.len < 8 or original.len > core.quic.constants.MAX_CID_LEN) {
+        return py.raiseValue("original_destination_connection_id must be 8..20 bytes");
+    }
+    if (client.len > core.quic.constants.MAX_CID_LEN) {
+        return py.raiseValue("client_source_connection_id must be at most 20 bytes");
+    }
+    if (server.len == 0 or server.len > core.quic.constants.MAX_CID_LEN) {
+        return py.raiseValue("server_source_connection_id must be 1..20 bytes");
+    }
+    if (token.len == 0) return py.raiseValue("token must not be empty");
+
+    var packet: std.ArrayListUnmanaged(u8) = .empty;
+    defer packet.deinit(gpa);
+    core.quic.packet.writeRetry(&packet, gpa, client, server, token, original) catch return c.PyErr_NoMemory();
+    return py.fromBytes(packet.items);
+}
+
 pub var module_methods = [_]c.PyMethodDef{
     .{ .ml_name = "parse_datagram_header", .ml_meth = parse_datagram_header, .ml_flags = c.METH_O, .ml_doc = "Parse the routable prefix of a received QUIC datagram: parse_datagram_header(datagram) -> DatagramHeader. Reads no connection state; for demultiplexing a shared UDP socket by connection id." },
+    .{ .ml_name = "build_retry", .ml_meth = @ptrCast(&build_retry), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Build a stateless QUIC v1 Retry packet." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

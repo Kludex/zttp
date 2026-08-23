@@ -124,6 +124,56 @@ def test_parse_datagram_header_routes_a_client_initial() -> None:
     assert header.destination_connection_id == b"\xaa\xbb\xcc\xdd"
 
 
+def test_build_retry_makes_a_client_retransmit_its_initial() -> None:
+    config = dict(CLIENT_CONFIG)
+    config["connection_id"] = b"original"
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
+    initial = client.data_to_send()[0]
+    header = zttp.parse_datagram_header(initial)
+    retry = zttp.build_retry(
+        header.destination_connection_id,
+        header.source_connection_id,
+        b"retry-server-cid",
+        b"opaque-address-token",
+    )
+
+    retry_header = zttp.parse_datagram_header(retry)
+    assert retry_header.destination_connection_id == header.source_connection_id
+    assert retry_header.source_connection_id == b"retry-server-cid"
+    client.receive_datagram(retry, 1000)
+    retried_initial = client.data_to_send()[0]
+    assert zttp.parse_datagram_header(retried_initial).destination_connection_id == b"retry-server-cid"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"original_destination_connection_id": b"short"},
+        {"original_destination_connection_id": b"x" * 21},
+        {"client_source_connection_id": b"x" * 21},
+        {"server_source_connection_id": b""},
+        {"server_source_connection_id": b"x" * 21},
+        {"token": b""},
+        {"version": 2},
+    ],
+)
+def test_build_retry_rejects_invalid_inputs(kwargs: dict[str, object]) -> None:
+    values: dict[str, object] = {
+        "original_destination_connection_id": b"original",
+        "client_source_connection_id": b"client",
+        "server_source_connection_id": b"server",
+        "token": b"token",
+    }
+    values.update(kwargs)
+    with pytest.raises(ValueError):
+        zttp.build_retry(**values)  # type: ignore[arg-type]
+
+
+def test_build_retry_requires_bytes() -> None:
+    with pytest.raises(TypeError):
+        zttp.build_retry(b"original", b"client", b"server", object())  # type: ignore[arg-type]
+
+
 def test_parse_datagram_header_reports_a_short_header() -> None:
     header = zttp.parse_datagram_header(b"\x40\x01\x02\x03")  # form bit clear = short header
     assert not header.is_long_header

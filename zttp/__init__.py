@@ -28,6 +28,7 @@ from zttp._zttp import (
     Settings,
     Stream,
     WindowUpdate,
+    build_retry,
     parse_datagram_header,
 )
 from zttp.config import SessionResumption, TlsCredentials
@@ -83,5 +84,6 @@ __all__ = [
     "Stream",
     "TlsCredentials",
     "WindowUpdate",
+    "build_retry",
     "parse_datagram_header",
 ]
