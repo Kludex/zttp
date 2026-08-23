@@ -20,8 +20,8 @@ test that feeds canned bytes? With a new async library? You're rewriting glue.
 [Sans-IO](https://sans-io.readthedocs.io/) flips it around. The parser is a pure
 state machine over bytes:
 
-* You give it bytes whenever you have them: `receive_data(data)`.
-* You ask it what happened, when you're ready: `next_event()`.
+* You give it bytes whenever you have them: `receive_event(data)` on HTTP/1.1.
+* You pull any additional events when you're ready: `next_event()`.
 
 It never reads a socket, never calls you back, never blocks. **You** own the I/O
 and the control flow; zttp owns only the protocol.
@@ -30,8 +30,8 @@ and the control flow; zttp owns only the protocol.
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)
-conn.receive_data(raw)        # bytes from wherever: socket, file, test
-event = conn.next_event()     # pull, when you want it
+event = conn.receive_event(raw)  # bytes from wherever: socket, file, test
+next_event = conn.next_event()   # pull another event, when you want it
 ```
 
 That shape is what you get for free:
@@ -65,14 +65,7 @@ emits each body span as a single `Data` event instead of a stream of callbacks.
 zttp is layered the same way [zloop](https://github.com/Kludex/zloop) is, and each
 layer depends only on the one below it:
 
-```mermaid
-flowchart TB
-    py["Python package: the public API"]
-    edge["C-API adapter: Connection, events, exceptions"]
-    core["Zig core: sans-IO parser, no Python.h"]
-
-    py --> edge --> core
-```
+![The Python package calls the C-API adapter, which calls the pure Zig core.](assets/diagrams/architecture.svg)
 
 The **core** is pure Zig with no CPython. It's the parser: a sans-IO state machine
 that turns bytes into events and back. It's where the real work and the real tests
@@ -95,11 +88,14 @@ build the connection:
 conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
 ```
 
-The read API (`receive_data` / `next_event`) and the `Request` / `Response` /
-`Data` / `EndOfMessage` payloads are **shared** across all three. An HTTP/2 or
-HTTP/3 request collapses its pseudo-headers into the same shape HTTP/1.1 uses
-(`:method` -> method, `:path` -> target, `:authority` -> a synthesized `host`
-header), so the events you handle look the same whatever the wire format was.
+The `next_event` API and the `Request` / `Response` / `Data` / `EndOfMessage`
+payloads are **shared** across all three. The feed call matches the transport:
+HTTP/1.1 can feed and parse with `receive_event`, HTTP/2 feeds a TCP byte stream
+with `receive_data`, and HTTP/3 feeds UDP packets with `receive_datagram`. An
+HTTP/2 or HTTP/3 request collapses its pseudo-headers into the same shape
+HTTP/1.1 uses (`:method` -> method, `:path` -> target, `:authority` -> a
+synthesized `host` header), so the events you handle look the same whatever the
+wire format was.
 
 What differs is each protocol's **event union**, so its surface is exactly as wide
 as its reality. HTTP/1.1 is a single stream and adds nothing. HTTP/2 and HTTP/3

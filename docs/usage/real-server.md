@@ -30,10 +30,11 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
                 event = conn.next_event()
                 if event is zttp.NEED_DATA:
                     data = await reader.read(65536)
-                    conn.receive_data(data)  # b"" signals EOF, which unblocks the parser
+                    event = conn.receive_event(data)  # b"" signals EOF
                     if not data:
                         return
-                    continue
+                    if event is zttp.NEED_DATA:
+                        continue
                 if isinstance(event, zttp.Request):
                     request = event
                     if event.end_stream:
@@ -92,23 +93,25 @@ sans-IO loop. Here's each piece.
 
 ## The read loop: refill on `NEED_DATA`
 
-The inner `while True` pulls events. When `next_event()` returns `NEED_DATA`, the
-parser has consumed everything you gave it and needs more, so you read from the
-socket and feed it in:
+The inner `while True` pulls buffered events. When `next_event()` returns
+`NEED_DATA`, the parser has consumed everything you gave it and needs more. Read
+from the socket, then use `receive_event` to feed the bytes and return the first
+event in one extension call:
 
 ```python
 event = conn.next_event()
 if event is zttp.NEED_DATA:
     data = await reader.read(65536)
-    conn.receive_data(data)
+    event = conn.receive_event(data)
     if not data:
         return          # the client closed; nothing more is coming
-    continue
+    if event is zttp.NEED_DATA:
+        continue
 ```
 
 This is the whole sans-IO contract: **you** decide when to read, so backpressure
-is yours. An empty read is EOF - feed the empty bytes (it lets the parser finalize
-a body that ends at connection close) and stop.
+is yours. An empty read is EOF. Feed the empty bytes so the parser can finalize
+a message that ends when the connection closes.
 
 ## Dispatching events
 
@@ -180,11 +183,11 @@ except zttp.RemoteProtocolError:
 ```
 
 !!! tip "This is HTTP/1.1"
-    The read loop above is identical for every protocol - `receive_data` /
-    `next_event`. Only the **send** side changes: on HTTP/2 and HTTP/3 you answer
-    on a [`Stream`](http2.md) (`conn.stream(request.stream_id)`) because one
-    connection carries many requests at once. Swap the socket read for
-    `receive_datagram` and you have an HTTP/3 server.
+    Event draining is shared across all protocols, but each transport has its
+    own feed call. HTTP/1.1 uses `receive_event`, HTTP/2 uses `receive_data`, and
+    HTTP/3 uses `receive_datagram`. On HTTP/2 and HTTP/3 you also answer on a
+    [`Stream`](http2.md) (`conn.stream(request.stream_id)`) because one
+    connection carries many requests at once.
 
 ## Where to go next
 

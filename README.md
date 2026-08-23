@@ -43,9 +43,10 @@ hand-written Zig engine underneath instead of pure Python.
 
 The key features are:
 
-* **Sans-IO**: a clean, event-based API. Feed bytes with `receive_data`, pull
-  `Request` / `Data` / `EndOfMessage` events with `next_event`. No callbacks, no
-  sockets, no surprises.
+* **Sans-IO**: a clean, event-based API. Feed HTTP/1.1 bytes with
+  `receive_event`, then pull any additional `Request` / `Data` /
+  `EndOfMessage` events with `next_event`. No callbacks, no sockets, no
+  surprises.
 * **HTTP/1.1, HTTP/2, and HTTP/3**: the *same* event API for all three, selected
   with one `protocol=` argument.
 * **Fast**: faster than [httptools](https://github.com/MagicStack/httptools) (a C
@@ -79,9 +80,7 @@ You play the **server**: bytes come in, events come out.
 import zttp
 
 conn = zttp.Connection(zttp.SERVER)
-conn.receive_data(b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
-
-request = conn.next_event()  # Request(...)
+request = conn.receive_event(b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
 request.end_stream           # True: this bodyless request is already complete
 conn.next_event()   # NEED_DATA
 
@@ -98,9 +97,11 @@ The read side yields `Request` / `Response` / `Data` / `EndOfMessage`, or the
 head, body data, and the end of the message, framing the body (Content-Length or
 chunked) for you.
 
-Feed `receive_data` whatever you have — a whole message, a fragment, or a single
-byte — and zttp buffers and resumes. There are **no callbacks**: you *pull*
-events when *you* are ready. That's what sans-IO means.
+Pass `receive_event` whatever HTTP/1.1 bytes you have - a whole message, a
+fragment, or a single byte. It returns the first complete event, and
+`next_event` pulls any events that follow. zttp buffers partial input and
+resumes. There are **no callbacks**: you *pull* events when *you* are ready.
+That's what sans-IO means.
 
 ## One API, three protocols
 

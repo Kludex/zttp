@@ -27,6 +27,7 @@ nav = [
   { "Reference" = [
     "reference/performance.md",
     "reference/api.md",
+    "reference/glossary.md",
   ] },
 ]
 
@@ -128,9 +129,6 @@ pygments_lang_class = true
 base_path = ["."]
 check_paths = true
 [project.markdown_extensions.pymdownx.superfences]
-custom_fences = [
-  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" }
-]
 [project.markdown_extensions.pymdownx.tabbed]
 alternate_style = true
 combine_header_slug = true
