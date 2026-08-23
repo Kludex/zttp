@@ -69,14 +69,17 @@ def test_post_content_length() -> None:
 def test_zero_content_length_has_no_data() -> None:
     events = parse_request(b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
     assert not any(isinstance(e, zttp.Data) for e in events)
-    assert isinstance(events[-1], zttp.Request)
-    assert events[-1].end_stream is True
+    request = events[-1]
+    assert isinstance(request, zttp.Request)
+    assert request.end_stream is True
 
 
 def test_no_body_get_completes_on_request() -> None:
     events = parse_request(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
     assert len(events) == 1
-    assert events[0].end_stream is True
+    request = events[0]
+    assert isinstance(request, zttp.Request)
+    assert request.end_stream is True
 
 
 def test_chunked_body() -> None:
@@ -108,6 +111,7 @@ def test_headers_are_owned_and_sequence_compatible() -> None:
     conn.receive_data(b"GET /one HTTP/1.1\r\nHost: first\r\nX-Test: a\r\nX-Test: b\r\n\r\n")
     req = conn.next_event()
 
+    assert isinstance(req, zttp.Request)
     assert isinstance(req.headers, zttp.HeaderBlock)
     assert len(req.headers) == 3
     assert req.headers[0] == (b"Host", b"first")
@@ -126,7 +130,7 @@ def test_headers_are_owned_and_sequence_compatible() -> None:
     with pytest.raises(IndexError, match="header index out of range"):
         req.headers[3]
     with pytest.raises(TypeError, match="header indices must be integers or slices"):
-        req.headers[b"Host"]  # type: ignore[index]
+        req.headers[b"Host"]  # ty: ignore[invalid-argument-type]
     assert req.headers.to_list(lowercase_names=True) == [
         (b"host", b"first"),
         (b"x-test", b"a"),
@@ -146,7 +150,9 @@ def test_header_block_releases_its_heap_type_reference() -> None:
         for _ in range(100):
             conn = zttp.Connection(zttp.SERVER)
             conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-            conn.next_event().headers
+            request = conn.next_event()
+            assert isinstance(request, zttp.Request)
+            _ = request.headers
 
     # Warm any interpreter-level caches before measuring the type reference.
     create_blocks()
@@ -162,11 +168,12 @@ def test_h1_headers_are_immutable_by_default() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
     req = conn.next_event()
+    assert isinstance(req, zttp.Request)
     assert isinstance(req.headers, zttp.HeaderBlock)
     with pytest.raises(AttributeError):
-        req.headers.append((b"X", b"y"))  # type: ignore[attr-defined]
+        req.headers.append((b"X", b"y"))  # ty: ignore[unresolved-attribute]
     with pytest.raises(TypeError, match="created by HTTP/1 parsing"):
-        zttp.HeaderBlock()  # type: ignore[call-arg]
+        zttp.HeaderBlock()
 
 
 def test_header_value_whitespace_stripped() -> None:
@@ -190,10 +197,14 @@ def test_body_split_across_feeds() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nhel")
     assert isinstance(conn.next_event(), zttp.Request)
-    assert conn.next_event().data == b"hel"
+    first = conn.next_event()
+    assert isinstance(first, zttp.Data)
+    assert first.data == b"hel"
     assert conn.next_event() is zttp.NEED_DATA
     conn.receive_data(b"loworld")
-    assert conn.next_event().data == b"loworld"
+    second = conn.next_event()
+    assert isinstance(second, zttp.Data)
+    assert second.data == b"loworld"
     assert isinstance(conn.next_event(), zttp.EndOfMessage)
 
 
@@ -282,10 +293,13 @@ def test_keep_alive_two_requests() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: y\r\n\r\n")
     first = conn.next_event()
+    assert isinstance(first, zttp.Request)
     assert first.target == b"/a"
     assert first.end_stream is True
     conn.start_next_cycle()
-    assert conn.next_event().target == b"/b"
+    second = conn.next_event()
+    assert isinstance(second, zttp.Request)
+    assert second.target == b"/b"
 
 
 def test_response_parsing() -> None:
@@ -298,7 +312,9 @@ def test_response_parsing() -> None:
     assert resp.http_version == b"1.1"
     assert isinstance(resp.headers, zttp.HeaderBlock)
     assert resp.headers.get(b"content-length") == b"3"
-    assert conn.next_event().data == b"xyz"
+    data = conn.next_event()
+    assert isinstance(data, zttp.Data)
+    assert data.data == b"xyz"
 
 
 @pytest.mark.parametrize(
@@ -333,7 +349,9 @@ def test_response_until_close() -> None:
     conn = zttp.Connection(zttp.CLIENT)
     conn.receive_data(b"HTTP/1.1 200 OK\r\nServer: z\r\n\r\nbody here")
     assert isinstance(conn.next_event(), zttp.Response)
-    assert conn.next_event().data == b"body here"
+    data = conn.next_event()
+    assert isinstance(data, zttp.Data)
+    assert data.data == b"body here"
     assert conn.next_event() is zttp.NEED_DATA
     conn.receive_data(b"")  # EOF
     assert isinstance(conn.next_event(), zttp.EndOfMessage)
@@ -399,11 +417,15 @@ def test_body_and_pipelined_request_in_one_feed() -> None:
         b"POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nfirstPOST /b HTTP/1.1\r\nContent-Length: 6\r\n\r\nsecond"
     )
     events = list(drain(conn))
-    assert events[0].target == b"/a"
+    first = events[0]
+    assert isinstance(first, zttp.Request)
+    assert first.target == b"/a"
     assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == b"first"
     conn.start_next_cycle()
     events = list(drain(conn))
-    assert events[0].target == b"/b"
+    second = events[0]
+    assert isinstance(second, zttp.Request)
+    assert second.target == b"/b"
     assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == b"second"
 
 

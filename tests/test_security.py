@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+from collections.abc import Callable
 
 import pytest
 
@@ -29,7 +30,7 @@ def test_h2_synthesizing_sequence_headers_roundtrip() -> None:
 
     n = 40
     client = zttp.Connection(zttp.CLIENT)
-    client.send_request(b"GET", b"/", b"1.1", Synth(n))
+    client.send_request(b"GET", b"/", b"1.1", Synth(n))  # ty: ignore[invalid-argument-type]
     client.end_message()
     wire = client.data_to_send()
 
@@ -96,7 +97,7 @@ def test_bare_lf_request_rejected_by_default() -> None:
         lambda c: c.send_request(b"GET", b"/", b"1.1", [(b"Bad Name", b"x")]),
     ],
 )
-def test_send_path_injection_rejected(call) -> None:  # type: ignore[no-untyped-def]
+def test_send_path_injection_rejected(call: Callable[[zttp.H1Connection], object]) -> None:
     conn = zttp.Connection(zttp.SERVER)
     with pytest.raises(zttp.LocalProtocolError):
         call(conn)
@@ -121,9 +122,9 @@ def test_event_cycle_is_collectable() -> None:
         e = c.next_event()
         assert isinstance(e, zttp.EndOfMessage)
         can = Canary()
-        e.trailers.append(e)
-        e.trailers.append(can)
-        can.back = e
+        e.trailers.append(e)  # ty: ignore[invalid-argument-type]
+        e.trailers.append(can)  # ty: ignore[invalid-argument-type]
+        can.back = e  # ty: ignore[unresolved-attribute]
 
     for _ in range(25):
         make_cycle()
