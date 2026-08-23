@@ -439,9 +439,6 @@ class H3Connection(Connection):
     def _endpoint_ready(self) -> bool:
         """Return whether the first Initial was authenticated."""
 
-    def _endpoint_connection_ids(self) -> list[bytes]:
-        """Return active local connection IDs for endpoint routing."""
-
     def challenge_path(self, peer_address: bytes, data: bytes, /) -> None:
         """Queue a QUIC `PATH_CHALLENGE` to a peer address (`data` must be 8 unpredictable bytes)."""
 

@@ -839,19 +839,6 @@ pub const Connection = struct {
         return self.initial_authenticated;
     }
 
-    /// Append every active local connection ID that can route packets here.
-    pub fn appendActiveLocalConnectionIds(
-        self: *const Connection,
-        out: *std.ArrayListUnmanaged([]const u8),
-        gpa: std.mem.Allocator,
-    ) Error!void {
-        if (!self.local_initial_cid_retired) out.append(gpa, self.scid) catch return error.OutOfMemory;
-        var it = self.local_cids.valueIterator();
-        while (it.next()) |entry| {
-            if (!entry.retired) out.append(gpa, entry.cid) catch return error.OutOfMemory;
-        }
-    }
-
     /// The built datagrams as one contiguous buffer; pair with `datagramLengths`.
     pub fn datagramsToSend(self: *Connection) []const u8 {
         return self.out.items;
@@ -2042,13 +2029,12 @@ pub const Connection = struct {
         const space = Space.initial;
         const st = &self.spaces[@intFromEnum(space)];
         st.crypto_send.write(bytes, false) catch return error.OutOfMemory;
-        const chunk = st.crypto_send.peek(constants.MIN_INITIAL_DATAGRAM) orelse return;
+        const chunk = st.crypto_send.peek(self.framePayloadRoom(space)) orelse return;
         var frames: std.ArrayListUnmanaged(u8) = .empty;
         defer frames.deinit(self.gpa);
         frame.encodeCrypto(&frames, self.gpa, chunk.offset, chunk.data) catch return error.OutOfMemory;
-        while (frames.items.len < constants.MIN_INITIAL_DATAGRAM) {
-            frames.append(self.gpa, 0x00) catch return error.OutOfMemory;
-        }
+        const target = try self.minimumInitialFramePayload();
+        while (frames.items.len < target) frames.append(self.gpa, 0x00) catch return error.OutOfMemory;
         st.crypto_sent.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
         const pn = try self.buildPacket(space, frames.items, true, now);
         st.crypto_sent.putAssumeCapacity(pn, .{ .offset = chunk.offset, .len = chunk.data.len });
@@ -2071,9 +2057,8 @@ pub const Connection = struct {
             defer frames.deinit(self.gpa);
             frame.encodeCrypto(&frames, self.gpa, chunk.offset, chunk.data) catch return error.OutOfMemory;
             if (self.role == .client and space == .initial) {
-                while (frames.items.len < constants.MIN_INITIAL_DATAGRAM) {
-                    frames.append(self.gpa, 0x00) catch return error.OutOfMemory;
-                }
+                const target = try self.minimumInitialFramePayload();
+                while (frames.items.len < target) frames.append(self.gpa, 0x00) catch return error.OutOfMemory;
             }
             st.crypto_sent.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
             const pn = self.buildPacket(space, frames.items, true, now) catch |e| switch (e) {
@@ -2135,6 +2120,30 @@ pub const Connection = struct {
             else => return e,
         };
         st.ack_pending = false;
+    }
+
+    fn minimumInitialFramePayload(self: *const Connection) Error!usize {
+        const space = Space.initial;
+        const st = &self.spaces[@intFromEnum(space)];
+        const pn_len = packet.packetNumberLen(st.next_pn, st.rec.largest_acked);
+        const token = self.initial_token orelse &.{};
+        const room = self.framePayloadRoom(space);
+        var header: std.ArrayListUnmanaged(u8) = .empty;
+        defer header.deinit(self.gpa);
+        _ = packet.writeLongHeader(
+            &header,
+            self.gpa,
+            .initial,
+            constants.VERSION_1,
+            self.peer_scid,
+            self.scid,
+            token,
+            pn_len + room + crypto.TAG_LEN,
+            pn_len,
+        ) catch return error.OutOfMemory;
+        const overhead = header.items.len + pn_len + crypto.TAG_LEN;
+        if (overhead >= constants.MIN_INITIAL_DATAGRAM) return 0;
+        return constants.MIN_INITIAL_DATAGRAM - overhead;
     }
 
     fn framePayloadRoom(self: *const Connection, space: Space) usize {

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast
 
-from typing_extensions import Protocol
+from typing_extensions import Protocol, TypedDict
 
 from zttp._tokens import AddressValidationContext, RetryContext, TokenCodec
 from zttp._zttp import (
@@ -30,11 +30,22 @@ def _random_connection_id(length: int) -> bytes:
     return secrets.token_bytes(length)
 
 
+class _AcceptanceParameters(TypedDict):
+    datagram: bytes
+    peer_address: bytes
+    now: int
+    initial_destination_connection_id: bytes
+    server_connection_id: bytes
+    original_destination_connection_id: bytes | None
+    address_validated: bool
+
+
 @dataclass
 class _ConnectionState:
     connection: H3Connection
     initial_destination_connection_id: bytes
     peer_address: bytes
+    connection_ids: set[bytes] = field(default_factory=set)
 
 
 class QuicEndpoint:
@@ -94,6 +105,8 @@ class QuicEndpoint:
             self._sync_routes(state)
             return state.connection
         if header.is_long_header and header.version not in {0, 1}:
+            if len(datagram) < 1200:
+                return None
             packet = _build_version_negotiation(
                 header.destination_connection_id,
                 header.source_connection_id,
@@ -106,23 +119,27 @@ class QuicEndpoint:
         context = self._token_codec.validate(peer_address, header.token, now) if header.token else None
         if isinstance(context, AddressValidationContext):
             return self._accept(
-                datagram,
-                peer_address,
-                now,
-                header.destination_connection_id,
-                self._new_connection_id(),
-                None,
-                True,
+                {
+                    "datagram": datagram,
+                    "peer_address": peer_address,
+                    "now": now,
+                    "initial_destination_connection_id": header.destination_connection_id,
+                    "server_connection_id": self._new_connection_id(),
+                    "original_destination_connection_id": None,
+                    "address_validated": True,
+                }
             )
         if not self._retry:
             return self._accept(
-                datagram,
-                peer_address,
-                now,
-                header.destination_connection_id,
-                self._new_connection_id(),
-                None,
-                False,
+                {
+                    "datagram": datagram,
+                    "peer_address": peer_address,
+                    "now": now,
+                    "initial_destination_connection_id": header.destination_connection_id,
+                    "server_connection_id": self._new_connection_id(),
+                    "original_destination_connection_id": None,
+                    "address_validated": False,
+                }
             )
         if len(header.destination_connection_id) < 8:
             return None
@@ -144,13 +161,15 @@ class QuicEndpoint:
         ):
             return None
         return self._accept(
-            datagram,
-            peer_address,
-            now,
-            header.destination_connection_id,
-            header.destination_connection_id,
-            context.original_destination_connection_id,
-            True,
+            {
+                "datagram": datagram,
+                "peer_address": peer_address,
+                "now": now,
+                "initial_destination_connection_id": header.destination_connection_id,
+                "server_connection_id": header.destination_connection_id,
+                "original_destination_connection_id": context.original_destination_connection_id,
+                "address_validated": True,
+            }
         )
 
     def issue_connection_id(
@@ -182,7 +201,6 @@ class QuicEndpoint:
         outgoing = self._outgoing
         self._outgoing = []
         for state in self._connections:
-            self._sync_routes(state)
             for datagram, peer_address in state.connection.data_to_send_with_addresses():
                 outgoing.append((datagram, cast(bytes, peer_address)))
         return outgoing
@@ -222,16 +240,7 @@ class QuicEndpoint:
             raise RuntimeError("connection_id_factory returned an active connection ID")
         return connection_id
 
-    def _accept(
-        self,
-        datagram: bytes,
-        peer_address: bytes,
-        now: int,
-        initial_dcid: bytes,
-        server_cid: bytes,
-        original_dcid: bytes | None,
-        address_validated: bool,
-    ) -> H3Connection | None:
+    def _accept(self, parameters: _AcceptanceParameters) -> H3Connection | None:
         connection = Connection(
             SERVER,
             HTTP3,
@@ -240,20 +249,30 @@ class QuicEndpoint:
             alpn=self._alpn,
             resumption=self._resumption,
         )
-        connection._set_endpoint_context(server_cid, original_dcid, address_validated)
-        connection.receive_datagram(datagram, now, peer_address)
+        connection._set_endpoint_context(
+            parameters["server_connection_id"],
+            parameters["original_destination_connection_id"],
+            parameters["address_validated"],
+        )
+        connection.receive_datagram(parameters["datagram"], parameters["now"], parameters["peer_address"])
         if not connection._endpoint_ready():
             return None
-        state = _ConnectionState(connection, initial_dcid, peer_address)
+        state = _ConnectionState(
+            connection,
+            parameters["initial_destination_connection_id"],
+            parameters["peer_address"],
+        )
         self._connections.append(state)
         self._sync_routes(state)
         return connection
 
     def _sync_routes(self, state: _ConnectionState) -> None:
-        self._long_routes = {cid: item for cid, item in self._long_routes.items() if item is not state}
-        self._short_routes = {cid: item for cid, item in self._short_routes.items() if item is not state}
+        connection_ids = {item.connection_id for item in state.connection.local_connection_ids()}
+        for connection_id in state.connection_ids - connection_ids:
+            self._long_routes.pop(connection_id, None)
+            self._short_routes.pop(connection_id, None)
         self._long_routes[state.initial_destination_connection_id] = state
-        for connection_id in state.connection._endpoint_connection_ids():
+        for connection_id in connection_ids - state.connection_ids:
             if len(connection_id) != self._connection_id_length:
                 raise RuntimeError(
                     "endpoint connection IDs must use connection_id_length"
@@ -266,3 +285,4 @@ class QuicEndpoint:
                 raise RuntimeError("connection issued an active connection ID")  # pragma: no cover - API bypass
             self._long_routes[connection_id] = state
             self._short_routes[connection_id] = state
+        state.connection_ids = connection_ids

@@ -33,6 +33,10 @@ class ServerConfig(TypedDict):
     ephemeral_seed: bytes
 
 
+class RetryTokenCase(TypedDict):
+    token_change: str
+
+
 class ClientConfig(TypedDict):
     transport_params: zttp.QuicTransportParameters
     random: bytes
@@ -203,7 +207,7 @@ def test_quic_endpoint_completes_retry_and_routes_the_connection() -> None:
         assert endpoint.receive_datagram(datagram, b"client-address", 7000) is server
     assert any(isinstance(event, zttp.Request) for event in drain_events(server))
 
-    replacement_connection_id = endpoint.issue_connection_id(server, 1)
+    replacement_connection_id = endpoint.issue_connection_id(server, 1, retire_prior_to=1)
     assert replacement_connection_id == b"n" * 16
     for datagram, _ in endpoint.data_to_send():
         client.receive_datagram(datagram, 8000)
@@ -239,8 +243,15 @@ def test_quic_endpoint_completes_retry_and_routes_the_connection() -> None:
     assert endpoint.next_timeout() is not None
 
 
-@pytest.mark.parametrize("token_change", ["address", "expired", "future", "tampered", "short", "destination"])
-def test_quic_endpoint_rejects_invalid_retry_tokens(token_change: str) -> None:
+@pytest.mark.parametrize(
+    "case",
+    [
+        {"token_change": token_change}
+        for token_change in ("address", "expired", "future", "tampered", "short", "destination")
+    ],
+)
+def test_quic_endpoint_rejects_invalid_retry_tokens(case: RetryTokenCase) -> None:
+    token_change = case["token_change"]
     endpoint = zttp.QuicEndpoint(
         retry=True,
         token_secret=b"s" * 32,
@@ -316,7 +327,7 @@ def test_http3_client_construction_emits_an_initial() -> None:
     assert type(conn) is zttp.H3Connection
     datagrams = conn.data_to_send()
     assert len(datagrams) == 1
-    assert len(datagrams[0]) >= 1200
+    assert len(datagrams[0]) == 1200
     assert datagrams[0][0] & 0x80
     assert conn.data_to_send() == []
 
@@ -326,6 +337,7 @@ def test_http3_client_initial_can_carry_validation_token() -> None:
     config["connection_id"] = b"\x11\x22\x33\x4d"
     conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config, validation_token=b"validated-earlier")
     [initial] = conn.data_to_send()
+    assert len(initial) == 1200
     assert b"validated-earlier" in initial
 
 
@@ -351,7 +363,7 @@ def test_http3_client_defaults_transport_settings_and_connection_id() -> None:
     conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
     datagrams = conn.data_to_send()
     assert len(datagrams) == 1
-    assert len(datagrams[0]) >= 1200
+    assert len(datagrams[0]) == 1200
 
 
 def test_http3_default_client_and_server_exchange_request() -> None:
@@ -887,13 +899,13 @@ def test_http3_client_request_trailers() -> None:
 
 
 def test_http3_receive_credit_waits_for_application_consumption() -> None:
-    config = dict(SERVER_CONFIG)
-    config["transport_params"] = (
-        b"\x04\x02\x42\x00"  # initial_max_data = 512
-        b"\x06\x02\x42\x00"  # initial_max_stream_data_bidi_remote = 512
-        b"\x07\x04\x80\x04\x00\x00"  # initial_max_stream_data_uni = 262144
-        b"\x08\x01\x08"  # initial_max_streams_bidi = 8
-        b"\x09\x01\x08"  # initial_max_streams_uni = 8
+    config: ResumedServerConfig = SERVER_CONFIG.copy()
+    config["transport_params"] = zttp.QuicTransportParameters(
+        initial_max_data=512,
+        initial_max_stream_data_bidi_remote=512,
+        initial_max_stream_data_uni=262144,
+        initial_max_streams_bidi=8,
+        initial_max_streams_uni=8,
     )
     client = make_client()
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
@@ -1368,7 +1380,7 @@ def test_local_connection_ids_route_two_connections_on_one_endpoint() -> None:
     pairs: list[tuple[zttp.H3Connection, zttp.H3Connection, bytes]] = []
     routes: dict[bytes, zttp.H3Connection] = {}
     for index, original in enumerate((b"client-a", b"client-b"), start=1):
-        config = dict(CLIENT_CONFIG)
+        config: ResumedClientConfig = CLIENT_CONFIG.copy()
         config["connection_id"] = original
         client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
         server = make_server()

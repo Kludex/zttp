@@ -796,9 +796,11 @@ const H3Engine = struct {
             }
         }
         const owned_server_cid = gpa.dupe(u8, server_cid) catch return c.PyErr_NoMemory();
-        errdefer gpa.free(owned_server_cid);
         const owned_original_dcid = if (original_dcid) |cid|
-            gpa.dupe(u8, cid) catch return c.PyErr_NoMemory()
+            gpa.dupe(u8, cid) catch {
+                gpa.free(owned_server_cid);
+                return c.PyErr_NoMemory();
+            }
         else
             null;
         self.endpoint_server_cid = owned_server_cid;
@@ -809,24 +811,6 @@ const H3Engine = struct {
 
     fn endpointReady(self: *const H3Engine) py.Object {
         return py.boolean(if (self.qc) |q| q.hasAuthenticatedInitial() else false);
-    }
-
-    fn endpointConnectionIds(self: *const H3Engine) py.Object {
-        const q = self.qc orelse return py.newList(0);
-        var connection_ids: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer connection_ids.deinit(gpa);
-        q.appendActiveLocalConnectionIds(&connection_ids, gpa) catch return c.PyErr_NoMemory();
-        const list = py.newList(@intCast(connection_ids.items.len));
-        if (list == null) return null;
-        for (connection_ids.items, 0..) |connection_id, index| {
-            const item = py.fromBytes(connection_id);
-            if (item == null) {
-                py.decref(list);
-                return null;
-            }
-            py.listSet(list, @intCast(index), item);
-        }
-        return list;
     }
 
     fn nextEvent(self: *H3Engine) py.Object {
@@ -2745,15 +2729,6 @@ fn h3_endpoint_ready(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Ob
     };
 }
 
-fn h3_endpoint_connection_ids(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
-    const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
-    return switch (engine.*) {
-        .h3 => |*e| e.endpointConnectionIds(),
-        else => py.raiseRuntime("endpoint connection IDs are only valid for an HTTP/3 connection"),
-    };
-}
-
 fn h3_challenge_path(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
@@ -3101,7 +3076,6 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "data_to_send_with_addresses", .ml_meth = h3_data_to_send_with_addresses, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams as (datagram, peer_address) pairs. peer_address is None when no address key is known." },
     .{ .ml_name = "_set_endpoint_context", .ml_meth = h3_set_endpoint_context, .ml_flags = c.METH_VARARGS, .ml_doc = "Configure endpoint-selected connection IDs before receiving the first Initial." },
     .{ .ml_name = "_endpoint_ready", .ml_meth = h3_endpoint_ready, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the endpoint connection authenticated its first Initial." },
-    .{ .ml_name = "_endpoint_connection_ids", .ml_meth = h3_endpoint_connection_ids, .ml_flags = c.METH_NOARGS, .ml_doc = "Return active local connection IDs for endpoint routing." },
     .{ .ml_name = "challenge_path", .ml_meth = h3_challenge_path, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC PATH_CHALLENGE for a peer address: challenge_path(peer_address, data). data must be 8 unpredictable bytes. Drain with data_to_send_with_addresses." },
     .{ .ml_name = "use_peer_connection_id", .ml_meth = h3_use_peer_connection_id, .ml_flags = c.METH_O, .ml_doc = "Switch future QUIC packets to a peer-issued NEW_CONNECTION_ID sequence: use_peer_connection_id(sequence_number)." },
     .{ .ml_name = "local_connection_ids", .ml_meth = h3_local_connection_ids, .ml_flags = c.METH_NOARGS, .ml_doc = "Return every active local QUIC connection ID and sequence number." },
