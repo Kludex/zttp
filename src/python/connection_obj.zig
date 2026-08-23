@@ -236,7 +236,10 @@ fn transportParameters(
 
     const is_dict = c.PyObject_IsInstance(obj, @ptrCast(&c.PyDict_Type));
     if (is_dict < 0) return null;
-    if (is_dict == 0) return py.asBytes(obj);
+    if (is_dict == 0) {
+        _ = py.raiseType("transport_params must be a QuicTransportParameters dictionary");
+        return null;
+    }
 
     var configuration = TransportParameterConfiguration{};
     var found: usize = 0;

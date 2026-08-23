@@ -16,27 +16,34 @@ SERVER_PUBLIC_KEY = bytes.fromhex(
     "2ca00e33928e5b66cc63a70e91c78f5d9e0db34711f9108778151912d389c5"
     "89c6c886572fd6dad9d01e0b98c5fec3276e9a2e4b89705140f564f7eb65016b95"
 )
+SERVER_TRANSPORT_PARAMS = (
+    b"\x04\x04\x80\x10\x00\x00"  # initial_max_data = 1048576
+    b"\x08\x01\x08"  # initial_max_streams_bidi = 8
+    b"\x09\x01\x08"  # initial_max_streams_uni = 8
+    b"\x06\x04\x80\x04\x00\x00"  # initial_max_stream_data_bidi_remote = 262144
+    b"\x07\x04\x80\x04\x00\x00"  # initial_max_stream_data_uni = 262144
+)
 SERVER_CONFIG = {
     "credentials": zttp.TlsCredentials(certificate=SERVER_PUBLIC_KEY, private_key=b"\x42" * 32),
-    "transport_params": (
-        b"\x04\x04\x80\x10\x00\x00"  # initial_max_data = 1048576
-        b"\x08\x01\x08"  # initial_max_streams_bidi = 8
-        b"\x09\x01\x08"  # initial_max_streams_uni = 8
-        b"\x06\x04\x80\x04\x00\x00"  # initial_max_stream_data_bidi_remote = 262144
-        b"\x07\x04\x80\x04\x00\x00"  # initial_max_stream_data_uni = 262144
+    "transport_params": zttp.QuicTransportParameters(
+        initial_max_data=1048576,
+        initial_max_streams_bidi=8,
+        initial_max_streams_uni=8,
+        initial_max_stream_data_bidi_remote=262144,
+        initial_max_stream_data_uni=262144,
     ),
     "random": b"\xab" * 32,
     "ephemeral_seed": b"\x33" * 32,
 }
 
 CLIENT_CONFIG = {
-    "transport_params": (
-        b"\x04\x04\x80\x01\x00\x00"  # initial_max_data = 65536
-        b"\x05\x04\x80\x04\x00\x00"  # initial_max_stream_data_bidi_local = 262144
-        b"\x06\x04\x80\x04\x00\x00"  # initial_max_stream_data_bidi_remote = 262144
-        b"\x07\x04\x80\x04\x00\x00"  # initial_max_stream_data_uni = 262144
-        b"\x08\x01\x10"  # initial_max_streams_bidi = 16
-        b"\x09\x01\x10"  # initial_max_streams_uni = 16
+    "transport_params": zttp.QuicTransportParameters(
+        initial_max_data=65536,
+        initial_max_stream_data_bidi_local=262144,
+        initial_max_stream_data_bidi_remote=262144,
+        initial_max_stream_data_uni=262144,
+        initial_max_streams_bidi=16,
+        initial_max_streams_uni=16,
     ),
     "random": b"\x44" * 32,
     "ephemeral_seed": b"\x55" * 32,
@@ -71,12 +78,6 @@ def make_server() -> zttp.H3Connection:
 
 def make_client() -> zttp.H3Connection:
     return zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **CLIENT_CONFIG)
-
-
-def make_server_with_transport_params(extra: bytes) -> zttp.H3Connection:
-    config = dict(SERVER_CONFIG)
-    config["transport_params"] = SERVER_CONFIG["transport_params"] + extra
-    return zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
 
 
 def transfer(src: zttp.H3Connection, dst: zttp.H3Connection, now: int) -> list[bytes]:
@@ -388,7 +389,7 @@ def test_http3_ticket_age_mismatch_does_not_accept_zero_rtt() -> None:
             "resumption": zttp.SessionResumption(identity=identity, psk=psk),
             "obfuscated_ticket_age": 0,
             "early_data": True,
-            "remembered_transport_params": SERVER_CONFIG["transport_params"],
+            "remembered_transport_params": SERVER_TRANSPORT_PARAMS,
         }
     )
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
@@ -431,7 +432,7 @@ def test_http3_expired_ticket_does_not_accept_zero_rtt() -> None:
             "resumption": zttp.SessionResumption(identity=identity, psk=psk),
             "obfuscated_ticket_age": obfuscated_ticket_age(age_add, 3000, resume_at),
             "early_data": True,
-            "remembered_transport_params": SERVER_CONFIG["transport_params"],
+            "remembered_transport_params": SERVER_TRANSPORT_PARAMS,
         }
     )
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
@@ -474,7 +475,7 @@ def test_http3_ticket_without_early_data_extension_does_not_accept_zero_rtt() ->
             "resumption": zttp.SessionResumption(identity=identity, psk=psk),
             "obfuscated_ticket_age": obfuscated_ticket_age(age_add, 3000, 6000),
             "early_data": True,
-            "remembered_transport_params": SERVER_CONFIG["transport_params"],
+            "remembered_transport_params": SERVER_TRANSPORT_PARAMS,
         }
     )
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
@@ -517,7 +518,7 @@ def test_http3_zero_rtt_ticket_is_single_use() -> None:
                 "resumption": zttp.SessionResumption(identity=identity, psk=psk),
                 "obfuscated_ticket_age": obfuscated_ticket_age(age_add, 3000, now),
                 "early_data": True,
-                "remembered_transport_params": SERVER_CONFIG["transport_params"],
+                "remembered_transport_params": SERVER_TRANSPORT_PARAMS,
             }
         )
         return zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
@@ -585,7 +586,7 @@ def test_http3_static_resumption_credentials_do_not_accept_zero_rtt() -> None:
             "resumption": zttp.SessionResumption(identity=b"ticket-identity", psk=psk),
             "obfuscated_ticket_age": 0x01020304,
             "early_data": True,
-            "remembered_transport_params": SERVER_CONFIG["transport_params"],
+            "remembered_transport_params": SERVER_TRANSPORT_PARAMS,
         }
     )
     server_config = dict(SERVER_CONFIG)
@@ -800,6 +801,8 @@ def test_http3_accepts_typed_transport_parameters() -> None:
 
 
 def test_http3_typed_transport_parameters_validate_in_the_extension() -> None:
+    with pytest.raises(TypeError):
+        zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params=b"raw")  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params={"unknown": 1})  # type: ignore[typeddict-unknown-key]
     with pytest.raises(ValueError):
@@ -820,7 +823,7 @@ def test_http3_rejects_a_wrong_size_key() -> None:
             zttp.SERVER,
             protocol=zttp.HTTP3,
             credentials=zttp.TlsCredentials(certificate=b"\xcc" * 48, private_key=b"\x42" * 16),
-            transport_params=b"\x00\x01",
+            transport_params=zttp.QuicTransportParameters(),
             random=b"\xab" * 32,
             ephemeral_seed=b"\x33" * 32,
         )
@@ -1135,7 +1138,11 @@ def test_request_key_update_applies_to_next_http3_packet() -> None:
 
 def test_disable_active_migration_rejects_new_peer_address_after_handshake() -> None:
     client = make_client()
-    server = make_server_with_transport_params(b"\x0c\x00")
+    config = dict(SERVER_CONFIG)
+    transport_params = dict(SERVER_CONFIG["transport_params"])
+    transport_params["disable_active_migration"] = True
+    config["transport_params"] = transport_params
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
     addr_a = b"203.0.113.10:4433"
     addr_b = b"203.0.113.11:4433"
 
@@ -1493,7 +1500,7 @@ def test_next_timeout_arms_after_the_handshake_flight() -> None:
 
 def test_idle_timeout_closes_http3_connection() -> None:
     config = dict(SERVER_CONFIG)
-    config["transport_params"] = SERVER_CONFIG["transport_params"] + b"\x01\x01\x05"  # max_idle_timeout = 5ms
+    config["transport_params"] = zttp.QuicTransportParameters(max_idle_timeout=5)
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
 
     conn.receive_datagram(CLIENT_HELLO, 1000)

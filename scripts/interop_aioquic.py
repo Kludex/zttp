@@ -45,13 +45,20 @@ ConnectionTerminated = _quic_events_mod.ConnectionTerminated
 pull_quic_header = _packet_mod.pull_quic_header
 
 
-CLIENT_TP = (
-    b"\x04\x04\x80\x01\x00\x00"  # initial_max_data = 65536
-    b"\x05\x04\x80\x04\x00\x00"  # initial_max_stream_data_bidi_local = 262144
-    b"\x06\x04\x80\x04\x00\x00"  # initial_max_stream_data_bidi_remote = 262144
-    b"\x07\x04\x80\x04\x00\x00"  # initial_max_stream_data_uni = 262144
-    b"\x08\x01\x10"  # initial_max_streams_bidi = 16
-    b"\x09\x01\x10"  # initial_max_streams_uni = 16
+CLIENT_TRANSPORT_PARAMS = zttp.QuicTransportParameters(
+    initial_max_data=65536,
+    initial_max_stream_data_bidi_local=262144,
+    initial_max_stream_data_bidi_remote=262144,
+    initial_max_stream_data_uni=262144,
+    initial_max_streams_bidi=16,
+    initial_max_streams_uni=16,
+)
+ZTTP_SERVER_TRANSPORT_PARAMS = zttp.QuicTransportParameters(
+    initial_max_data=1048576,
+    initial_max_streams_bidi=8,
+    initial_max_streams_uni=8,
+    initial_max_stream_data_bidi_remote=262144,
+    initial_max_stream_data_uni=262144,
 )
 ZTTP_SERVER_TP = (
     b"\x04\x04\x80\x10\x00\x00"  # initial_max_data = 1048576
@@ -137,7 +144,7 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
     client = zttp.Connection(
         zttp.CLIENT,
         protocol=zttp.HTTP3,
-        transport_params=CLIENT_TP,
+        transport_params=CLIENT_TRANSPORT_PARAMS,
         random=b"\x44" * 32,
         ephemeral_seed=b"\x55" * 32,
         connection_id=dcid,
@@ -180,7 +187,7 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
     resumed = zttp.Connection(
         zttp.CLIENT,
         protocol=zttp.HTTP3,
-        transport_params=CLIENT_TP,
+        transport_params=CLIENT_TRANSPORT_PARAMS,
         random=b"\x66" * 32,
         ephemeral_seed=b"\x77" * 32,
         connection_id=b"\x11\x22\x33\x45",
@@ -361,7 +368,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
         credentials=zttp.TlsCredentials(
             certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
         ),
-        transport_params=ZTTP_SERVER_TP,
+        transport_params=ZTTP_SERVER_TRANSPORT_PARAMS,
         random=b"\xab" * 32,
         ephemeral_seed=b"\x33" * 32,
         alpn=b"h3",
@@ -517,7 +524,7 @@ def assert_aioquic_client_to_zttp_server() -> None:
         credentials=zttp.TlsCredentials(
             certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
         ),
-        transport_params=ZTTP_SERVER_TP,
+        transport_params=ZTTP_SERVER_TRANSPORT_PARAMS,
         random=b"\xac" * 32,
         ephemeral_seed=b"\x34" * 32,
         alpn=b"h3",
@@ -626,7 +633,7 @@ def assert_udp_loopback_zttp_client_to_aioquic_server(tmp: Path, drop_first_serv
     client = zttp.Connection(
         zttp.CLIENT,
         protocol=zttp.HTTP3,
-        transport_params=CLIENT_TP,
+        transport_params=CLIENT_TRANSPORT_PARAMS,
         random=b"\xae" * 32,
         ephemeral_seed=b"\x36" * 32,
         connection_id=b"\x11\x22\x33\x46",
@@ -768,7 +775,7 @@ def assert_udp_loopback_aioquic_client_to_zttp_server(drop_first_server_datagram
         credentials=zttp.TlsCredentials(
             certificate=make_zttp_server_cert_der(), private_key=b"\x42" * 32
         ),
-        transport_params=ZTTP_SERVER_TP,
+        transport_params=ZTTP_SERVER_TRANSPORT_PARAMS,
         random=b"\xad" * 32,
         ephemeral_seed=b"\x35" * 32,
         alpn=b"h3",
