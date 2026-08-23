@@ -79,6 +79,24 @@ pub const TransportParameters = struct {
     has_injected_cid_param: bool = false,
 };
 
+/// Caller-configurable transport parameters. Connection ID fields injected by
+/// the QUIC connection are deliberately omitted.
+pub const Configuration = struct {
+    max_idle_timeout: ?u64 = null,
+    stateless_reset_token: ?[16]u8 = null,
+    max_udp_payload_size: ?u64 = null,
+    initial_max_data: ?u64 = null,
+    initial_max_stream_data_bidi_local: ?u64 = null,
+    initial_max_stream_data_bidi_remote: ?u64 = null,
+    initial_max_stream_data_uni: ?u64 = null,
+    initial_max_streams_bidi: ?u64 = null,
+    initial_max_streams_uni: ?u64 = null,
+    ack_delay_exponent: ?u64 = null,
+    max_ack_delay: ?u64 = null,
+    disable_active_migration: bool = false,
+    active_connection_id_limit: ?u64 = null,
+};
+
 const Id = enum(u64) {
     original_destination_connection_id = 0x00,
     max_idle_timeout = 0x01,
@@ -99,6 +117,58 @@ const Id = enum(u64) {
     retry_source_connection_id = 0x10,
     _,
 };
+
+/// Encode caller configuration with canonical QUIC varints.
+pub fn encodeConfiguration(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    configuration: Configuration,
+) error{ Malformed, OutOfMemory }!void {
+    if (configuration.max_idle_timeout) |value| {
+        if (value > MAX_IDLE_TIMEOUT_MS_CAP) return error.Malformed;
+        try appendIntegerParam(out, gpa, .max_idle_timeout, value);
+    }
+    if (configuration.stateless_reset_token) |token| {
+        try appendBytesParam(out, gpa, @intFromEnum(Id.stateless_reset_token), &token);
+    }
+    if (configuration.max_udp_payload_size) |value| {
+        if (value < 1200 or value > 65527) return error.Malformed;
+        try appendIntegerParam(out, gpa, .max_udp_payload_size, value);
+    }
+    if (configuration.initial_max_data) |value| try appendIntegerParam(out, gpa, .initial_max_data, value);
+    if (configuration.initial_max_stream_data_bidi_local) |value| {
+        try appendIntegerParam(out, gpa, .initial_max_stream_data_bidi_local, value);
+    }
+    if (configuration.initial_max_stream_data_bidi_remote) |value| {
+        try appendIntegerParam(out, gpa, .initial_max_stream_data_bidi_remote, value);
+    }
+    if (configuration.initial_max_stream_data_uni) |value| {
+        try appendIntegerParam(out, gpa, .initial_max_stream_data_uni, value);
+    }
+    if (configuration.initial_max_streams_bidi) |value| {
+        if (value > MAX_STREAM_COUNT) return error.Malformed;
+        try appendIntegerParam(out, gpa, .initial_max_streams_bidi, value);
+    }
+    if (configuration.initial_max_streams_uni) |value| {
+        if (value > MAX_STREAM_COUNT) return error.Malformed;
+        try appendIntegerParam(out, gpa, .initial_max_streams_uni, value);
+    }
+    if (configuration.ack_delay_exponent) |value| {
+        if (value > MAX_ACK_DELAY_EXPONENT) return error.Malformed;
+        try appendIntegerParam(out, gpa, .ack_delay_exponent, value);
+    }
+    if (configuration.max_ack_delay) |value| {
+        if (value >= MAX_ACK_DELAY_MS_CAP) return error.Malformed;
+        try appendIntegerParam(out, gpa, .max_ack_delay, value);
+    }
+    if (configuration.disable_active_migration) {
+        try appendBytesParam(out, gpa, @intFromEnum(Id.disable_active_migration), &.{});
+    }
+    if (configuration.active_connection_id_limit) |value| {
+        if (value < 2) return error.Malformed;
+        try appendIntegerParam(out, gpa, .active_connection_id_limit, value);
+    }
+}
 
 /// Parse the client's transport-parameter list. Unknown ids are skipped; a known
 /// id appearing twice is a TRANSPORT_PARAMETER_ERROR (RFC 9000 7.4).
@@ -178,6 +248,17 @@ pub fn appendBytesParam(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator
     try out.appendSlice(gpa, value);
 }
 
+fn appendIntegerParam(
+    out: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    id: Id,
+    value: u64,
+) error{ Malformed, OutOfMemory }!void {
+    var scratch: [8]u8 = undefined;
+    const encoded = varint.encode(&scratch, value) catch return error.Malformed;
+    try appendBytesParam(out, gpa, @intFromEnum(id), encoded);
+}
+
 /// An integer-valued parameter is exactly one varint filling its value (RFC 9000 18.2).
 fn intParam(value: []const u8) Error!u64 {
     const d = varint.decode(value) catch return error.Malformed;
@@ -220,6 +301,59 @@ fn take(buf: []const u8, pos: *usize) varint.Error!u64 {
 }
 
 const testing = std.testing;
+
+test "configuration encodes canonical transport parameters" {
+    const gpa = testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodeConfiguration(&out, gpa, .{
+        .max_idle_timeout = 63,
+        .stateless_reset_token = [_]u8{'r'} ** 16,
+        .max_udp_payload_size = 1200,
+        .initial_max_data = 64,
+        .initial_max_stream_data_bidi_local = 16383,
+        .initial_max_stream_data_bidi_remote = 16384,
+        .initial_max_stream_data_uni = 1 << 30,
+        .initial_max_streams_bidi = 4,
+        .initial_max_streams_uni = 5,
+        .ack_delay_exponent = 3,
+        .max_ack_delay = 25,
+        .disable_active_migration = true,
+        .active_connection_id_limit = 2,
+    });
+    const expected = [_]u8{
+        0x01, 0x01, 0x3f,
+        0x02, 0x10,
+    } ++ [_]u8{'r'} ** 16 ++ [_]u8{
+        0x03, 0x02, 0x44, 0xb0,
+        0x04, 0x02, 0x40, 0x40,
+        0x05, 0x02, 0x7f, 0xff,
+        0x06, 0x04, 0x80, 0x00,
+        0x40, 0x00, 0x07, 0x08,
+        0xc0, 0x00, 0x00, 0x00,
+        0x40, 0x00, 0x00, 0x00,
+        0x08, 0x01, 0x04, 0x09,
+        0x01, 0x05, 0x0a, 0x01,
+        0x03, 0x0b, 0x01, 0x19,
+        0x0c, 0x00, 0x0e, 0x01,
+        0x02,
+    };
+    try testing.expectEqualSlices(u8, &expected, out.items);
+}
+
+test "configuration rejects values outside transport parameter ranges" {
+    const gpa = testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try testing.expectError(error.Malformed, encodeConfiguration(&out, gpa, .{ .max_idle_timeout = (1 << 32) + 1 }));
+    try testing.expectError(error.Malformed, encodeConfiguration(&out, gpa, .{ .max_udp_payload_size = 1199 }));
+    try testing.expectError(error.Malformed, encodeConfiguration(&out, gpa, .{ .initial_max_data = varint.MAX + 1 }));
+    try testing.expectError(error.Malformed, encodeConfiguration(&out, gpa, .{ .initial_max_streams_bidi = MAX_STREAM_COUNT + 1 }));
+    try testing.expectError(error.Malformed, encodeConfiguration(&out, gpa, .{ .initial_max_streams_uni = MAX_STREAM_COUNT + 1 }));
+    try testing.expectError(error.Malformed, encodeConfiguration(&out, gpa, .{ .ack_delay_exponent = 21 }));
+    try testing.expectError(error.Malformed, encodeConfiguration(&out, gpa, .{ .max_ack_delay = 1 << 14 }));
+    try testing.expectError(error.Malformed, encodeConfiguration(&out, gpa, .{ .active_connection_id_limit = 1 }));
+}
 
 test "parses the integer parameters and skips unknown ids" {
     // id 0x04 (initial_max_data) len 4 value 0x80010000 (varint 65536); then an

@@ -25,6 +25,14 @@ def test_session_resumption_needs_both_halves() -> None:
         zttp.SessionResumption(identity=b"id")  # type: ignore[call-arg]
 
 
+def test_quic_transport_parameters_is_a_typed_dictionary() -> None:
+    parameters: zttp.QuicTransportParameters = {
+        "initial_max_data": 64,
+        "disable_active_migration": True,
+    }
+    assert parameters == {"initial_max_data": 64, "disable_active_migration": True}
+
+
 @pytest.mark.parametrize(
     ("credentials", "exception"),
     [

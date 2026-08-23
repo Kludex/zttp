@@ -13,9 +13,28 @@ from dataclasses import dataclass
 from typing_extensions import NotRequired, TypedDict
 
 __all__ = [
+    "QuicTransportParameters",
     "SessionResumption",
     "TlsCredentials",
 ]
+
+
+class QuicTransportParameters(TypedDict, total=False):
+    """QUIC flow-control, stream, timeout, payload, and migration settings."""
+
+    max_idle_timeout: int
+    stateless_reset_token: bytes
+    max_udp_payload_size: int
+    initial_max_data: int
+    initial_max_stream_data_bidi_local: int
+    initial_max_stream_data_bidi_remote: int
+    initial_max_stream_data_uni: int
+    initial_max_streams_bidi: int
+    initial_max_streams_uni: int
+    ack_delay_exponent: int
+    max_ack_delay: int
+    disable_active_migration: bool
+    active_connection_id_limit: int
 
 
 class TlsCredentials(TypedDict):
