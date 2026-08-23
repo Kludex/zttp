@@ -763,13 +763,13 @@ def test_http3_client_request_trailers() -> None:
 
 
 def test_http3_receive_credit_waits_for_application_consumption() -> None:
-    config = dict(SERVER_CONFIG)
-    config["transport_params"] = (
-        b"\x04\x02\x42\x00"  # initial_max_data = 512
-        b"\x06\x02\x42\x00"  # initial_max_stream_data_bidi_remote = 512
-        b"\x07\x04\x80\x04\x00\x00"  # initial_max_stream_data_uni = 262144
-        b"\x08\x01\x08"  # initial_max_streams_bidi = 8
-        b"\x09\x01\x08"  # initial_max_streams_uni = 8
+    config = SERVER_CONFIG.copy()
+    config["transport_params"] = zttp.QuicTransportParameters(
+        initial_max_data=512,
+        initial_max_stream_data_bidi_remote=512,
+        initial_max_stream_data_uni=262144,
+        initial_max_streams_bidi=8,
+        initial_max_streams_uni=8,
     )
     client = make_client()
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
@@ -1244,7 +1244,7 @@ def test_local_connection_ids_route_two_connections_on_one_endpoint() -> None:
     pairs: list[tuple[zttp.H3Connection, zttp.H3Connection, bytes]] = []
     routes: dict[bytes, zttp.H3Connection] = {}
     for index, original in enumerate((b"client-a", b"client-b"), start=1):
-        config = dict(CLIENT_CONFIG)
+        config = CLIENT_CONFIG.copy()
         config["connection_id"] = original
         client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
         server = make_server()
