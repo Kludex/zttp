@@ -25,6 +25,14 @@ def test_credentials_and_resumption_need_both_halves() -> None:
         zttp.SessionResumption(identity=b"id")  # type: ignore[call-arg]
 
 
+def test_quic_transport_parameters_is_a_typed_dictionary() -> None:
+    parameters: zttp.QuicTransportParameters = {
+        "initial_max_data": 64,
+        "disable_active_migration": True,
+    }
+    assert parameters == {"initial_max_data": 64, "disable_active_migration": True}
+
+
 def test_h3_constructor_takes_value_objects() -> None:
     client = zttp.Connection(
         zttp.CLIENT,
