@@ -2811,21 +2811,38 @@ pub const Connection = struct {
         return &.{};
     }
 
-    /// Mark `n` bytes of a stream consumed, re-granting flow-control credit. The
-    /// connection window slides by the connection-wide consumed total (the sum
-    /// across streams), matching how `onStreamFrame` charges it.
+    /// Advance past `n` ordered stream bytes without returning flow-control credit.
+    /// HTTP/3 uses this for DATA payloads until the application acknowledges them.
+    pub fn advanceStream(self: *Connection, id: u64, n: usize) void {
+        if (self.streams.get(id)) |s| s.consume(n);
+    }
+
+    /// Return credit for up to `n` bytes already advanced by the parser.
+    pub fn creditStream(self: *Connection, id: u64, n: u64) void {
+        if (self.streams.get(id)) |s| self.applyStreamCredit(id, s, s.credit(n));
+    }
+
+    /// Return all received stream credit after a reset or local abandonment.
+    pub fn releaseStreamCredit(self: *Connection, id: u64) void {
+        if (self.streams.get(id)) |s| self.applyStreamCredit(id, s, s.releaseCredit());
+    }
+
+    fn applyStreamCredit(self: *Connection, id: u64, s: *stream.RecvStream, credited: u64) void {
+        self.conn_consumed_total += credited;
+        self.conn_recv_window.onConsumed(self.conn_consumed_total);
+        if (self.conn_recv_window.shouldUpdate()) self.max_data_pending = true;
+        if (self.recv_windows.getPtr(id)) |rw| {
+            rw.onConsumed(s.flow_consumed);
+            if (rw.shouldUpdate()) self.max_stream_data_pending.put(self.gpa, id, {}) catch {};
+        }
+    }
+
+    /// Mark `n` stream bytes parsed and return their flow-control credit.
     pub fn consumeStream(self: *Connection, id: u64, n: usize) void {
         if (self.streams.get(id)) |s| {
             const before = s.read_offset;
             s.consume(n);
-            self.conn_consumed_total += s.read_offset - before;
-            self.conn_recv_window.onConsumed(self.conn_consumed_total);
-            // Enough has been consumed to advertise a higher limit; flushSend emits it.
-            if (self.conn_recv_window.shouldUpdate()) self.max_data_pending = true;
-            if (self.recv_windows.getPtr(id)) |rw| {
-                rw.onConsumed(s.read_offset);
-                if (rw.shouldUpdate()) self.max_stream_data_pending.put(self.gpa, id, {}) catch {};
-            }
+            self.applyStreamCredit(id, s, s.credit(s.read_offset - before));
         }
     }
 
