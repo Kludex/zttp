@@ -10,12 +10,12 @@ from typing_extensions import disjoint_base
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
 from zttp.results import CloseInfo, DatagramHeader, SessionTicket
 
-SERVER: Final = 1
-CLIENT: Final = 2
+SERVER: Final[Literal[1]] = 1
+CLIENT: Final[Literal[2]] = 2
 # Literal-typed so Connection(role, HTTP2) selects the H2Connection __new__ overload.
-HTTP1: Final = 1
-HTTP2: Final = 2
-HTTP3: Final = 3
+HTTP1: Final[Literal[1]] = 1
+HTTP2: Final[Literal[2]] = 2
+HTTP3: Final[Literal[3]] = 3
 
 _DefaultT = TypeVar("_DefaultT")
 

@@ -9,7 +9,7 @@ set -x
 
 # Python.
 uv run --no-sync ruff format --check --diff $SOURCE_FILES
-uv run --no-sync ty check --error-on-warning zttp
+uv run --no-sync ty check --error-on-warning zttp tests
 # Verify the hand-written extension stub matches the compiled module, so the
 # types cannot silently drift from _zttp. Intentional gaps live in the allowlist.
 # mypy remains a development dependency only because it provides stubtest.
