@@ -764,26 +764,26 @@ def test_http3_server_defaults_transport_settings_and_credentials() -> None:
 
 def test_http3_accepts_typed_transport_parameters() -> None:
     client_config = dict(CLIENT_CONFIG)
-    client_config["transport_params"] = {
-        "initial_max_data": 65536,
-        "initial_max_stream_data_bidi_local": 4096,
-        "initial_max_stream_data_bidi_remote": 262144,
-        "initial_max_stream_data_uni": 262144,
-        "initial_max_streams_bidi": 16,
-        "initial_max_streams_uni": 16,
-        "max_idle_timeout": 30_000,
-        "max_udp_payload_size": 1200,
-        "disable_active_migration": True,
-    }
+    client_config["transport_params"] = zttp.QuicTransportParameters(
+        initial_max_data=65536,
+        initial_max_stream_data_bidi_local=4096,
+        initial_max_stream_data_bidi_remote=262144,
+        initial_max_stream_data_uni=262144,
+        initial_max_streams_bidi=16,
+        initial_max_streams_uni=16,
+        max_idle_timeout=30_000,
+        max_udp_payload_size=1200,
+        disable_active_migration=True,
+    )
     server_config = dict(SERVER_CONFIG)
-    server_config["transport_params"] = {
-        "initial_max_data": 1048576,
-        "initial_max_stream_data_bidi_remote": 262144,
-        "initial_max_stream_data_uni": 262144,
-        "initial_max_streams_bidi": 8,
-        "initial_max_streams_uni": 8,
-        "active_connection_id_limit": 2,
-    }
+    server_config["transport_params"] = zttp.QuicTransportParameters(
+        initial_max_data=1048576,
+        initial_max_stream_data_bidi_remote=262144,
+        initial_max_stream_data_uni=262144,
+        initial_max_streams_bidi=8,
+        initial_max_streams_uni=8,
+        active_connection_id_limit=2,
+    )
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **server_config)
 
@@ -800,13 +800,34 @@ def test_http3_accepts_typed_transport_parameters() -> None:
     assert 0 <= stream.send_window < 4096
 
 
+def test_http3_typed_transport_parameters_preserve_role_defaults() -> None:
+    config = dict(SERVER_CONFIG)
+    config["transport_params"] = zttp.QuicTransportParameters(max_idle_timeout=30_000)
+    client = make_client()
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
+
+    transfer(client, server, 1000)
+    transfer(server, client, 2000)
+    transfer(client, server, 3000)
+    client.send_request(b"GET", b"/defaults", b"3", [(b"host", b"example.test")])
+    transfer(client, server, 4000)
+
+    assert any(isinstance(event, zttp.Request) for event in drain_events(server))
+
+
 def test_http3_typed_transport_parameters_validate_in_the_extension() -> None:
     with pytest.raises(TypeError):
         zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params=b"raw")  # type: ignore[arg-type]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unknown field"):
         zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params={"unknown": 1})  # type: ignore[typeddict-unknown-key]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="outside the QUIC range"):
         zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params={"max_udp_payload_size": 1199})
+    with pytest.raises(ValueError, match="only valid for HTTP/3 servers"):
+        zttp.Connection(
+            zttp.CLIENT,
+            zttp.HTTP3,
+            transport_params=zttp.QuicTransportParameters(stateless_reset_token=b"\x00" * 16),
+        )
 
 
 def test_http3_server_custom_credentials_must_be_a_pair() -> None:

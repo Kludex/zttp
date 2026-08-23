@@ -229,10 +229,12 @@ fn readTransportInteger(dict: py.Object, key: [*c]const u8, target: *?u64, found
 
 fn transportParameters(
     obj: ?*c.PyObject,
-    default: []const u8,
+    role: c_long,
     encoded: *std.ArrayListUnmanaged(u8),
 ) ?[]const u8 {
-    if (obj == null or py.isNone(obj)) return default;
+    if (obj == null or py.isNone(obj)) {
+        return if (role == SERVER) &DEFAULT_SERVER_TRANSPORT_PARAMS else &DEFAULT_CLIENT_TRANSPORT_PARAMS;
+    }
 
     const is_dict = c.PyObject_IsInstance(obj, @ptrCast(&c.PyDict_Type));
     if (is_dict < 0) return null;
@@ -241,7 +243,23 @@ fn transportParameters(
         return null;
     }
 
-    var configuration = TransportParameterConfiguration{};
+    var configuration: TransportParameterConfiguration = if (role == SERVER)
+        .{
+            .initial_max_data = 1048576,
+            .initial_max_stream_data_bidi_remote = 262144,
+            .initial_max_stream_data_uni = 262144,
+            .initial_max_streams_bidi = 8,
+            .initial_max_streams_uni = 8,
+        }
+    else
+        .{
+            .initial_max_data = 65536,
+            .initial_max_stream_data_bidi_local = 262144,
+            .initial_max_stream_data_bidi_remote = 262144,
+            .initial_max_stream_data_uni = 262144,
+            .initial_max_streams_bidi = 16,
+            .initial_max_streams_uni = 16,
+        };
     var found: usize = 0;
     if (!readTransportInteger(obj, "max_idle_timeout", &configuration.max_idle_timeout, &found)) return null;
     if (!readTransportInteger(obj, "max_udp_payload_size", &configuration.max_udp_payload_size, &found)) return null;
@@ -287,6 +305,10 @@ fn transportParameters(
 
     if (c.PyDict_GetItemString(obj, "stateless_reset_token")) |value| {
         found += 1;
+        if (role == CLIENT) {
+            _ = py.raiseValue("stateless_reset_token is only valid for HTTP/3 servers");
+            return null;
+        }
         const token = py.asBytes(value) orelse return null;
         if (token.len != 16) {
             _ = py.raiseValue("stateless_reset_token must be exactly 16 bytes");
@@ -1729,14 +1751,11 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
         &validation_token_obj,
     ) == 0) return null;
     if (protocol_val != HTTP3) return py.raiseValue("protocol does not match this Connection subclass; construct zttp.Connection to choose by protocol");
+    if (role_val != SERVER and role_val != CLIENT) return py.raiseValue("role must be zttp.SERVER or zttp.CLIENT");
 
     var encoded_tp: std.ArrayListUnmanaged(u8) = .empty;
     defer encoded_tp.deinit(gpa);
-    const default_tp: []const u8 = if (role_val == SERVER)
-        &DEFAULT_SERVER_TRANSPORT_PARAMS
-    else
-        &DEFAULT_CLIENT_TRANSPORT_PARAMS;
-    const tp_src = transportParameters(tp_obj, default_tp, &encoded_tp) orelse return null;
+    const tp_src = transportParameters(tp_obj, role_val, &encoded_tp) orelse return null;
 
     // Unpack the credential / resumption value objects into the raw byte objects the
     // builders consume. TlsCredentials(certificate, private_key) and
