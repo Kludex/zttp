@@ -19,6 +19,15 @@ HTTP3: Final = 3
 
 _DefaultT = TypeVar("_DefaultT")
 
+def _build_retry(
+    original_destination_connection_id: bytes,
+    client_source_connection_id: bytes,
+    server_source_connection_id: bytes,
+    token: bytes,
+    version: int = ...,
+) -> bytes:
+    """Build a stateless QUIC v1 Retry packet for `QuicEndpoint`."""
+
 def parse_datagram_header(datagram: bytes, /) -> DatagramHeader:
     """Parse the routable prefix of a received QUIC datagram (RFC 9000 17).
 
@@ -405,6 +414,11 @@ class H3Connection(Connection):
 
     def data_to_send_with_addresses(self) -> list[tuple[bytes, bytes | None]]:
         """Like `data_to_send`, but as `(datagram, peer_address)` pairs."""
+
+    def _set_endpoint_context(
+        self, server_connection_id: bytes, original_destination_connection_id: bytes | None = ...
+    ) -> None:
+        """Configure endpoint-selected connection IDs before the first Initial."""
 
     def challenge_path(self, peer_address: bytes, data: bytes, /) -> None:
         """Queue a QUIC `PATH_CHALLENGE` to a peer address (`data` must be 8 unpredictable bytes)."""
