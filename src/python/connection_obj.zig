@@ -773,6 +773,12 @@ const H3Engine = struct {
         return events_obj.fromH3Event(h.nextEvent());
     }
 
+    fn consumeData(self: *H3Engine, id: u64, length: u64) py.Object {
+        const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        h.consumeData(id, length) catch return py.raiseValue("unknown stream or length exceeds its unconsumed DATA");
+        return self.flush();
+    }
+
     /// The pending outbound datagrams (handshake flight, ACKs, response STREAM
     /// frames) as a list of bytes, one per UDP datagram - QUIC datagram boundaries
     /// are semantic, so each must reach the peer as its own packet, unlike the byte
@@ -2109,6 +2115,14 @@ fn receive_datagram(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.
     }
 }
 
+fn h3_consume_data(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    var stream_id: c_ulonglong = 0;
+    var length: c_ulonglong = 0;
+    if (c.PyArg_ParseTuple(args, "KK", &stream_id, &length) == 0) return null;
+    return e.consumeData(@intCast(stream_id), @intCast(length));
+}
+
 fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
@@ -2867,6 +2881,7 @@ var h2_getset = [_]c.PyGetSetDef{
 // feeds handle_timeout; a Stream send uses the most recent `now` the caller gave.
 var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "receive_datagram", .ml_meth = receive_datagram, .ml_flags = c.METH_VARARGS, .ml_doc = "Feed one received UDP datagram: receive_datagram(datagram, now=0, peer_address=None). peer_address is an optional opaque bytes key for QUIC path validation and migration." },
+    .{ .ml_name = "consume_data", .ml_meth = h3_consume_data, .ml_flags = c.METH_VARARGS, .ml_doc = "Acknowledge HTTP/3 DATA payload bytes after the application consumes them: consume_data(stream_id, length)." },
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing UDP datagrams as a list of bytes (one per datagram - QUIC datagram boundaries are semantic)." },
     .{ .ml_name = "data_to_send_with_addresses", .ml_meth = h3_data_to_send_with_addresses, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams as (datagram, peer_address) pairs. peer_address is None when no address key is known." },
     .{ .ml_name = "challenge_path", .ml_meth = h3_challenge_path, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC PATH_CHALLENGE for a peer address: challenge_path(peer_address, data). data must be 8 unpredictable bytes. Drain with data_to_send_with_addresses." },

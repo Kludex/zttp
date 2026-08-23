@@ -66,6 +66,9 @@ pub const RecvStream = struct {
     gpa: std.mem.Allocator,
     state: RecvState = .recv,
     read_offset: u64 = 0,
+    /// Bytes whose flow-control credit has been returned. This can trail
+    /// `read_offset` when HTTP/3 has parsed body data the application has not read.
+    flow_consumed: u64 = 0,
     contiguous: u64 = 0,
     /// The largest byte offset ever received on this stream (may exceed
     /// `contiguous` when fragments arrive out of order). Connection-level flow
@@ -177,6 +180,20 @@ pub const RecvStream = struct {
         std.mem.copyForwards(u8, self.ready.items[0..rest], self.ready.items[take..]);
         self.ready.shrinkRetainingCapacity(rest);
         if (self.isFinished() and self.ready.items.len == 0) self.state = .data_read;
+    }
+
+    /// Return up to `n` bytes of parsed data to flow control.
+    pub fn credit(self: *RecvStream, n: u64) u64 {
+        const credited = @min(n, self.read_offset -| self.flow_consumed);
+        self.flow_consumed += credited;
+        return credited;
+    }
+
+    /// Return all received credit when a stream is reset or abandoned.
+    pub fn releaseCredit(self: *RecvStream) u64 {
+        const credited = self.highest_received - self.flow_consumed;
+        self.flow_consumed = self.highest_received;
+        return credited;
     }
 
     /// Has every byte through the final size been delivered into `ready`?

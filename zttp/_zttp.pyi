@@ -115,7 +115,9 @@ class Data:
         data: Owned body bytes that are safe to keep. Qualifying HTTP/1 spans
             reuse the immutable `bytes` supplied to `receive_data()` or
             `receive_event()`; other paths copy out of the parse buffer.
-        stream_id: The stream the body belongs to (`0` on HTTP/1.1).
+        stream_id: The stream the body belongs to (`0` on HTTP/1.1). For HTTP/3,
+            call `connection.consume_data(stream_id, len(data))` after delivering
+            these bytes to the application.
     """
 
     data: bytes
@@ -399,6 +401,14 @@ class H3Connection(Connection):
 
     def data_to_send(self) -> list[bytes]:
         """Return and clear the pending outgoing UDP datagrams, one per list element."""
+
+    def consume_data(self, stream_id: int, length: int, /) -> None:
+        """Return receive-window credit after the application consumes DATA bytes.
+
+        Reading a `Data` event does not return its payload credit. Call this after
+        the application accepts some or all of that event's bytes. Frame overhead
+        and non-DATA frames are credited internally.
+        """
 
     def receive_datagram(self, datagram: bytes, now: int = ..., peer_address: bytes | None = ..., /) -> None:
         """Feed one received UDP datagram. `peer_address` is an opaque key for path validation."""
