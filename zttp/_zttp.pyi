@@ -7,7 +7,7 @@ from typing import Final, Literal, TypeVar, final, overload
 
 from typing_extensions import disjoint_base
 
-from zttp.config import SessionResumption, TlsCredentials
+from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
 from zttp.results import CloseInfo, DatagramHeader, SessionTicket
 
 SERVER: Final = 1
@@ -292,7 +292,7 @@ class Connection:
         protocol: Literal[3],
         *,
         credentials: TlsCredentials | None = ...,
-        transport_params: bytes | None = ...,
+        transport_params: QuicTransportParameters | None = ...,
         random: bytes | None = ...,
         ephemeral_seed: bytes | None = ...,
         alpn: bytes | None = ...,
@@ -304,7 +304,7 @@ class Connection:
         role: Literal[2],
         protocol: Literal[3],
         *,
-        transport_params: bytes | None = ...,
+        transport_params: QuicTransportParameters | None = ...,
         random: bytes | None = ...,
         ephemeral_seed: bytes | None = ...,
         connection_id: bytes | None = ...,

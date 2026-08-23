@@ -31,7 +31,7 @@ from zttp._zttp import (
     build_retry,
     parse_datagram_header,
 )
-from zttp.config import SessionResumption, TlsCredentials
+from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
 from zttp.results import CloseInfo, DatagramHeader, SessionTicket
 from zttp.settings import H2Settings
 
@@ -74,6 +74,7 @@ __all__ = [
     "NeedData",
     "Ping",
     "ProtocolError",
+    "QuicTransportParameters",
     "RemoteProtocolError",
     "Request",
     "Response",
