@@ -72,6 +72,7 @@ pub const DatagramHeader = struct {
     version: u32,
     dcid: []const u8,
     scid: []const u8,
+    token: []const u8,
 };
 
 /// Parse just the routable prefix of a received datagram (RFC 9000 17), without
@@ -84,7 +85,7 @@ pub fn parseDatagramHeader(buf: []const u8) Error!DatagramHeader {
     if (!isLong(buf[0])) {
         // A short header still carries the QUIC fixed bit; a clear one is malformed.
         if ((buf[0] & constants.FIXED_BIT) == 0) return error.Malformed;
-        return .{ .long = false, .initial = false, .version = 0, .dcid = &.{}, .scid = &.{} };
+        return .{ .long = false, .initial = false, .version = 0, .dcid = &.{}, .scid = &.{}, .token = &.{} };
     }
     const prefix = try parseLongPrefix(buf);
     // The long-header type bits are version-specific, so only trust them for QUIC v1;
@@ -92,7 +93,14 @@ pub fn parseDatagramHeader(buf: []const u8) Error!DatagramHeader {
     // Initial we would open a connection for.
     const initial = prefix.version == constants.VERSION_1 and
         @as(LongType, @enumFromInt(@as(u2, @truncate(buf[0] >> 4)))) == .initial;
-    return .{ .long = true, .initial = initial, .version = prefix.version, .dcid = prefix.dcid, .scid = prefix.scid };
+    const token = if (initial) token: {
+        const token_length = varint.decode(buf[prefix.header_len..]) catch return error.Truncated;
+        const length = std.math.cast(usize, token_length.value) orelse return error.Malformed;
+        const start = prefix.header_len + token_length.len;
+        if (length > buf.len - start) return error.Truncated;
+        break :token buf[start .. start + length];
+    } else &.{};
+    return .{ .long = true, .initial = initial, .version = prefix.version, .dcid = prefix.dcid, .scid = prefix.scid, .token = token };
 }
 
 /// Parse only the invariant long-header prefix: form/fixed bits, version, and
@@ -396,13 +404,14 @@ test "parseLongPrefix reads connection ids before version dispatch" {
 
 test "parseDatagramHeader routes a long-header Initial" {
     // 0xC0: long form + fixed bit + type bits 00 (Initial); version 1; dcid "dst", scid "src".
-    var pkt = [_]u8{ 0xC0, 0x00, 0x00, 0x00, 0x01, 0x03, 'd', 's', 't', 0x03, 's', 'r', 'c' };
+    var pkt = [_]u8{ 0xC0, 0x00, 0x00, 0x00, 0x01, 0x03, 'd', 's', 't', 0x03, 's', 'r', 'c', 0x00 };
     const h = try parseDatagramHeader(&pkt);
     try std.testing.expect(h.long);
     try std.testing.expect(h.initial);
     try std.testing.expectEqual(@as(u32, 1), h.version);
     try std.testing.expectEqualStrings("dst", h.dcid);
     try std.testing.expectEqualStrings("src", h.scid);
+    try std.testing.expectEqual(@as(usize, 0), h.token.len);
 }
 
 test "parseDatagramHeader reports a short header without connection ids" {

@@ -137,70 +137,49 @@ produces a `stream_id`-bearing control event, and only HTTP/2 produces `Ping` or
 
 ## Demultiplexing a shared UDP socket
 
-An HTTP/3 server usually has one UDP socket and many connections on it, so it
-must decide which `H3Connection` a datagram belongs to **before** feeding it to
-one. `parse_datagram_header` reads the routable prefix without decrypting
-anything or touching connection state.
-
-There are four cases, and a server has to handle all of them:
-
 ```python
 import time
 
 import zttp
 
-connections: dict[bytes, zttp.H3Connection] = {}  # keyed by local connection id
+endpoint = zttp.QuicEndpoint(retry=True, token_secret=b"replace-with-at-least-32-secret-bytes")
+outbound: list[zttp.OutboundDatagram] = []
 
 
-def now_us() -> int:
-    """QUIC timestamps are monotonic microseconds."""
-    return time.monotonic_ns() // 1000
-
-
-def lookup_by_prefix(datagram: bytes) -> zttp.H3Connection | None:
-    """Match a short header's destination id, whose length is not on the wire."""
-    for connection_id, conn in connections.items():
-        if datagram[1:].startswith(connection_id):
-            return conn
-    return None
-
-
-def route(datagram: bytes, peer_address: bytes) -> None:
-    try:
-        header = zttp.parse_datagram_header(datagram)
-    except zttp.RemoteProtocolError:
-        return  # not a QUIC datagram we can route: drop it
-
-    if header.is_long_header:
-        conn = connections.get(header.destination_connection_id)
-        if conn is None:
-            if not header.is_initial:
-                # Handshake or 0-RTT for a connection we do not have. We hold no
-                # keys for it and it must not start one: drop it.
-                return
-            # A new connection. The client chose this destination id, so key the
-            # connection on it until it issues ids of its own.
-            conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
-            connections[header.destination_connection_id] = conn
-    else:
-        # A short (1-RTT) header does not encode the destination id's length on
-        # the wire, so match its prefix against the ids you already track.
-        conn = lookup_by_prefix(datagram)
-        if conn is None:
-            return  # unknown connection: drop, or send a stateless reset
-
-    conn.receive_datagram(datagram, now_us(), peer_address)
+def receive(datagram: bytes, peer_address: bytes) -> zttp.H3Connection | None:
+    now = time.monotonic_ns() // 1000
+    connection = endpoint.receive_datagram(datagram, peer_address, now)
+    outbound.extend(endpoint.data_to_send())
+    return connection
 ```
 
-!!! warning "Only an Initial may create a connection"
-    Routing an unknown *non*-Initial long-header packet into a fresh connection
-    lets any peer allocate state with one spoofed datagram. Drop it - the keys to
-    decrypt it do not exist. Same for an unmatched short header, though there you
-    may instead send a stateless reset (RFC 9000 10.3), so a peer holding a dead
-    connection learns to give up rather than retrying into silence.
+`QuicEndpoint` maps destination connection IDs to `H3Connection` instances. It
+retains state only after the QUIC core authenticates an Initial packet. Unknown
+short, Handshake, and 0-RTT packets are dropped. Unsupported versions receive a
+Version Negotiation packet. The endpoint returns the routed connection so you can
+drain its HTTP events with `next_event()`.
 
-See [HTTP/3](../usage/http3.md#serving-many-connections-on-one-socket) for how
-this sits inside the read and timer loop.
+Retry remains stateless. The endpoint sends a Retry before allocating a
+connection, authenticates the token with HMAC-SHA256, binds it to `peer_address`,
+and retains the connection only when the client returns a valid token. Use the
+same `token_secret` in every worker that can receive packets for the same UDP
+address. `issue_token()` sends a compatible `NEW_TOKEN` so a later connection can
+validate its address without Retry.
+
+Use `issue_connection_id()` on the endpoint for connection ID rotation. It keeps
+routing synchronized with active and retired IDs in the QUIC core.
+
+The endpoint does not own `udp_socket`, call `sendto`, read the clock, or schedule
+a timer. Call `next_timeout()` and `handle_timeout(now)` from your event loop.
+
+::: zttp.QuicEndpoint
+
+::: zttp.ConnectionIDFactory
+
+::: zttp.OutboundDatagram
+
+`parse_datagram_header` remains available when you need the lower-level routing
+prefix directly.
 
 ::: zttp.parse_datagram_header
 

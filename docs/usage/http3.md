@@ -213,7 +213,8 @@ collapses its pseudo-headers into the same shape the other protocols use, and
 
     Use [`data_to_send_with_addresses()`](../reference/api.md#zttp.H3Connection.data_to_send_with_addresses)
     instead if the peer may have migrated and you need the address to send each
-    one to.
+    one to. It returns `OutboundDatagram` objects with `data` and `peer_address`
+    attributes.
 
 ## Sending a response
 
@@ -358,22 +359,62 @@ actually send it.
 
 ## Serving many connections on one socket
 
-A server has one UDP socket and many connections on it, so it has to route each
-datagram to the right `H3Connection` before feeding it. Use
-[`parse_datagram_header`](../reference/api.md#zttp.parse_datagram_header), which reads the routable
-prefix without decrypting anything:
-
 ```python
+import time
+
 import zttp
 
-header = zttp.parse_datagram_header(datagram)
-if header.is_initial:
-    ...  # a new connection: create an H3Connection for header.destination_connection_id
+endpoint = zttp.QuicEndpoint(
+    retry=True,
+    token_secret=b"replace-with-at-least-32-secret-bytes",
+)
+outbound: list[zttp.OutboundDatagram] = []
+
+
+def receive(datagram: bytes, peer_address: bytes) -> zttp.H3Connection | None:
+    connection = endpoint.receive_datagram(
+        datagram,
+        peer_address,
+        time.monotonic_ns() // 1000,
+    )
+    outbound.extend(endpoint.data_to_send())
+    return connection
 ```
 
+`QuicEndpoint` routes long and short headers by destination connection ID. It
+retains an `H3Connection` only after the QUIC core authenticates the first Initial.
+It sends Version Negotiation for unsupported versions. The returned connection
+owns the HTTP event queue, so call `next_event()` on it after `receive()` returns.
+Each `OutboundDatagram` from `endpoint.data_to_send()` exposes its payload as
+`data` and its opaque destination key as `peer_address`.
+
+Call `endpoint.issue_connection_id(connection, sequence_number)` instead of
+`connection.issue_connection_id()` for endpoint-managed connections. The endpoint
+generates the connection ID and stateless reset token, sends `NEW_CONNECTION_ID`,
+and updates its long-header and short-header routes. It also removes retired IDs
+from those routes after processing `RETIRE_CONNECTION_ID`.
+
+With `retry=True`, the first Initial produces a Retry packet but no connection.
+The endpoint binds its authenticated token to `peer_address`. It allocates the
+connection only after the client echoes a valid token in its next Initial. This
+prevents a spoofed source address from making the server allocate handshake
+state.
+
+After the handshake, call `endpoint.issue_token(connection, now)` to send a
+`NEW_TOKEN` bound to the connection's current peer address. A later connection can
+use that token to validate its address without a Retry round trip.
+
+!!! warning "Share the token secret between workers"
+    Every worker receiving datagrams for the same UDP address must use the same
+    `token_secret`. A client can receive Retry or `NEW_TOKEN` from one worker and
+    return the token to another. That worker must be able to authenticate it.
+
+Call `endpoint.next_timeout()` to get the earliest deadline across all
+connections. Call `endpoint.handle_timeout(now)` when it expires. The endpoint
+still does no I/O: your event loop owns the socket, clock, and timer scheduling.
+
 See the [API reference](../reference/api.md#demultiplexing-a-shared-udp-socket)
-for the full picture, including short-header datagrams, which don't encode the
-connection id's length.
+for every endpoint method and the lower-level `parse_datagram_header` API.
 
 ## The transport is inside
 

@@ -8,7 +8,7 @@ from typing import Final, Literal, TypeVar, final, overload
 from typing_extensions import disjoint_base
 
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
-from zttp.results import CloseInfo, DatagramHeader, LocalConnectionId, SessionTicket
+from zttp.results import CloseInfo, DatagramHeader, LocalConnectionId, OutboundDatagram, SessionTicket
 
 SERVER: Final[Literal[1]] = 1
 CLIENT: Final[Literal[2]] = 2
@@ -18,6 +18,18 @@ HTTP2: Final[Literal[2]] = 2
 HTTP3: Final[Literal[3]] = 3
 
 _DefaultT = TypeVar("_DefaultT")
+
+def _build_version_negotiation(client_destination_connection_id: bytes, client_source_connection_id: bytes, /) -> bytes:
+    """Build a stateless QUIC Version Negotiation packet for `QuicEndpoint`."""
+
+def _build_retry(
+    original_destination_connection_id: bytes,
+    client_source_connection_id: bytes,
+    server_source_connection_id: bytes,
+    token: bytes,
+    version: int = ...,
+) -> bytes:
+    """Build a stateless QUIC v1 Retry packet for `QuicEndpoint`."""
 
 def parse_datagram_header(datagram: bytes, /) -> DatagramHeader:
     """Parse the routable prefix of a received QUIC datagram (RFC 9000 17).
@@ -413,8 +425,22 @@ class H3Connection(Connection):
     def receive_datagram(self, datagram: bytes, now: int = ..., peer_address: bytes | None = ..., /) -> None:
         """Feed one received UDP datagram. `peer_address` is an opaque key for path validation."""
 
-    def data_to_send_with_addresses(self) -> list[tuple[bytes, bytes | None]]:
-        """Like `data_to_send`, but as `(datagram, peer_address)` pairs."""
+    def data_to_send_with_addresses(self) -> list[OutboundDatagram]:
+        """Return queued datagrams with their opaque destination address keys."""
+
+    def _set_endpoint_context(
+        self,
+        server_connection_id: bytes,
+        original_destination_connection_id: bytes | None = ...,
+        address_validated: bool = ...,
+    ) -> None:
+        """Configure endpoint-selected connection IDs before the first Initial."""
+
+    def _endpoint_ready(self) -> bool:
+        """Return whether the first Initial was authenticated."""
+
+    def _endpoint_connection_id_generation(self) -> int:
+        """Return the active local connection ID generation."""
 
     def challenge_path(self, peer_address: bytes, data: bytes, /) -> None:
         """Queue a QUIC `PATH_CHALLENGE` to a peer address (`data` must be 8 unpredictable bytes)."""

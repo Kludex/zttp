@@ -13,6 +13,7 @@ __all__ = [
     "CloseInfo",
     "DatagramHeader",
     "LocalConnectionId",
+    "OutboundDatagram",
     "SessionTicket",
 ]
 
@@ -47,6 +48,14 @@ class LocalConnectionId:
     connection_id: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class OutboundDatagram:
+    """One QUIC datagram and its opaque destination address key."""
+
+    data: bytes
+    peer_address: bytes | None
+
+
 @dataclass(frozen=True)
 class DatagramHeader:
     """The routable prefix of a received QUIC datagram (RFC 9000 17).
@@ -55,7 +64,8 @@ class DatagramHeader:
     shared UDP socket onto per-connection state. A long header carries the connection
     ids and their lengths on the wire; a short (1-RTT) header does not encode the
     destination id's length, so `destination_connection_id` is empty for one and the
-    receiver must match it against connection ids it already tracks.
+    receiver must match it against connection ids it already tracks. `token` contains
+    the address-validation token from a QUIC v1 Initial and is empty for other packets.
     """
 
     destination_connection_id: bytes
@@ -63,3 +73,4 @@ class DatagramHeader:
     version: int
     is_long_header: bool
     is_initial: bool
+    token: bytes
