@@ -16,8 +16,10 @@ class CredentialsCase(TypedDict):
 
 def test_tls_credentials_is_a_typed_dictionary() -> None:
     credentials = zttp.TlsCredentials(certificate=b"CERT", private_key=b"KEY")
+    scalar_credentials = zttp.TlsCredentials(certificate=b"CERT", private_key_scalar=b"SCALAR")
 
     assert credentials == {"certificate": b"CERT", "private_key": b"KEY"}
+    assert scalar_credentials == {"certificate": b"CERT", "private_key_scalar": b"SCALAR"}
 
 
 def test_session_resumption_is_frozen() -> None:
@@ -51,7 +53,7 @@ def test_quic_transport_parameters_is_a_typed_dictionary() -> None:
         CredentialsCase(
             credentials={"certificate": b"leaf"},
             exception=TypeError,
-            match="credentials must include private_key",
+            match="credentials must include private_key or private_key_scalar",
         ),
         CredentialsCase(
             credentials={"private_key": b"\x42" * 32},
@@ -68,9 +70,28 @@ def test_quic_transport_parameters_is_a_typed_dictionary() -> None:
             match="pass either certificate or certificates, not both",
         ),
         CredentialsCase(
+            credentials={
+                "certificate": b"leaf",
+                "private_key": b"\x42" * 32,
+                "private_key_scalar": b"\x43" * 32,
+            },
+            exception=ValueError,
+            match="pass either private_key or private_key_scalar, not both",
+        ),
+        CredentialsCase(
             credentials={"certificate": b"leaf", "private_key": b"\x42" * 32, "unknown": b"value"},
             exception=ValueError,
             match="credentials contains an unknown field",
+        ),
+        CredentialsCase(
+            credentials={"certificate": b"leaf", "private_key_scalar": b"short"},
+            exception=ValueError,
+            match="private_key_scalar must be exactly 32 bytes",
+        ),
+        CredentialsCase(
+            credentials={"certificate": b"leaf", "private_key_scalar": b"\x00" * 32},
+            exception=ValueError,
+            match="private_key_scalar is not a valid P-256 scalar",
         ),
         CredentialsCase(
             credentials={"certificate": b"", "private_key": b"\x42" * 32},

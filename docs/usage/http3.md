@@ -33,7 +33,7 @@ they cannot be transposed. A swap is a type error, not a handshake failure:
 ```python
 server = zttp.Connection(
     zttp.SERVER, zttp.HTTP3,
-    credentials=zttp.TlsCredentials(certificate=cert, private_key=key),
+    credentials=zttp.TlsCredentials(certificate=certificate_der, private_key_scalar=private_key_scalar),
 )
 client = zttp.Connection(
     zttp.CLIENT, zttp.HTTP3,

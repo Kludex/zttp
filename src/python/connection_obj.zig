@@ -357,6 +357,7 @@ const TlsCredentialObjects = struct {
     certificate: ?*c.PyObject = null,
     certificates: ?*c.PyObject = null,
     private_key: ?*c.PyObject = null,
+    private_key_scalar: ?*c.PyObject = null,
 };
 
 fn parseTlsCredentials(obj: ?*c.PyObject) ?TlsCredentialObjects {
@@ -371,8 +372,13 @@ fn parseTlsCredentials(obj: ?*c.PyObject) ?TlsCredentialObjects {
     const certificate = c.PyDict_GetItemString(obj, "certificate");
     const certificates = c.PyDict_GetItemString(obj, "certificates");
     const private_key = c.PyDict_GetItemString(obj, "private_key");
-    if (private_key == null) {
-        _ = py.raiseType("credentials must include private_key");
+    const private_key_scalar = c.PyDict_GetItemString(obj, "private_key_scalar");
+    if (private_key != null and private_key_scalar != null) {
+        _ = py.raiseValue("pass either private_key or private_key_scalar, not both");
+        return null;
+    }
+    if (private_key == null and private_key_scalar == null) {
+        _ = py.raiseType("credentials must include private_key or private_key_scalar");
         return null;
     }
     if (certificate != null and certificates != null) {
@@ -387,7 +393,12 @@ fn parseTlsCredentials(obj: ?*c.PyObject) ?TlsCredentialObjects {
         _ = py.raiseValue("credentials contains an unknown field");
         return null;
     }
-    return .{ .certificate = certificate, .certificates = certificates, .private_key = private_key };
+    return .{
+        .certificate = certificate,
+        .certificates = certificates,
+        .private_key = private_key,
+        .private_key_scalar = private_key_scalar,
+    };
 }
 
 fn randomSigner() ?Signer {
@@ -2231,6 +2242,16 @@ fn buildServerConfig(
             _ = py.raiseValue("private_key is not a valid signing key seed");
             return null;
         };
+    } else if (credentials.private_key_scalar) |key_obj| {
+        const key_src = py.asBytes(key_obj) orelse return null;
+        if (key_src.len != 32) {
+            _ = py.raiseValue("private_key_scalar must be exactly 32 bytes");
+            return null;
+        }
+        signer = Signer.fromPrivateKey(key_src[0..32].*) catch {
+            _ = py.raiseValue("private_key_scalar is not a valid P-256 scalar");
+            return null;
+        };
     } else {
         signer = randomSigner() orelse return null;
         default_cert = signer.publicKeySec1();
@@ -2239,6 +2260,17 @@ fn buildServerConfig(
     if (resumption == null and c.PyErr_Occurred() != null) return null;
 
     const certificates = copyCertificateChain(credentials, &default_cert) orelse return null;
+    const leaf_public_key = tls_sign.certificatePublicKeySec1(certificates[0]) catch {
+        freeCertificateChain(certificates);
+        _ = py.raiseValue("the leaf certificate must contain a P-256 public key");
+        return null;
+    };
+    const signer_public_key = signer.publicKeySec1();
+    if (!std.mem.eql(u8, leaf_public_key, &signer_public_key)) {
+        freeCertificateChain(certificates);
+        _ = py.raiseValue("the leaf certificate public key does not match the signing key");
+        return null;
+    }
     const tp_copy = gpa.dupe(u8, tp_src) catch {
         freeCertificateChain(certificates);
         _ = c.PyErr_NoMemory();

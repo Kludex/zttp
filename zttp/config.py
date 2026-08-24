@@ -38,9 +38,10 @@ class QuicTransportParameters(TypedDict, total=False):
 
 
 class TlsCredentials(TypedDict):
-    """An HTTP/3 server's ordered certificate chain and leaf private key."""
+    """An HTTP/3 server's certificate chain and signing key or raw P-256 scalar."""
 
-    private_key: bytes
+    private_key: NotRequired[bytes]
+    private_key_scalar: NotRequired[bytes]
     certificate: NotRequired[bytes]
     certificates: NotRequired[tuple[bytes, ...]]
 

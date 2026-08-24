@@ -385,18 +385,21 @@ def test_http3_default_client_and_server_exchange_request() -> None:
     assert any(isinstance(e, zttp.EndOfMessage) for e in events)
 
 
-def test_http3_client_rejects_unverifiable_server_certificate() -> None:
+def test_http3_server_rejects_unverifiable_certificate() -> None:
     config = SERVER_CONFIG.copy()
     config["credentials"] = zttp.TlsCredentials(certificate=b"\xcc" * 48, private_key=b"\x42" * 32)
-    client = make_client()
-    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
+    with pytest.raises(ValueError, match="leaf certificate must contain a P-256 public key"):
+        zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
 
-    transfer(client, server, 1000)
-    server_flight = server.data_to_send()
-    assert len(server_flight) >= 2
-    with pytest.raises(zttp.RemoteProtocolError):
-        client.receive_datagram(server_flight[0], 2000)
-        client.receive_datagram(server_flight[1], 2000)
+
+def test_http3_server_rejects_a_mismatched_private_key_scalar() -> None:
+    config = SERVER_CONFIG.copy()
+    config["credentials"] = zttp.TlsCredentials(
+        certificate=SERVER_PUBLIC_KEY,
+        private_key_scalar=b"\x42" * 32,
+    )
+    with pytest.raises(ValueError, match="leaf certificate public key does not match the signing key"):
+        zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
 
 
 def test_http3_client_server_request_response() -> None:
