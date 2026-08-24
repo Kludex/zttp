@@ -2260,6 +2260,17 @@ fn buildServerConfig(
     if (resumption == null and c.PyErr_Occurred() != null) return null;
 
     const certificates = copyCertificateChain(credentials, &default_cert) orelse return null;
+    const leaf_public_key = tls_sign.certificatePublicKeySec1(certificates[0]) catch {
+        freeCertificateChain(certificates);
+        _ = py.raiseValue("the leaf certificate must contain a P-256 public key");
+        return null;
+    };
+    const signer_public_key = signer.publicKeySec1();
+    if (!std.mem.eql(u8, leaf_public_key, &signer_public_key)) {
+        freeCertificateChain(certificates);
+        _ = py.raiseValue("the leaf certificate public key does not match the signing key");
+        return null;
+    }
     const tp_copy = gpa.dupe(u8, tp_src) catch {
         freeCertificateChain(certificates);
         _ = c.PyErr_NoMemory();
