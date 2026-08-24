@@ -8,16 +8,28 @@ from typing import Final, Literal, TypeVar, final, overload
 from typing_extensions import disjoint_base
 
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
-from zttp.results import CloseInfo, DatagramHeader, SessionTicket
+from zttp.results import CloseInfo, DatagramHeader, LocalConnectionId, OutboundDatagram, SessionTicket
 
-SERVER: Final = 1
-CLIENT: Final = 2
+SERVER: Final[Literal[1]] = 1
+CLIENT: Final[Literal[2]] = 2
 # Literal-typed so Connection(role, HTTP2) selects the H2Connection __new__ overload.
-HTTP1: Final = 1
-HTTP2: Final = 2
-HTTP3: Final = 3
+HTTP1: Final[Literal[1]] = 1
+HTTP2: Final[Literal[2]] = 2
+HTTP3: Final[Literal[3]] = 3
 
 _DefaultT = TypeVar("_DefaultT")
+
+def _build_version_negotiation(client_destination_connection_id: bytes, client_source_connection_id: bytes, /) -> bytes:
+    """Build a stateless QUIC Version Negotiation packet for `QuicEndpoint`."""
+
+def _build_retry(
+    original_destination_connection_id: bytes,
+    client_source_connection_id: bytes,
+    server_source_connection_id: bytes,
+    token: bytes,
+    version: int = ...,
+) -> bytes:
+    """Build a stateless QUIC v1 Retry packet for `QuicEndpoint`."""
 
 def parse_datagram_header(datagram: bytes, /) -> DatagramHeader:
     """Parse the routable prefix of a received QUIC datagram (RFC 9000 17).
@@ -115,7 +127,9 @@ class Data:
         data: Owned body bytes that are safe to keep. Qualifying HTTP/1 spans
             reuse the immutable `bytes` supplied to `receive_data()` or
             `receive_event()`; other paths copy out of the parse buffer.
-        stream_id: The stream the body belongs to (`0` on HTTP/1.1).
+        stream_id: The stream the body belongs to (`0` on HTTP/1.1). For HTTP/3,
+            call `connection.consume_data(stream_id, len(data))` after delivering
+            these bytes to the application.
     """
 
     data: bytes
@@ -400,17 +414,47 @@ class H3Connection(Connection):
     def data_to_send(self) -> list[bytes]:
         """Return and clear the pending outgoing UDP datagrams, one per list element."""
 
+    def consume_data(self, stream_id: int, length: int, /) -> None:
+        """Return receive-window credit after the application consumes DATA bytes.
+
+        Reading a `Data` event does not return its payload credit. Call this after
+        the application accepts some or all of that event's bytes. Frame overhead
+        and non-DATA frames are credited internally.
+        """
+
     def receive_datagram(self, datagram: bytes, now: int = ..., peer_address: bytes | None = ..., /) -> None:
         """Feed one received UDP datagram. `peer_address` is an opaque key for path validation."""
 
-    def data_to_send_with_addresses(self) -> list[tuple[bytes, bytes | None]]:
-        """Like `data_to_send`, but as `(datagram, peer_address)` pairs."""
+    def data_to_send_with_addresses(self) -> list[OutboundDatagram]:
+        """Return queued datagrams with their opaque destination address keys."""
+
+    def _set_endpoint_context(
+        self,
+        server_connection_id: bytes,
+        original_destination_connection_id: bytes | None = ...,
+        address_validated: bool = ...,
+    ) -> None:
+        """Configure endpoint-selected connection IDs before the first Initial."""
+
+    def _endpoint_ready(self) -> bool:
+        """Return whether the first Initial was authenticated."""
+
+    def _endpoint_connection_id_generation(self) -> int:
+        """Return the active local connection ID generation."""
 
     def challenge_path(self, peer_address: bytes, data: bytes, /) -> None:
         """Queue a QUIC `PATH_CHALLENGE` to a peer address (`data` must be 8 unpredictable bytes)."""
 
     def use_peer_connection_id(self, sequence_number: int, /) -> None:
         """Switch outgoing packets to a peer-issued `NEW_CONNECTION_ID` sequence."""
+
+    def local_connection_ids(self) -> list[LocalConnectionId]:
+        """Return a snapshot of every active local destination connection ID.
+
+        A newly issued ID appears before `issue_connection_id()` returns. An ID is
+        removed after `receive_datagram()` processes the peer's
+        `RETIRE_CONNECTION_ID`.
+        """
 
     def issue_connection_id(
         self,

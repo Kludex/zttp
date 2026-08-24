@@ -345,6 +345,8 @@ def extract_zttp(w: Workload) -> list[Message]:
     while (ev := conn.next_event()) is not zttp.NEED_DATA:
         if isinstance(ev, zttp.Request):
             starts[ev.stream_id], pending[ev.stream_id], bodies[ev.stream_id] = ev.method, list(ev.headers), b""
+            if ev.end_stream:
+                out.append(_normalize(starts[ev.stream_id], pending[ev.stream_id], bodies[ev.stream_id]))
         elif isinstance(ev, zttp.Response):
             starts[ev.stream_id], pending[ev.stream_id], bodies[ev.stream_id] = ev.status_code, list(ev.headers), b""
         elif isinstance(ev, zttp.Data):

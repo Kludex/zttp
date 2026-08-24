@@ -210,6 +210,13 @@ const LocalCid = struct {
     retired: bool = false,
 };
 
+/// One active destination connection ID the integrator must route to this
+/// connection. The borrowed ID remains valid until the next connection operation.
+pub const LocalConnectionId = struct {
+    sequence_number: u64,
+    connection_id: []const u8,
+};
+
 const ParsedShortForLocalCid = struct {
     hdr: packet.ShortHeader,
     local_cid_seq: u64,
@@ -236,9 +243,11 @@ pub const Connection = struct {
     peer_scid: []u8, // the peer's scid: the dcid of everything we send (owned)
     retry_scid: ?[]u8 = null, // client only: SCID received in Retry, for TP validation
     peer_cids: std.AutoHashMapUnmanaged(u64, PeerCid) = .empty,
+    peer_cid_seq: u64 = 0,
     peer_retire_prior_to: u64 = 0,
     local_cids: std.AutoHashMapUnmanaged(u64, LocalCid) = .empty,
     local_cid_max_seq: u64 = 0,
+    local_cid_generation: u64 = 0,
     local_initial_cid_retired: bool = false,
     spaces: [3]SpaceState,
     rtt: recovery.RttEstimator = .{},
@@ -335,6 +344,7 @@ pub const Connection = struct {
     peer_tp: transport_params.TransportParameters = .{},
     remembered_peer_tp: ?transport_params.TransportParameters = null,
     peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
+    initial_authenticated: bool = false,
     handshake_confirmed: bool = false, // the client Finished verified; HANDSHAKE_DONE sent
     /// The connection-level recv window grew enough to advertise a new MAX_DATA
     /// (RFC 9000 4.1); flushSend emits it so the peer is not stalled at its grant.
@@ -441,6 +451,46 @@ pub const Connection = struct {
         }
         conn.setLocalTransportParameters(local_tp);
         conn.tls = tls.server.Server.init(tls_config);
+        return conn;
+    }
+
+    /// A server connection that derives Initial keys from the client's destination
+    /// ID but advertises an endpoint-selected source connection ID.
+    pub fn initServerWithCid(
+        gpa: std.mem.Allocator,
+        client_dcid: []const u8,
+        server_scid: []const u8,
+        tls_config: tls.flight.Config,
+    ) Error!Connection {
+        if (server_scid.len == 0 or server_scid.len > constants.MAX_CID_LEN) return error.ProtocolViolation;
+        var conn = try initServer(gpa, client_dcid, tls_config);
+        errdefer conn.deinit();
+        const owned_scid = gpa.dupe(u8, server_scid) catch return error.OutOfMemory;
+        gpa.free(conn.scid);
+        conn.scid = owned_scid;
+        return conn;
+    }
+
+    /// A server connection for an Initial whose address-validation token proves a
+    /// preceding Retry. Initial keys use the Retry source ID while transport
+    /// parameters retain the client's original destination ID.
+    pub fn initServerAfterRetry(
+        gpa: std.mem.Allocator,
+        original_dcid: []const u8,
+        retry_scid: []const u8,
+        tls_config: tls.flight.Config,
+    ) Error!Connection {
+        if (original_dcid.len < 8 or original_dcid.len > constants.MAX_CID_LEN) return error.ProtocolViolation;
+        var conn = try initServerWithCid(gpa, retry_scid, retry_scid, tls_config);
+        errdefer conn.deinit();
+        const owned_dcid = gpa.dupe(u8, original_dcid) catch return error.OutOfMemory;
+        errdefer gpa.free(owned_dcid);
+        const owned_retry_scid = gpa.dupe(u8, retry_scid) catch return error.OutOfMemory;
+        gpa.free(conn.dcid);
+        conn.dcid = owned_dcid;
+        conn.retry_scid = owned_retry_scid;
+        conn.retried = true;
+        conn.address_validated = true;
         return conn;
     }
 
@@ -780,6 +830,16 @@ pub const Connection = struct {
         self.closed = true;
     }
 
+    /// Mark the peer address as validated before processing its token-bearing Initial.
+    pub fn markAddressValidated(self: *Connection) void {
+        self.address_validated = true;
+    }
+
+    /// Whether this connection has authenticated an Initial packet.
+    pub fn hasAuthenticatedInitial(self: *const Connection) bool {
+        return self.initial_authenticated;
+    }
+
     /// The built datagrams as one contiguous buffer; pair with `datagramLengths`.
     pub fn datagramsToSend(self: *Connection) []const u8 {
         return self.out.items;
@@ -812,6 +872,7 @@ pub const Connection = struct {
         const owned = self.gpa.dupe(u8, peer_cid.cid) catch return error.OutOfMemory;
         self.gpa.free(self.peer_scid);
         self.peer_scid = owned;
+        self.peer_cid_seq = seq;
     }
 
     /// Issue a replacement local connection id to the peer (RFC 9000 5.1/19.15).
@@ -835,6 +896,40 @@ pub const Connection = struct {
         const gop = self.pending_new_cids.getOrPut(self.gpa, seq) catch return error.OutOfMemory;
         gop.value_ptr.* = .{ .retire_prior_to = retire_prior_to };
         self.local_cid_max_seq = seq;
+        self.local_cid_generation +%= 1;
+    }
+
+    /// Return the generation of the active local connection ID set.
+    pub fn localConnectionIdGeneration(self: *const Connection) u64 {
+        return self.local_cid_generation;
+    }
+
+    /// Copy the active local connection IDs into `out`. A newly issued ID appears
+    /// immediately, before its `NEW_CONNECTION_ID` can be drained and sent. An ID
+    /// disappears after the peer's `RETIRE_CONNECTION_ID` is processed.
+    pub fn localConnectionIds(self: *const Connection, out: []LocalConnectionId) usize {
+        var count: usize = 0;
+        if (!self.local_initial_cid_retired and count < out.len) {
+            out[count] = .{ .sequence_number = 0, .connection_id = self.scid };
+            count += 1;
+        }
+        var iterator = self.local_cids.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.retired or count >= out.len) continue;
+            out[count] = .{ .sequence_number = entry.key_ptr.*, .connection_id = entry.value_ptr.cid };
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Return the number of active local connection IDs.
+    pub fn localConnectionIdCount(self: *const Connection) usize {
+        var count: usize = if (self.local_initial_cid_retired) 0 else 1;
+        var iterator = self.local_cids.valueIterator();
+        while (iterator.next()) |local| if (!local.retired) {
+            count += 1;
+        };
+        return count;
     }
 
     /// Drop the drained datagrams (the integrator has sent them).
@@ -1941,13 +2036,12 @@ pub const Connection = struct {
         const space = Space.initial;
         const st = &self.spaces[@intFromEnum(space)];
         st.crypto_send.write(bytes, false) catch return error.OutOfMemory;
-        const chunk = st.crypto_send.peek(constants.MIN_INITIAL_DATAGRAM) orelse return;
+        const chunk = st.crypto_send.peek(self.framePayloadRoom(space)) orelse return;
         var frames: std.ArrayListUnmanaged(u8) = .empty;
         defer frames.deinit(self.gpa);
         frame.encodeCrypto(&frames, self.gpa, chunk.offset, chunk.data) catch return error.OutOfMemory;
-        while (frames.items.len < constants.MIN_INITIAL_DATAGRAM) {
-            frames.append(self.gpa, 0x00) catch return error.OutOfMemory;
-        }
+        const target = try self.minimumInitialFramePayload();
+        while (frames.items.len < target) frames.append(self.gpa, 0x00) catch return error.OutOfMemory;
         st.crypto_sent.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
         const pn = try self.buildPacket(space, frames.items, true, now);
         st.crypto_sent.putAssumeCapacity(pn, .{ .offset = chunk.offset, .len = chunk.data.len });
@@ -1969,6 +2063,10 @@ pub const Connection = struct {
             var frames: std.ArrayListUnmanaged(u8) = .empty;
             defer frames.deinit(self.gpa);
             frame.encodeCrypto(&frames, self.gpa, chunk.offset, chunk.data) catch return error.OutOfMemory;
+            if (self.role == .client and space == .initial) {
+                const target = try self.minimumInitialFramePayload();
+                while (frames.items.len < target) frames.append(self.gpa, 0x00) catch return error.OutOfMemory;
+            }
             st.crypto_sent.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
             const pn = self.buildPacket(space, frames.items, true, now) catch |e| switch (e) {
                 error.AmplificationLimited => return, // budget exhausted: keep the rest retained
@@ -2029,6 +2127,30 @@ pub const Connection = struct {
             else => return e,
         };
         st.ack_pending = false;
+    }
+
+    fn minimumInitialFramePayload(self: *const Connection) Error!usize {
+        const space = Space.initial;
+        const st = &self.spaces[@intFromEnum(space)];
+        const pn_len = packet.packetNumberLen(st.next_pn, st.rec.largest_acked);
+        const token = self.initial_token orelse &.{};
+        const room = self.framePayloadRoom(space);
+        var header: std.ArrayListUnmanaged(u8) = .empty;
+        defer header.deinit(self.gpa);
+        _ = packet.writeLongHeader(
+            &header,
+            self.gpa,
+            .initial,
+            constants.VERSION_1,
+            self.peer_scid,
+            self.scid,
+            token,
+            pn_len + room + crypto.TAG_LEN,
+            pn_len,
+        ) catch return error.OutOfMemory;
+        const overhead = header.items.len + pn_len + crypto.TAG_LEN;
+        if (overhead >= constants.MIN_INITIAL_DATAGRAM) return 0;
+        return constants.MIN_INITIAL_DATAGRAM - overhead;
     }
 
     fn framePayloadRoom(self: *const Connection, space: Space) usize {
@@ -2097,7 +2219,10 @@ pub const Connection = struct {
             }
             const new_peer_path = self.default_path_token != null and self.default_path_token.? != pt;
             self.current_path_token = pt;
-            if (self.default_path_token == null) self.default_path_token = pt;
+            if (self.default_path_token == null) {
+                self.default_path_token = pt;
+                if (self.address_validated) self.paths.getPtr(pt).?.validated = true;
+            }
             if (self.paths.getPtr(pt)) |p| {
                 p.recv_bytes += datagram.len;
                 if (self.handshake_confirmed and new_peer_path and !p.validated) {
@@ -2340,6 +2465,7 @@ pub const Connection = struct {
             try self.openPacket(pkt, pn_offset, space, long, st.recv_keys orelse return error.Dropped, null);
         defer self.gpa.free(opened.work);
         defer self.gpa.free(opened.plaintext);
+        if (space == .initial) self.initial_authenticated = true;
 
         // A decryptable Handshake packet proves the peer received our Initial/
         // handshake keys, so its address is validated and the 3x send limit lifts
@@ -2512,17 +2638,28 @@ pub const Connection = struct {
         }
         if (seq > self.local_cid_max_seq) return error.ProtocolViolation;
         if (seq == 0) {
-            self.local_initial_cid_retired = true;
+            if (!self.local_initial_cid_retired) {
+                self.local_initial_cid_retired = true;
+                self.local_cid_generation +%= 1;
+            }
             return;
         }
         const local = self.local_cids.getPtr(seq) orelse return error.ProtocolViolation;
-        local.retired = true;
+        if (!local.retired) {
+            local.retired = true;
+            self.local_cid_generation +%= 1;
+        }
     }
 
     fn onNewConnectionId(self: *Connection, seq: u64, retire_prior_to: u64, cid: []const u8, token: []const u8) Error!void {
-        if (token.len != 16) return error.ProtocolViolation;
+        if (token.len != 16 or retire_prior_to > seq) return error.ProtocolViolation;
         if (retire_prior_to > self.peer_retire_prior_to) {
+            const previous_retire_prior_to = self.peer_retire_prior_to;
             self.peer_retire_prior_to = retire_prior_to;
+            if (previous_retire_prior_to == 0 and retire_prior_to > 0) {
+                const initial = self.pending_retire_cids.getOrPut(self.gpa, 0) catch return error.OutOfMemory;
+                if (!initial.found_existing) initial.value_ptr.* = .{};
+            }
             var retire: std.ArrayListUnmanaged(u64) = .empty;
             defer retire.deinit(self.gpa);
             var it = self.peer_cids.keyIterator();
@@ -2542,14 +2679,19 @@ pub const Connection = struct {
         const token_array = token[0..16].*;
         if (self.peer_cids.get(seq)) |existing| {
             if (!std.mem.eql(u8, existing.cid, cid) or !std.mem.eql(u8, &existing.token, &token_array)) return error.ProtocolViolation;
+            if (self.peer_cid_seq < self.peer_retire_prior_to) try self.usePeerConnectionId(seq);
             return;
         }
         if (std.mem.eql(u8, cid, self.peer_scid) or self.peerCidValueExists(cid)) return error.ProtocolViolation;
 
-        if (self.peer_cids.count() + 2 > self.local_tp.active_connection_id_limit) return error.ProtocolViolation;
+        const active_initial: usize = if (self.peer_retire_prior_to == 0) 1 else 0;
+        if (self.peer_cids.count() + active_initial + 1 > self.local_tp.active_connection_id_limit) {
+            return error.ProtocolViolation;
+        }
         const owned = self.gpa.dupe(u8, cid) catch return error.OutOfMemory;
         errdefer self.gpa.free(owned);
         self.peer_cids.put(self.gpa, seq, .{ .cid = owned, .token = token_array }) catch return error.OutOfMemory;
+        if (self.peer_cid_seq < self.peer_retire_prior_to) try self.usePeerConnectionId(seq);
     }
 
     /// RFC 9002 2: every frame except ACK, PADDING, and CONNECTION_CLOSE makes its
@@ -2811,21 +2953,38 @@ pub const Connection = struct {
         return &.{};
     }
 
-    /// Mark `n` bytes of a stream consumed, re-granting flow-control credit. The
-    /// connection window slides by the connection-wide consumed total (the sum
-    /// across streams), matching how `onStreamFrame` charges it.
+    /// Advance past `n` ordered stream bytes without returning flow-control credit.
+    /// HTTP/3 uses this for DATA payloads until the application acknowledges them.
+    pub fn advanceStream(self: *Connection, id: u64, n: usize) void {
+        if (self.streams.get(id)) |s| s.consume(n);
+    }
+
+    /// Return credit for up to `n` bytes already advanced by the parser.
+    pub fn creditStream(self: *Connection, id: u64, n: u64) void {
+        if (self.streams.get(id)) |s| self.applyStreamCredit(id, s, s.credit(n));
+    }
+
+    /// Return all received stream credit after a reset or local abandonment.
+    pub fn releaseStreamCredit(self: *Connection, id: u64) void {
+        if (self.streams.get(id)) |s| self.applyStreamCredit(id, s, s.releaseCredit());
+    }
+
+    fn applyStreamCredit(self: *Connection, id: u64, s: *stream.RecvStream, credited: u64) void {
+        self.conn_consumed_total += credited;
+        self.conn_recv_window.onConsumed(self.conn_consumed_total);
+        if (self.conn_recv_window.shouldUpdate()) self.max_data_pending = true;
+        if (self.recv_windows.getPtr(id)) |rw| {
+            rw.onConsumed(s.flow_consumed);
+            if (rw.shouldUpdate()) self.max_stream_data_pending.put(self.gpa, id, {}) catch {};
+        }
+    }
+
+    /// Mark `n` stream bytes parsed and return their flow-control credit.
     pub fn consumeStream(self: *Connection, id: u64, n: usize) void {
         if (self.streams.get(id)) |s| {
             const before = s.read_offset;
             s.consume(n);
-            self.conn_consumed_total += s.read_offset - before;
-            self.conn_recv_window.onConsumed(self.conn_consumed_total);
-            // Enough has been consumed to advertise a higher limit; flushSend emits it.
-            if (self.conn_recv_window.shouldUpdate()) self.max_data_pending = true;
-            if (self.recv_windows.getPtr(id)) |rw| {
-                rw.onConsumed(s.read_offset);
-                if (rw.shouldUpdate()) self.max_stream_data_pending.put(self.gpa, id, {}) catch {};
-            }
+            self.applyStreamCredit(id, s, s.credit(s.read_offset - before));
         }
     }
 
@@ -4512,18 +4671,18 @@ test "NEW_CONNECTION_ID retire_prior_to queues RETIRE_CONNECTION_ID" {
 
     var second: std.ArrayListUnmanaged(u8) = .empty;
     defer second.deinit(gpa);
-    try frame.encodeNewConnectionId(&second, gpa, 2, 2, &[_]u8{ 5, 6, 7, 8 }, token);
+    try frame.encodeNewConnectionId(&second, gpa, 2, 1, &[_]u8{ 5, 6, 7, 8 }, token);
     const d2 = try testBuildApp(gpa, &dcid, 1, second.items);
     defer gpa.free(d2);
     try conn.receiveDatagram(d2, 2000);
-    try testing.expect(conn.pending_retire_cids.contains(1));
+    try testing.expect(conn.pending_retire_cids.contains(0));
 
     conn.clearSend();
     try conn.flushSend(3000);
 
     const dgram = conn.datagramsToSend()[0..conn.datagramLengths()[0]];
     const keys = testAppKeys();
-    const hdr = try packet.parseShort(dgram, dcid.len);
+    const hdr = try packet.parseShort(dgram, conn.peer_scid.len);
     const work = try gpa.dupe(u8, dgram);
     defer gpa.free(work);
     const pn_len = try crypto.unprotectHeader(keys.hp, work, hdr.pn_offset, false);
@@ -4535,7 +4694,7 @@ test "NEW_CONNECTION_ID retire_prior_to queues RETIRE_CONNECTION_ID" {
     defer gpa.free(plaintext);
     const payload = try crypto.open(keys, truncated, header, ciphertext, plaintext);
     const decoded = try frame.decode(payload);
-    try testing.expectEqual(frame.Frame{ .retire_connection_id = 1 }, decoded.frame);
+    try testing.expectEqual(frame.Frame{ .retire_connection_id = 0 }, decoded.frame);
 }
 
 test "RETIRE_CONNECTION_ID can retire the initial local cid" {
@@ -5245,6 +5404,39 @@ test "client processes Retry and resends Initial with token and new dcid" {
     try testing.expectEqual(constants.LongType.initial, h.ltype);
     try testing.expectEqualSlices(u8, &retry_scid, h.dcid);
     try testing.expectEqualStrings("retry-token", h.token);
+}
+
+test "server accepts a token-bearing Initial after Retry" {
+    const gpa = testing.allocator;
+    const original_dcid = "original";
+    const client_tp = [_]u8{
+        0x04, 0x04, 0x80, 0x01, 0x00, 0x00,
+        0x05, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x06, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x07, 0x04, 0x80, 0x04, 0x00, 0x00,
+        0x08, 0x01, 0x10, 0x09, 0x01, 0x10,
+    };
+    var client = try Connection.initClient(gpa, original_dcid, .{
+        .transport_params = &client_tp,
+        .random = [_]u8{0x44} ** 32,
+        .ephemeral_seed = [_]u8{0x55} ** 32,
+        .alpn = "h3",
+        .server_name = "example.test",
+    }, 1000);
+    defer client.deinit();
+    client.clearSend();
+
+    const retry_scid = "retry-server-cid";
+    var retry: std.ArrayListUnmanaged(u8) = .empty;
+    defer retry.deinit(gpa);
+    try packet.writeRetry(&retry, gpa, client.scid, retry_scid, "retry-token", original_dcid);
+    try client.receiveDatagram(retry.items, 2000);
+
+    var server = try Connection.initServerAfterRetry(gpa, original_dcid, retry_scid, testServerConfig());
+    defer server.deinit();
+    try server.receiveDatagramFrom(client.datagramsToSend(), 3000, "peer-address");
+    try testing.expect(server.datagramsToSend().len > 0);
+    try testing.expect(server.paths.get(std.hash.Wyhash.hash(0, "peer-address")).?.validated);
 }
 
 test "server answers an unsupported long-header version with Version Negotiation" {

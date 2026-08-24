@@ -6,7 +6,7 @@ import zttp
 from tests.conftest import drain
 
 
-def _parse(data: bytes) -> zttp.Connection:
+def _parse(data: bytes) -> zttp.H1Connection:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(data)
     list(drain(conn))
@@ -63,7 +63,7 @@ def test_client_should_close_for_close_delimited_response() -> None:
     assert conn.should_close() is True
 
 
-def _respond(*headers: tuple[bytes, bytes]) -> zttp.Connection:
+def _respond(*headers: tuple[bytes, bytes]) -> zttp.H1Connection:
     conn = _parse(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
     assert conn.should_close() is False
     conn.send_response(200, [(b"content-length", b"0"), *headers])

@@ -4,6 +4,7 @@ import dataclasses
 import pickle
 
 import pytest
+from typing_extensions import TypedDict
 
 import zttp
 
@@ -23,7 +24,40 @@ SERVER_TRANSPORT_PARAMS = (
     b"\x06\x04\x80\x04\x00\x00"  # initial_max_stream_data_bidi_remote = 262144
     b"\x07\x04\x80\x04\x00\x00"  # initial_max_stream_data_uni = 262144
 )
-SERVER_CONFIG = {
+
+
+class ServerConfig(TypedDict):
+    credentials: zttp.TlsCredentials
+    transport_params: zttp.QuicTransportParameters
+    random: bytes
+    ephemeral_seed: bytes
+
+
+class RetryTokenCase(TypedDict):
+    token_change: str
+
+
+class ClientConfig(TypedDict):
+    transport_params: zttp.QuicTransportParameters
+    random: bytes
+    ephemeral_seed: bytes
+    connection_id: bytes
+    alpn: bytes
+    server_name: bytes
+
+
+class ResumedClientConfig(ClientConfig, total=False):
+    resumption: zttp.SessionResumption
+    obfuscated_ticket_age: int
+    early_data: bool
+    remembered_transport_params: bytes
+
+
+class ResumedServerConfig(ServerConfig, total=False):
+    resumption: zttp.SessionResumption
+
+
+SERVER_CONFIG: ResumedServerConfig = {
     "credentials": zttp.TlsCredentials(certificate=SERVER_PUBLIC_KEY, private_key=b"\x42" * 32),
     "transport_params": zttp.QuicTransportParameters(
         initial_max_data=1048576,
@@ -36,7 +70,7 @@ SERVER_CONFIG = {
     "ephemeral_seed": b"\x33" * 32,
 }
 
-CLIENT_CONFIG = {
+CLIENT_CONFIG: ResumedClientConfig = {
     "transport_params": zttp.QuicTransportParameters(
         initial_max_data=65536,
         initial_max_stream_data_bidi_local=262144,
@@ -123,6 +157,136 @@ def test_parse_datagram_header_routes_a_client_initial() -> None:
     assert header.is_initial
     assert header.version == 1
     assert header.destination_connection_id == b"\xaa\xbb\xcc\xdd"
+    assert header.token == b""
+
+
+def test_quic_endpoint_completes_retry_and_routes_the_connection() -> None:
+    connection_ids = iter((b"r" * 16, b"n" * 16))
+    endpoint = zttp.QuicEndpoint(
+        credentials=zttp.TlsCredentials(certificate=SERVER_PUBLIC_KEY, private_key=b"\x42" * 32),
+        transport_params=zttp.QuicTransportParameters(
+            initial_max_data=1048576,
+            initial_max_streams_bidi=8,
+            initial_max_streams_uni=8,
+            initial_max_stream_data_bidi_remote=262144,
+            initial_max_stream_data_uni=262144,
+        ),
+        retry=True,
+        token_secret=b"s" * 32,
+        connection_id_factory=lambda length: next(connection_ids),
+    )
+    config: ResumedClientConfig = CLIENT_CONFIG.copy()
+    config["connection_id"] = b"original"
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
+    [initial] = client.data_to_send()
+
+    assert endpoint.receive_datagram(initial, b"client-address", 1000) is None
+    [retry] = endpoint.data_to_send()
+    assert retry.peer_address == b"client-address"
+    retry_header = zttp.parse_datagram_header(retry.data)
+    assert retry_header.source_connection_id == b"r" * 16
+
+    client.receive_datagram(retry.data, 2000)
+    [retried_initial] = client.data_to_send()
+    retried_header = zttp.parse_datagram_header(retried_initial)
+    assert retried_header.destination_connection_id == b"r" * 16
+    assert retried_header.token
+
+    server = endpoint.receive_datagram(retried_initial, b"client-address", 3000)
+    assert server is not None
+    assert endpoint.connections() == [server]
+    for datagram in endpoint.data_to_send():
+        assert datagram.peer_address == b"client-address"
+        client.receive_datagram(datagram.data, 4000)
+    for datagram in client.data_to_send():
+        assert endpoint.receive_datagram(datagram, b"client-address", 5000) is server
+    for datagram in endpoint.data_to_send():
+        client.receive_datagram(datagram.data, 6000)
+    client.send_request(b"GET", b"/", b"3", [(b"host", b"example.test")])
+    for datagram in client.data_to_send():
+        assert endpoint.receive_datagram(datagram, b"client-address", 7000) is server
+    assert any(isinstance(event, zttp.Request) for event in drain_events(server))
+
+    replacement_connection_id = endpoint.issue_connection_id(server, 1, retire_prior_to=1)
+    assert replacement_connection_id == b"n" * 16
+    for datagram in endpoint.data_to_send():
+        client.receive_datagram(datagram.data, 8000)
+    for datagram in client.data_to_send():
+        assert endpoint.receive_datagram(datagram, b"client-address", 9000) is server
+    endpoint.data_to_send()
+
+    client.use_peer_connection_id(1)
+    client.send_request(b"GET", b"/rotated", b"3", [(b"host", b"example.test")])
+    routed = [endpoint.receive_datagram(datagram, b"client-address", 11_000) for datagram in client.data_to_send()]
+    assert routed
+    assert all(connection is server for connection in routed)
+
+    endpoint.issue_token(server, 12_000)
+    for datagram in endpoint.data_to_send():
+        client.receive_datagram(datagram.data, 13_000)
+    [validation_token] = client.validation_tokens()
+    returning_client = zttp.Connection(
+        zttp.CLIENT,
+        zttp.HTTP3,
+        connection_id=b"returning",
+        server_name=b"localhost",
+        validation_token=validation_token,
+    )
+    returning_endpoint = zttp.QuicEndpoint(
+        retry=True,
+        token_secret=b"s" * 32,
+        connection_id_factory=lambda length: b"v" * length,
+    )
+    assert (
+        returning_endpoint.receive_datagram(returning_client.data_to_send()[0], b"client-address", 14_000) is not None
+    )
+    assert endpoint.next_timeout() is not None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        {"token_change": token_change}
+        for token_change in ("address", "expired", "future", "tampered", "short", "destination")
+    ],
+)
+def test_quic_endpoint_rejects_invalid_retry_tokens(case: RetryTokenCase) -> None:
+    token_change = case["token_change"]
+    endpoint = zttp.QuicEndpoint(
+        retry=True,
+        token_secret=b"s" * 32,
+        token_ttl=10,
+        connection_id_factory=lambda length: b"r" * length,
+    )
+    client = zttp.Connection(
+        zttp.CLIENT,
+        protocol=zttp.HTTP3,
+        connection_id=b"original",
+        server_name=b"localhost",
+    )
+    [initial] = client.data_to_send()
+    endpoint.receive_datagram(initial, b"address", 1000)
+    [retry] = endpoint.data_to_send()
+    client.receive_datagram(retry.data, 1001)
+    [retried_initial] = client.data_to_send()
+    address = b"other" if token_change == "address" else b"address"
+    now = 1011 if token_change == "expired" else 999 if token_change == "future" else 1002
+    if token_change == "tampered":
+        token = zttp.parse_datagram_header(retried_initial).token
+        tampered = token[:-1] + bytes((token[-1] ^ 1,))
+        retried_initial = retried_initial.replace(token, tampered, 1)
+    elif token_change in {"short", "destination"}:
+        token = b"short" if token_change == "short" else zttp.parse_datagram_header(retried_initial).token
+        other = zttp.Connection(
+            zttp.CLIENT,
+            protocol=zttp.HTTP3,
+            connection_id=b"different" if token_change == "destination" else b"r" * 16,
+            server_name=b"localhost",
+            validation_token=token,
+        )
+        [retried_initial] = other.data_to_send()
+    assert endpoint.receive_datagram(retried_initial, address, now) is None
+    assert endpoint.connections() == []
 
 
 def test_parse_datagram_header_reports_a_short_header() -> None:
@@ -131,6 +295,7 @@ def test_parse_datagram_header_reports_a_short_header() -> None:
     assert not header.is_initial
     assert header.destination_connection_id == b""
     assert header.source_connection_id == b""
+    assert header.token == b""
 
 
 def test_parse_datagram_header_rejects_a_malformed_datagram() -> None:
@@ -154,7 +319,7 @@ def test_parse_datagram_header_does_not_trust_an_unsupported_version() -> None:
 def test_parse_datagram_header_result_is_frozen() -> None:
     header = zttp.parse_datagram_header(b"\x40\x00")
     with pytest.raises(dataclasses.FrozenInstanceError):
-        header.version = 9  # type: ignore[misc]
+        header.version = 9  # ty: ignore[invalid-assignment]
 
 
 def test_http3_client_construction_emits_an_initial() -> None:
@@ -162,16 +327,17 @@ def test_http3_client_construction_emits_an_initial() -> None:
     assert type(conn) is zttp.H3Connection
     datagrams = conn.data_to_send()
     assert len(datagrams) == 1
-    assert len(datagrams[0]) >= 1200
+    assert len(datagrams[0]) == 1200
     assert datagrams[0][0] & 0x80
     assert conn.data_to_send() == []
 
 
 def test_http3_client_initial_can_carry_validation_token() -> None:
-    config = dict(CLIENT_CONFIG)
+    config = CLIENT_CONFIG.copy()
     config["connection_id"] = b"\x11\x22\x33\x4d"
     conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config, validation_token=b"validated-earlier")
     [initial] = conn.data_to_send()
+    assert len(initial) == 1200
     assert b"validated-earlier" in initial
 
 
@@ -181,21 +347,23 @@ def test_http3_validation_tokens_starts_empty() -> None:
 
 
 def test_http3_validation_token_must_not_be_empty() -> None:
-    config = dict(CLIENT_CONFIG)
+    config = CLIENT_CONFIG.copy()
     with pytest.raises(ValueError):
         zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config, validation_token=b"")
 
 
 def test_http3_validation_token_is_client_only() -> None:
     with pytest.raises(ValueError):
-        zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **SERVER_CONFIG, validation_token=b"token")
+        zttp.Connection(  # ty: ignore[no-matching-overload]
+            zttp.SERVER, protocol=zttp.HTTP3, **SERVER_CONFIG, validation_token=b"token"
+        )
 
 
 def test_http3_client_defaults_transport_settings_and_connection_id() -> None:
     conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
     datagrams = conn.data_to_send()
     assert len(datagrams) == 1
-    assert len(datagrams[0]) >= 1200
+    assert len(datagrams[0]) == 1200
 
 
 def test_http3_default_client_and_server_exchange_request() -> None:
@@ -218,7 +386,7 @@ def test_http3_default_client_and_server_exchange_request() -> None:
 
 
 def test_http3_client_rejects_unverifiable_server_certificate() -> None:
-    config = dict(SERVER_CONFIG)
+    config = SERVER_CONFIG.copy()
     config["credentials"] = zttp.TlsCredentials(certificate=b"\xcc" * 48, private_key=b"\x42" * 32)
     client = make_client()
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
@@ -334,7 +502,7 @@ def test_http3_received_session_ticket_psk_resumes_later_connection() -> None:
     assert len(psk) == 32
     assert psk == issued_psk
 
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x47",
@@ -381,8 +549,9 @@ def test_http3_ticket_age_mismatch_does_not_accept_zero_rtt() -> None:
     assert transfer(first_server, first_client, 5000)
     [ticket] = first_client.session_tickets()
     identity, psk = ticket.ticket, ticket.psk
+    assert isinstance(psk, bytes)
 
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x48",
@@ -423,9 +592,10 @@ def test_http3_expired_ticket_does_not_accept_zero_rtt() -> None:
     assert transfer(first_server, first_client, 5000)
     [ticket] = first_client.session_tickets()
     age_add, identity, psk = ticket.age_add, ticket.ticket, ticket.psk
+    assert isinstance(psk, bytes)
 
     resume_at = 2_500_000
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x49",
@@ -466,9 +636,10 @@ def test_http3_ticket_without_early_data_extension_does_not_accept_zero_rtt() ->
     assert transfer(first_server, first_client, 5000)
     [ticket] = first_client.session_tickets()
     age_add, identity, psk = ticket.age_add, ticket.ticket, ticket.psk
+    assert isinstance(psk, bytes)
     assert ticket.max_early_data_size is None
 
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x4a",
@@ -509,9 +680,10 @@ def test_http3_zero_rtt_ticket_is_single_use() -> None:
     assert transfer(first_server, first_client, 5000)
     [ticket] = first_client.session_tickets()
     age_add, identity, psk = ticket.age_add, ticket.ticket, ticket.psk
+    assert isinstance(psk, bytes)
 
     def make_early_client(connection_id: bytes, now: int) -> zttp.H3Connection:
-        client_config = dict(CLIENT_CONFIG)
+        client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
         client_config.update(
             {
                 "connection_id": connection_id,
@@ -544,7 +716,7 @@ def test_http3_zero_rtt_ticket_is_single_use() -> None:
 
 def test_http3_client_server_resumed_handshake() -> None:
     psk = b"\x7b" * 32
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x45",
@@ -552,7 +724,7 @@ def test_http3_client_server_resumed_handshake() -> None:
             "obfuscated_ticket_age": 0x01020304,
         }
     )
-    server_config = dict(SERVER_CONFIG)
+    server_config: ResumedServerConfig = SERVER_CONFIG.copy()
     server_config.update(
         {
             "resumption": zttp.SessionResumption(identity=b"ticket-identity", psk=psk),
@@ -579,7 +751,7 @@ def test_http3_client_server_resumed_handshake() -> None:
 
 def test_http3_static_resumption_credentials_do_not_accept_zero_rtt() -> None:
     psk = b"\x7b" * 32
-    client_config = dict(CLIENT_CONFIG)
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
     client_config.update(
         {
             "connection_id": b"\x11\x22\x33\x46",
@@ -589,7 +761,7 @@ def test_http3_static_resumption_credentials_do_not_accept_zero_rtt() -> None:
             "remembered_transport_params": SERVER_TRANSPORT_PARAMS,
         }
     )
-    server_config = dict(SERVER_CONFIG)
+    server_config: ResumedServerConfig = SERVER_CONFIG.copy()
     server_config.update(
         {
             "resumption": zttp.SessionResumption(identity=b"ticket-identity", psk=psk),
@@ -717,9 +889,68 @@ def test_http3_client_request_trailers() -> None:
         events.append(ev)
 
     assert any(isinstance(e, zttp.Request) for e in events)
-    assert any(isinstance(e, zttp.Data) and e.data == b"body" for e in events)
+    data = next(e for e in events if isinstance(e, zttp.Data))
+    assert data.data == b"body"
     eom = next(e for e in events if isinstance(e, zttp.EndOfMessage))
     assert eom.trailers == [(b"x-checksum", b"abc")]
+    server.consume_data(data.stream_id, len(data.data))
+    with pytest.raises(ValueError):
+        server.consume_data(data.stream_id, 1)
+
+
+def test_http3_receive_credit_waits_for_application_consumption() -> None:
+    config: ResumedServerConfig = SERVER_CONFIG.copy()
+    config["transport_params"] = zttp.QuicTransportParameters(
+        initial_max_data=512,
+        initial_max_stream_data_bidi_remote=512,
+        initial_max_stream_data_uni=262144,
+        initial_max_streams_bidi=8,
+        initial_max_streams_uni=8,
+    )
+    client = make_client()
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
+    transfer(client, server, 1000)
+    transfer(server, client, 2000)
+    transfer(client, server, 3000)
+
+    stream = client.send_request(
+        b"POST",
+        b"/slow",
+        b"3",
+        [(b"host", b"example.test"), (b"content-length", b"1024")],
+    )
+    for _ in range(4):
+        stream.send_data(b"x" * 256)
+    stream.end_message()
+    assert stream.pending_bytes is not None
+    assert stream.pending_bytes > 0
+    transfer(client, server, 4000)
+    events = drain_events(server)
+    request = next(event for event in events if isinstance(event, zttp.Request))
+    server.initiate_connection()
+    transfer(server, client, 5000)
+    client.initiate_connection()
+    transfer(client, server, 6000)
+    events.extend(drain_events(server))
+    data = b"".join(event.data for event in events if isinstance(event, zttp.Data))
+    assert data
+    assert len(data) < 1024
+
+    pending = stream.pending_bytes
+    server.initiate_connection()
+    transfer(server, client, 7000)
+    client.initiate_connection()
+    transfer(client, server, 8000)
+    assert stream.pending_bytes == pending
+
+    with pytest.raises(ValueError):
+        server.consume_data(request.stream_id, len(data) + 1)
+    server.consume_data(request.stream_id, len(data))
+    transfer(server, client, 9000)
+    client.initiate_connection()
+    transfer(client, server, 10_000)
+    assert stream.pending_bytes is not None
+    assert stream.pending_bytes < pending
 
 
 def test_http3_stream_send_window_and_pending_bytes_track_backpressure() -> None:
@@ -763,7 +994,7 @@ def test_http3_server_defaults_transport_settings_and_credentials() -> None:
 
 
 def test_http3_accepts_typed_transport_parameters() -> None:
-    client_config = dict(CLIENT_CONFIG)
+    client_config = CLIENT_CONFIG.copy()
     client_config["transport_params"] = zttp.QuicTransportParameters(
         initial_max_data=65536,
         initial_max_stream_data_bidi_local=4096,
@@ -775,7 +1006,7 @@ def test_http3_accepts_typed_transport_parameters() -> None:
         max_udp_payload_size=1200,
         disable_active_migration=True,
     )
-    server_config = dict(SERVER_CONFIG)
+    server_config = SERVER_CONFIG.copy()
     server_config["transport_params"] = zttp.QuicTransportParameters(
         initial_max_data=1048576,
         initial_max_stream_data_bidi_remote=262144,
@@ -801,7 +1032,7 @@ def test_http3_accepts_typed_transport_parameters() -> None:
 
 
 def test_http3_typed_transport_parameters_preserve_role_defaults() -> None:
-    config = dict(SERVER_CONFIG)
+    config = SERVER_CONFIG.copy()
     config["transport_params"] = zttp.QuicTransportParameters(max_idle_timeout=30_000)
     client = make_client()
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
@@ -817,9 +1048,15 @@ def test_http3_typed_transport_parameters_preserve_role_defaults() -> None:
 
 def test_http3_typed_transport_parameters_validate_in_the_extension() -> None:
     with pytest.raises(TypeError):
-        zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params=b"raw")  # type: ignore[arg-type]
+        zttp.Connection(  # ty: ignore[no-matching-overload]
+            zttp.CLIENT, zttp.HTTP3, transport_params=b"raw"
+        )
     with pytest.raises(ValueError, match="unknown field"):
-        zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params={"unknown": 1})  # type: ignore[typeddict-unknown-key]
+        zttp.Connection(  # ty: ignore[no-matching-overload]
+            zttp.CLIENT,
+            zttp.HTTP3,
+            transport_params={"unknown": 1},  # ty: ignore[invalid-key]
+        )
     with pytest.raises(ValueError, match="outside the QUIC range"):
         zttp.Connection(zttp.CLIENT, zttp.HTTP3, transport_params={"max_udp_payload_size": 1199})
     with pytest.raises(ValueError, match="only valid for HTTP/3 servers"):
@@ -831,7 +1068,7 @@ def test_http3_typed_transport_parameters_validate_in_the_extension() -> None:
 
 
 def test_http3_server_accepts_a_certificate_chain() -> None:
-    config = dict(SERVER_CONFIG)
+    config: ResumedServerConfig = SERVER_CONFIG.copy()
     config["credentials"] = zttp.TlsCredentials(
         certificates=(SERVER_PUBLIC_KEY, b"intermediate-certificate"),
         private_key=b"\x42" * 32,
@@ -885,7 +1122,7 @@ def test_first_datagram_must_be_an_initial() -> None:
 
 def test_a_non_conformant_client_hello_is_rejected() -> None:
     # Wrong ALPN - the server requires HTTP/3 clients to negotiate "h3".
-    config = dict(CLIENT_CONFIG)
+    config = CLIENT_CONFIG.copy()
     config["alpn"] = b"http/1.1"
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
     conn = make_server()
@@ -918,8 +1155,8 @@ def test_data_to_send_with_addresses_preserves_peer_address_key() -> None:
     conn.receive_datagram(CLIENT_HELLO, 1000, peer)
     datagrams = conn.data_to_send_with_addresses()
     assert len(datagrams) >= 1
-    assert all(isinstance(dgram, bytes) and dgram for dgram, _addr in datagrams)
-    assert all(addr == peer for _dgram, addr in datagrams)
+    assert all(isinstance(datagram.data, bytes) and datagram.data for datagram in datagrams)
+    assert all(datagram.peer_address == peer for datagram in datagrams)
     assert conn.data_to_send_with_addresses() == []
 
 
@@ -927,9 +1164,9 @@ def test_data_to_send_with_addresses_uses_none_without_peer_address_key() -> Non
     conn = make_client()
     datagrams = conn.data_to_send_with_addresses()
     assert len(datagrams) == 1
-    dgram, addr = datagrams[0]
-    assert isinstance(dgram, bytes)
-    assert addr is None
+    [datagram] = datagrams
+    assert isinstance(datagram.data, bytes)
+    assert datagram.peer_address is None
     assert conn.data_to_send() == []
 
 
@@ -954,7 +1191,7 @@ def test_response_datagrams_keep_latest_peer_address_key() -> None:
     stream.end_message()
     datagrams = conn.data_to_send_with_addresses()
     assert len(datagrams) >= 1
-    assert all(addr == peer for _dgram, addr in datagrams)
+    assert all(datagram.peer_address == peer for datagram in datagrams)
 
 
 def test_unvalidated_migrated_peer_address_does_not_become_default_route() -> None:
@@ -970,7 +1207,7 @@ def test_unvalidated_migrated_peer_address_does_not_become_default_route() -> No
         conn.receive_datagram(dgram, 3000, addr_b)
     acks = conn.data_to_send_with_addresses()
     assert acks
-    assert all(addr == addr_b for _dgram, addr in acks)
+    assert all(datagram.peer_address == addr_b for datagram in acks)
 
     events = []
     while (ev := conn.next_event()) is not zttp.NEED_DATA:
@@ -982,7 +1219,7 @@ def test_unvalidated_migrated_peer_address_does_not_become_default_route() -> No
     stream.end_message()
     datagrams = conn.data_to_send_with_addresses()
     assert datagrams
-    assert all(addr == addr_a for _dgram, addr in datagrams)
+    assert all(datagram.peer_address == addr_a for datagram in datagrams)
 
 
 def test_challenge_path_emits_addressed_datagram() -> None:
@@ -1001,7 +1238,7 @@ def test_challenge_path_emits_addressed_datagram() -> None:
     conn.challenge_path(addr_b, b"12345678")
     datagrams = conn.data_to_send_with_addresses()
     assert datagrams
-    assert all(addr == addr_b for _dgram, addr in datagrams)
+    assert all(datagram.peer_address == addr_b for datagram in datagrams)
 
 
 def test_migrated_peer_address_is_challenged_automatically() -> None:
@@ -1013,15 +1250,15 @@ def test_migrated_peer_address_is_challenged_automatically() -> None:
 
     for dgram in client.data_to_send():
         server.receive_datagram(dgram, 1000, addr_a)
-    for dgram, addr in server.data_to_send_with_addresses():
-        assert addr == addr_a
-        client.receive_datagram(dgram, 2000, server_addr)
-    for dgram, addr in client.data_to_send_with_addresses():
-        assert addr == server_addr
-        server.receive_datagram(dgram, 3000, addr_a)
-    for dgram, addr in server.data_to_send_with_addresses():
-        assert addr == addr_a
-        client.receive_datagram(dgram, 4000, server_addr)
+    for outbound in server.data_to_send_with_addresses():
+        assert outbound.peer_address == addr_a
+        client.receive_datagram(outbound.data, 2000, server_addr)
+    for outbound in client.data_to_send_with_addresses():
+        assert outbound.peer_address == server_addr
+        server.receive_datagram(outbound.data, 3000, addr_a)
+    for outbound in server.data_to_send_with_addresses():
+        assert outbound.peer_address == addr_a
+        client.receive_datagram(outbound.data, 4000, server_addr)
 
     client.send_request(b"GET", b"/auto-migrated", b"3", [(b"host", b"example.test")])
     for dgram in client.data_to_send():
@@ -1029,15 +1266,15 @@ def test_migrated_peer_address_is_challenged_automatically() -> None:
 
     challenge_datagrams = server.data_to_send_with_addresses()
     assert challenge_datagrams
-    assert all(addr == addr_b for _dgram, addr in challenge_datagrams)
-    for dgram, _addr in challenge_datagrams:
-        client.receive_datagram(dgram, 6000, server_addr)
+    assert all(datagram.peer_address == addr_b for datagram in challenge_datagrams)
+    for outbound in challenge_datagrams:
+        client.receive_datagram(outbound.data, 6000, server_addr)
 
     responses = client.data_to_send_with_addresses()
     assert responses
-    assert all(addr == server_addr for _dgram, addr in responses)
-    for dgram, _addr in responses:
-        server.receive_datagram(dgram, 7000, addr_b)
+    assert all(datagram.peer_address == server_addr for datagram in responses)
+    for outbound in responses:
+        server.receive_datagram(outbound.data, 7000, addr_b)
     server.data_to_send_with_addresses()
 
     events = []
@@ -1051,7 +1288,7 @@ def test_migrated_peer_address_is_challenged_automatically() -> None:
     stream.end_message()
     datagrams = server.data_to_send_with_addresses()
     assert datagrams
-    assert all(addr == addr_b for _dgram, addr in datagrams)
+    assert all(datagram.peer_address == addr_b for datagram in datagrams)
 
 
 def test_validated_migrated_peer_address_becomes_default_route() -> None:
@@ -1063,35 +1300,35 @@ def test_validated_migrated_peer_address_becomes_default_route() -> None:
 
     for dgram in client.data_to_send():
         server.receive_datagram(dgram, 1000, addr_a)
-    for dgram, addr in server.data_to_send_with_addresses():
-        assert addr == addr_a
-        client.receive_datagram(dgram, 2000, server_addr)
-    for dgram, addr in client.data_to_send_with_addresses():
-        assert addr == server_addr
-        server.receive_datagram(dgram, 3000, addr_a)
-    for dgram, addr in server.data_to_send_with_addresses():
-        assert addr == addr_a
-        client.receive_datagram(dgram, 4000, server_addr)
+    for outbound in server.data_to_send_with_addresses():
+        assert outbound.peer_address == addr_a
+        client.receive_datagram(outbound.data, 2000, server_addr)
+    for outbound in client.data_to_send_with_addresses():
+        assert outbound.peer_address == server_addr
+        server.receive_datagram(outbound.data, 3000, addr_a)
+    for outbound in server.data_to_send_with_addresses():
+        assert outbound.peer_address == addr_a
+        client.receive_datagram(outbound.data, 4000, server_addr)
 
     client.send_request(b"GET", b"/migrated", b"3", [(b"host", b"example.test")])
     for dgram in client.data_to_send():
         server.receive_datagram(dgram, 5000, addr_b)
     acks = server.data_to_send_with_addresses()
     assert acks
-    assert all(addr == addr_b for _dgram, addr in acks)
+    assert all(datagram.peer_address == addr_b for datagram in acks)
 
     server.challenge_path(addr_b, b"abcdefgh")
     challenges = server.data_to_send_with_addresses()
     assert challenges
-    assert all(addr == addr_b for _dgram, addr in challenges)
-    for dgram, _addr in challenges:
-        client.receive_datagram(dgram, 6000, server_addr)
+    assert all(datagram.peer_address == addr_b for datagram in challenges)
+    for outbound in challenges:
+        client.receive_datagram(outbound.data, 6000, server_addr)
 
     responses = client.data_to_send_with_addresses()
     assert responses
-    assert all(addr == server_addr for _dgram, addr in responses)
-    for dgram, _addr in responses:
-        server.receive_datagram(dgram, 7000, addr_b)
+    assert all(datagram.peer_address == server_addr for datagram in responses)
+    for outbound in responses:
+        server.receive_datagram(outbound.data, 7000, addr_b)
     server.data_to_send_with_addresses()
 
     events = []
@@ -1105,7 +1342,7 @@ def test_validated_migrated_peer_address_becomes_default_route() -> None:
     stream.end_message()
     datagrams = server.data_to_send_with_addresses()
     assert datagrams
-    assert all(addr == addr_b for _dgram, addr in datagrams)
+    assert all(datagram.peer_address == addr_b for datagram in datagrams)
 
 
 def test_challenge_path_requires_eight_bytes() -> None:
@@ -1122,6 +1359,70 @@ def test_use_peer_connection_id_rejects_unknown_sequence() -> None:
     conn = make_client()
     with pytest.raises(ValueError):
         conn.use_peer_connection_id(1)
+
+
+def test_local_connection_ids_track_issue_and_peer_retirement() -> None:
+    client, server = handshake_pair()
+    initial = server.local_connection_ids()
+    assert len(initial) == 1
+    assert initial[0].sequence_number == 0
+
+    server.issue_connection_id(1, b"server-cid-1", b"\x5a" * 16)
+    assert {(item.sequence_number, item.connection_id) for item in server.local_connection_ids()} == {
+        (0, initial[0].connection_id),
+        (1, b"server-cid-1"),
+    }
+    transfer(server, client, 4000)
+    transfer(client, server, 5000)
+
+    server.issue_connection_id(2, b"server-cid-2", b"\x6a" * 16, 1)
+    transfer(server, client, 6000)
+    client.initiate_connection()
+    transfer(client, server, 7000)
+
+    assert {(item.sequence_number, item.connection_id) for item in server.local_connection_ids()} == {
+        (1, b"server-cid-1"),
+        (2, b"server-cid-2"),
+    }
+
+
+def test_local_connection_ids_route_two_connections_on_one_endpoint() -> None:
+    pairs: list[tuple[zttp.H3Connection, zttp.H3Connection, bytes]] = []
+    routes: dict[bytes, zttp.H3Connection] = {}
+    for index, original in enumerate((b"client-a", b"client-b"), start=1):
+        config: ResumedClientConfig = CLIENT_CONFIG.copy()
+        config["connection_id"] = original
+        client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
+        server = make_server()
+        transfer(client, server, index * 1000)
+        transfer(server, client, index * 1000 + 100)
+        transfer(client, server, index * 1000 + 200)
+        rotated = f"server-cid-{index}".encode()
+        server.issue_connection_id(1, rotated, bytes((index,)) * 16)
+        issued = next(item for item in server.local_connection_ids() if item.sequence_number == 1)
+        routes[issued.connection_id] = server
+        transfer(server, client, index * 1000 + 300)
+        transfer(client, server, index * 1000 + 400)
+        client.use_peer_connection_id(1)
+        pairs.append((client, server, rotated))
+
+    for index, (client, _server, _rotated) in enumerate(pairs, start=1):
+        client.send_request(b"GET", f"/connection-{index}".encode(), b"3", [(b"host", b"example.test")])
+        for datagram in client.data_to_send():
+            connection_id_length = len(rotated)
+            destination = datagram[1 : 1 + connection_id_length]
+            assert destination in routes
+            routes[destination].receive_datagram(datagram, 5000 + index)
+
+    for index, (_client, server, rotated) in enumerate(pairs, start=1):
+        assert routes[rotated] is server
+        requests = [event for event in drain_events(server) if isinstance(event, zttp.Request)]
+        assert requests[-1].path == f"/connection-{index}".encode()
+
+
+def test_local_connection_ids_require_an_established_connection() -> None:
+    with pytest.raises(zttp.LocalProtocolError):
+        make_server().local_connection_ids()
 
 
 def test_issue_connection_id_queues_new_connection_id_datagram() -> None:
@@ -1143,7 +1444,7 @@ def test_issue_connection_id_validates_inputs() -> None:
     with pytest.raises(ValueError):
         server.issue_connection_id(1, b"server-cid-1", b"short")
     with pytest.raises(TypeError):
-        server.issue_connection_id(1, object(), b"\x5a" * 16)  # type: ignore[arg-type]
+        server.issue_connection_id(1, object(), b"\x5a" * 16)  # ty: ignore[invalid-argument-type]
 
 
 def test_request_key_update_requires_application_keys() -> None:
@@ -1169,8 +1470,8 @@ def test_request_key_update_applies_to_next_http3_packet() -> None:
 
 def test_disable_active_migration_rejects_new_peer_address_after_handshake() -> None:
     client = make_client()
-    config = dict(SERVER_CONFIG)
-    transport_params = dict(SERVER_CONFIG["transport_params"])
+    config = SERVER_CONFIG.copy()
+    transport_params = SERVER_CONFIG["transport_params"].copy()
     transport_params["disable_active_migration"] = True
     config["transport_params"] = transport_params
     server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
@@ -1195,7 +1496,7 @@ def test_disable_active_migration_rejects_new_peer_address_after_handshake() -> 
 def test_receive_datagram_peer_address_must_be_bytes() -> None:
     conn = make_server()
     with pytest.raises(TypeError):
-        conn.receive_datagram(CLIENT_HELLO, 1000, object())
+        conn.receive_datagram(CLIENT_HELLO, 1000, object())  # ty: ignore[invalid-argument-type]
 
 
 def test_http3_reads_a_get_request_after_a_real_handshake() -> None:
@@ -1327,6 +1628,19 @@ def test_http3_stream_reset() -> None:
     # An error code past the 62-bit QUIC range is rejected.
     with pytest.raises(ValueError):
         conn.stream(4).reset(1 << 62)
+
+
+def test_http3_reset_reclaims_unconsumed_data() -> None:
+    client, server = handshake_pair()
+    stream = client.send_request(b"POST", b"/cancel", b"3", [(b"host", b"example.test")])
+    stream.send_data(b"body")
+    transfer(client, server, 4000)
+    data = next(event for event in drain_events(server) if isinstance(event, zttp.Data))
+
+    server.stream(data.stream_id).reset()
+
+    with pytest.raises(ValueError):
+        server.consume_data(data.stream_id, 1)
 
 
 def test_http3_initiate_connection_sends_the_control_stream() -> None:
@@ -1530,7 +1844,7 @@ def test_next_timeout_arms_after_the_handshake_flight() -> None:
 
 
 def test_idle_timeout_closes_http3_connection() -> None:
-    config = dict(SERVER_CONFIG)
+    config = SERVER_CONFIG.copy()
     config["transport_params"] = zttp.QuicTransportParameters(max_idle_timeout=5)
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
 
@@ -1572,7 +1886,7 @@ def test_h3_result_rows_are_frozen_dataclasses() -> None:
     assert row.lifetime == 1
     assert row.max_early_data_size is None
     with pytest.raises(dataclasses.FrozenInstanceError):
-        row.lifetime = 2  # type: ignore[misc]
+        row.lifetime = 2  # ty: ignore[invalid-assignment]
 
 
 def test_h3_result_rows_are_picklable() -> None:

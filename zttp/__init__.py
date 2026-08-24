@@ -31,7 +31,8 @@ from zttp._zttp import (
     parse_datagram_header,
 )
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
-from zttp.results import CloseInfo, DatagramHeader, SessionTicket
+from zttp.endpoint import ConnectionIDFactory, QuicEndpoint
+from zttp.results import CloseInfo, DatagramHeader, LocalConnectionId, OutboundDatagram, SessionTicket
 from zttp.settings import H2Settings
 
 Event = (
@@ -59,6 +60,7 @@ __all__ = [
     "CloseInfo",
     "Connection",
     "ConnectionClosed",
+    "ConnectionIDFactory",
     "Data",
     "DatagramHeader",
     "EndOfMessage",
@@ -69,10 +71,13 @@ __all__ = [
     "H1Connection",
     "H2Connection",
     "H3Connection",
+    "LocalConnectionId",
     "LocalProtocolError",
+    "OutboundDatagram",
     "NeedData",
     "Ping",
     "ProtocolError",
+    "QuicEndpoint",
     "QuicTransportParameters",
     "RemoteProtocolError",
     "Request",

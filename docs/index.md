@@ -31,9 +31,10 @@ dependencies.**
 
 The key features are:
 
-* **Sans-IO**: a clean, event-based API. Feed bytes with `receive_data`, pull
-  `Request` / `Data` / `EndOfMessage` events with `next_event`. No callbacks, no
-  sockets, no surprises.
+* **Sans-IO**: a clean, event-based API. Feed HTTP/1.1 bytes with
+  `receive_event`, then pull any additional `Request` / `Data` /
+  `EndOfMessage` events with `next_event`. No callbacks, no sockets, no
+  surprises.
 * **HTTP/1.1, HTTP/2, and HTTP/3**: the *same* event API for all three. Pass
   `protocol=zttp.HTTP2` and you get multiplexed streams, HPACK, and flow control
   (see [HTTP/2](usage/http2.md)); pass `protocol=zttp.HTTP3` and a from-scratch
@@ -73,13 +74,11 @@ import zttp
 
 conn = zttp.Connection(zttp.SERVER)
 
-conn.receive_data(
+event = conn.receive_event(
     b"GET /hello?name=you HTTP/1.1\r\n"
     b"Host: example.com\r\n"
     b"\r\n"
 )
-
-event = conn.next_event()
 print(event.method, event.target)
 #> b'GET' b'/hello?name=you'
 
@@ -87,11 +86,11 @@ print(event.end_stream)
 #> True
 ```
 
-Feed `receive_data` whatever bytes you have - a whole request, half a request, or
-a single byte - and zttp buffers and resumes. A request with `end_stream=True` is
-already complete; requests with a body continue with `Data` and `EndOfMessage`.
-Each `next_event` call returns the next complete event, or the `NEED_DATA`
-sentinel when it needs more bytes.
+Pass `receive_event` whatever HTTP/1.1 bytes you have - a whole request, half a
+request, or a single byte. It returns the first complete event or `NEED_DATA`.
+zttp buffers partial input and resumes on the next call. A request with
+`end_stream=True` is already complete; requests with a body continue through
+`next_event` as `Data` and `EndOfMessage` events.
 
 Run it:
 

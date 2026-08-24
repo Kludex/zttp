@@ -23,7 +23,7 @@ def frame(ftype: int, flags: int, stream_id: int, payload: bytes) -> bytes:
     return header + payload
 
 
-def drain_h2(conn: zttp.Connection) -> Iterator[object]:
+def drain_h2(conn: zttp.H2Connection) -> Iterator[object]:
     """Pull events until NEED_DATA. Unlike the HTTP/1.1 drain, it does NOT stop at
     the first EndOfMessage - HTTP/2 multiplexes many streams on one connection."""
     while True:
@@ -33,7 +33,7 @@ def drain_h2(conn: zttp.Connection) -> Iterator[object]:
         yield ev
 
 
-def server_with(*extra: bytes) -> zttp.Connection:
+def server_with(*extra: bytes) -> zttp.H2Connection:
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
     conn.receive_data(PREFACE + frame(0x04, 0, 0, b"") + b"".join(extra))
     return conn
@@ -207,7 +207,7 @@ def test_partial_feed_resumes() -> None:
 STATUS_200 = bytes([0x88])
 
 
-def client_with(*extra: bytes) -> zttp.Connection:
+def client_with(*extra: bytes) -> zttp.H2Connection:
     """A client sees only the server's SETTINGS (no preface to consume)."""
     conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
     conn.receive_data(frame(0x04, 0, 0, b"") + b"".join(extra))
@@ -279,7 +279,7 @@ def test_h2_send_side_trailers_rejected() -> None:
     with pytest.raises(zttp.LocalProtocolError, match="HTTP/2 send-side trailers are not supported yet"):
         stream.end_message([(b"x-trailer", b"v")])
     with pytest.raises(zttp.LocalProtocolError, match="HTTP/2 send-side trailers are not supported yet"):
-        stream.end_message([(b"malformed",)])  # type: ignore[list-item]
+        stream.end_message([(b"malformed",)])  # ty: ignore[invalid-argument-type]
 
 
 def test_h2_concurrent_responses_route_by_their_stream() -> None:
@@ -361,7 +361,7 @@ def test_protocol_defaults_to_http1() -> None:
 
 def test_invalid_protocol_rejected() -> None:
     with pytest.raises(ValueError):
-        zttp.Connection(zttp.SERVER, protocol=99)
+        zttp.Connection(zttp.SERVER, protocol=99)  # ty: ignore[no-matching-overload]
 
 
 def test_connection_factory_cannot_be_subclassed() -> None:
@@ -419,7 +419,7 @@ def test_stream_handle_round_trips_a_response() -> None:
 # -- Outbound flow control -----------------------------------------------------
 
 
-def server_with_small_window(initial: int) -> zttp.Connection:
+def server_with_small_window(initial: int) -> zttp.H2Connection:
     """A server whose peer advertised SETTINGS_INITIAL_WINDOW_SIZE=`initial`, with
     request stream 1 already opened and drained."""
     settings = (0x04).to_bytes(2, "big") + initial.to_bytes(4, "big")  # INITIAL_WINDOW_SIZE
@@ -544,7 +544,7 @@ def test_h2_close_accepts_an_explicit_code_and_last_stream_id() -> None:
 def test_h2_close_on_an_http1_connection_is_an_error() -> None:
     conn = zttp.Connection(zttp.SERVER)
     with pytest.raises(AttributeError):
-        conn.close()
+        conn.close()  # ty: ignore[unresolved-attribute]
 
 
 def test_h2_response_after_stream_reset_is_ignored() -> None:
@@ -717,7 +717,7 @@ def test_initiate_connection_is_idempotent() -> None:
 def test_initiate_connection_on_http1_is_an_error() -> None:
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP1)
     with pytest.raises(AttributeError):
-        conn.initiate_connection()
+        conn.initiate_connection()  # ty: ignore[unresolved-attribute]
 
 
 def test_send_response_end_stream_rides_the_headers_frame() -> None:
@@ -894,4 +894,6 @@ def test_h2c_seed_twice_is_an_error() -> None:
 def test_initiate_upgrade_connection_on_http1_is_an_error() -> None:
     conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP1)
     with pytest.raises(AttributeError):
-        conn.initiate_upgrade_connection(b"GET", b"/", [(b"host", b"x")])
+        conn.initiate_upgrade_connection(  # ty: ignore[unresolved-attribute]
+            b"GET", b"/", [(b"host", b"x")]
+        )

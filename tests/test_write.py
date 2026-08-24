@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 import zttp
@@ -72,7 +74,7 @@ def test_trailers_rejected_on_bodyless_message() -> None:
         (lambda c: c.end_message(), "no message is in progress to end"),
     ],
 )
-def test_send_misuse_raises_specific_message(misuse, message: str) -> None:  # type: ignore[no-untyped-def]
+def test_send_misuse_raises_specific_message(misuse: Callable[[zttp.H1Connection], object], message: str) -> None:
     # Distinct, actionable messages - all catchable by the one base class.
     conn = zttp.Connection(zttp.SERVER)
     with pytest.raises(zttp.ProtocolError, match=message):
@@ -99,7 +101,7 @@ def test_send_request() -> None:
 )
 def test_send_response_accepts_common_header_sequence_shapes(headers: object) -> None:
     conn = zttp.Connection(zttp.SERVER)
-    conn.send_response(204, headers)  # type: ignore[arg-type]
+    conn.send_response(204, headers)  # ty: ignore[invalid-argument-type]
     conn.end_message()
     assert conn.data_to_send() == b"HTTP/1.1 204 No Content\r\nX-One: 1\r\nX-Two: 2\r\n\r\n"
 

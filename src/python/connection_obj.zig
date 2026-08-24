@@ -761,6 +761,9 @@ const H3Engine = struct {
     config: ?ServerConfig = null,
     qc: ?*QuicConnection = null,
     h3: ?*H3Connection = null,
+    endpoint_server_cid: ?[]u8 = null,
+    retry_original_dcid: ?[]u8 = null,
+    endpoint_address_validated: bool = false,
     /// The integrator's clock at the last receive_datagram / handle_timeout. A Stream
     /// send does not carry its own `now` (the API matches H2's, which has no clock),
     /// so it packetises against the most recent time the caller gave us.
@@ -782,9 +785,15 @@ const H3Engine = struct {
             if (hdr.ltype != .initial) {
                 return py.raise(exceptions.RemoteProtocolError, "the first HTTP/3 datagram must be a long-header Initial");
             }
-            const q = gpa.create(QuicConnection) catch return c.PyErr_NoMemory();
             const cfg = self.config orelse return py.raise(exceptions.LocalProtocolError, "this HTTP/3 connection has no server configuration");
-            q.* = QuicConnection.initServer(gpa, hdr.dcid, cfg.flightConfig(now)) catch |e| {
+            const q = gpa.create(QuicConnection) catch return c.PyErr_NoMemory();
+            q.* = (if (self.endpoint_server_cid) |server_cid|
+                if (self.retry_original_dcid) |original_dcid|
+                    QuicConnection.initServerAfterRetry(gpa, original_dcid, server_cid, cfg.flightConfig(now))
+                else
+                    QuicConnection.initServerWithCid(gpa, hdr.dcid, server_cid, cfg.flightConfig(now))
+            else
+                QuicConnection.initServer(gpa, hdr.dcid, cfg.flightConfig(now))) catch |e| {
                 gpa.destroy(q);
                 return exceptions.raiseQuic(e);
             };
@@ -793,6 +802,7 @@ const H3Engine = struct {
                 gpa.destroy(q);
                 return c.PyErr_NoMemory();
             };
+            if (self.endpoint_address_validated) q.markAddressValidated();
             h.* = H3Connection.init(gpa, q);
             self.qc = q;
             self.h3 = h;
@@ -807,9 +817,55 @@ const H3Engine = struct {
         return py.none();
     }
 
+    fn setEndpointContext(
+        self: *H3Engine,
+        server_cid: []const u8,
+        original_dcid: ?[]const u8,
+        address_validated: bool,
+    ) py.Object {
+        if (self.config == null or self.qc != null or self.endpoint_server_cid != null) {
+            return py.raise(exceptions.LocalProtocolError, "endpoint context requires a fresh HTTP/3 server connection");
+        }
+        if (server_cid.len == 0 or server_cid.len > core.quic.constants.MAX_CID_LEN) {
+            return py.raiseValue("server_connection_id must be 1..20 bytes");
+        }
+        if (original_dcid) |cid| {
+            if (cid.len < 8 or cid.len > core.quic.constants.MAX_CID_LEN) {
+                return py.raiseValue("original_destination_connection_id must be 8..20 bytes");
+            }
+        }
+        const owned_server_cid = gpa.dupe(u8, server_cid) catch return c.PyErr_NoMemory();
+        const owned_original_dcid = if (original_dcid) |cid|
+            gpa.dupe(u8, cid) catch {
+                gpa.free(owned_server_cid);
+                return c.PyErr_NoMemory();
+            }
+        else
+            null;
+        self.endpoint_server_cid = owned_server_cid;
+        self.retry_original_dcid = owned_original_dcid;
+        self.endpoint_address_validated = address_validated;
+        return py.none();
+    }
+
+    fn endpointReady(self: *const H3Engine) py.Object {
+        return py.boolean(if (self.qc) |q| q.hasAuthenticatedInitial() else false);
+    }
+
+    fn endpointConnectionIdGeneration(self: *const H3Engine) py.Object {
+        const q = self.qc orelse return c.PyLong_FromUnsignedLongLong(0);
+        return c.PyLong_FromUnsignedLongLong(q.localConnectionIdGeneration());
+    }
+
     fn nextEvent(self: *H3Engine) py.Object {
         const h = self.h3 orelse return py.newRef(events_obj.need_data); // no datagram fed yet
         return events_obj.fromH3Event(h.nextEvent());
+    }
+
+    fn consumeData(self: *H3Engine, id: u64, length: u64) py.Object {
+        const h = self.h3 orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        h.consumeData(id, length) catch return py.raiseValue("unknown stream or length exceeds its unconsumed DATA");
+        return self.flush();
     }
 
     /// The pending outbound datagrams (handshake flight, ACKs, response STREAM
@@ -840,6 +896,7 @@ const H3Engine = struct {
     /// QUIC datagram so integrators can route migration/path-validation traffic.
     fn dataToSendWithAddresses(self: *H3Engine) py.Object {
         const q = self.qc orelse return py.newList(0);
+        const result_type = resultType(&outbound_datagram_type, "OutboundDatagram") orelse return null;
         const flat = q.datagramsToSend();
         const lengths = q.datagramLengths();
         const tokens = q.datagramPathTokens();
@@ -847,33 +904,39 @@ const H3Engine = struct {
         if (list == null) return null;
         var off: usize = 0;
         for (lengths, 0..) |len, i| {
-            const tuple = py.tupleNew(2);
-            if (tuple == null) {
+            const args = py.tupleNew(2);
+            if (args == null) {
                 py.decref(list);
                 return null;
             }
-            const item = py.fromBytes(flat[off .. off + len]);
-            if (item == null) {
-                py.decref(tuple);
+            const data = py.fromBytes(flat[off .. off + len]);
+            if (data == null) {
+                py.decref(args);
                 py.decref(list);
                 return null;
             }
-            const addr = if (tokens.len > i) blk: {
-                if (tokens[i]) |tok| {
-                    const bytes = q.pathAddress(tok) orelse break :blk py.none();
-                    break :blk py.fromBytes(bytes);
+            const peer_address = if (tokens.len > i) blk: {
+                if (tokens[i]) |token| {
+                    const address = q.pathAddress(token) orelse break :blk py.none();
+                    break :blk py.fromBytes(address);
                 }
                 break :blk py.none();
             } else py.none();
-            if (addr == null) {
-                py.decref(item);
-                py.decref(tuple);
+            if (peer_address == null) {
+                py.decref(data);
+                py.decref(args);
                 py.decref(list);
                 return null;
             }
-            py.tupleSet(tuple, 0, item);
-            py.tupleSet(tuple, 1, addr);
-            py.listSet(list, @intCast(i), tuple);
+            py.tupleSet(args, 0, data);
+            py.tupleSet(args, 1, peer_address);
+            const result = c.PyObject_CallObject(result_type, args);
+            py.decref(args);
+            if (result == null) {
+                py.decref(list);
+                return null;
+            }
+            py.listSet(list, @intCast(i), result);
             off += len;
         }
         q.clearSend();
@@ -963,6 +1026,42 @@ const H3Engine = struct {
             else => return py.raiseValue("unknown or retired peer connection id sequence"),
         };
         return py.none();
+    }
+
+    fn localConnectionIds(self: *const H3Engine) py.Object {
+        const q = self.qc orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
+        const ids = gpa.alloc(core.quic.connection.LocalConnectionId, q.localConnectionIdCount()) catch return c.PyErr_NoMemory();
+        defer gpa.free(ids);
+        const count = q.localConnectionIds(ids);
+        const result_type = resultType(&local_connection_id_type, "LocalConnectionId") orelse return null;
+        const list = py.newList(@intCast(count));
+        if (list == null) return null;
+        for (ids[0..count], 0..) |id, index| {
+            const tuple = py.tupleNew(2);
+            if (tuple == null) {
+                py.decref(list);
+                return null;
+            }
+            const sequence = c.PyLong_FromUnsignedLongLong(id.sequence_number);
+            const connection_id = py.fromBytes(id.connection_id);
+            if (sequence == null or connection_id == null) {
+                py.xdecref(sequence);
+                py.xdecref(connection_id);
+                py.decref(tuple);
+                py.decref(list);
+                return null;
+            }
+            py.tupleSet(tuple, 0, sequence);
+            py.tupleSet(tuple, 1, connection_id);
+            const value = c.PyObject_CallObject(result_type, tuple);
+            py.decref(tuple);
+            if (value == null) {
+                py.decref(list);
+                return null;
+            }
+            py.listSet(list, @intCast(index), value);
+        }
+        return list;
     }
 
     fn issueConnectionId(self: *H3Engine, seq: u64, cid: []const u8, token: []const u8, retire_prior_to: u64) py.Object {
@@ -1213,6 +1312,8 @@ const H3Engine = struct {
             gpa.destroy(q);
         }
         if (self.config) |*cfg| cfg.deinit();
+        if (self.endpoint_server_cid) |cid| gpa.free(cid);
+        if (self.retry_original_dcid) |cid| gpa.free(cid);
     }
 };
 
@@ -1324,6 +1425,8 @@ var stream_type: py.Object = null;
 var session_ticket_type: py.Object = null;
 var close_info_type: py.Object = null;
 var datagram_header_type: py.Object = null;
+var local_connection_id_type: py.Object = null;
+var outbound_datagram_type: py.Object = null;
 
 /// Module-level `parse_datagram_header(datagram) -> DatagramHeader`: the routable
 /// prefix of a received QUIC datagram, for demultiplexing a shared UDP socket onto
@@ -1333,19 +1436,21 @@ fn parse_datagram_header(_: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Obj
     const hdr = core.quic.packet.parseDatagramHeader(data) catch
         return py.raise(exceptions.RemoteProtocolError, "malformed QUIC packet header");
     const dh_type = resultType(&datagram_header_type, "DatagramHeader") orelse return null;
-    const tuple = py.tupleNew(5);
+    const tuple = py.tupleNew(6);
     if (tuple == null) return null;
     const dcid = py.fromBytes(hdr.dcid);
     const scid = py.fromBytes(hdr.scid);
     const version = c.PyLong_FromUnsignedLong(hdr.version);
     const long = py.boolean(hdr.long);
     const initial = py.boolean(hdr.initial);
-    if (dcid == null or scid == null or version == null or long == null or initial == null) {
+    const token = py.fromBytes(hdr.token);
+    if (dcid == null or scid == null or version == null or long == null or initial == null or token == null) {
         py.xdecref(dcid);
         py.xdecref(scid);
         py.xdecref(version);
         py.xdecref(long);
         py.xdecref(initial);
+        py.xdecref(token);
         py.decref(tuple);
         return null;
     }
@@ -1354,13 +1459,85 @@ fn parse_datagram_header(_: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Obj
     py.tupleSet(tuple, 2, version);
     py.tupleSet(tuple, 3, long);
     py.tupleSet(tuple, 4, initial);
+    py.tupleSet(tuple, 5, token);
     const row = c.PyObject_CallObject(dh_type, tuple);
     py.decref(tuple);
     return row;
 }
 
+fn build_version_negotiation(_: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    var client_destination_obj: ?*c.PyObject = null;
+    var client_source_obj: ?*c.PyObject = null;
+    if (c.PyArg_ParseTuple(args, "OO", &client_destination_obj, &client_source_obj) == 0) return null;
+    const client_destination = py.asBytes(client_destination_obj) orelse return null;
+    const client_source = py.asBytes(client_source_obj) orelse return null;
+    if (client_destination.len > core.quic.constants.MAX_CID_LEN or
+        client_source.len > core.quic.constants.MAX_CID_LEN)
+    {
+        return py.raiseValue("connection IDs must be at most 20 bytes");
+    }
+
+    var packet: std.ArrayListUnmanaged(u8) = .empty;
+    defer packet.deinit(gpa);
+    core.quic.packet.writeVersionNegotiation(&packet, gpa, client_source, client_destination) catch
+        return c.PyErr_NoMemory();
+    return py.fromBytes(packet.items);
+}
+
+/// Build a QUIC v1 Retry packet without allocating connection state. The caller
+/// creates and validates the opaque token, including any client-address binding.
+fn build_retry(_: ?*c.PyObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+    var original_obj: ?*c.PyObject = null;
+    var client_obj: ?*c.PyObject = null;
+    var server_obj: ?*c.PyObject = null;
+    var token_obj: ?*c.PyObject = null;
+    var version: c_uint = core.quic.constants.VERSION_1;
+    var kwlist = [_][*c]u8{
+        @constCast("original_destination_connection_id"),
+        @constCast("client_source_connection_id"),
+        @constCast("server_source_connection_id"),
+        @constCast("token"),
+        @constCast("version"),
+        null,
+    };
+    if (c.PyArg_ParseTupleAndKeywords(
+        args,
+        kwds,
+        "OOOO|I",
+        @ptrCast(&kwlist),
+        &original_obj,
+        &client_obj,
+        &server_obj,
+        &token_obj,
+        &version,
+    ) == 0) return null;
+
+    const original = py.asBytes(original_obj) orelse return null;
+    const client = py.asBytes(client_obj) orelse return null;
+    const server = py.asBytes(server_obj) orelse return null;
+    const token = py.asBytes(token_obj) orelse return null;
+    if (version != core.quic.constants.VERSION_1) return py.raiseValue("only QUIC version 1 Retry packets are supported");
+    if (original.len < 8 or original.len > core.quic.constants.MAX_CID_LEN) {
+        return py.raiseValue("original_destination_connection_id must be 8..20 bytes");
+    }
+    if (client.len > core.quic.constants.MAX_CID_LEN) {
+        return py.raiseValue("client_source_connection_id must be at most 20 bytes");
+    }
+    if (server.len == 0 or server.len > core.quic.constants.MAX_CID_LEN) {
+        return py.raiseValue("server_source_connection_id must be 1..20 bytes");
+    }
+    if (token.len == 0) return py.raiseValue("token must not be empty");
+
+    var packet: std.ArrayListUnmanaged(u8) = .empty;
+    defer packet.deinit(gpa);
+    core.quic.packet.writeRetry(&packet, gpa, client, server, token, original) catch return c.PyErr_NoMemory();
+    return py.fromBytes(packet.items);
+}
+
 pub var module_methods = [_]c.PyMethodDef{
     .{ .ml_name = "parse_datagram_header", .ml_meth = parse_datagram_header, .ml_flags = c.METH_O, .ml_doc = "Parse the routable prefix of a received QUIC datagram: parse_datagram_header(datagram) -> DatagramHeader. Reads no connection state; for demultiplexing a shared UDP socket by connection id." },
+    .{ .ml_name = "_build_version_negotiation", .ml_meth = build_version_negotiation, .ml_flags = c.METH_VARARGS, .ml_doc = "Build a stateless QUIC Version Negotiation packet for QuicEndpoint." },
+    .{ .ml_name = "_build_retry", .ml_meth = @ptrCast(&build_retry), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Build a stateless QUIC v1 Retry packet for QuicEndpoint." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
@@ -2194,6 +2371,14 @@ fn receive_datagram(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.
     }
 }
 
+fn h3_consume_data(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    var stream_id: c_ulonglong = 0;
+    var length: c_ulonglong = 0;
+    if (c.PyArg_ParseTuple(args, "KK", &stream_id, &length) == 0) return null;
+    return e.consumeData(@intCast(stream_id), @intCast(length));
+}
+
 fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
@@ -2615,6 +2800,42 @@ fn h3_data_to_send_with_addresses(self_obj: ?*c.PyObject, _: ?*c.PyObject) callc
     };
 }
 
+fn h3_set_endpoint_context(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    var server_obj: ?*c.PyObject = null;
+    var original_obj: ?*c.PyObject = null;
+    var address_validated: c_int = 0;
+    if (c.PyArg_ParseTuple(args, "O|Op", &server_obj, &original_obj, &address_validated) == 0) return null;
+    const server_cid = py.asBytes(server_obj) orelse return null;
+    const original_dcid = if (original_obj != null and !py.isNone(original_obj))
+        py.asBytes(original_obj) orelse return null
+    else
+        null;
+    return switch (engine.*) {
+        .h3 => |*e| e.setEndpointContext(server_cid, original_dcid, address_validated != 0),
+        else => py.raiseRuntime("endpoint context is only valid for an HTTP/3 connection"),
+    };
+}
+
+fn h3_endpoint_ready(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    return switch (engine.*) {
+        .h3 => |*e| e.endpointReady(),
+        else => py.raiseRuntime("endpoint readiness is only valid for an HTTP/3 connection"),
+    };
+}
+
+fn h3_endpoint_connection_id_generation(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    return switch (engine.*) {
+        .h3 => |*e| e.endpointConnectionIdGeneration(),
+        else => py.raiseRuntime("endpoint connection ID generation is only valid for an HTTP/3 connection"),
+    };
+}
+
 fn h3_challenge_path(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
@@ -2634,6 +2855,11 @@ fn h3_use_peer_connection_id(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv
     const seq = c.PyLong_AsUnsignedLongLong(arg);
     if (seq == @as(c_ulonglong, @bitCast(@as(c_longlong, -1))) and c.PyErr_Occurred() != null) return null;
     return e.usePeerConnectionId(@intCast(seq));
+}
+
+fn h3_local_connection_ids(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const e = h3(@ptrCast(self_obj.?)) orelse return null;
+    return e.localConnectionIds();
 }
 
 fn h3_issue_connection_id(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
@@ -2952,10 +3178,15 @@ var h2_getset = [_]c.PyGetSetDef{
 // feeds handle_timeout; a Stream send uses the most recent `now` the caller gave.
 var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "receive_datagram", .ml_meth = receive_datagram, .ml_flags = c.METH_VARARGS, .ml_doc = "Feed one received UDP datagram: receive_datagram(datagram, now=0, peer_address=None). peer_address is an optional opaque bytes key for QUIC path validation and migration." },
+    .{ .ml_name = "consume_data", .ml_meth = h3_consume_data, .ml_flags = c.METH_VARARGS, .ml_doc = "Acknowledge HTTP/3 DATA payload bytes after the application consumes them: consume_data(stream_id, length)." },
     .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing UDP datagrams as a list of bytes (one per datagram - QUIC datagram boundaries are semantic)." },
-    .{ .ml_name = "data_to_send_with_addresses", .ml_meth = h3_data_to_send_with_addresses, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams as (datagram, peer_address) pairs. peer_address is None when no address key is known." },
+    .{ .ml_name = "data_to_send_with_addresses", .ml_meth = h3_data_to_send_with_addresses, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams with their destination address keys." },
+    .{ .ml_name = "_set_endpoint_context", .ml_meth = h3_set_endpoint_context, .ml_flags = c.METH_VARARGS, .ml_doc = "Configure endpoint-selected connection IDs before receiving the first Initial." },
+    .{ .ml_name = "_endpoint_ready", .ml_meth = h3_endpoint_ready, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the endpoint connection authenticated its first Initial." },
+    .{ .ml_name = "_endpoint_connection_id_generation", .ml_meth = h3_endpoint_connection_id_generation, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the active local connection ID generation." },
     .{ .ml_name = "challenge_path", .ml_meth = h3_challenge_path, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC PATH_CHALLENGE for a peer address: challenge_path(peer_address, data). data must be 8 unpredictable bytes. Drain with data_to_send_with_addresses." },
     .{ .ml_name = "use_peer_connection_id", .ml_meth = h3_use_peer_connection_id, .ml_flags = c.METH_O, .ml_doc = "Switch future QUIC packets to a peer-issued NEW_CONNECTION_ID sequence: use_peer_connection_id(sequence_number)." },
+    .{ .ml_name = "local_connection_ids", .ml_meth = h3_local_connection_ids, .ml_flags = c.METH_NOARGS, .ml_doc = "Return every active local QUIC connection ID and sequence number." },
     .{ .ml_name = "issue_connection_id", .ml_meth = h3_issue_connection_id, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC NEW_CONNECTION_ID for a local CID: issue_connection_id(sequence_number, connection_id, stateless_reset_token, retire_prior_to=0). Drain with data_to_send." },
     .{ .ml_name = "request_key_update", .ml_meth = h3_request_key_update, .ml_flags = c.METH_NOARGS, .ml_doc = "Advance QUIC 1-RTT send keys. The next application packet carries the new key phase." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
