@@ -32,6 +32,12 @@ pub const Signer = struct {
         return .{ .key_pair = try Ecdsa.KeyPair.generateDeterministic(seed) };
     }
 
+    /// Load the raw big-endian P-256 private scalar used by an existing certificate.
+    pub fn fromPrivateKey(private_key: [Ecdsa.SecretKey.encoded_length]u8) !Signer {
+        const secret_key = try Ecdsa.SecretKey.fromBytes(private_key);
+        return .{ .key_pair = try Ecdsa.KeyPair.fromSecretKey(secret_key) };
+    }
+
     /// The SEC1-uncompressed public point (0x04 || X || Y), what a server
     /// Certificate message carries for ecdsa_secp256r1.
     pub fn publicKeySec1(self: Signer) [PUBLIC_SEC1_LEN]u8 {
@@ -126,6 +132,13 @@ test "CertificateVerify round-trips through the client's verify" {
     var buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
     const der = try signer.sign(th, &buf);
     try verify(&signer.publicKeySec1(), th, der);
+}
+
+test "Signer loads a raw private scalar" {
+    const private_key = [_]u8{0x42} ** Ecdsa.SecretKey.encoded_length;
+    const signer = try Signer.fromPrivateKey(private_key);
+    const expected = (try Ecdsa.KeyPair.fromSecretKey(try Ecdsa.SecretKey.fromBytes(private_key))).public_key;
+    try testing.expectEqualSlices(u8, &expected.toUncompressedSec1(), &signer.publicKeySec1());
 }
 
 test "certificatePublicKeySec1 extracts a P-256 key from DER SubjectPublicKeyInfo" {

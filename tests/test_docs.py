@@ -114,7 +114,16 @@ PLACEHOLDERS = {
     "errors.md": {"conn"},
     "first-steps.md": {"request", "transport"},
     "http2.md": {"bytes_from_socket", "incoming_bytes", "very_large_body"},
-    "http3.md": {"cert", "key", "peer_address", "recv_with_timeout", "sock", "ticket_id", "ticket_psk", "udp_payload"},
+    "http3.md": {
+        "certificate_der",
+        "peer_address",
+        "private_key_scalar",
+        "recv_with_timeout",
+        "sock",
+        "ticket_id",
+        "ticket_psk",
+        "udp_payload",
+    },
 }
 
 
