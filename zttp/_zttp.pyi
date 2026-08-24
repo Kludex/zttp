@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Final, Literal, TypeVar, final, overload
 
-from typing_extensions import disjoint_base
+from typing_extensions import Buffer, disjoint_base
 
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
 from zttp.results import CloseInfo, DatagramHeader, LocalConnectionId, OutboundDatagram, SessionTicket
@@ -31,7 +31,7 @@ def _build_retry(
 ) -> bytes:
     """Build a stateless QUIC v1 Retry packet for `QuicEndpoint`."""
 
-def parse_datagram_header(datagram: bytes, /) -> DatagramHeader:
+def parse_datagram_header(datagram: Buffer, /) -> DatagramHeader:
     """Parse the routable prefix of a received QUIC datagram (RFC 9000 17).
 
     Reads no connection state and does not decrypt - it just exposes the form bit,
@@ -327,11 +327,11 @@ class Connection:
 class H1Connection(Connection):
     """An HTTP/1.1 connection: a byte-stream transport with a message-scoped API."""
 
-    def receive_data(self, data: bytes, /) -> None:
-        """Append received bytes to the parse buffer (empty bytes signals EOF)."""
+    def receive_data(self, data: Buffer, /) -> None:
+        """Append a contiguous buffer to the parse buffer (an empty buffer signals EOF)."""
 
-    def receive_event(self, data: bytes, /) -> Request | Response | Data | EndOfMessage | NeedData | ConnectionClosed:
-        """Feed received bytes and return the first available event, or `NEED_DATA`."""
+    def receive_event(self, data: Buffer, /) -> Request | Response | Data | EndOfMessage | NeedData | ConnectionClosed:
+        """Feed a contiguous buffer and return the first available event, or `NEED_DATA`."""
 
     def data_to_send(self) -> bytes:
         """Return and clear the bytes queued to send."""
@@ -370,8 +370,8 @@ class H2Connection(Connection):
     """
 
     send_window: int
-    def receive_data(self, data: bytes, /) -> None:
-        """Append received bytes to the parse buffer (empty bytes signals EOF)."""
+    def receive_data(self, data: Buffer, /) -> None:
+        """Append a contiguous buffer to the parse buffer (an empty buffer signals EOF)."""
 
     def data_to_send(self) -> bytes:
         """Return and clear the HTTP/2 frames queued to send."""
@@ -422,7 +422,7 @@ class H3Connection(Connection):
         and non-DATA frames are credited internally.
         """
 
-    def receive_datagram(self, datagram: bytes, now: int = ..., peer_address: bytes | None = ..., /) -> None:
+    def receive_datagram(self, datagram: Buffer, now: int = ..., peer_address: bytes | None = ..., /) -> None:
         """Feed one received UDP datagram. `peer_address` is an opaque key for path validation."""
 
     def data_to_send_with_addresses(self) -> list[OutboundDatagram]:

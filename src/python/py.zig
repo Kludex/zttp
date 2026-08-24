@@ -117,14 +117,40 @@ pub fn fromBytes(s: []const u8) Object {
     return c.PyBytes_FromStringAndSize(s.ptr, @intCast(s.len));
 }
 
-/// Borrow the buffer behind a Python `bytes`/`bytearray`/buffer-protocol object.
-/// Returns null and sets a TypeError if `o` is not bytes-like.
+/// Borrow the contents of a Python `bytes` object for the active call.
 pub fn asBytes(o: Object) ?[]const u8 {
     var ptr: [*c]u8 = undefined;
     var len: ssize = undefined;
     if (c.PyBytes_AsStringAndSize(o, @ptrCast(&ptr), &len) != 0) return null;
     return ptr[0..@intCast(len)];
 }
+
+/// A contiguous buffer export borrowed for one native call. Exact `bytes` keep
+/// their allocation-free fast path and may be retained by HTTP/1 body events.
+pub const BorrowedBuffer = struct {
+    bytes: []const u8,
+    stable_owner: Object = null,
+    view: c.Py_buffer = undefined,
+    acquired: bool = false,
+
+    pub fn init(o: Object) ?BorrowedBuffer {
+        if (@intFromPtr(c.Py_TYPE(o)) == @intFromPtr(&c.PyBytes_Type)) {
+            return .{ .bytes = asBytes(o) orelse return null, .stable_owner = o };
+        }
+
+        var view: c.Py_buffer = undefined;
+        if (c.PyObject_GetBuffer(o, &view, c.PyBUF_SIMPLE) != 0) return null;
+        const bytes: []const u8 = if (view.len == 0)
+            &.{}
+        else
+            @as([*]const u8, @ptrCast(view.buf))[0..@intCast(view.len)];
+        return .{ .bytes = bytes, .view = view, .acquired = true };
+    }
+
+    pub fn deinit(self: *BorrowedBuffer) void {
+        if (self.acquired) c.PyBuffer_Release(&self.view);
+    }
+};
 
 // -- containers ---------------------------------------------------------------
 

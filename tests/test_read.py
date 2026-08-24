@@ -20,6 +20,27 @@ def test_receive_event_feeds_and_returns_first_available_http1_event() -> None:
     assert isinstance(conn.next_event(), zttp.EndOfMessage)
 
 
+def test_receive_event_accepts_bytearray_input() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    incoming = bytearray(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+
+    event = conn.receive_event(incoming)
+    incoming[-5:] = b"other"
+
+    assert isinstance(event, zttp.Request)
+    data = conn.next_event()
+    assert isinstance(data, zttp.Data)
+    assert data.data == b"hello"
+
+
+def test_receive_data_accepts_memoryview_input() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+
+    conn.receive_data(memoryview(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"))
+
+    assert isinstance(conn.next_event(), zttp.Request)
+
+
 def test_receive_event_returns_need_data_for_partial_http1_input() -> None:
     conn = zttp.Connection(zttp.SERVER)
     assert conn.receive_event(b"GET / HTTP/1.1\r\nHost:") is zttp.NEED_DATA

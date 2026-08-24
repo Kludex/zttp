@@ -1402,7 +1402,7 @@ fuzz = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "typing-extensions", specifier = ">=4.0" }]
+requires-dist = [{ name = "typing-extensions", specifier = ">=4.6" }]
 
 [package.metadata.requires-dev]
 bench = [

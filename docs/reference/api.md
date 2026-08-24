@@ -15,7 +15,8 @@ protocol you picked - an `H1Connection` (the default), an `H2Connection`, or an
 isn't a usable instance type and can't be subclassed; only `next_event()` is
 common to all three, because the read/write *byte* surface is transport-specific.
 HTTP/1.1 provides `receive_event` and `receive_data`, HTTP/2 reads
-`receive_data`, and HTTP/3 reads `receive_datagram`.
+`receive_data`, and HTTP/3 reads `receive_datagram`. Each receive method accepts
+any contiguous buffer, including `bytes`, `bytearray`, and `memoryview`.
 
 ::: zttp.Connection
 
