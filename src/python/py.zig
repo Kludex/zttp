@@ -135,8 +135,7 @@ pub const BorrowedBuffer = struct {
 
     pub fn init(o: Object) ?BorrowedBuffer {
         if (@intFromPtr(c.Py_TYPE(o)) == @intFromPtr(&c.PyBytes_Type)) {
-            const ptr: [*]const u8 = @ptrCast(c.PyBytes_AS_STRING(o));
-            return .{ .bytes = ptr[0..@intCast(c.PyBytes_GET_SIZE(o))], .stable_owner = o };
+            return .{ .bytes = asBytes(o) orelse return null, .stable_owner = o };
         }
 
         var view: c.Py_buffer = undefined;
