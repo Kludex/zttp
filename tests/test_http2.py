@@ -60,6 +60,14 @@ def _own_settings(buf: bytes) -> dict[int, int]:
     }
 
 
+def test_receive_data_accepts_bytearray_input() -> None:
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+
+    conn.receive_data(bytearray(PREFACE + frame(0x04, 0, 0, b"")))
+
+    assert isinstance(conn.next_event(), zttp.Settings)
+
+
 def test_handshake_advertises_real_settings() -> None:
     # The server must advertise its enforced limits, not an empty SETTINGS, or a
     # peer uses RFC defaults and gets spurious REFUSED_STREAM resets (RFC 9113 6.5).

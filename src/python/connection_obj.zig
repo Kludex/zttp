@@ -1,5 +1,5 @@
 //! The Python `Connection` object: a thin wrapper over the core engine exposing
-//! the sans-IO pull API. `receive_data(bytes)` appends to the parse buffer;
+//! the sans-IO pull API. `receive_data(buffer)` appends to the parse buffer;
 //! `next_event()` returns the next Request/Response/Data/EndOfMessage event, or
 //! the NEED_DATA singleton. The write side (send/data_to_send) is added on top.
 
@@ -62,6 +62,7 @@ const PendingInput = struct {
     const retain_body_min = 512;
 
     inline fn retain(self: *PendingInput, reader: *Reader, owner: py.Object, bytes: []const u8) core.errors.ParseError!void {
+        std.debug.assert(owner != null);
         std.debug.assert(bytes.len > 0);
         std.debug.assert(self.owner == null);
         std.debug.assert(self.bytes.len == 0);
@@ -460,7 +461,7 @@ const H1Engine = struct {
     /// itself when a sizeable body follows.
     const head_split_min_feed = 1024;
 
-    fn feedData(self: *H1Engine, data: []const u8, obj: py.Object) bool {
+    fn feedData(self: *H1Engine, data: []const u8, stable_owner: py.Object) bool {
         self.pending.flushInto(&self.reader) catch |err| {
             _ = exceptions.raiseParse(err);
             return false;
@@ -469,9 +470,9 @@ const H1Engine = struct {
             _ = exceptions.raiseParse(error.ProtocolError);
             return false;
         }
-        if (data.len > 0 and self.reader.backlogEmpty()) {
+        if (stable_owner != null and data.len > 0 and self.reader.backlogEmpty()) {
             if (self.reader.bodyLengthRemaining() != null) {
-                self.pending.retain(&self.reader, obj, data) catch |err| {
+                self.pending.retain(&self.reader, stable_owner, data) catch |err| {
                     _ = exceptions.raiseParse(err);
                     return false;
                 };
@@ -487,7 +488,7 @@ const H1Engine = struct {
                         _ = exceptions.raiseParse(err);
                         return false;
                     };
-                    if (head_end < data.len) self.pending.retain(&self.reader, obj, data[head_end..]) catch |err| {
+                    if (head_end < data.len) self.pending.retain(&self.reader, stable_owner, data[head_end..]) catch |err| {
                         _ = exceptions.raiseParse(err);
                         return false;
                     };
@@ -502,8 +503,8 @@ const H1Engine = struct {
         return true;
     }
 
-    fn receiveData(self: *H1Engine, data: []const u8, obj: py.Object) py.Object {
-        return if (self.feedData(data, obj)) py.none() else null;
+    fn receiveData(self: *H1Engine, data: []const u8, stable_owner: py.Object) py.Object {
+        return if (self.feedData(data, stable_owner)) py.none() else null;
     }
 
     fn deinit(self: *H1Engine) void {
@@ -1432,8 +1433,9 @@ var outbound_datagram_type: py.Object = null;
 /// prefix of a received QUIC datagram, for demultiplexing a shared UDP socket onto
 /// per-connection state without constructing a connection.
 fn parse_datagram_header(_: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
-    const data = py.asBytes(arg) orelse return null;
-    const hdr = core.quic.packet.parseDatagramHeader(data) catch
+    var data = py.BorrowedBuffer.init(arg) orelse return null;
+    defer data.deinit();
+    const hdr = core.quic.packet.parseDatagramHeader(data.bytes) catch
         return py.raise(exceptions.RemoteProtocolError, "malformed QUIC packet header");
     const dh_type = resultType(&datagram_header_type, "DatagramHeader") orelse return null;
     const tuple = py.tupleNew(6);
@@ -2339,17 +2341,18 @@ fn h1(self: *ConnectionObject) ?*H1Engine {
 
 fn receive_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const bytes = py.asBytes(arg) orelse return null;
+    var data = py.BorrowedBuffer.init(arg) orelse return null;
+    defer data.deinit();
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
     switch (engine.*) {
         .h2 => |*e| {
-            e.conn.feed(bytes) catch |err| {
+            e.conn.feed(data.bytes) catch |err| {
                 e.emitGoAwayIfOwed(); // a fatal feed (e.g. max_buffer flood) still owes a GOAWAY
                 return exceptions.raiseH2(err);
             };
             return py.none();
         },
-        .h1 => |*e| return e.receiveData(bytes, arg),
+        .h1 => |*e| return e.receiveData(data.bytes, data.stable_owner),
         .h3 => return py.raiseRuntime("receive_data is not valid for an HTTP/3 connection; use receive_datagram"),
     }
 }
@@ -2363,9 +2366,10 @@ fn receive_datagram(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.
             var now: c_ulonglong = 0;
             var addr_obj: ?*c.PyObject = null;
             if (c.PyArg_ParseTuple(args, "O|KO", &dgram_obj, &now, &addr_obj) == 0) return null;
-            const dgram = py.asBytes(dgram_obj) orelse return null;
+            var dgram = py.BorrowedBuffer.init(dgram_obj) orelse return null;
+            defer dgram.deinit();
             const peer_address = if (addr_obj != null and !py.isNone(addr_obj)) py.asBytes(addr_obj) orelse return null else null;
-            return e.receiveDatagram(dgram, @intCast(now), peer_address);
+            return e.receiveDatagram(dgram.bytes, @intCast(now), peer_address);
         },
         else => return py.raiseRuntime("receive_datagram is only valid for an HTTP/3 connection"),
     }
@@ -2444,9 +2448,10 @@ fn next_event_eager_for_benchmark(self_obj: ?*c.PyObject, _: ?*c.PyObject) callc
 /// return NEED_DATA, avoiding a container allocation on the one-event hot path.
 fn receive_event(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
-    const bytes = py.asBytes(arg) orelse return null;
+    var data = py.BorrowedBuffer.init(arg) orelse return null;
+    defer data.deinit();
     const engine = h1(self) orelse return null;
-    if (!engine.feedData(bytes, arg)) return null;
+    if (!engine.feedData(data.bytes, data.stable_owner)) return null;
     return nextEventImpl(self_obj, false);
 }
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass, field
 
-from typing_extensions import Protocol, TypedDict
+from typing_extensions import Buffer, Protocol, TypedDict
 
 from zttp._tokens import AddressValidationContext, RetryContext, TokenCodec
 from zttp._zttp import (
@@ -85,8 +85,9 @@ class QuicEndpoint:
         self._connections: list[_ConnectionState] = []
         self._outgoing: list[OutboundDatagram] = []
 
-    def receive_datagram(self, datagram: bytes, peer_address: bytes, now: int) -> H3Connection | None:
+    def receive_datagram(self, datagram: Buffer, peer_address: bytes, now: int) -> H3Connection | None:
         """Route a datagram and return its connection, or `None` when dropped."""
+        datagram = bytes(datagram)
         if not datagram:
             return None
         if not datagram[0] & 0x80:

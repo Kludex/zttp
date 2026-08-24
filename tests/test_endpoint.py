@@ -73,6 +73,12 @@ def test_quic_endpoint_accepts_without_retry_and_manages_the_connection(initial:
     assert endpoint.next_timeout() is None
 
 
+def test_quic_endpoint_accepts_bytearray_input(initial: bytes) -> None:
+    endpoint = zttp.QuicEndpoint(connection_id_factory=lambda length: b"s" * length)
+
+    assert endpoint.receive_datagram(bytearray(initial), b"address", 0) is not None
+
+
 def test_quic_endpoint_does_not_retain_an_unauthenticated_initial(initial: bytes) -> None:
     corrupted = initial[:-1] + bytes((initial[-1] ^ 1,))
     endpoint = zttp.QuicEndpoint(

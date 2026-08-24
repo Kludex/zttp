@@ -151,7 +151,7 @@ def test_parse_datagram_header_routes_a_client_initial() -> None:
         zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"localhost", connection_id=b"\xaa\xbb\xcc\xdd"
     )
     initial = client.data_to_send()[0]
-    header = zttp.parse_datagram_header(initial)
+    header = zttp.parse_datagram_header(bytearray(initial))
     assert isinstance(header, zttp.DatagramHeader)
     assert header.is_long_header
     assert header.is_initial
@@ -1139,6 +1139,14 @@ def test_handshake_emits_a_flight() -> None:
     assert isinstance(datagrams, list)
     assert len(datagrams) >= 1
     assert all(isinstance(d, bytes) and d for d in datagrams)
+
+
+def test_receive_datagram_accepts_memoryview_input() -> None:
+    conn = make_server()
+
+    conn.receive_datagram(memoryview(CLIENT_HELLO), 1000)
+
+    assert conn.data_to_send()
 
 
 def test_receive_datagram_accepts_peer_address_key() -> None:
