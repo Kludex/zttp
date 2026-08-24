@@ -48,7 +48,7 @@ class LocalConnectionId:
     connection_id: bytes
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OutboundDatagram:
     """One QUIC datagram and its opaque destination address key."""
 

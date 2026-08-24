@@ -813,6 +813,11 @@ const H3Engine = struct {
         return py.boolean(if (self.qc) |q| q.hasAuthenticatedInitial() else false);
     }
 
+    fn endpointConnectionIdGeneration(self: *const H3Engine) py.Object {
+        const q = self.qc orelse return c.PyLong_FromUnsignedLongLong(0);
+        return c.PyLong_FromUnsignedLongLong(q.localConnectionIdGeneration());
+    }
+
     fn nextEvent(self: *H3Engine) py.Object {
         const h = self.h3 orelse return py.newRef(events_obj.need_data); // no datagram fed yet
         return events_obj.fromH3Event(h.nextEvent());
@@ -2737,6 +2742,15 @@ fn h3_endpoint_ready(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Ob
     };
 }
 
+fn h3_endpoint_connection_id_generation(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return py.raiseRuntime("connection is closed");
+    return switch (engine.*) {
+        .h3 => |*e| e.endpointConnectionIdGeneration(),
+        else => py.raiseRuntime("endpoint connection ID generation is only valid for an HTTP/3 connection"),
+    };
+}
+
 fn h3_challenge_path(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const engine = self.engine orelse return py.raiseRuntime("connection is closed");
@@ -3084,6 +3098,7 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "data_to_send_with_addresses", .ml_meth = h3_data_to_send_with_addresses, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams with their destination address keys." },
     .{ .ml_name = "_set_endpoint_context", .ml_meth = h3_set_endpoint_context, .ml_flags = c.METH_VARARGS, .ml_doc = "Configure endpoint-selected connection IDs before receiving the first Initial." },
     .{ .ml_name = "_endpoint_ready", .ml_meth = h3_endpoint_ready, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the endpoint connection authenticated its first Initial." },
+    .{ .ml_name = "_endpoint_connection_id_generation", .ml_meth = h3_endpoint_connection_id_generation, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the active local connection ID generation." },
     .{ .ml_name = "challenge_path", .ml_meth = h3_challenge_path, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC PATH_CHALLENGE for a peer address: challenge_path(peer_address, data). data must be 8 unpredictable bytes. Drain with data_to_send_with_addresses." },
     .{ .ml_name = "use_peer_connection_id", .ml_meth = h3_use_peer_connection_id, .ml_flags = c.METH_O, .ml_doc = "Switch future QUIC packets to a peer-issued NEW_CONNECTION_ID sequence: use_peer_connection_id(sequence_number)." },
     .{ .ml_name = "local_connection_ids", .ml_meth = h3_local_connection_ids, .ml_flags = c.METH_NOARGS, .ml_doc = "Return every active local QUIC connection ID and sequence number." },

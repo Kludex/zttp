@@ -11,6 +11,7 @@ from zttp._zttp import (
     SERVER,
     Connection,
     H3Connection,
+    LocalProtocolError,
     RemoteProtocolError,
     _build_retry,
     _build_version_negotiation,
@@ -45,6 +46,7 @@ class _ConnectionState:
     connection: H3Connection
     initial_destination_connection_id: bytes
     peer_address: bytes
+    connection_id_generation: int = -1
     connection_ids: set[bytes] = field(default_factory=set)
 
 
@@ -85,25 +87,21 @@ class QuicEndpoint:
 
     def receive_datagram(self, datagram: bytes, peer_address: bytes, now: int) -> H3Connection | None:
         """Route a datagram and return its connection, or `None` when dropped."""
-        if not peer_address:
-            raise ValueError("peer_address must not be empty")
-        if now < 0 or now > 0xFFFFFFFFFFFFFFFF:
-            raise ValueError("now must fit in an unsigned 64-bit integer")
+        if not datagram:
+            return None
+        if not datagram[0] & 0x80:
+            if not datagram[0] & 0x40:
+                return None
+            cid_end = 1 + self._connection_id_length
+            state = self._short_routes.get(datagram[1:cid_end]) if len(datagram) >= cid_end else None
+            return self._receive(state, datagram, peer_address, now) if state is not None else None
         try:
             header = parse_datagram_header(datagram)
         except RemoteProtocolError:
             return None
-        if header.is_long_header:
-            state = self._long_routes.get(header.destination_connection_id)
-        else:
-            cid_end = 1 + self._connection_id_length
-            state = self._short_routes.get(datagram[1:cid_end]) if len(datagram) >= cid_end else None
-
+        state = self._long_routes.get(header.destination_connection_id)
         if state is not None:
-            state.connection.receive_datagram(datagram, now, peer_address)
-            state.peer_address = peer_address
-            self._sync_routes(state)
-            return state.connection
+            return self._receive(state, datagram, peer_address, now)
         if header.is_long_header and header.version not in {0, 1}:
             if len(datagram) < 1200:
                 return None
@@ -179,9 +177,7 @@ class QuicEndpoint:
         retire_prior_to: int = 0,
     ) -> bytes:
         """Issue and route a new connection ID for an accepted connection."""
-        state = next((item for item in self._connections if item.connection is connection), None)
-        if state is None:
-            raise ValueError("connection does not belong to this endpoint")
+        state = self._connection_state(connection)
         connection_id = self._new_connection_id()
         connection.issue_connection_id(sequence_number, connection_id, secrets.token_bytes(16), retire_prior_to)
         self._sync_routes(state)
@@ -189,11 +185,7 @@ class QuicEndpoint:
 
     def issue_token(self, connection: H3Connection, now: int) -> None:
         """Queue a NEW_TOKEN bound to the connection's current peer address."""
-        if now < 0 or now > 0xFFFFFFFFFFFFFFFF:
-            raise ValueError("now must fit in an unsigned 64-bit integer")
-        state = next((item for item in self._connections if item.connection is connection), None)
-        if state is None:
-            raise ValueError("connection does not belong to this endpoint")
+        state = self._connection_state(connection)
         connection.send_new_token(self._token_codec.create_address_token(state.peer_address, now))
 
     def data_to_send(self) -> list[OutboundDatagram]:
@@ -210,9 +202,7 @@ class QuicEndpoint:
 
     def discard(self, connection: H3Connection) -> None:
         """Remove a closed connection and all of its routes."""
-        state = next((item for item in self._connections if item.connection is connection), None)
-        if state is None:
-            raise ValueError("connection does not belong to this endpoint")
+        state = self._connection_state(connection)
         self._connections.remove(state)
         self._long_routes = {cid: item for cid, item in self._long_routes.items() if item is not state}
         self._short_routes = {cid: item for cid, item in self._short_routes.items() if item is not state}
@@ -230,6 +220,12 @@ class QuicEndpoint:
             deadline = state.connection.next_timeout()
             if deadline is not None and deadline <= now:
                 state.connection.handle_timeout(now)
+
+    def _connection_state(self, connection: H3Connection) -> _ConnectionState:
+        state = next((item for item in self._connections if item.connection is connection), None)
+        if state is None:
+            raise LocalProtocolError("connection does not belong to this endpoint")
+        return state
 
     def _new_connection_id(self) -> bytes:
         connection_id = self._connection_id_factory(self._connection_id_length)
@@ -265,6 +261,19 @@ class QuicEndpoint:
         self._sync_routes(state)
         return connection
 
+    def _receive(
+        self,
+        state: _ConnectionState,
+        datagram: bytes,
+        peer_address: bytes,
+        now: int,
+    ) -> H3Connection:
+        state.connection.receive_datagram(datagram, now, peer_address)
+        state.peer_address = peer_address
+        if state.connection_id_generation != state.connection._endpoint_connection_id_generation():
+            self._sync_routes(state)
+        return state.connection
+
     def _sync_routes(self, state: _ConnectionState) -> None:
         connection_ids = {item.connection_id for item in state.connection.local_connection_ids()}
         for connection_id in state.connection_ids - connection_ids:
@@ -284,4 +293,5 @@ class QuicEndpoint:
                 raise RuntimeError("connection issued an active connection ID")  # pragma: no cover - API bypass
             self._long_routes[connection_id] = state
             self._short_routes[connection_id] = state
+        state.connection_id_generation = state.connection._endpoint_connection_id_generation()
         state.connection_ids = connection_ids

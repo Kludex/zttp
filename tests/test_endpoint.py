@@ -49,9 +49,11 @@ def test_quic_endpoint_accepts_without_retry_and_manages_the_connection(initial:
         server_name=b"localhost",
     )
     assert endpoint.receive_datagram(another.data_to_send()[0], b"address", 1002) is None
-    assert endpoint.receive_datagram(b"\x40short", b"address", 1003) is None
-    assert endpoint.receive_datagram(b"\x40" + b"x" * 16, b"address", 1004) is None
-    assert endpoint.receive_datagram(b"\xc0\x00", b"address", 1005) is None
+    assert endpoint.receive_datagram(b"", b"address", 1003) is None
+    assert endpoint.receive_datagram(b"\x00" + b"x" * 16, b"address", 1004) is None
+    assert endpoint.receive_datagram(b"\x40short", b"address", 1005) is None
+    assert endpoint.receive_datagram(b"\x40" + b"x" * 16, b"address", 1006) is None
+    assert endpoint.receive_datagram(b"\xc0\x00", b"address", 1007) is None
 
     outgoing = endpoint.data_to_send()
     assert outgoing
@@ -64,7 +66,7 @@ def test_quic_endpoint_accepts_without_retry_and_manages_the_connection(initial:
     assert server.is_closed()
 
     other = zttp.QuicEndpoint()
-    with pytest.raises(ValueError, match="does not belong"):
+    with pytest.raises(zttp.LocalProtocolError, match="does not belong"):
         other.discard(server)
     endpoint.discard(server)
     assert endpoint.connections() == []
@@ -129,28 +131,18 @@ def test_quic_endpoint_rejects_an_active_generated_connection_id(initial: bytes)
         endpoint.receive_datagram(another.data_to_send()[0], b"address", 0)
 
 
-@pytest.mark.parametrize("now", [-1, 0x10000000000000000])
-def test_quic_endpoint_validates_time(now: int, initial: bytes) -> None:
-    endpoint = zttp.QuicEndpoint()
-    with pytest.raises(ValueError, match="now"):
-        endpoint.receive_datagram(initial, b"address", now)
-
-
-def test_quic_endpoint_validates_token_time() -> None:
+def test_quic_endpoint_rejects_connections_from_another_endpoint() -> None:
     endpoint = zttp.QuicEndpoint()
     connection = zttp.Connection(zttp.SERVER, zttp.HTTP3)
-    with pytest.raises(ValueError, match="now"):
-        endpoint.issue_token(connection, -1)
-    with pytest.raises(ValueError, match="does not belong"):
+    with pytest.raises(zttp.LocalProtocolError, match="does not belong"):
         endpoint.issue_token(connection, 0)
-    with pytest.raises(ValueError, match="does not belong"):
+    with pytest.raises(zttp.LocalProtocolError, match="does not belong"):
         endpoint.issue_connection_id(connection, 1)
 
 
-def test_quic_endpoint_requires_a_peer_address(initial: bytes) -> None:
+def test_quic_endpoint_accepts_an_empty_peer_address(initial: bytes) -> None:
     endpoint = zttp.QuicEndpoint()
-    with pytest.raises(ValueError, match="peer_address"):
-        endpoint.receive_datagram(initial, b"", 0)
+    assert endpoint.receive_datagram(initial, b"", 0) is not None
 
 
 def test_quic_endpoint_limits_retry_address_size(initial: bytes) -> None:

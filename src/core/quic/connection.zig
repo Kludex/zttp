@@ -247,6 +247,7 @@ pub const Connection = struct {
     peer_retire_prior_to: u64 = 0,
     local_cids: std.AutoHashMapUnmanaged(u64, LocalCid) = .empty,
     local_cid_max_seq: u64 = 0,
+    local_cid_generation: u64 = 0,
     local_initial_cid_retired: bool = false,
     spaces: [3]SpaceState,
     rtt: recovery.RttEstimator = .{},
@@ -895,6 +896,12 @@ pub const Connection = struct {
         const gop = self.pending_new_cids.getOrPut(self.gpa, seq) catch return error.OutOfMemory;
         gop.value_ptr.* = .{ .retire_prior_to = retire_prior_to };
         self.local_cid_max_seq = seq;
+        self.local_cid_generation +%= 1;
+    }
+
+    /// Return the generation of the active local connection ID set.
+    pub fn localConnectionIdGeneration(self: *const Connection) u64 {
+        return self.local_cid_generation;
     }
 
     /// Copy the active local connection IDs into `out`. A newly issued ID appears
@@ -2631,11 +2638,17 @@ pub const Connection = struct {
         }
         if (seq > self.local_cid_max_seq) return error.ProtocolViolation;
         if (seq == 0) {
-            self.local_initial_cid_retired = true;
+            if (!self.local_initial_cid_retired) {
+                self.local_initial_cid_retired = true;
+                self.local_cid_generation +%= 1;
+            }
             return;
         }
         const local = self.local_cids.getPtr(seq) orelse return error.ProtocolViolation;
-        local.retired = true;
+        if (!local.retired) {
+            local.retired = true;
+            self.local_cid_generation +%= 1;
+        }
     }
 
     fn onNewConnectionId(self: *Connection, seq: u64, retire_prior_to: u64, cid: []const u8, token: []const u8) Error!void {
