@@ -1067,12 +1067,22 @@ def test_http3_typed_transport_parameters_validate_in_the_extension() -> None:
         )
 
 
-def test_http3_server_custom_credentials_must_be_a_pair() -> None:
-    # TlsCredentials names both halves, so a lone certificate or key cannot be built.
-    with pytest.raises(TypeError):
-        zttp.TlsCredentials(certificate=b"\xcc" * 48)  # ty: ignore[missing-argument]
-    with pytest.raises(TypeError):
-        zttp.TlsCredentials(private_key=b"\x42" * 32)  # ty: ignore[missing-argument]
+def test_http3_server_accepts_a_certificate_chain() -> None:
+    config: ResumedServerConfig = SERVER_CONFIG.copy()
+    config["credentials"] = zttp.TlsCredentials(
+        certificates=(SERVER_PUBLIC_KEY, b"intermediate-certificate"),
+        private_key=b"\x42" * 32,
+    )
+    client = make_client()
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, **config)
+
+    transfer(client, server, 1000)
+    transfer(server, client, 2000)
+    transfer(client, server, 3000)
+    client.send_request(b"GET", b"/chain", b"3", [(b"host", b"example.test")])
+    transfer(client, server, 4000)
+
+    assert any(isinstance(event, zttp.Request) for event in drain_events(server))
 
 
 def test_http3_rejects_a_wrong_size_key() -> None:

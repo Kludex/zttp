@@ -3,24 +3,31 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
+from typing_extensions import TypedDict
 
 import zttp
 
 
-def test_value_objects_are_frozen() -> None:
-    creds = zttp.TlsCredentials(certificate=b"CERT", private_key=b"KEY")
+class CredentialsCase(TypedDict):
+    credentials: object
+    exception: type[Exception]
+    match: str
+
+
+def test_tls_credentials_is_a_typed_dictionary() -> None:
+    credentials = zttp.TlsCredentials(certificate=b"CERT", private_key=b"KEY")
+
+    assert credentials == {"certificate": b"CERT", "private_key": b"KEY"}
+
+
+def test_session_resumption_is_frozen() -> None:
     resumption = zttp.SessionResumption(identity=b"id", psk=b"\x00" * 32)
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        creds.certificate = b"other"  # ty: ignore[invalid-assignment]
+
     with pytest.raises(dataclasses.FrozenInstanceError):
         resumption.psk = b"other"  # ty: ignore[invalid-assignment]
 
 
-def test_credentials_and_resumption_need_both_halves() -> None:
-    # Naming both fields is the whole point: neither can be built half-formed, so a
-    # certificate/key (or identity/psk) swap has nowhere to hide.
-    with pytest.raises(TypeError):
-        zttp.TlsCredentials(certificate=b"CERT")  # ty: ignore[missing-argument]
+def test_session_resumption_needs_both_halves() -> None:
     with pytest.raises(TypeError):
         zttp.SessionResumption(identity=b"id")  # ty: ignore[missing-argument]
 
@@ -31,6 +38,74 @@ def test_quic_transport_parameters_is_a_typed_dictionary() -> None:
         "disable_active_migration": True,
     }
     assert parameters == {"initial_max_data": 64, "disable_active_migration": True}
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        CredentialsCase(
+            credentials=object(),
+            exception=TypeError,
+            match="credentials must be a TlsCredentials dictionary",
+        ),
+        CredentialsCase(
+            credentials={"certificate": b"leaf"},
+            exception=TypeError,
+            match="credentials must include private_key",
+        ),
+        CredentialsCase(
+            credentials={"private_key": b"\x42" * 32},
+            exception=ValueError,
+            match="credentials must include certificate or certificates",
+        ),
+        CredentialsCase(
+            credentials={
+                "certificate": b"leaf",
+                "certificates": (b"intermediate",),
+                "private_key": b"\x42" * 32,
+            },
+            exception=ValueError,
+            match="pass either certificate or certificates, not both",
+        ),
+        CredentialsCase(
+            credentials={"certificate": b"leaf", "private_key": b"\x42" * 32, "unknown": b"value"},
+            exception=ValueError,
+            match="credentials contains an unknown field",
+        ),
+        CredentialsCase(
+            credentials={"certificate": b"", "private_key": b"\x42" * 32},
+            exception=ValueError,
+            match="every certificate must be non-empty bytes",
+        ),
+        CredentialsCase(
+            credentials={"certificates": (), "private_key": b"\x42" * 32},
+            exception=ValueError,
+            match="the certificate chain must not be empty",
+        ),
+        CredentialsCase(
+            credentials={"certificates": (b"",), "private_key": b"\x42" * 32},
+            exception=ValueError,
+            match="every certificate must be non-empty bytes",
+        ),
+        CredentialsCase(
+            credentials={"certificates": b"single-certificate", "private_key": b"\x42" * 32},
+            exception=TypeError,
+            match="bytes",
+        ),
+        CredentialsCase(
+            credentials={"certificates": ("not-bytes",), "private_key": b"\x42" * 32},
+            exception=TypeError,
+            match="bytes",
+        ),
+    ],
+)
+def test_h3_constructor_validates_tls_credentials(case: CredentialsCase) -> None:
+    with pytest.raises(case["exception"], match=case["match"]):
+        zttp.Connection(
+            zttp.SERVER,
+            zttp.HTTP3,
+            credentials=case["credentials"],  # ty: ignore[invalid-argument-type]
+        )
 
 
 def test_h3_constructor_takes_value_objects() -> None:
@@ -52,13 +127,6 @@ def test_h3_constructor_rejects_the_old_raw_kwargs() -> None:
             zttp.Connection(zttp.SERVER, zttp.HTTP3, **bad)  # ty: ignore[no-matching-overload]
 
 
-def test_value_objects_are_keyword_only() -> None:
-    # Positional construction is where a same-typed swap could still hide, so the
-    # fields are keyword-only: TlsCredentials(key, cert) is a TypeError, not a silent
-    # transposition.
-    with pytest.raises(TypeError):
-        zttp.TlsCredentials(b"cert", b"key")  # ty: ignore[missing-argument, too-many-positional-arguments]
+def test_session_resumption_is_keyword_only() -> None:
     with pytest.raises(TypeError):
         zttp.SessionResumption(b"id", b"psk")  # ty: ignore[missing-argument, too-many-positional-arguments]
-    # Keyword construction is unaffected.
-    assert zttp.TlsCredentials(certificate=b"c", private_key=b"k").private_key == b"k"

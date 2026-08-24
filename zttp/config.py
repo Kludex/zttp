@@ -1,18 +1,16 @@
 """Typed configuration for the HTTP/3 constructor.
 
 The HTTP/3 handshake needs two pairs of same-typed `bytes` - a certificate and its
-private key, and a resumption ticket identity and its PSK. Passed as bare keyword
-arguments they can be silently transposed. These frozen value objects name each
-half, so `Connection(SERVER, HTTP3, credentials=TlsCredentials(...))` makes a swap
-a type error rather than a handshake failure. They are keyword-only, so even
-positional construction cannot transpose the two same-typed fields.
+private key, and a resumption ticket identity and its PSK. The credential dictionary
+names each field, while the frozen resumption value keeps its two fields together.
+The Zig extension validates both values when you construct a connection.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 __all__ = [
     "QuicTransportParameters",
@@ -39,12 +37,12 @@ class QuicTransportParameters(TypedDict, total=False):
     active_connection_id_limit: int
 
 
-@dataclass(frozen=True, kw_only=True)
-class TlsCredentials:
-    """An HTTP/3 server's TLS identity: the certificate and its private key."""
+class TlsCredentials(TypedDict):
+    """An HTTP/3 server's ordered certificate chain and leaf private key."""
 
-    certificate: bytes
     private_key: bytes
+    certificate: NotRequired[bytes]
+    certificates: NotRequired[tuple[bytes, ...]]
 
 
 @dataclass(frozen=True, kw_only=True)
