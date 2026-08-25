@@ -79,6 +79,19 @@ def test_quic_endpoint_accepts_bytearray_input(initial: bytes) -> None:
     assert endpoint.receive_datagram(bytearray(initial), b"address", 0) is not None
 
 
+def test_quic_endpoint_drains_application_output_without_scanning_idle_connections(initial: bytes) -> None:
+    endpoint = zttp.QuicEndpoint(connection_id_factory=lambda length: b"s" * length)
+    connection = endpoint.receive_datagram(initial, b"address", 0)
+    assert connection is not None
+    assert endpoint.data_to_send()
+    assert endpoint.next_timeout() is not None
+
+    connection.close(app=False)
+    assert endpoint.data_to_send() == []
+    assert endpoint.data_to_send(connection)
+    assert endpoint.next_timeout() is None
+
+
 def test_quic_endpoint_does_not_retain_an_unauthenticated_initial(initial: bytes) -> None:
     corrupted = initial[:-1] + bytes((initial[-1] ^ 1,))
     endpoint = zttp.QuicEndpoint(
@@ -89,6 +102,18 @@ def test_quic_endpoint_does_not_retain_an_unauthenticated_initial(initial: bytes
     assert endpoint.receive_datagram(corrupted, b"address", 0) is None
     assert endpoint.connections() == []
     assert endpoint.receive_datagram(initial, b"address", 0) is not None
+
+
+def test_quic_endpoint_drops_an_undersized_initial_before_retry() -> None:
+    endpoint = zttp.QuicEndpoint(
+        retry=True,
+        token_secret=b"s" * 32,
+        connection_id_factory=lambda length: b"r" * length,
+    )
+    datagram = b"\xc0\x00\x00\x00\x01\x08original\x00\x00"
+
+    assert endpoint.receive_datagram(datagram, b"address", 0) is None
+    assert endpoint.data_to_send() == []
 
 
 def test_quic_endpoint_sends_version_negotiation() -> None:
@@ -104,6 +129,77 @@ def test_quic_endpoint_sends_version_negotiation() -> None:
     assert header.version == 0
     assert header.destination_connection_id == b"peer"
     assert header.source_connection_id == b"original"
+
+
+def test_quic_endpoint_updates_connection_timeouts() -> None:
+    endpoint = zttp.QuicEndpoint(
+        transport_params=zttp.QuicTransportParameters(max_idle_timeout=1),
+        connection_id_factory=lambda length: b"s" * length,
+    )
+    client = zttp.Connection(
+        zttp.CLIENT,
+        zttp.HTTP3,
+        connection_id=b"original",
+        server_name=b"localhost",
+    )
+    initial = client.data_to_send()[0]
+    connection = endpoint.receive_datagram(initial, b"address", 1000)
+    assert connection is not None
+    first_deadline = endpoint.next_timeout()
+    assert first_deadline is not None
+
+    assert endpoint.receive_datagram(initial, b"address", 2000) is connection
+    later_deadline = endpoint.next_timeout()
+    assert later_deadline is not None
+    assert later_deadline > first_deadline
+
+    assert endpoint.receive_datagram(initial, b"address", 500) is connection
+    earlier_deadline = endpoint.next_timeout()
+    assert earlier_deadline is not None
+    assert earlier_deadline < later_deadline
+    endpoint.handle_timeout(earlier_deadline)
+    assert connection.is_closed()
+    assert endpoint.next_timeout() is None
+
+
+def test_quic_endpoint_orders_connection_timeouts() -> None:
+    connection_ids = iter((b"a" * 16, b"b" * 16, b"c" * 16))
+    endpoint = zttp.QuicEndpoint(
+        transport_params=zttp.QuicTransportParameters(max_idle_timeout=1),
+        connection_id_factory=lambda length: next(connection_ids),
+    )
+    first_client = zttp.Connection(
+        zttp.CLIENT,
+        zttp.HTTP3,
+        connection_id=b"first-id",
+        server_name=b"localhost",
+    )
+    second_client = zttp.Connection(
+        zttp.CLIENT,
+        zttp.HTTP3,
+        connection_id=b"secondid",
+        server_name=b"localhost",
+    )
+    third_client = zttp.Connection(
+        zttp.CLIENT,
+        zttp.HTTP3,
+        connection_id=b"third-id",
+        server_name=b"localhost",
+    )
+    first = endpoint.receive_datagram(first_client.data_to_send()[0], b"first", 2000)
+    second_initial = second_client.data_to_send()[0]
+    second = endpoint.receive_datagram(second_initial, b"second", 1000)
+    third = endpoint.receive_datagram(third_client.data_to_send()[0], b"third", 4000)
+    assert first is not None
+    assert second is not None
+    assert third is not None
+    assert endpoint.next_timeout() == 2000
+    assert endpoint.receive_datagram(second_initial, b"second", 1500) is second
+    assert endpoint.next_timeout() == 2500
+
+    endpoint.discard(second)
+    assert endpoint.next_timeout() == 3000
+    assert endpoint.connections() == [first, third]
 
 
 def test_quic_endpoint_uses_random_connection_ids_by_default(initial: bytes) -> None:
@@ -135,6 +231,15 @@ def test_quic_endpoint_rejects_an_active_generated_connection_id(initial: bytes)
     )
     with pytest.raises(RuntimeError, match="active connection ID"):
         endpoint.receive_datagram(another.data_to_send()[0], b"address", 0)
+
+
+def test_quic_endpoint_requires_endpoint_connection_id_issuance(initial: bytes) -> None:
+    endpoint = zttp.QuicEndpoint(connection_id_factory=lambda length: b"s" * length)
+    connection = endpoint.receive_datagram(initial, b"address", 0)
+    assert connection is not None
+
+    with pytest.raises(zttp.LocalProtocolError, match=r"QuicEndpoint\.issue_connection_id"):
+        connection.issue_connection_id(1, b"replacement-cid", b"t" * 16)
 
 
 def test_quic_endpoint_rejects_connections_from_another_endpoint() -> None:

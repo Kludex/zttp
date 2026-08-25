@@ -41,13 +41,16 @@ class _AcceptanceParameters(TypedDict):
     address_validated: bool
 
 
-@dataclass
+@dataclass(eq=False)
 class _ConnectionState:
     connection: H3Connection
     initial_destination_connection_id: bytes
     peer_address: bytes
     connection_id_generation: int = -1
     connection_ids: set[bytes] = field(default_factory=set)
+    timer_deadline: int | None = None
+    timer_index: int = -1
+    active: bool = True
 
 
 class QuicEndpoint:
@@ -82,7 +85,10 @@ class QuicEndpoint:
         self._token_codec = TokenCodec(token_secret if token_secret is not None else secrets.token_bytes(32), token_ttl)
         self._long_routes: dict[bytes, _ConnectionState] = {}
         self._short_routes: dict[bytes, _ConnectionState] = {}
-        self._connections: list[_ConnectionState] = []
+        self._connections: dict[H3Connection, _ConnectionState] = {}
+        self._ready: dict[_ConnectionState, None] = {}
+        self._timer_dirty: dict[_ConnectionState, None] = {}
+        self._timeouts: list[_ConnectionState] = []
         self._outgoing: list[OutboundDatagram] = []
 
     def receive_datagram(self, datagram: Buffer, peer_address: bytes, now: int) -> H3Connection | None:
@@ -113,6 +119,8 @@ class QuicEndpoint:
             self._outgoing.append(OutboundDatagram(packet, peer_address))
             return None
         if not header.is_initial or len(self._connections) >= self._max_connections:
+            return None
+        if len(datagram) < 1200:
             return None
 
         context = self._token_codec.validate(peer_address, header.token, now) if header.token else None
@@ -180,50 +188,71 @@ class QuicEndpoint:
         """Issue and route a new connection ID for an accepted connection."""
         state = self._connection_state(connection)
         connection_id = self._new_connection_id()
-        connection.issue_connection_id(sequence_number, connection_id, secrets.token_bytes(16), retire_prior_to)
+        connection._endpoint_issue_connection_id(
+            sequence_number,
+            connection_id,
+            secrets.token_bytes(16),
+            retire_prior_to,
+        )
         self._sync_routes(state)
+        self._mark_ready(state)
+        self._mark_timer_dirty(state)
         return connection_id
 
     def issue_token(self, connection: H3Connection, now: int) -> None:
         """Queue a NEW_TOKEN bound to the connection's current peer address."""
         state = self._connection_state(connection)
         connection.send_new_token(self._token_codec.create_address_token(state.peer_address, now))
+        self._mark_ready(state)
+        self._mark_timer_dirty(state)
 
-    def data_to_send(self) -> list[OutboundDatagram]:
-        """Return and clear outbound QUIC datagrams."""
+    def data_to_send(self, connection: H3Connection | None = None) -> list[OutboundDatagram]:
+        """Drain ready connections, optionally marking `connection` as ready."""
+        if connection is not None:
+            self._mark_ready(self._connection_state(connection))
         outgoing = self._outgoing
         self._outgoing = []
-        for state in self._connections:
+        ready = list(self._ready)
+        self._ready.clear()
+        for state in ready:
             outgoing.extend(state.connection.data_to_send_with_addresses())
+            self._mark_timer_dirty(state)
         return outgoing
 
     def connections(self) -> list[H3Connection]:
         """Return the accepted HTTP/3 connections."""
-        return [state.connection for state in self._connections]
+        return list(self._connections)
 
     def discard(self, connection: H3Connection) -> None:
         """Remove a closed connection and all of its routes."""
         state = self._connection_state(connection)
-        self._connections.remove(state)
-        self._long_routes = {cid: item for cid, item in self._long_routes.items() if item is not state}
-        self._short_routes = {cid: item for cid, item in self._short_routes.items() if item is not state}
+        del self._connections[connection]
+        state.active = False
+        self._remove_timeout(state)
+        self._ready.pop(state, None)
+        self._timer_dirty.pop(state, None)
+        for connection_id in state.connection_ids | {state.initial_destination_connection_id}:
+            self._long_routes.pop(connection_id, None)
+            self._short_routes.pop(connection_id, None)
 
     def next_timeout(self) -> int | None:
         """Return the earliest connection deadline, or `None`."""
-        deadlines = [
-            deadline for state in self._connections if (deadline := state.connection.next_timeout()) is not None
-        ]
-        return min(deadlines, default=None)
+        self._sync_timeouts()
+        return self._timeouts[0].timer_deadline if self._timeouts else None
 
     def handle_timeout(self, now: int) -> None:
         """Fire every connection timer due at `now`."""
-        for state in self._connections:
-            deadline = state.connection.next_timeout()
-            if deadline is not None and deadline <= now:
+        while (deadline := self.next_timeout()) is not None and deadline <= now:
+            state = self._timeouts[0]
+            self._remove_timeout(state)
+            try:
                 state.connection.handle_timeout(now)
+            finally:
+                self._mark_ready(state)
+                self._mark_timer_dirty(state)
 
     def _connection_state(self, connection: H3Connection) -> _ConnectionState:
-        state = next((item for item in self._connections if item.connection is connection), None)
+        state = self._connections.get(connection)
         if state is None:
             raise LocalProtocolError("connection does not belong to this endpoint")
         return state
@@ -258,8 +287,10 @@ class QuicEndpoint:
             parameters["initial_destination_connection_id"],
             parameters["peer_address"],
         )
-        self._connections.append(state)
+        self._connections[connection] = state
         self._sync_routes(state)
+        self._mark_ready(state)
+        self._mark_timer_dirty(state)
         return connection
 
     def _receive(
@@ -269,11 +300,90 @@ class QuicEndpoint:
         peer_address: bytes,
         now: int,
     ) -> H3Connection:
-        state.connection.receive_datagram(datagram, now, peer_address)
         state.peer_address = peer_address
-        if state.connection_id_generation != state.connection._endpoint_connection_id_generation():
-            self._sync_routes(state)
+        try:
+            state.connection.receive_datagram(datagram, now, peer_address)
+        finally:
+            if state.connection_id_generation != state.connection._endpoint_connection_id_generation():
+                self._sync_routes(state)
+            self._mark_ready(state)
+            self._mark_timer_dirty(state)
         return state.connection
+
+    def _mark_ready(self, state: _ConnectionState) -> None:
+        self._ready[state] = None
+
+    def _mark_timer_dirty(self, state: _ConnectionState) -> None:
+        self._timer_dirty[state] = None
+
+    def _sync_timeouts(self) -> None:
+        dirty = list(self._timer_dirty)
+        self._timer_dirty.clear()
+        for state in dirty:
+            self._schedule_timeout(state)
+
+    def _schedule_timeout(self, state: _ConnectionState) -> None:
+        deadline = state.connection.next_timeout() if state.active else None
+        if deadline == state.timer_deadline:
+            return
+        if deadline is None:
+            self._remove_timeout(state)
+            return
+        previous = state.timer_deadline
+        state.timer_deadline = deadline
+        if state.timer_index < 0:
+            state.timer_index = len(self._timeouts)
+            self._timeouts.append(state)
+            self._sift_timeout_up(state.timer_index)
+        elif previous is not None and deadline < previous:
+            self._sift_timeout_up(state.timer_index)
+        else:
+            self._sift_timeout_down(state.timer_index)
+
+    def _remove_timeout(self, state: _ConnectionState) -> None:
+        index = state.timer_index
+        state.timer_index = -1
+        state.timer_deadline = None
+        if index < 0:
+            return
+        last = self._timeouts.pop()
+        if index == len(self._timeouts):
+            return
+        self._timeouts[index] = last
+        last.timer_index = index
+        self._sift_timeout_up(index)
+        self._sift_timeout_down(last.timer_index)
+
+    def _sift_timeout_up(self, index: int) -> None:
+        while index > 0:
+            parent = (index - 1) // 2
+            if self._timeout_before(self._timeouts[parent], self._timeouts[index]):
+                return
+            self._swap_timeouts(parent, index)
+            index = parent
+
+    def _sift_timeout_down(self, index: int) -> None:
+        size = len(self._timeouts)
+        while (left := 2 * index + 1) < size:
+            right = left + 1
+            child = (
+                right if right < size and self._timeout_before(self._timeouts[right], self._timeouts[left]) else left
+            )
+            if self._timeout_before(self._timeouts[index], self._timeouts[child]):
+                return
+            self._swap_timeouts(index, child)
+            index = child
+
+    def _swap_timeouts(self, first: int, second: int) -> None:
+        self._timeouts[first], self._timeouts[second] = self._timeouts[second], self._timeouts[first]
+        self._timeouts[first].timer_index = first
+        self._timeouts[second].timer_index = second
+
+    @staticmethod
+    def _timeout_before(first: _ConnectionState, second: _ConnectionState) -> bool:
+        assert first.timer_deadline is not None
+        assert second.timer_deadline is not None
+        return first.timer_deadline <= second.timer_deadline
 
     def _sync_routes(self, state: _ConnectionState) -> None:
         connection_ids = {item.connection_id for item in state.connection.local_connection_ids()}

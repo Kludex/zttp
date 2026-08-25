@@ -173,6 +173,11 @@ routing synchronized with active and retired IDs in the QUIC core.
 The endpoint does not own `udp_socket`, call `sendto`, read the clock, or schedule
 a timer. Call `next_timeout()` and `handle_timeout(now)` from your event loop.
 
+`data_to_send()` drains connections changed by `receive_datagram()`, endpoint timer
+handling, or endpoint control methods. If your application queues output on a
+connection after an earlier drain, pass that connection to
+`data_to_send(connection)`.
+
 ::: zttp.QuicEndpoint
 
 ::: zttp.ConnectionIDFactory
