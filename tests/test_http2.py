@@ -136,6 +136,19 @@ def test_request_with_body() -> None:
     assert any(isinstance(e, zttp.EndOfMessage) for e in events)
 
 
+def test_invalid_stream_window_update_closes_the_stream() -> None:
+    conn = server_with(frame(0x01, END_HEADERS, 1, GET_BLOCK))
+    list(drain_h2(conn))
+    conn.receive_data(frame(0x08, 0, 1, b"\x00\x00\x00\x00") + frame(0x00, END_STREAM, 1, b"late"))
+
+    events = list(drain_h2(conn))
+
+    assert not any(isinstance(event, (zttp.Data, zttp.EndOfMessage)) for event in events)
+    reset = next(event for event in events if isinstance(event, zttp.RstStream))
+    assert reset.stream_id == 1
+    assert reset.error_code == 0x01
+
+
 def test_two_multiplexed_streams_carry_their_ids() -> None:
     conn = server_with(
         frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK),
