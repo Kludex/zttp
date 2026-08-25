@@ -121,6 +121,15 @@ def test_simple_get_request() -> None:
     assert (b"host", b"www.example.com") in req.headers
 
 
+def test_hpack_decodes_symbol_208() -> None:
+    huffman_value = bytes([0x00, 0x03]) + b"x-a" + bytes([0x83, 0xFF, 0xFE, 0x5F])
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK + huffman_value))
+
+    request = next(event for event in drain_h2(conn) if isinstance(event, zttp.Request))
+
+    assert (b"x-a", b"\xd0") in request.headers
+
+
 def test_request_with_body() -> None:
     conn = server_with(
         frame(0x01, END_HEADERS, 1, GET_BLOCK),  # no END_STREAM

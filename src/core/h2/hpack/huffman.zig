@@ -124,7 +124,7 @@ const CODES = [257]Sym{
     .{ .code = 0x3ffffe4, .bits = 26 },  .{ .code = 0x7ffffde, .bits = 27 },
     .{ .code = 0x7ffffdf, .bits = 27 },  .{ .code = 0x3ffffe5, .bits = 26 },
     .{ .code = 0xfffff1, .bits = 24 },   .{ .code = 0x1ffffed, .bits = 25 },
-    .{ .code = 0x5fff, .bits = 15 },     .{ .code = 0x1fffe3, .bits = 21 },
+    .{ .code = 0x7fff2, .bits = 19 },    .{ .code = 0x1fffe3, .bits = 21 },
     .{ .code = 0x3ffffe6, .bits = 26 },  .{ .code = 0x7ffffe0, .bits = 27 },
     .{ .code = 0x7ffffe1, .bits = 27 },  .{ .code = 0x3ffffe7, .bits = 26 },
     .{ .code = 0x7ffffe2, .bits = 27 },  .{ .code = 0xfffff2, .bits = 24 },
