@@ -141,9 +141,10 @@ pub const Decoder = struct {
         if (ric > self.insert_count) return error.Blocked;
         self.last_required_insert_count = ric;
         const base = if (sign) blk: {
-            if (delta + 1 > ric) return error.DecompressionFailed;
-            break :blk ric - delta - 1;
-        } else ric + delta;
+            const distance = std.math.add(u64, delta, 1) catch return error.DecompressionFailed;
+            if (distance > ric) return error.DecompressionFailed;
+            break :blk ric - distance;
+        } else std.math.add(u64, ric, delta) catch return error.DecompressionFailed;
 
         var section_size: usize = 0;
         while (p.pos < block.len) {
@@ -199,13 +200,13 @@ pub const Decoder = struct {
 
     fn indexedPostBase(self: *Decoder, p: *Parser, base: u64, section_size: *usize) Error!void {
         const index = try p.integer(4);
-        const entry = self.dynamicPostBase(index, base) orelse return error.BadIndex;
+        const entry = (try self.dynamicPostBase(index, base)) orelse return error.BadIndex;
         try self.emit(try self.intern(entry.name), try self.intern(entry.value), section_size);
     }
 
     fn literalPostBaseNameRef(self: *Decoder, p: *Parser, base: u64, section_size: *usize) Error!void {
         const index = try p.integer(3);
-        const entry = self.dynamicPostBase(index, base) orelse return error.BadIndex;
+        const entry = (try self.dynamicPostBase(index, base)) orelse return error.BadIndex;
         const value = try self.string(p, 7);
         try self.emit(try self.intern(entry.name), value, section_size);
     }
@@ -305,8 +306,9 @@ pub const Decoder = struct {
         return self.dynamicAbsolute(base - index - 1);
     }
 
-    fn dynamicPostBase(self: *const Decoder, index: u64, base: u64) ?DynamicEntry {
-        return self.dynamicAbsolute(base + index);
+    fn dynamicPostBase(self: *const Decoder, index: u64, base: u64) Error!?DynamicEntry {
+        const absolute = std.math.add(u64, base, index) catch return error.DecompressionFailed;
+        return self.dynamicAbsolute(absolute);
     }
 
     fn dynamicAbsolute(self: *const Decoder, abs: u64) ?DynamicEntry {
@@ -565,6 +567,22 @@ test "decode a dynamic post-base indexed field" {
     try testing.expectEqual(@as(usize, 1), hs.len);
     try testing.expectEqualStrings("b", hs[0].name);
     try testing.expectEqualStrings("2", hs[0].value);
+}
+
+test "field section base arithmetic rejects overflow" {
+    const gpa = testing.allocator;
+    var dec = Decoder.init(gpa, 1 << 20);
+    defer dec.deinit();
+    dec.setMaxDynamicCapacity(128);
+    const max = [_]u8{0x80} ++ [_]u8{0xFF} ** 8 ++ [_]u8{0x01};
+
+    try testing.expectError(error.DecompressionFailed, dec.decode(&([_]u8{ 0x00, 0xFF } ++ max)));
+
+    dec.insert_count = 1;
+    try testing.expectError(error.DecompressionFailed, dec.decode(&([_]u8{ 0x02, 0x7F } ++ max)));
+
+    dec.insert_count = 0;
+    try testing.expectError(error.DecompressionFailed, dec.decode(&([_]u8{ 0x00, 0x7F } ++ max ++ [_]u8{0x11})));
 }
 
 test "an out-of-range static index is rejected" {
