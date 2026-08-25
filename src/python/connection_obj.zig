@@ -2991,7 +2991,10 @@ fn next_message(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
     // Convenience for keep-alive: reset the reader for the next request/response.
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const e = h1(self) orelse return null;
-    e.reader.reset();
+    e.reader.reset() catch return py.raise(
+        exceptions.LocalProtocolError,
+        "cannot start the next cycle before the current message is complete",
+    );
     e.message.startNextCycle();
     return py.none();
 }

@@ -310,6 +310,22 @@ def test_body_buffer_with_pipelined_bytes_keeps_copy_path() -> None:
     assert next_request.target == b"/next"
 
 
+def test_start_next_cycle_rejects_a_stashed_body() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    prefix = b"GET /smuggled HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    body = prefix + b"x" * (2048 - len(prefix))
+    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 2048\r\n\r\n" + body)
+    assert isinstance(conn.next_event(), zttp.Request)
+
+    with pytest.raises(zttp.LocalProtocolError, match="before the current message is complete"):
+        conn.start_next_cycle()
+
+    event = conn.next_event()
+    assert isinstance(event, zttp.Data)
+    assert event.data == body
+    assert isinstance(conn.next_event(), zttp.EndOfMessage)
+
+
 def test_keep_alive_two_requests() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: y\r\n\r\n")
