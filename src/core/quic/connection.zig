@@ -2397,21 +2397,17 @@ pub const Connection = struct {
 
     fn detectStatelessReset(self: *Connection, buf: []const u8) bool {
         if (buf.len < 21) return false;
-        const token = buf[buf.len - 16 ..];
+        const token = buf[buf.len - 16 ..][0..16].*;
+        var matched = false;
         if (self.peer_tp.stateless_reset_token) |t| {
-            if (std.mem.eql(u8, token, &t)) {
-                self.closed = true;
-                return true;
-            }
+            matched = std.crypto.timing_safe.eql([16]u8, token, t);
         }
         var it = self.peer_cids.valueIterator();
         while (it.next()) |cid| {
-            if (std.mem.eql(u8, token, &cid.token)) {
-                self.closed = true;
-                return true;
-            }
+            matched = std.crypto.timing_safe.eql([16]u8, token, cid.token) or matched;
         }
-        return false;
+        if (matched) self.closed = true;
+        return matched;
     }
 
     fn acceptsLocalCid(self: *const Connection, dcid: []const u8) bool {
