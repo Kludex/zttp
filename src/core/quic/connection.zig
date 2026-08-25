@@ -5239,12 +5239,15 @@ test "a client Initial carries a ClientHello the server can answer" {
         0x08, 0x01, 0x10, // initial_max_streams_bidi = 16
         0x09, 0x01, 0x10, // initial_max_streams_uni = 16
     };
+    const signer = tls.sign.Signer.fromSeed([_]u8{0x42} ** 32) catch unreachable;
+    const cert_pub = signer.publicKeySec1();
     var client = try Connection.initClient(gpa, &dcid, .{
         .random = [_]u8{0x44} ** 32,
         .ephemeral_seed = [_]u8{0x55} ** 32,
         .transport_params = &client_tp,
         .alpn = "h3",
         .server_name = "example.test",
+        .server_certificate = &cert_pub,
     }, 1000);
     defer client.deinit();
 
@@ -5253,8 +5256,6 @@ test "a client Initial carries a ClientHello the server can answer" {
 
     var server_cfg = testServerConfig();
     server_cfg.alpn = "h3";
-    const signer = tls.sign.Signer.fromSeed([_]u8{0x42} ** 32) catch unreachable;
-    const cert_pub = signer.publicKeySec1();
     server_cfg.cert_chain = &cert_pub;
     var server = try Connection.initServer(gpa, &dcid, server_cfg);
     defer server.deinit();

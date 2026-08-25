@@ -16,6 +16,7 @@ client = zttp.Connection(
     zttp.CLIENT,
     protocol=zttp.HTTP3,
     server_name=b"example.com",
+    server_certificate=certificate_der,
 )
 ```
 
@@ -38,12 +39,15 @@ server = zttp.Connection(
 client = zttp.Connection(
     zttp.CLIENT, zttp.HTTP3,
     server_name=b"example.com",
+    server_certificate=certificate_der,
     resumption=zttp.SessionResumption(identity=ticket_id, psk=ticket_psk),
 )
 ```
 
 Omit `credentials` and the server uses an ephemeral local identity (development
-only).
+only). A client pins the exact certificate or raw P-256 public key with
+`server_certificate`. The handshake fails if the peer presents anything else or
+if you omit the pin.
 
 !!! warning "Scope"
     HTTP/3 support is still experimental. The public surface is intentionally
@@ -243,8 +247,19 @@ def transfer(src, dst, now):
         dst.receive_datagram(datagram, now)
 
 
-client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
-server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+certificate = bytes.fromhex(
+    "04"
+    "2ca00e33928e5b66cc63a70e91c78f5d9e0db34711f9108778151912d389c5"
+    "89c6c886572fd6dad9d01e0b98c5fec3276e9a2e4b89705140f564f7eb65016b95"
+)
+credentials = zttp.TlsCredentials(certificate=certificate, private_key=b"\x42" * 32)
+client = zttp.Connection(
+    zttp.CLIENT,
+    protocol=zttp.HTTP3,
+    server_name=b"example.test",
+    server_certificate=certificate,
+)
+server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3, credentials=credentials)
 
 transfer(client, server, 1000)  # ClientHello
 transfer(server, client, 2000)  # ServerHello and the rest of the server's flight

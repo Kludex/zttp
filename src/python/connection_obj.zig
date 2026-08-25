@@ -1961,7 +1961,7 @@ fn new_h2(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
 
 // H3Connection(role, protocol=HTTP3, *, credentials=None, transport_params=None,
 // random=None, ephemeral_seed=None, alpn=None,
-// connection_id=None, server_name=None, resumption_identity=None,
+// connection_id=None, server_name=None, server_certificate=None, resumption_identity=None,
 // resumption_psk=None, obfuscated_ticket_age=0, early_data=False,
 // remembered_transport_params=None, validation_token=None).
 // role and protocol stay
@@ -1978,22 +1978,24 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     var alpn_obj: ?*c.PyObject = null;
     var cid_obj: ?*c.PyObject = null;
     var sni_obj: ?*c.PyObject = null;
+    var server_certificate_obj: ?*c.PyObject = null;
     var resumption_obj: ?*c.PyObject = null;
     var obfuscated_ticket_age_obj: ?*c.PyObject = null;
     var early_data_obj: ?*c.PyObject = null;
     var remembered_tp_obj: ?*c.PyObject = null;
     var validation_token_obj: ?*c.PyObject = null;
     var kwlist = [_][*c]u8{
-        @constCast("role"),                        @constCast("protocol"),              @constCast("credentials"),
-        @constCast("transport_params"),            @constCast("random"),                @constCast("ephemeral_seed"),
-        @constCast("alpn"),                        @constCast("connection_id"),         @constCast("server_name"),
-        @constCast("resumption"),                  @constCast("obfuscated_ticket_age"), @constCast("early_data"),
-        @constCast("remembered_transport_params"), @constCast("validation_token"),      null,
+        @constCast("role"),               @constCast("protocol"),                    @constCast("credentials"),
+        @constCast("transport_params"),   @constCast("random"),                      @constCast("ephemeral_seed"),
+        @constCast("alpn"),               @constCast("connection_id"),               @constCast("server_name"),
+        @constCast("server_certificate"), @constCast("resumption"),                  @constCast("obfuscated_ticket_age"),
+        @constCast("early_data"),         @constCast("remembered_transport_params"), @constCast("validation_token"),
+        null,
     };
     if (c.PyArg_ParseTupleAndKeywords(
         args,
         kwds,
-        "l|l$OOOOOOOOOOOO",
+        "l|l$OOOOOOOOOOOOO",
         @ptrCast(&kwlist),
         &role_val,
         &protocol_val,
@@ -2004,6 +2006,7 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
         &alpn_obj,
         &cid_obj,
         &sni_obj,
+        &server_certificate_obj,
         &resumption_obj,
         &obfuscated_ticket_age_obj,
         &early_data_obj,
@@ -2034,6 +2037,10 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
     self.engine = null;
     const engine: *Engine = @ptrCast(@alignCast(&self.engine_storage));
     if (role_val == SERVER) {
+        if (server_certificate_obj != null and !py.isNone(server_certificate_obj)) {
+            py.decref(obj);
+            return py.raiseValue("server_certificate is only valid for HTTP/3 clients");
+        }
         if (obfuscated_ticket_age_obj != null and !py.isNone(obfuscated_ticket_age_obj)) {
             py.decref(obj);
             return py.raiseValue("obfuscated_ticket_age is only valid for HTTP/3 clients");
@@ -2079,6 +2086,7 @@ fn new_h3(tp: ?*c.PyTypeObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv
             alpn_obj,
             cid_obj,
             sni_obj,
+            server_certificate_obj,
             resumption_identity_obj,
             resumption_psk_obj,
             obfuscated_ticket_age_obj,
@@ -2105,6 +2113,7 @@ fn buildClientH3(
     alpn_obj: ?*c.PyObject,
     cid_obj: ?*c.PyObject,
     sni_obj: ?*c.PyObject,
+    server_certificate_obj: ?*c.PyObject,
     resumption_identity_obj: ?*c.PyObject,
     resumption_psk_obj: ?*c.PyObject,
     obfuscated_ticket_age_obj: ?*c.PyObject,
@@ -2122,6 +2131,14 @@ fn buildClientH3(
     }
     const alpn = if (alpn_obj != null and !py.isNone(alpn_obj)) py.asBytes(alpn_obj) orelse return null else "h3";
     const server_name = if (sni_obj != null and !py.isNone(sni_obj)) py.asBytes(sni_obj) orelse return null else null;
+    const server_certificate = if (server_certificate_obj != null and !py.isNone(server_certificate_obj))
+        py.asBytes(server_certificate_obj) orelse return null
+    else
+        &.{};
+    if (server_certificate_obj != null and !py.isNone(server_certificate_obj) and server_certificate.len == 0) {
+        _ = py.raiseValue("server_certificate must not be empty");
+        return null;
+    }
     const validation_token = if (validation_token_obj != null and !py.isNone(validation_token_obj)) blk: {
         const token = py.asBytes(validation_token_obj) orelse return null;
         if (token.len == 0) {
@@ -2142,6 +2159,7 @@ fn buildClientH3(
         .transport_params = tp_src,
         .alpn = alpn,
         .server_name = server_name,
+        .server_certificate = server_certificate,
         .resumption = if (resumption) |r| .{
             .identity = r.identity,
             .obfuscated_ticket_age = r.obfuscated_ticket_age,
