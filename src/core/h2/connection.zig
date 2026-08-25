@@ -719,7 +719,7 @@ pub const Connection = struct {
             if (h.name[0] == ':') {
                 if (seen_regular) return error.Malformed; // pseudo after regular
                 if (eql(h.name, ":method")) {
-                    if (method != null) return error.Malformed;
+                    if (method != null or !fields.isValidToken(h.value)) return error.Malformed;
                     method = h.value;
                 } else if (eql(h.name, ":path")) {
                     if (path != null) return error.Malformed;

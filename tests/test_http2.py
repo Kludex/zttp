@@ -674,6 +674,18 @@ def _request_block(*extra: tuple[bytes, bytes], method: bytes = b"GET") -> bytes
     return block
 
 
+@pytest.mark.parametrize("method", [b"", b"GET /admin HTTP/1.1", b"GE\tT"])
+def test_h2_rejects_an_invalid_method(method: bytes) -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, _request_block(method=method)))
+
+    events = list(drain_h2(conn))
+
+    assert not any(isinstance(event, zttp.Request) for event in events)
+    reset = next(event for event in events if isinstance(event, zttp.RstStream))
+    assert reset.stream_id == 1
+    assert reset.error_code == 0x01
+
+
 def test_h2_bodyless_request_with_content_length_is_reset() -> None:
     # A request declaring content-length but sending no DATA is an h2->h1 smuggling
     # vector (the downgraded h1 request advertises a body that never arrives). It
