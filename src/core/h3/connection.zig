@@ -1123,7 +1123,10 @@ pub const Connection = struct {
             }
         }
         const method_v = method orelse return self.failStream(.message_error);
-        if (method_v.len == 0) return self.failStream(.message_error);
+        if (!fields.isValidToken(method_v)) return self.failStream(.message_error);
+        if (authority) |auth| {
+            if (auth.len == 0 or std.mem.indexOfAny(u8, auth, " \t") != null) return self.failStream(.message_error);
+        }
         if (eql(method_v, "HEAD")) self.send_bodyless.put(self.gpa, id, {}) catch return error.OutOfMemory;
         const target_v = if (eql(method_v, "CONNECT")) blk: {
             if (path != null or scheme != null) return self.failStream(.message_error);
@@ -1900,6 +1903,18 @@ fn pumpHeaders(gpa: std.mem.Allocator, qpack_block: []const u8) Error!bool {
     qc.receiveDatagram(dgram, 1000) catch return error.H3Error;
     try h3.pump(0);
     return h3.nextEvent() == .request;
+}
+
+test "a request method containing spaces is malformed" {
+    const block = [_]u8{ 0x00, 0x00, 0x27, 0x00 } ++ ":method".* ++ [_]u8{0x13} ++
+        "GET /admin HTTP/1.1".* ++ [_]u8{ 0xC0 | 23, 0xC0 | 1 };
+    try testing.expect(!try pumpHeaders(testing.allocator, &block));
+}
+
+test "a request authority containing spaces is malformed" {
+    const block = [_]u8{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x50, 0x16 } ++
+        "a.example evil.example".*;
+    try testing.expect(!try pumpHeaders(testing.allocator, &block));
 }
 
 test "a duplicate request pseudo-header is malformed" {
