@@ -674,6 +674,37 @@ def _request_block(*extra: tuple[bytes, bytes], method: bytes = b"GET") -> bytes
     return block
 
 
+def test_server_accepts_request_trailers_after_finishing_its_response() -> None:
+    conn = server_with(frame(0x01, END_HEADERS, 1, _request_block(method=b"POST")))
+    next(event for event in drain_h2(conn) if isinstance(event, zttp.Request))
+    stream = conn.stream(1)
+    stream.send_response(400)
+    stream.end_message()
+    conn.receive_data(frame(0x01, END_HEADERS | END_STREAM, 1, _lit(b"x-checksum", b"abc")))
+
+    events = list(drain_h2(conn))
+
+    end = next(event for event in events if isinstance(event, zttp.EndOfMessage))
+    assert end.trailers == [(b"x-checksum", b"abc")]
+
+
+def test_client_accepts_response_trailers_after_finishing_its_request() -> None:
+    conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    conn.send_request(b"POST", b"/", b"2", [(b"host", b"example.com")]).end_message()
+    conn.data_to_send()
+    conn.receive_data(
+        frame(0x04, 0, 0, b"")
+        + frame(0x01, END_HEADERS, 1, STATUS_200)
+        + frame(0x00, 0, 1, b"body")
+        + frame(0x01, END_HEADERS | END_STREAM, 1, _lit(b"grpc-status", b"0"))
+    )
+
+    events = list(drain_h2(conn))
+
+    end = next(event for event in events if isinstance(event, zttp.EndOfMessage))
+    assert end.trailers == [(b"grpc-status", b"0")]
+
+
 def test_h2_bodyless_request_with_content_length_is_reset() -> None:
     # A request declaring content-length but sending no DATA is an h2->h1 smuggling
     # vector (the downgraded h1 request advertises a body that never arrives). It
