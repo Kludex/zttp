@@ -423,6 +423,9 @@ pub const Connection = struct {
         // Connection-window accounting against the FULL frame payload length.
         if (@as(i64, self.conn_recv_window) - @as(i64, f.header.length) < 0) return error.FlowControlError;
         self.conn_recv_window -= @intCast(f.header.length);
+        // Return connection credit even when stream validation later discards the payload.
+        self.conn_recv_window += @intCast(f.header.length);
+        self.conn_recv_credit +|= f.header.length;
 
         const s = self.streams.getPtr(f.header.stream_id) orelse {
             // No live stream: an idle id (never opened) is a connection error;
@@ -447,10 +450,7 @@ pub const Connection = struct {
             return;
         }
         s.recordData(content.len);
-        // Refill the receive windows immediately (the data is surfaced now) and
-        // accumulate the consumed length to advertise back via WINDOW_UPDATE.
-        self.conn_recv_window += @intCast(f.header.length);
-        self.conn_recv_credit +|= f.header.length;
+        // Refill the stream receive window immediately because the data is surfaced now.
         s.creditRecvWindow(f.header.length);
         // A response the request marked bodyless (HEAD, or a 204/304) must carry no
         // DATA; surfacing a body here would let a proxy forward one where none is
