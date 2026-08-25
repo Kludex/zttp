@@ -897,7 +897,7 @@ def test_http3_client_request_trailers() -> None:
     eom = next(e for e in events if isinstance(e, zttp.EndOfMessage))
     assert eom.trailers == [(b"x-checksum", b"abc")]
     server.consume_data(data.stream_id, len(data.data))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unknown stream or length exceeds its unconsumed DATA"):
         server.consume_data(data.stream_id, 1)
 
 
@@ -946,7 +946,7 @@ def test_http3_receive_credit_waits_for_application_consumption() -> None:
     transfer(client, server, 8000)
     assert stream.pending_bytes == pending
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unknown stream or length exceeds its unconsumed DATA"):
         server.consume_data(request.stream_id, len(data) + 1)
     server.consume_data(request.stream_id, len(data))
     transfer(server, client, 9000)
@@ -1417,7 +1417,7 @@ def test_local_connection_ids_route_two_connections_on_one_endpoint() -> None:
         client.use_peer_connection_id(1)
         pairs.append((client, server, rotated))
 
-    for index, (client, _server, _rotated) in enumerate(pairs, start=1):
+    for index, (client, _server, rotated) in enumerate(pairs, start=1):
         client.send_request(b"GET", f"/connection-{index}".encode(), b"3", [(b"host", b"example.test")])
         for datagram in client.data_to_send():
             connection_id_length = len(rotated)
@@ -1650,7 +1650,7 @@ def test_http3_reset_reclaims_unconsumed_data() -> None:
 
     server.stream(data.stream_id).reset()
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unknown stream or length exceeds its unconsumed DATA"):
         server.consume_data(data.stream_id, 1)
 
 

@@ -916,14 +916,8 @@ const H3Engine = struct {
         if (list == null) return null;
         var off: usize = 0;
         for (lengths, 0..) |len, i| {
-            const args = py.tupleNew(2);
-            if (args == null) {
-                py.decref(list);
-                return null;
-            }
             const data = py.fromBytes(flat[off .. off + len]);
             if (data == null) {
-                py.decref(args);
                 py.decref(list);
                 return null;
             }
@@ -936,14 +930,10 @@ const H3Engine = struct {
             } else py.none();
             if (peer_address == null) {
                 py.decref(data);
-                py.decref(args);
                 py.decref(list);
                 return null;
             }
-            py.tupleSet(args, 0, data);
-            py.tupleSet(args, 1, peer_address);
-            const result = c.PyObject_CallObject(result_type, args);
-            py.decref(args);
+            const result = newOutboundDatagram(result_type, data, peer_address);
             if (result == null) {
                 py.decref(list);
                 return null;
@@ -1076,7 +1066,17 @@ const H3Engine = struct {
         return list;
     }
 
-    fn issueConnectionId(self: *H3Engine, seq: u64, cid: []const u8, token: []const u8, retire_prior_to: u64) py.Object {
+    fn issueConnectionId(
+        self: *H3Engine,
+        seq: u64,
+        cid: []const u8,
+        token: []const u8,
+        retire_prior_to: u64,
+        endpoint: bool,
+    ) py.Object {
+        if (self.endpoint_server_cid != null and !endpoint) {
+            return py.raise(exceptions.LocalProtocolError, "use QuicEndpoint.issue_connection_id() for this connection");
+        }
         const q = self.qc orelse return py.raise(exceptions.LocalProtocolError, "no datagram received yet: the HTTP/3 connection is not established");
         if (cid.len == 0 or cid.len > 20) return py.raiseValue("connection_id must be 1..20 bytes");
         if (token.len != 16) return py.raiseValue("stateless_reset_token must be exactly 16 bytes");
@@ -1439,6 +1439,8 @@ var close_info_type: py.Object = null;
 var datagram_header_type: py.Object = null;
 var local_connection_id_type: py.Object = null;
 var outbound_datagram_type: py.Object = null;
+var outbound_data_name: py.Object = null;
+var outbound_peer_address_name: py.Object = null;
 
 /// Module-level `parse_datagram_header(datagram) -> DatagramHeader`: the routable
 /// prefix of a received QUIC datagram, for demultiplexing a shared UDP socket onto
@@ -1553,6 +1555,35 @@ pub var module_methods = [_]c.PyMethodDef{
     .{ .ml_name = "_build_retry", .ml_meth = @ptrCast(&build_retry), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Build a stateless QUIC v1 Retry packet for QuicEndpoint." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
+
+fn newOutboundDatagram(result_type: py.Object, data: py.Object, peer_address: py.Object) py.Object {
+    if (outbound_data_name == null) outbound_data_name = c.PyUnicode_InternFromString("data");
+    if (outbound_peer_address_name == null) {
+        outbound_peer_address_name = c.PyUnicode_InternFromString("peer_address");
+    }
+    if (outbound_data_name == null or outbound_peer_address_name == null) {
+        py.decref(data);
+        py.decref(peer_address);
+        return null;
+    }
+    const result = py.allocInstance(result_type);
+    if (result == null) {
+        py.decref(data);
+        py.decref(peer_address);
+        return null;
+    }
+    if (c.PyObject_GenericSetAttr(result, outbound_data_name, data) < 0 or
+        c.PyObject_GenericSetAttr(result, outbound_peer_address_name, peer_address) < 0)
+    {
+        py.decref(data);
+        py.decref(peer_address);
+        py.decref(result);
+        return null;
+    }
+    py.decref(data);
+    py.decref(peer_address);
+    return result;
+}
 
 // Return the zttp.results dataclass named `name`, importing and caching it once.
 fn resultType(cache: *py.Object, name: [*c]const u8) py.Object {
@@ -2899,7 +2930,7 @@ fn h3_local_connection_ids(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c)
     return e.localConnectionIds();
 }
 
-fn h3_issue_connection_id(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+fn issue_connection_id(self_obj: ?*c.PyObject, args: ?*c.PyObject, endpoint: bool) py.Object {
     const e = h3(@ptrCast(self_obj.?)) orelse return null;
     var seq: c_ulonglong = 0;
     var cid_obj: ?*c.PyObject = null;
@@ -2908,7 +2939,15 @@ fn h3_issue_connection_id(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.
     if (c.PyArg_ParseTuple(args, "KOO|K", &seq, &cid_obj, &token_obj, &retire_prior_to) == 0) return null;
     const cid = py.asBytes(cid_obj) orelse return null;
     const token = py.asBytes(token_obj) orelse return null;
-    return e.issueConnectionId(@intCast(seq), cid, token, @intCast(retire_prior_to));
+    return e.issueConnectionId(@intCast(seq), cid, token, @intCast(retire_prior_to), endpoint);
+}
+
+fn h3_issue_connection_id(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    return issue_connection_id(self_obj, args, false);
+}
+
+fn h3_endpoint_issue_connection_id(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    return issue_connection_id(self_obj, args, true);
 }
 
 fn h3_request_key_update(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
@@ -3225,6 +3264,7 @@ var h3_methods = [_]py.MethodDef{
     .{ .ml_name = "use_peer_connection_id", .ml_meth = h3_use_peer_connection_id, .ml_flags = c.METH_O, .ml_doc = "Switch future QUIC packets to a peer-issued NEW_CONNECTION_ID sequence: use_peer_connection_id(sequence_number)." },
     .{ .ml_name = "local_connection_ids", .ml_meth = h3_local_connection_ids, .ml_flags = c.METH_NOARGS, .ml_doc = "Return every active local QUIC connection ID and sequence number." },
     .{ .ml_name = "issue_connection_id", .ml_meth = h3_issue_connection_id, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC NEW_CONNECTION_ID for a local CID: issue_connection_id(sequence_number, connection_id, stateless_reset_token, retire_prior_to=0). Drain with data_to_send." },
+    .{ .ml_name = "_endpoint_issue_connection_id", .ml_meth = h3_endpoint_issue_connection_id, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC NEW_CONNECTION_ID owned by QuicEndpoint." },
     .{ .ml_name = "request_key_update", .ml_meth = h3_request_key_update, .ml_flags = c.METH_NOARGS, .ml_doc = "Advance QUIC 1-RTT send keys. The next application packet carries the new key phase." },
     .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
     .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id (the request's stream_id). The handle is the stream-scoped send surface: send_response / send_data / end_message." },

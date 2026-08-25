@@ -442,6 +442,16 @@ class H3Connection(Connection):
     def _endpoint_connection_id_generation(self) -> int:
         """Return the active local connection ID generation."""
 
+    def _endpoint_issue_connection_id(
+        self,
+        sequence_number: int,
+        connection_id: bytes,
+        stateless_reset_token: bytes,
+        retire_prior_to: int = ...,
+        /,
+    ) -> None:
+        """Queue a connection ID owned by `QuicEndpoint`."""
+
     def challenge_path(self, peer_address: bytes, data: bytes, /) -> None:
         """Queue a QUIC `PATH_CHALLENGE` to a peer address (`data` must be 8 unpredictable bytes)."""
 

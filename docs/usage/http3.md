@@ -413,6 +413,10 @@ Call `endpoint.next_timeout()` to get the earliest deadline across all
 connections. Call `endpoint.handle_timeout(now)` when it expires. The endpoint
 still does no I/O: your event loop owns the socket, clock, and timer scheduling.
 
+`endpoint.data_to_send()` drains connections changed by a receive, timer, or
+endpoint control method. Pass a connection as `endpoint.data_to_send(connection)`
+when your application queues output after it already drained that connection.
+
 See the [API reference](../reference/api.md#demultiplexing-a-shared-udp-socket)
 for every endpoint method and the lower-level `parse_datagram_header` API.
 

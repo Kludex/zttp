@@ -2135,20 +2135,10 @@ pub const Connection = struct {
         const pn_len = packet.packetNumberLen(st.next_pn, st.rec.largest_acked);
         const token = self.initial_token orelse &.{};
         const room = self.framePayloadRoom(space);
-        var header: std.ArrayListUnmanaged(u8) = .empty;
-        defer header.deinit(self.gpa);
-        _ = packet.writeLongHeader(
-            &header,
-            self.gpa,
-            .initial,
-            constants.VERSION_1,
-            self.peer_scid,
-            self.scid,
-            token,
-            pn_len + room + crypto.TAG_LEN,
-            pn_len,
-        ) catch return error.OutOfMemory;
-        const overhead = header.items.len + pn_len + crypto.TAG_LEN;
+        const header_len = 1 + 4 + 1 + self.peer_scid.len + 1 + self.scid.len +
+            (varint.len(token.len) catch return error.ProtocolViolation) + token.len +
+            (varint.len(pn_len + room + crypto.TAG_LEN) catch return error.ProtocolViolation);
+        const overhead = header_len + pn_len + crypto.TAG_LEN;
         if (overhead >= constants.MIN_INITIAL_DATAGRAM) return 0;
         return constants.MIN_INITIAL_DATAGRAM - overhead;
     }
