@@ -2212,6 +2212,7 @@ test "a request stream ending before HEADERS is request incomplete" {
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
     quic_conn.testInstallAppKeys(&peer);
+    try peer.sendStreamData(0, &.{}, false);
     quic_conn.testSetAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
@@ -2471,6 +2472,7 @@ test "a peer STOP_SENDING resets our send half" {
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
     quic_conn.testInstallAppKeys(&peer);
+    try peer.sendStreamData(0, &.{}, false);
     quic_conn.testSetAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
@@ -2569,6 +2571,7 @@ test "client decodes an HTTP/3 response over a request stream" {
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
     quic_conn.testInstallAppKeys(&qc);
+    try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2615,6 +2618,7 @@ test "a response stream ending with a truncated frame is a connection error" {
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
     quic_conn.testInstallAppKeys(&qc);
+    try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2684,6 +2688,7 @@ test "client rejects trailers on bodyless responses" {
         var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
         defer qc.deinit();
         quic_conn.testInstallAppKeys(&qc);
+        try qc.sendStreamData(0, &.{}, false);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
 
@@ -2721,6 +2726,7 @@ test "client rejects trailers on bodyless responses" {
         var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
         defer qc.deinit();
         quic_conn.testInstallAppKeys(&qc);
+        try qc.sendStreamData(0, &.{}, false);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
 
@@ -2757,6 +2763,7 @@ test "client rejects Content-Length on responses that cannot carry it" {
         var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
         defer qc.deinit();
         quic_conn.testInstallAppKeys(&qc);
+        try qc.sendStreamData(0, &.{}, false);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
 
@@ -2873,6 +2880,7 @@ test "client decodes informational then final HTTP/3 response" {
     var client_qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer client_qc.deinit();
     quic_conn.testInstallAppKeys(&client_qc);
+    try client_qc.sendStreamData(0, &.{}, false);
     var client_h3 = Connection.init(gpa, &client_qc);
     defer client_h3.deinit();
 
@@ -2901,6 +2909,7 @@ test "client rejects 101 Switching Protocols in HTTP/3 response" {
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
     quic_conn.testInstallAppKeys(&qc);
+    try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2928,6 +2937,7 @@ test "client rejects a malformed PUSH_PROMISE as a frame error" {
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
     quic_conn.testInstallAppKeys(&qc);
+    try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2961,6 +2971,7 @@ test "client rejects PUSH_PROMISE when push is disabled" {
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
     quic_conn.testInstallAppKeys(&qc);
+    try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3005,6 +3016,7 @@ test "HTTP/3 response trailers flow into EndOfMessage" {
     var client_qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer client_qc.deinit();
     quic_conn.testInstallAppKeys(&client_qc);
+    try client_qc.sendStreamData(0, &.{}, false);
     var client_h3 = Connection.init(gpa, &client_qc);
     defer client_h3.deinit();
 
@@ -3045,6 +3057,7 @@ test "server dynamically encodes a response header when peer QPACK settings allo
     var client_qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer client_qc.deinit();
     quic_conn.testInstallAppKeys(&client_qc);
+    try client_qc.sendStreamData(0, &.{}, false);
     var client_h3 = Connection.init(gpa, &client_qc);
     defer client_h3.deinit();
 
@@ -3274,6 +3287,7 @@ test "client rejects request pseudo-headers in an HTTP/3 response" {
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
     quic_conn.testInstallAppKeys(&qc);
+    try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3436,6 +3450,7 @@ test "a server sends a response: HEADERS then DATA then FIN" {
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
     quic_conn.testInstallAppKeys(&peer);
+    try peer.sendStreamData(0, &.{}, false);
     quic_conn.testSetAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
@@ -3472,6 +3487,7 @@ test "the server resets a request stream" {
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
     quic_conn.testInstallAppKeys(&peer);
+    try peer.sendStreamData(0, &.{}, false);
     quic_conn.testSetAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
@@ -3539,6 +3555,7 @@ test "the server opens its control stream with a SETTINGS frame" {
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
     quic_conn.testInstallAppKeys(&peer);
+    try peer.sendStreamData(0, &.{}, false);
     quic_conn.testSetAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
@@ -4670,6 +4687,7 @@ test "a rejected dynamic request sends QPACK stream cancellation" {
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
     quic_conn.testInstallAppKeys(&peer);
+    try peer.sendStreamData(0, &.{}, false);
     quic_conn.testSetAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
