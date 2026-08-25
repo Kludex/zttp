@@ -640,6 +640,11 @@ pub const Connection = struct {
             .push => {
                 const push_id = varint.decode(ready[consumed..]) catch {
                     if (self.qc.streamFinished(id)) return self.fail(.frame_error, "truncated push stream header");
+                    if (self.qc.streamReset(id)) {
+                        self.qc.consumeStream(id, ready.len);
+                        if (self.qc.dropStream(id)) _ = self.uni_streams.remove(id);
+                        return;
+                    }
                     if (consumed > 0) self.qc.consumeStream(id, consumed);
                     return;
                 };
@@ -5038,6 +5043,37 @@ test "a split truncated server push id is a frame error" {
     const pc = peer.peer_close.?;
     try testing.expect(pc.app);
     try testing.expectEqual(@intFromEnum(h3_error.ErrorCode.frame_error), pc.error_code);
+}
+
+test "a reset server push stream with a partial push id is reclaimed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xea, 0xeb, 0xec, 0xf1 };
+    var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    var first: std.ArrayListUnmanaged(u8) = .empty;
+    defer first.deinit(gpa);
+    try first.append(gpa, 0x0a); // STREAM, LEN, no FIN
+    try varint.append(&first, gpa, 3); // server-initiated uni stream
+    try varint.append(&first, gpa, 2);
+    try first.appendSlice(gpa, &.{ 0x01, 0x40 }); // push stream type, partial two-byte push id
+    const data = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 0, first.items);
+    defer gpa.free(data);
+    try qc.receiveDatagram(data, 1000);
+    try h3.pump(3);
+
+    const reset = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 1, &.{ 0x04, 0x03, 0x00, 0x03 });
+    defer gpa.free(reset);
+    try qc.receiveDatagram(reset, 1100);
+    try h3.pump(3);
+
+    var ids: [1]u64 = undefined;
+    try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
+    try testing.expectEqual(@as(u32, 0), h3.uni_streams.count());
+    try testing.expect(!qc.closed);
 }
 
 test "a server push stream is rejected when the client did not enable push" {
