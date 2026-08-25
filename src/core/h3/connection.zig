@@ -3406,7 +3406,7 @@ test "the event arena is reclaimed when the queue drains" {
     // without corrupting the decode path).
     try testing.expect(h3.nextEvent() == .need_data);
 
-    const dgram2 = try buildRequest(gpa, &dcid, 4, h3_bytes.items); // stream 4 (client bidi)
+    const dgram2 = try buildRequestOnFin(gpa, &dcid, 4, 1, h3_bytes.items); // stream 4 (client bidi)
     defer gpa.free(dgram2);
     try qc.receiveDatagram(dgram2, 2000);
     try h3.pump(4);
@@ -4658,7 +4658,7 @@ test "a rejected dynamic request sends QPACK stream cancellation" {
     var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
     defer h3_bytes.deinit(gpa);
     try h3_frame.append(&h3_bytes, gpa, .headers, &qpack_block);
-    const req_dgram = try buildRequest(gpa, &dcid, 0, h3_bytes.items);
+    const req_dgram = try buildRequestOnFin(gpa, &dcid, 0, 1, h3_bytes.items);
     defer gpa.free(req_dgram);
     try qc.receiveDatagram(req_dgram, 2000);
     try h3.pump(0);
@@ -4670,7 +4670,7 @@ test "a rejected dynamic request sends QPACK stream cancellation" {
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
     quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.testSetAppNextPn(&peer, 2);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {

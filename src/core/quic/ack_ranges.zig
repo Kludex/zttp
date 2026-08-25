@@ -28,6 +28,14 @@ pub const AckRanges = struct {
         return if (self.ranges.items.len == 0) null else self.ranges.items[0].hi;
     }
 
+    /// Return whether `pn` is already recorded in a retained range.
+    pub fn contains(self: *const AckRanges, pn: u64) bool {
+        for (self.ranges.items) |range| {
+            if (pn >= range.lo and pn <= range.hi) return true;
+        }
+        return false;
+    }
+
     /// Record that packet number `pn` was received. Extends or merges an existing
     /// range, or inserts a new one in descending order. If the list is at capacity
     /// the oldest (smallest) range is dropped - the peer will simply re-send those
@@ -153,4 +161,6 @@ test "a duplicate pn is a no-op" {
     try a.add(gpa, 5);
     try a.add(gpa, 5);
     try testing.expectEqual(@as(usize, 1), a.ranges.items.len);
+    try testing.expect(a.contains(5));
+    try testing.expect(!a.contains(4));
 }
