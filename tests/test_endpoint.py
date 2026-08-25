@@ -238,7 +238,7 @@ def test_quic_endpoint_requires_endpoint_connection_id_issuance(initial: bytes) 
     connection = endpoint.receive_datagram(initial, b"address", 0)
     assert connection is not None
 
-    with pytest.raises(zttp.LocalProtocolError, match="QuicEndpoint.issue_connection_id"):
+    with pytest.raises(zttp.LocalProtocolError, match=r"QuicEndpoint\.issue_connection_id"):
         connection.issue_connection_id(1, b"replacement-cid", b"t" * 16)
 
 
