@@ -1610,6 +1610,30 @@ def test_http3_rejects_a_pseudo_header_in_trailers() -> None:
         stream.end_message([(b":status", b"200")])
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        b"content-length",
+        b"transfer-encoding",
+        b"trailer",
+        b"host",
+        b"connection",
+        b"upgrade",
+        b"te",
+        b"content-encoding",
+        b"content-type",
+        b"content-range",
+    ],
+)
+def test_http3_rejects_forbidden_fields_in_trailers(name: bytes) -> None:
+    conn = _handshaken_with_request()
+    stream = conn.stream(0)
+    stream.send_response(200)
+
+    with pytest.raises(zttp.RemoteProtocolError):
+        stream.end_message([(name, b"value")])
+
+
 def test_http3_final_response_rejects_informational_status() -> None:
     conn = _handshaken_with_request()
 

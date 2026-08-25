@@ -5,8 +5,8 @@
 
 const std = @import("std");
 const tables = @import("../tables.zig");
-const ascii = @import("../ascii.zig");
 const events = @import("../events.zig");
+const fields = @import("../fields.zig");
 const scanner = @import("../scanner.zig");
 const Scanner = scanner.Scanner;
 const trimTrailingOws = scanner.trimTrailingOws;
@@ -93,27 +93,8 @@ fn parseVersion(tok: []const u8) ParseError![]const u8 {
     return num;
 }
 
-/// Whether a field-name is allowed in a chunked trailer section. Trailers cannot
-/// carry message framing, connection routing, or payload-processing metadata.
-pub fn trailerFieldAllowed(name: []const u8) bool {
-    inline for (.{
-        // Message framing / connection routing fields.
-        "content-length",
-        "transfer-encoding",
-        "trailer",
-        "host",
-        "connection",
-        "upgrade",
-        "te",
-        // Payload-processing metadata that RFC 9110 forbids in trailers.
-        "content-encoding",
-        "content-type",
-        "content-range",
-    }) |forbidden| {
-        if (ascii.eqIgnoreCase(name, forbidden)) return false;
-    }
-    return true;
-}
+/// Whether a field-name is allowed in a chunked trailer section.
+pub const trailerFieldAllowed = fields.trailerFieldAllowed;
 
 /// Parse one header field-line into a (name, value) pair. The name is the raw
 /// token (case preserved); the value has surrounding OWS stripped. A line with

@@ -5,6 +5,7 @@
 //! allows inner HTAB, while the write side is stricter and rejects it.
 
 const std = @import("std");
+const ascii = @import("ascii.zig");
 const tables = @import("tables.zig");
 
 /// A valid HTTP/2 field name: a non-empty RFC 9110 token (so no SP, NUL, ':',
@@ -41,6 +42,43 @@ pub fn isConnectionSpecific(name: []const u8) bool {
         if (std.mem.eql(u8, name, f)) return true;
     }
     return false;
+}
+
+/// Return whether a field may appear in a trailer section (RFC 9110 6.5.1).
+pub fn trailerFieldAllowed(name: []const u8) bool {
+    inline for (.{
+        "content-length",
+        "transfer-encoding",
+        "trailer",
+        "host",
+        "connection",
+        "upgrade",
+        "te",
+        "content-encoding",
+        "content-type",
+        "content-range",
+    }) |forbidden| {
+        if (ascii.eqIgnoreCase(name, forbidden)) return false;
+    }
+    return true;
+}
+
+test "trailerFieldAllowed rejects framing, routing, and payload metadata" {
+    for ([_][]const u8{
+        "content-length",
+        "transfer-encoding",
+        "trailer",
+        "host",
+        "connection",
+        "upgrade",
+        "te",
+        "content-encoding",
+        "content-type",
+        "content-range",
+    }) |name| {
+        try std.testing.expect(!trailerFieldAllowed(name));
+    }
+    try std.testing.expect(trailerFieldAllowed("x-checksum"));
 }
 
 test "isValidFieldName accepts lowercase token, rejects uppercase and empty" {
