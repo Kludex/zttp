@@ -2456,7 +2456,14 @@ fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
                 e.emitGoAwayIfOwed(); // queue one GOAWAY for the next data_to_send
                 return exceptions.raiseH2(err);
             };
-            e.autoRespond(ev) catch |err| return h2RaiseWrite(err);
+            const handshake_sent = e.handshake_sent;
+            e.autoRespond(ev) catch |err| {
+                e.writer.clear();
+                e.handshake_sent = handshake_sent;
+                e.conn.poisonResourceFailure();
+                e.emitGoAwayIfOwed();
+                return h2RaiseWrite(err);
+            };
             return events_obj.fromH2Event(ev);
         },
         .h1 => |*e| {
