@@ -3546,6 +3546,9 @@ test "PATH_CHALLENGE elicits a matching PATH_RESPONSE" {
 
     try conn.receiveDatagram(dgram, 1000);
     try testing.expect(conn.datagramLengths().len >= 1);
+    const response_count = conn.datagramLengths().len;
+    try conn.receiveDatagram(dgram, 1001);
+    try testing.expectEqual(response_count, conn.datagramLengths().len);
 
     const response = conn.datagramsToSend()[0..conn.datagramLengths()[0]];
     var work = try gpa.dupe(u8, response);
