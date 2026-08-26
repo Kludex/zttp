@@ -218,10 +218,9 @@ pub const Reader = struct {
     }
 
     /// Prepare to read the next message on the same connection (keep-alive).
-    /// A poisoned (`.failed`) connection stays poisoned: a parse error is
-    /// terminal, so reset cannot revive a desynchronized byte stream.
-    pub fn reset(self: *Reader) void {
-        if (self.state == .failed) return;
+    /// The current message must have surfaced its completion event.
+    pub fn reset(self: *Reader) error{MessageInProgress}!void {
+        if (self.state != .done) return error.MessageInProgress;
         self.state = .head;
         self.head_scanner.reset();
         self.headers.clearRetainingCapacity();
@@ -683,7 +682,7 @@ test "keep-alive: two requests via reset" {
     var e = try r.nextEvent();
     try t.expectEqualStrings("/a", e.request.target);
     try t.expect(e.request.end_stream);
-    r.reset();
+    try r.reset();
     e = try r.nextEvent();
     try t.expectEqualStrings("/b", e.request.target);
 }
@@ -694,7 +693,7 @@ test "reset cannot un-poison a failed connection" {
     // A malformed request followed by a smuggled one; the error must be terminal.
     try r.feed("GET / HTTP/1.1\nX: 1\n\nGET /smuggled HTTP/1.1\r\nHost: y\r\n\r\n");
     try t.expectError(error.InvalidLine, r.nextEvent());
-    r.reset(); // an attacker-influenced caller trying to recover
+    try t.expectError(error.MessageInProgress, r.reset());
     // Still poisoned: it must NOT parse /smuggled as a fresh request.
     try t.expectError(error.InvalidLine, r.nextEvent());
 }
@@ -955,7 +954,7 @@ test "feed rejects input past max_buffer" {
     try t.expectError(error.MessageTooLong, r.feed(big));
     try t.expectError(error.MessageTooLong, r.feed("GET / HTTP/1.1\r\n\r\n"));
     try t.expectError(error.MessageTooLong, r.nextEvent());
-    r.reset();
+    try t.expectError(error.MessageInProgress, r.reset());
     try t.expectError(error.MessageTooLong, r.nextEvent());
 }
 
@@ -1029,7 +1028,7 @@ fn driveReader(input: []const u8) void {
                 switch (ev) {
                     .need_data, .connection_closed => break,
                     .end_of_message => {
-                        r.reset();
+                        r.reset() catch break;
                         break;
                     },
                     else => {},

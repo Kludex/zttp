@@ -13,6 +13,7 @@ pub const AckRanges = struct {
     /// disjoint and non-adjacent. An ACK frame rarely needs more than a handful;
     /// the list is capped so a pathological gap pattern cannot grow it unbounded.
     ranges: std.ArrayListUnmanaged(Range) = .empty,
+    ignore_below: u64 = 0,
 
     pub const MAX_RANGES: usize = 32;
 
@@ -26,6 +27,22 @@ pub const AckRanges = struct {
 
     pub fn largest(self: *const AckRanges) ?u64 {
         return if (self.ranges.items.len == 0) null else self.ranges.items[0].hi;
+    }
+
+    /// Return whether `pn` is already recorded in a retained range.
+    pub fn contains(self: *const AckRanges, pn: u64) bool {
+        for (self.ranges.items) |range| {
+            if (pn >= range.lo and pn <= range.hi) return true;
+        }
+        return false;
+    }
+
+    /// Return whether a packet was already recorded or is older than the bounded
+    /// ACK history. Packets below a full range set cannot be distinguished from an
+    /// evicted duplicate, so they are ignored rather than dispatched twice.
+    pub fn shouldIgnore(self: *const AckRanges, pn: u64) bool {
+        if (self.contains(pn)) return true;
+        return pn < self.ignore_below;
     }
 
     /// Record that packet number `pn` was received. Extends or merges an existing
@@ -57,6 +74,9 @@ pub const AckRanges = struct {
             _ = self.ranges.pop(); // evict the current smallest to make room
         }
         try self.ranges.insert(gpa, i, .{ .lo = pn, .hi = pn });
+        if (self.ranges.items.len == MAX_RANGES) {
+            self.ignore_below = @max(self.ignore_below, self.ranges.items[MAX_RANGES - 1].lo);
+        }
     }
 
     /// After growing range `i`, coalesce it with the neighbour it may now touch.
@@ -153,4 +173,22 @@ test "a duplicate pn is a no-op" {
     try a.add(gpa, 5);
     try a.add(gpa, 5);
     try testing.expectEqual(@as(usize, 1), a.ranges.items.len);
+    try testing.expect(a.contains(5));
+    try testing.expect(!a.contains(4));
+}
+
+test "packets older than full ACK history are ignored" {
+    const gpa = testing.allocator;
+    var a = AckRanges{};
+    defer a.deinit(gpa);
+    for (1..AckRanges.MAX_RANGES + 1) |index| try a.add(gpa, @intCast(index * 2));
+
+    try testing.expect(a.shouldIgnore(2));
+    try testing.expect(a.shouldIgnore(1));
+    try testing.expect(!a.shouldIgnore(3));
+
+    try a.add(gpa, (AckRanges.MAX_RANGES + 1) * 2);
+    try a.add(gpa, 5);
+    try testing.expectEqual(AckRanges.MAX_RANGES - 1, a.ranges.items.len);
+    try testing.expect(a.shouldIgnore(2));
 }

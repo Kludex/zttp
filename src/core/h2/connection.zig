@@ -408,7 +408,7 @@ pub const Connection = struct {
         const t = s.creditSendWindow(increment);
         switch (t.action) {
             .ok => self.push(.{ .window_update = .{ .stream_id = f.header.stream_id, .increment = increment } }),
-            .stream_error => self.pushRst(f.header.stream_id, t.code),
+            .stream_error => try self.resetStream(s, f.header.stream_id, t.code),
             .connection_error => return error.FlowControlError,
         }
     }
@@ -451,6 +451,10 @@ pub const Connection = struct {
                 return;
             },
             .connection_error => return error.ProtocolError,
+        }
+        if (self.role == .client and !s.headers_done) {
+            try self.resetStream(s, f.header.stream_id, .protocol_error);
+            return;
         }
         const wt = s.debitRecvWindow(f.header.length);
         if (wt.action == .stream_error) {
@@ -546,7 +550,7 @@ pub const Connection = struct {
             if (id <= self.highest_local_id) {
                 ignored = true;
             } else {
-                try self.openPeerStream(id);
+                return error.ProtocolError;
             }
         } else {
             // A new request stream. Its id must be odd and exceed the highest peer
@@ -1244,6 +1248,7 @@ fn validTrailers(headers: []const events.Header) bool {
         if (!fields.isValidFieldName(h.name)) return false;
         if (!fields.validValue(h.value)) return false;
         if (fields.isConnectionSpecific(h.name)) return false;
+        if (!fields.trailerFieldAllowed(h.name)) return false;
     }
     return true;
 }
@@ -1837,6 +1842,7 @@ test "client rejects a body on a bodyless (HEAD) response" {
 // A client's inbound handshake is just the server's SETTINGS - no preface to
 // consume - so it differs from the server `handshook` helper.
 fn clientHandshook(c: *Connection, extra: []const u8) !void {
+    try c.registerSendStream(1);
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(testing.allocator);
     try frameBytes(&input, .settings, 0, 0, &.{});
