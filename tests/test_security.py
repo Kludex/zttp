@@ -160,6 +160,7 @@ def test_start_next_cycle_cannot_unpoison_after_error() -> None:
     [
         [(b"Transfer-Encoding", b"chunked"), (b"Content-Length", b"5")],  # TE + CL
         [(b"Content-Length", b"5"), (b"Content-Length", b"6")],  # conflicting dup CL
+        [(b"Content-Length", b"5"), (b"Content-Length", b"5")],  # senders emit one CL at most
         [(b"Content-Length", b"5x")],  # non-digit CL
     ],
 )
@@ -167,6 +168,16 @@ def test_send_rejects_ambiguous_framing(headers: list[tuple[bytes, bytes]]) -> N
     conn = zttp.Connection(zttp.SERVER)
     with pytest.raises(zttp.LocalProtocolError):
         conn.send_response(200, headers)
+
+
+def test_numerically_equal_content_lengths_must_match_textually() -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 010\r\nContent-Length: 10\r\n\r\n")
+
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
 
 
 @pytest.mark.parametrize("version", [b"GET / HTTP/2.0\r\n\r\n", b"GET / HTTP/0.9\r\n\r\n"])
