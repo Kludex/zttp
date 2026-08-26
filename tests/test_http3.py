@@ -1479,7 +1479,7 @@ def test_request_key_update_applies_to_next_http3_packet() -> None:
     assert req.path == b"/key-update"
 
 
-def test_disable_active_migration_rejects_new_peer_address_after_handshake() -> None:
+def test_disable_active_migration_drops_new_peer_address_after_handshake() -> None:
     client = make_client()
     config = SERVER_CONFIG.copy()
     transport_params = SERVER_CONFIG["transport_params"].copy()
@@ -1497,11 +1497,15 @@ def test_disable_active_migration_rejects_new_peer_address_after_handshake() -> 
         server.receive_datagram(dgram, 3000, addr_a)
     server.data_to_send()
 
-    client.send_request(b"GET", b"/moved", b"3", [(b"host", b"example.test")])
-    with pytest.raises(zttp.RemoteProtocolError):
-        server.receive_datagram(client.data_to_send()[0], 4000, addr_b)
-    assert server.is_closed() is True
-    assert server.data_to_send()
+    server.receive_datagram(b"spoofed", 4000, addr_b)
+    assert server.is_closed() is False
+
+    client.send_request(b"GET", b"/original-path", b"3", [(b"host", b"example.test")])
+    for datagram in client.data_to_send():
+        server.receive_datagram(datagram, 5000, addr_a)
+
+    request = next(event for event in drain_events(server) if isinstance(event, zttp.Request))
+    assert request.path == b"/original-path"
 
 
 def test_receive_datagram_peer_address_must_be_bytes() -> None:

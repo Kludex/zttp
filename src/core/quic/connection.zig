@@ -2194,6 +2194,14 @@ pub const Connection = struct {
 
     fn receiveDatagramOn(self: *Connection, datagram: []const u8, now: u64, peer_address: ?[]const u8) Error!void {
         if (self.closed) return error.ProtocolViolation;
+        if (peer_address) |addr| {
+            // A spoofable path change is silently dropped, never connection-fatal.
+            if (self.local_tp.disable_active_migration and self.handshake_confirmed) {
+                if (self.default_path_token) |current| {
+                    if (current != std.hash.Wyhash.hash(0, addr)) return;
+                }
+            }
+        }
         // Anti-amplification credit (RFC 9000 8.1): every received byte raises the
         // budget for what the server may send before the address is validated.
         self.recv_bytes += datagram.len;
@@ -2202,11 +2210,6 @@ pub const Connection = struct {
         var auto_path_challenge_queued = false;
         if (peer_address) |addr| {
             const pt = try self.pathTokenForAddress(addr);
-            if (self.local_tp.disable_active_migration and self.handshake_confirmed) {
-                if (self.default_path_token) |current| {
-                    if (current != pt) return error.ProtocolViolation;
-                }
-            }
             const new_peer_path = self.default_path_token != null and self.default_path_token.? != pt;
             self.current_path_token = pt;
             if (self.default_path_token == null) {
@@ -3701,7 +3704,7 @@ test "application sends stay on the default path until a migrated path validates
     for (conn.datagramPathTokens()) |tok| try testing.expectEqual(pt_a, tok.?);
 }
 
-test "disable_active_migration rejects a new peer path after handshake" {
+test "disable_active_migration drops a new peer path after handshake" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x1b };
     const addr_a = "198.51.100.10:4433";
@@ -3724,8 +3727,13 @@ test "disable_active_migration rejects a new peer path after handshake" {
 
     const d2 = try testBuildApp(gpa, &dcid, 1, frames.items);
     defer gpa.free(d2);
-    try testing.expectError(error.ProtocolViolation, conn.receiveDatagramFrom(d2, 2000, addr_b));
+    try conn.receiveDatagramFrom(d2, 2000, addr_b);
+    try testing.expect(!conn.closed);
+    try testing.expectEqual(@as(u32, 1), conn.paths.count());
     try testing.expectEqual(std.hash.Wyhash.hash(0, addr_a), conn.default_path_token.?);
+
+    try conn.receiveDatagramFrom(d2, 3000, addr_a);
+    try testing.expectEqual(@as(?u64, 1), conn.spaces[@intFromEnum(Space.application)].largest_recv_pn);
 }
 
 test "passive MAX_DATA is ack-eliciting" {
