@@ -529,11 +529,11 @@ pub const Connection = struct {
         var refused = false;
         var ignored = false;
         if (existing) |s| {
-            // A second HEADERS block is a trailer ONLY while the stream is still
-            // open (body not yet ended). A HEADERS after the peer's END_STREAM
-            // (half-closed-remote) or on a closed stream is a protocol error.
+            // A second HEADERS block is a trailer while the peer can still send.
+            // A HEADERS after the peer's END_STREAM or on a closed stream is a
+            // protocol error.
             const client_reading = self.role == .client and (s.state == .open or s.state == .half_closed_local);
-            if (s.headers_done and s.state == .open) {
+            if (s.headers_done and (s.state == .open or s.state == .half_closed_local)) {
                 is_trailer = true;
             } else if (client_reading and !s.headers_done) {
                 // A client reading a response head: the stream is open, or
