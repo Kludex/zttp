@@ -1253,7 +1253,7 @@ pub const Connection = struct {
             if (!fields.isValidFieldName(h.name)) return self.failStream(.message_error);
             if (!fields.validValue(h.value)) return self.failStream(.message_error);
             if (fields.isConnectionSpecific(h.name)) return self.failStream(.message_error);
-            if (eql(h.name, "te") or eql(h.name, "content-length")) return self.failStream(.message_error);
+            if (!fields.trailerFieldAllowed(h.name)) return self.failStream(.message_error);
             const name = self.gpa.dupe(u8, h.name) catch return error.OutOfMemory;
             errdefer self.gpa.free(name);
             const value = self.gpa.dupe(u8, h.value) catch return error.OutOfMemory;
@@ -1640,7 +1640,7 @@ fn validateTrailerHeader(h: Header) Error!void {
     if (!fields.isValidFieldName(h.name)) return error.H3Error;
     try validateSendValue(h.value);
     if (fields.isConnectionSpecific(h.name)) return error.H3Error;
-    if (eql(h.name, "te") or eql(h.name, "content-length")) return error.H3Error;
+    if (!fields.trailerFieldAllowed(h.name)) return error.H3Error;
 }
 
 fn fieldSectionSize(headers: []const Header) Error!u64 {

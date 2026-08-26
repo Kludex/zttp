@@ -758,6 +758,35 @@ def _request_block(*extra: tuple[bytes, bytes], method: bytes = b"GET") -> bytes
     return block
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        b"content-length",
+        b"transfer-encoding",
+        b"trailer",
+        b"host",
+        b"connection",
+        b"upgrade",
+        b"te",
+        b"content-encoding",
+        b"content-type",
+        b"content-range",
+    ],
+)
+def test_h2_rejects_forbidden_trailer_fields(name: bytes) -> None:
+    conn = server_with(
+        frame(0x01, END_HEADERS, 1, _request_block(method=b"POST")),
+        frame(0x01, END_HEADERS | END_STREAM, 1, _lit(name, b"value")),
+    )
+
+    events = list(drain_h2(conn))
+
+    assert not any(isinstance(event, zttp.EndOfMessage) for event in events)
+    reset = next(event for event in events if isinstance(event, zttp.RstStream))
+    assert reset.stream_id == 1
+    assert reset.error_code == 0x01
+
+
 @pytest.mark.parametrize("method", [b"", b"GET /admin HTTP/1.1", b"GE\tT"])
 def test_h2_rejects_an_invalid_method(method: bytes) -> None:
     conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, _request_block(method=method)))

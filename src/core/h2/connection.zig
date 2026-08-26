@@ -1238,6 +1238,7 @@ fn validTrailers(headers: []const events.Header) bool {
         if (!fields.isValidFieldName(h.name)) return false;
         if (!fields.validValue(h.value)) return false;
         if (fields.isConnectionSpecific(h.name)) return false;
+        if (!fields.trailerFieldAllowed(h.name)) return false;
     }
     return true;
 }
