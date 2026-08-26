@@ -408,7 +408,7 @@ pub const Connection = struct {
         const t = s.creditSendWindow(increment);
         switch (t.action) {
             .ok => self.push(.{ .window_update = .{ .stream_id = f.header.stream_id, .increment = increment } }),
-            .stream_error => self.pushRst(f.header.stream_id, t.code),
+            .stream_error => try self.resetStream(s, f.header.stream_id, t.code),
             .connection_error => return error.FlowControlError,
         }
     }
