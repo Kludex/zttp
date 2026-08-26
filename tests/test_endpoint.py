@@ -148,12 +148,18 @@ def test_quic_endpoint_updates_connection_timeouts() -> None:
     first_deadline = endpoint.next_timeout()
     assert first_deadline is not None
 
-    assert endpoint.receive_datagram(initial, b"address", 2000) is connection
+    client_deadline = client.next_timeout()
+    assert client_deadline is not None
+    client.handle_timeout(client_deadline)
+    assert endpoint.receive_datagram(client.data_to_send()[0], b"address", 2000) is connection
     later_deadline = endpoint.next_timeout()
     assert later_deadline is not None
     assert later_deadline > first_deadline
 
-    assert endpoint.receive_datagram(initial, b"address", 500) is connection
+    client_deadline = client.next_timeout()
+    assert client_deadline is not None
+    client.handle_timeout(client_deadline)
+    assert endpoint.receive_datagram(client.data_to_send()[0], b"address", 500) is connection
     earlier_deadline = endpoint.next_timeout()
     assert earlier_deadline is not None
     assert earlier_deadline < later_deadline
@@ -194,7 +200,10 @@ def test_quic_endpoint_orders_connection_timeouts() -> None:
     assert second is not None
     assert third is not None
     assert endpoint.next_timeout() == 2000
-    assert endpoint.receive_datagram(second_initial, b"second", 1500) is second
+    client_deadline = second_client.next_timeout()
+    assert client_deadline is not None
+    second_client.handle_timeout(client_deadline)
+    assert endpoint.receive_datagram(second_client.data_to_send()[0], b"second", 1500) is second
     assert endpoint.next_timeout() == 2500
 
     endpoint.discard(second)
