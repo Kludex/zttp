@@ -1416,12 +1416,13 @@ pub const Connection = struct {
         defer section.deinit(self.gpa);
         var all: std.ArrayList(Header) = .empty;
         defer all.deinit(self.gpa);
-        try validateSendValue(method);
-        if (method.len == 0) return error.H3Error;
+        if (!fields.isValidToken(method)) return error.H3Error;
         all.append(self.gpa, .{ .name = ":method", .value = method }) catch return error.OutOfMemory;
         const effective_authority = if (eql(method, "CONNECT") and authority.len == 0) target else authority;
+        if (effective_authority.len == 0 or std.mem.indexOfAny(u8, effective_authority, " \t") != null) {
+            return error.H3Error;
+        }
         if (eql(method, "CONNECT")) {
-            if (effective_authority.len == 0) return error.H3Error;
             if (authority.len > 0 and target.len > 0 and !eql(authority, target)) return error.H3Error;
             try validateSendValue(effective_authority);
             all.append(self.gpa, .{ .name = ":authority", .value = effective_authority }) catch return error.OutOfMemory;
@@ -3260,9 +3261,12 @@ test "client request send validates HTTP/3 fields" {
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
+    try testing.expectError(error.H3Error, h3.sendRequest("GET /admin", "/", "https", "example.test", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/bad\r\nx", "https", "example.test", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https\r\nx", "example.test", &.{}, true));
+    try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", " example.test", &.{}, true));
+    try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "example .test", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "example.test", &.{.{ .name = "X-Bad", .value = "x" }}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "example.test", &.{.{ .name = "connection", .value = "close" }}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("POST", "/", "https", "example.test", &.{.{ .name = "content-length", .value = "x" }}, false));
