@@ -310,6 +310,7 @@ class Connection:
         connection_id: bytes | None = ...,
         alpn: bytes | None = ...,
         server_name: bytes | None = ...,
+        server_certificate: bytes | None = ...,
         resumption: SessionResumption | None = ...,
         obfuscated_ticket_age: int = ...,
         early_data: bool = ...,
