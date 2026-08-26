@@ -640,6 +640,11 @@ pub const Connection = struct {
             .push => {
                 const push_id = varint.decode(ready[consumed..]) catch {
                     if (self.qc.streamFinished(id)) return self.fail(.frame_error, "truncated push stream header");
+                    if (self.qc.streamReset(id)) {
+                        self.qc.consumeStream(id, ready.len);
+                        if (self.qc.dropStream(id)) _ = self.uni_streams.remove(id);
+                        return;
+                    }
                     if (consumed > 0) self.qc.consumeStream(id, consumed);
                     return;
                 };
@@ -1123,7 +1128,10 @@ pub const Connection = struct {
             }
         }
         const method_v = method orelse return self.failStream(.message_error);
-        if (method_v.len == 0) return self.failStream(.message_error);
+        if (!fields.isValidToken(method_v)) return self.failStream(.message_error);
+        if (authority) |auth| {
+            if (auth.len == 0 or std.mem.indexOfAny(u8, auth, " \t") != null) return self.failStream(.message_error);
+        }
         if (eql(method_v, "HEAD")) self.send_bodyless.put(self.gpa, id, {}) catch return error.OutOfMemory;
         const target_v = if (eql(method_v, "CONNECT")) blk: {
             if (path != null or scheme != null) return self.failStream(.message_error);
@@ -1413,12 +1421,13 @@ pub const Connection = struct {
         defer section.deinit(self.gpa);
         var all: std.ArrayList(Header) = .empty;
         defer all.deinit(self.gpa);
-        try validateSendValue(method);
-        if (method.len == 0) return error.H3Error;
+        if (!fields.isValidToken(method)) return error.H3Error;
         all.append(self.gpa, .{ .name = ":method", .value = method }) catch return error.OutOfMemory;
         const effective_authority = if (eql(method, "CONNECT") and authority.len == 0) target else authority;
+        if (effective_authority.len == 0 or std.mem.indexOfAny(u8, effective_authority, " \t") != null) {
+            return error.H3Error;
+        }
         if (eql(method, "CONNECT")) {
-            if (effective_authority.len == 0) return error.H3Error;
             if (authority.len > 0 and target.len > 0 and !eql(authority, target)) return error.H3Error;
             try validateSendValue(effective_authority);
             all.append(self.gpa, .{ .name = ":authority", .value = effective_authority }) catch return error.OutOfMemory;
@@ -1900,6 +1909,18 @@ fn pumpHeaders(gpa: std.mem.Allocator, qpack_block: []const u8) Error!bool {
     qc.receiveDatagram(dgram, 1000) catch return error.H3Error;
     try h3.pump(0);
     return h3.nextEvent() == .request;
+}
+
+test "a request method containing spaces is malformed" {
+    const block = [_]u8{ 0x00, 0x00, 0x27, 0x00 } ++ ":method".* ++ [_]u8{0x13} ++
+        "GET /admin HTTP/1.1".* ++ [_]u8{ 0xC0 | 23, 0xC0 | 1 };
+    try testing.expect(!try pumpHeaders(testing.allocator, &block));
+}
+
+test "a request authority containing spaces is malformed" {
+    const block = [_]u8{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x50, 0x16 } ++
+        "a.example evil.example".*;
+    try testing.expect(!try pumpHeaders(testing.allocator, &block));
 }
 
 test "a duplicate request pseudo-header is malformed" {
@@ -3245,9 +3266,12 @@ test "client request send validates HTTP/3 fields" {
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
+    try testing.expectError(error.H3Error, h3.sendRequest("GET /admin", "/", "https", "example.test", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/bad\r\nx", "https", "example.test", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https\r\nx", "example.test", &.{}, true));
+    try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", " example.test", &.{}, true));
+    try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "example .test", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "example.test", &.{.{ .name = "X-Bad", .value = "x" }}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "example.test", &.{.{ .name = "connection", .value = "close" }}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("POST", "/", "https", "example.test", &.{.{ .name = "content-length", .value = "x" }}, false));
@@ -5038,6 +5062,37 @@ test "a split truncated server push id is a frame error" {
     const pc = peer.peer_close.?;
     try testing.expect(pc.app);
     try testing.expectEqual(@intFromEnum(h3_error.ErrorCode.frame_error), pc.error_code);
+}
+
+test "a reset server push stream with a partial push id is reclaimed" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xea, 0xeb, 0xec, 0xf1 };
+    var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    var first: std.ArrayListUnmanaged(u8) = .empty;
+    defer first.deinit(gpa);
+    try first.append(gpa, 0x0a); // STREAM, LEN, no FIN
+    try varint.append(&first, gpa, 3); // server-initiated uni stream
+    try varint.append(&first, gpa, 2);
+    try first.appendSlice(gpa, &.{ 0x01, 0x40 }); // push stream type, partial two-byte push id
+    const data = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 0, first.items);
+    defer gpa.free(data);
+    try qc.receiveDatagram(data, 1000);
+    try h3.pump(3);
+
+    const reset = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 1, &.{ 0x04, 0x03, 0x00, 0x03 });
+    defer gpa.free(reset);
+    try qc.receiveDatagram(reset, 1100);
+    try h3.pump(3);
+
+    var ids: [1]u64 = undefined;
+    try testing.expectEqual(@as(usize, 0), qc.streamIds(&ids));
+    try testing.expectEqual(@as(u32, 0), h3.uni_streams.count());
+    try testing.expect(!qc.closed);
 }
 
 test "a server push stream is rejected when the client did not enable push" {

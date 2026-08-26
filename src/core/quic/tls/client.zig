@@ -31,6 +31,7 @@ pub const Config = struct {
     transport_params: []const u8,
     alpn: ?[]const u8 = null,
     server_name: ?[]const u8 = null,
+    server_certificate: []const u8 = &.{},
     resumption: ?ResumptionPsk = null,
     validation_token: ?[]const u8 = null,
 };
@@ -89,6 +90,8 @@ pub const Client = struct {
     resumption_master_secret: ?[schedule.SECRET_LEN]u8 = null,
     expected_alpn: [255]u8 = [_]u8{0} ** 255,
     expected_alpn_len: u8 = 0,
+    expected_certificate_hash: [Sha256.digest_length]u8 = [_]u8{0} ** Sha256.digest_length,
+    certificate_configured: bool = false,
 
     pub fn init() Client {
         return .{};
@@ -110,6 +113,8 @@ pub const Client = struct {
         } else {
             self.expected_alpn_len = 0;
         }
+        self.certificate_configured = cfg.server_certificate.len > 0;
+        Sha256.hash(cfg.server_certificate, &self.expected_certificate_hash, .{});
         self.transcript.update(out.items[before..]);
         self.early_traffic_secret = if (cfg.resumption) |psk|
             if (psk.early_data) schedule.clientEarlyTrafficSecret(psk.psk, self.transcript.hash()) else null
@@ -146,6 +151,12 @@ pub const Client = struct {
             if (!std.mem.eql(u8, selected, self.expected_alpn[0..self.expected_alpn_len])) return error.BadServerHello;
         }
         const cert = handshake.firstCertificate(scanned.cert.body) catch return error.BadServerHello;
+        if (!self.certificate_configured) return error.BadServerHello;
+        var certificate_hash: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(cert, &certificate_hash, .{});
+        if (!std.crypto.timing_safe.eql([Sha256.digest_length]u8, certificate_hash, self.expected_certificate_hash)) {
+            return error.BadServerHello;
+        }
 
         self.transcript.update(scanned.ee.raw);
         self.transcript.update(scanned.cert.raw);

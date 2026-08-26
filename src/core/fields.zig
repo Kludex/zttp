@@ -7,14 +7,22 @@
 const std = @import("std");
 const tables = @import("tables.zig");
 
+/// Return whether `value` is a non-empty RFC 9110 token.
+pub fn isValidToken(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |ch| {
+        if (!tables.is_tchar[ch]) return false;
+    }
+    return true;
+}
+
 /// A valid HTTP/2 field name: a non-empty RFC 9110 token (so no SP, NUL, ':',
 /// or other separators) with no uppercase ASCII (RFC 9113 8.2.1). `:` is
 /// excluded here, so this is only applied to regular (non-pseudo) names.
 pub fn isValidFieldName(name: []const u8) bool {
-    if (name.len == 0) return false;
+    if (!isValidToken(name)) return false;
     for (name) |ch| {
         if (ch >= 'A' and ch <= 'Z') return false;
-        if (!tables.is_tchar[ch]) return false;
     }
     return true;
 }

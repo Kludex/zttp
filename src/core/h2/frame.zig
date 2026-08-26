@@ -153,6 +153,7 @@ pub fn writeHeader(out: *std.ArrayList(u8), gpa: std.mem.Allocator, header: Fram
 /// layer is expected to split payloads to the peer's max frame size first.
 pub fn write(out: *std.ArrayList(u8), gpa: std.mem.Allocator, ftype: FrameType, flags: u8, stream_id: u32, payload: []const u8) !void {
     if (payload.len > std.math.maxInt(u24)) return error.TooLarge;
+    try out.ensureUnusedCapacity(gpa, 9 + payload.len);
     try writeHeader(out, gpa, .{
         .length = @intCast(payload.len),
         .ftype = @intFromEnum(ftype),
@@ -291,6 +292,20 @@ test "checkLength passes variable-length frames" {
     try checkLength(.{ .length = 12345, .ftype = 0x00, .flags = 0, .stream_id = 1 }); // DATA
     try checkLength(.{ .length = 999, .ftype = 0x01, .flags = 0, .stream_id = 1 }); // HEADERS
     try checkLength(.{ .length = 50000, .ftype = 0xFE, .flags = 0, .stream_id = 1 }); // unknown
+}
+
+fn writeFrameUnderAllocationFailure(gpa: std.mem.Allocator) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    write(&out, gpa, .data, 0, 1, &[_]u8{0xAA} ** 1024) catch |err| {
+        try testing.expectEqual(@as(usize, 0), out.items.len);
+        return err;
+    };
+    try testing.expectEqual(@as(usize, 9 + 1024), out.items.len);
+}
+
+test "frame writes are atomic on allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, writeFrameUnderAllocationFailure, .{});
 }
 
 test "write then parse round-trips" {
