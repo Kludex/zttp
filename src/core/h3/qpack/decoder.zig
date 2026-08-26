@@ -253,11 +253,12 @@ pub const Decoder = struct {
     fn insertDynamic(self: *Decoder, name: []const u8, value: []const u8) Error!void {
         const size = name.len + value.len + 32;
         if (size > self.dynamic_capacity) return error.DecompressionFailed;
-        self.evictUntilFits(size);
+        // The source may borrow the dynamic entry that eviction frees.
         const name_copy = self.gpa.dupe(u8, name) catch return error.OutOfMemory;
         errdefer self.gpa.free(name_copy);
         const value_copy = self.gpa.dupe(u8, value) catch return error.OutOfMemory;
         errdefer self.gpa.free(value_copy);
+        self.evictUntilFits(size);
         self.dynamic.append(self.gpa, .{ .name = name_copy, .value = value_copy, .size = size, .abs = self.insert_count }) catch return error.OutOfMemory;
         self.dynamic_size += size;
         self.insert_count += 1;
@@ -520,6 +521,24 @@ test "decode a dynamic relative indexed field after encoder insert literal" {
     try testing.expectEqual(@as(usize, 1), hs.len);
     try testing.expectEqualStrings("x", hs[0].name);
     try testing.expectEqualStrings("y", hs[0].value);
+}
+
+test "duplicate copies an entry before evicting it" {
+    const gpa = testing.allocator;
+    var dec = Decoder.init(gpa, 1 << 20);
+    defer dec.deinit();
+    dec.setMaxDynamicCapacity(34); // room for exactly one entry: 1 + 1 + 32
+
+    // Insert a=b into a one-entry table, then duplicate index 0.
+    const progress = try dec.processEncoder(&.{ 0x3f, 0x03, 0x41, 'a', 0x01, 'b', 0x00 });
+    try testing.expectEqual(@as(usize, 7), progress.consumed);
+    try testing.expectEqual(@as(u64, 2), progress.inserts);
+
+    // The survivor is the duplicate; RIC=2, Base=2, dynamic relative index 0 -> a=b.
+    const hs = try dec.decode(&.{ 0x01, 0x00, 0x80 });
+    try testing.expectEqual(@as(usize, 1), hs.len);
+    try testing.expectEqualStrings("a", hs[0].name);
+    try testing.expectEqualStrings("b", hs[0].value);
 }
 
 test "encoder stream processing stops before an incomplete instruction" {
