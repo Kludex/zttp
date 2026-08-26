@@ -2462,7 +2462,7 @@ pub const Connection = struct {
         // (RFC 9000 8.1).
         if (space == .handshake) self.validateCurrentPath();
 
-        if (st.recv_ranges.contains(opened.pn)) return;
+        if (st.recv_ranges.shouldIgnore(opened.pn)) return;
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, opened.pn) else opened.pn;
         st.recv_ranges.add(self.gpa, opened.pn) catch return error.OutOfMemory; // for accurate ACKs
         try self.dispatchFrames(opened.payload, space, long, now);

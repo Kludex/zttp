@@ -36,6 +36,15 @@ pub const AckRanges = struct {
         return false;
     }
 
+    /// Return whether a packet was already recorded or is older than the bounded
+    /// ACK history. Packets below a full range set cannot be distinguished from an
+    /// evicted duplicate, so they are ignored rather than dispatched twice.
+    pub fn shouldIgnore(self: *const AckRanges, pn: u64) bool {
+        if (self.contains(pn)) return true;
+        if (self.ranges.items.len < MAX_RANGES) return false;
+        return pn < self.ranges.items[self.ranges.items.len - 1].lo;
+    }
+
     /// Record that packet number `pn` was received. Extends or merges an existing
     /// range, or inserts a new one in descending order. If the list is at capacity
     /// the oldest (smallest) range is dropped - the peer will simply re-send those
@@ -163,4 +172,15 @@ test "a duplicate pn is a no-op" {
     try testing.expectEqual(@as(usize, 1), a.ranges.items.len);
     try testing.expect(a.contains(5));
     try testing.expect(!a.contains(4));
+}
+
+test "packets older than full ACK history are ignored" {
+    const gpa = testing.allocator;
+    var a = AckRanges{};
+    defer a.deinit(gpa);
+    for (1..AckRanges.MAX_RANGES + 1) |index| try a.add(gpa, @intCast(index * 2));
+
+    try testing.expect(a.shouldIgnore(2));
+    try testing.expect(a.shouldIgnore(1));
+    try testing.expect(!a.shouldIgnore(3));
 }
