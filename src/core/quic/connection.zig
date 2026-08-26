@@ -2079,8 +2079,8 @@ pub const Connection = struct {
 
     /// The client Finished verified: the handshake is confirmed. Signal it to the
     /// client with HANDSHAKE_DONE (RFC 9001 4.1.2) and discard the now-unneeded
-    /// Initial and Handshake keys (RFC 9001 4.9.1/4.9.2) so no further packet is
-    /// processed in or sent from those spaces.
+    /// Initial, Handshake, and 0-RTT receive keys (RFC 9001 4.9) so no further
+    /// packet is processed in or sent from those spaces.
     fn confirmHandshake(self: *Connection, now: u64) Error!void {
         if (self.handshake_confirmed) return;
         // Queue HANDSHAKE_DONE before committing the confirmation state, so a failed
@@ -2090,6 +2090,7 @@ pub const Connection = struct {
         // 19.20, 19.1).
         _ = try self.buildPacket(.application, &([_]u8{0x1e} ++ [_]u8{0x00} ** 19), true, now);
         self.handshake_confirmed = true;
+        self.spaces[@intFromEnum(Space.application)].zero_rtt_recv_keys = null;
         self.discardSpace(.initial);
         self.discardSpace(.handshake);
     }
@@ -2397,21 +2398,17 @@ pub const Connection = struct {
 
     fn detectStatelessReset(self: *Connection, buf: []const u8) bool {
         if (buf.len < 21) return false;
-        const token = buf[buf.len - 16 ..];
+        const token = buf[buf.len - 16 ..][0..16].*;
+        var matched = false;
         if (self.peer_tp.stateless_reset_token) |t| {
-            if (std.mem.eql(u8, token, &t)) {
-                self.closed = true;
-                return true;
-            }
+            matched = std.crypto.timing_safe.eql([16]u8, token, t);
         }
         var it = self.peer_cids.valueIterator();
         while (it.next()) |cid| {
-            if (std.mem.eql(u8, token, &cid.token)) {
-                self.closed = true;
-                return true;
-            }
+            matched = std.crypto.timing_safe.eql([16]u8, token, cid.token) or matched;
         }
-        return false;
+        if (matched) self.closed = true;
+        return matched;
     }
 
     fn acceptsLocalCid(self: *const Connection, dcid: []const u8) bool {
@@ -2456,6 +2453,7 @@ pub const Connection = struct {
         defer self.gpa.free(opened.work);
         defer self.gpa.free(opened.plaintext);
         if (space == .initial) self.initial_authenticated = true;
+        if (space == .application and !long) st.zero_rtt_recv_keys = null;
 
         // A decryptable Handshake packet proves the peer received our Initial/
         // handshake keys, so its address is validated and the 3x send limit lifts
@@ -3334,6 +3332,26 @@ test "server decrypts accepted 0-RTT STREAM data with the early traffic secret" 
     try testing.expectEqualStrings("early", server.streamData(0));
     try testing.expect(server.streamFinished(0));
     try testing.expect(server.spaces[@intFromEnum(Space.application)].ack_pending);
+}
+
+test "server discards 0-RTT receive keys after authenticating 1-RTT" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x09 };
+    const early_secret = [_]u8{0x7d} ** tls.schedule.SECRET_LEN;
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    server.installZeroRttRecvSecret(early_secret);
+    testInstallAppKeys(&server);
+
+    const current = try testBuildApp(gpa, &dcid, 0, &.{ 0x0a, 0x00, 0x03, 'n', 'e', 'w' });
+    defer gpa.free(current);
+    try server.receiveDatagram(current, 1000);
+    try testing.expect(server.spaces[@intFromEnum(Space.application)].zero_rtt_recv_keys == null);
+
+    const late = try testBuildZeroRtt(gpa, &dcid, 1, &.{ 0x0a, 0x04, 0x04, 'l', 'a', 't', 'e' }, early_secret);
+    defer gpa.free(late);
+    try server.receiveDatagram(late, 2000);
+    try testing.expectEqual(@as(usize, 0), server.streamData(4).len);
 }
 
 test "pending 0-RTT ACK is sent once 1-RTT send keys are available" {
