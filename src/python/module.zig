@@ -35,11 +35,6 @@ fn PyInit__zttp() callconv(.c) ?*c.PyObject {
         py.decref(m);
         return null;
     }
-    // Deliberately NOT declaring Py_MOD_GIL_NOT_USED: the module-global
-    // server_ticket_store (connection_obj.zig) is mutated and read across
-    // connections with no synchronization, so a free-threaded build would race it.
-    // Without the declaration CPython re-enables the compatibility GIL on
-    // free-threaded builds, which serializes these accesses and keeps the cp314t/
-    // cp315t wheels correct. Re-enable once the extension is synchronized (#151).
+    py.declareGilNotUsed(m);
     return m;
 }

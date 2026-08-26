@@ -231,7 +231,7 @@ def test_body_split_across_feeds() -> None:
 
 def test_large_content_length_body_reuses_exact_received_bytes() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    body = b"x" * 1024
+    body = bytes(bytearray(b"x" * 1024))
     conn.receive_data(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n")
     assert isinstance(conn.next_event(), zttp.Request)
 
@@ -246,7 +246,7 @@ def test_pending_body_owner_is_released_with_the_connection() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 1024\r\n\r\n")
     assert isinstance(conn.next_event(), zttp.Request)
-    body = b"x" * 1024
+    body = bytes(bytearray(b"x" * 1024))
     before = sys.getrefcount(body)
     conn.receive_data(body)
     assert sys.getrefcount(body) == before + 1
@@ -258,7 +258,7 @@ def test_pending_body_owner_is_released_when_a_second_feed_flushes_it() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n")
     assert isinstance(conn.next_event(), zttp.Request)
-    first = b"hello"
+    first = bytes(bytearray(b"hello"))
     before = sys.getrefcount(first)
     conn.receive_data(first)
     assert sys.getrefcount(first) == before + 1
@@ -269,7 +269,7 @@ def test_pending_body_owner_is_released_when_a_second_feed_flushes_it() -> None:
 
 def test_pending_input_owner_is_released_after_a_head_parse_error() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    raw = b"GET / HTTP/1.1\r\nBad header\r\n\r\n" + b"x" * 1024
+    raw = bytes(bytearray(b"GET / HTTP/1.1\r\nBad header\r\n\r\n" + b"x" * 1024))
     before = sys.getrefcount(raw)
     conn.receive_data(raw)
     assert sys.getrefcount(raw) == before + 1

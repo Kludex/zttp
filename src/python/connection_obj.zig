@@ -53,6 +53,7 @@ const DEFAULT_CLIENT_TRANSPORT_PARAMS = [_]u8{
 // Fixed backing keeps per-handshake slices valid while tickets rotate.
 var server_ticket_store: [MAX_SERVER_TICKET_STORE]ResumptionCredential = undefined;
 var server_ticket_store_len: usize = 0;
+var module_lock_object: py.Object = null;
 
 fn serverTickets() []ResumptionCredential {
     return server_ticket_store[0..server_ticket_store_len];
@@ -419,6 +420,9 @@ fn randomSigner() ?Signer {
 
 fn rememberServerTicket(identity: []const u8, psk: [32]u8, lifetime: u32, age_add: u32, issued_at_ms: u64, max_early_data_size: ?u32) !void {
     if (lifetime == 0) return;
+    var critical_section: py.CriticalSection = .{};
+    critical_section.beginObject(module_lock_object);
+    defer critical_section.end();
     for (serverTickets()) |*entry| {
         if (std.mem.eql(u8, entry.identity, identity)) {
             entry.psk = psk;
@@ -794,6 +798,12 @@ const H3Engine = struct {
     /// so it packetises against the most recent time the caller gave us.
     now: u64 = 0,
 
+    fn needsTicketStore(self: *const H3Engine) bool {
+        const q = self.qc orelse return self.config != null;
+        const tls = q.tls orelse return false;
+        return tls.state == .wait_client_hello;
+    }
+
     fn receiveDatagram(self: *H3Engine, dgram: []const u8, now: u64, peer_address: ?[]const u8) py.Object {
         self.now = now;
         if (self.qc == null) {
@@ -922,6 +932,7 @@ const H3Engine = struct {
     fn dataToSendWithAddresses(self: *H3Engine) py.Object {
         const q = self.qc orelse return py.newList(0);
         const result_type = resultType(&outbound_datagram_type, "OutboundDatagram") orelse return null;
+        if (!ensureOutboundNames()) return null;
         const flat = q.datagramsToSend();
         const lengths = q.datagramLengths();
         const tokens = q.datagramPathTokens();
@@ -1143,8 +1154,8 @@ const H3Engine = struct {
 
     fn sessionTickets(self: *const H3Engine) py.Object {
         const q = self.qc orelse return py.newList(0);
-        const tickets = q.sessionTickets();
         const st_type = resultType(&session_ticket_type, "SessionTicket") orelse return null;
+        const tickets = q.sessionTickets();
         const list = py.newList(@intCast(tickets.len));
         if (list == null) return null;
         for (tickets, 0..) |ticket, i| {
@@ -1280,8 +1291,8 @@ const H3Engine = struct {
     /// just that it did.
     fn closeInfo(self: *const H3Engine) py.Object {
         const q = self.qc orelse return py.none();
-        const pc = q.peer_close orelse return py.none();
         const ci_type = resultType(&close_info_type, "CloseInfo") orelse return null;
+        const pc = q.peer_close orelse return py.none();
         const tuple = py.tupleNew(3);
         if (tuple == null) return null;
         const code = c.PyLong_FromUnsignedLongLong(pc.error_code);
@@ -1569,16 +1580,18 @@ pub var module_methods = [_]c.PyMethodDef{
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
-fn newOutboundDatagram(result_type: py.Object, data: py.Object, peer_address: py.Object) py.Object {
+fn ensureOutboundNames() bool {
+    var critical_section: py.CriticalSection = .{};
+    critical_section.beginObject(module_lock_object);
+    defer critical_section.end();
     if (outbound_data_name == null) outbound_data_name = c.PyUnicode_InternFromString("data");
     if (outbound_peer_address_name == null) {
         outbound_peer_address_name = c.PyUnicode_InternFromString("peer_address");
     }
-    if (outbound_data_name == null or outbound_peer_address_name == null) {
-        py.decref(data);
-        py.decref(peer_address);
-        return null;
-    }
+    return outbound_data_name != null and outbound_peer_address_name != null;
+}
+
+fn newOutboundDatagram(result_type: py.Object, data: py.Object, peer_address: py.Object) py.Object {
     const result = py.allocInstance(result_type);
     if (result == null) {
         py.decref(data);
@@ -1600,6 +1613,9 @@ fn newOutboundDatagram(result_type: py.Object, data: py.Object, peer_address: py
 
 // Return the zttp.results dataclass named `name`, importing and caching it once.
 fn resultType(cache: *py.Object, name: [*c]const u8) py.Object {
+    var critical_section: py.CriticalSection = .{};
+    critical_section.beginObject(module_lock_object);
+    defer critical_section.end();
     if (cache.* != null) return cache.*;
     const mod = py.import("zttp.results") orelse return null;
     defer py.decref(mod);
@@ -1650,6 +1666,110 @@ const StreamObject = extern struct {
         };
     }
 };
+
+fn lockedConnectionMethod(comptime method: anytype) *const @TypeOf(method) {
+    return &struct {
+        fn call(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+            var critical_section: py.CriticalSection = .{};
+            critical_section.beginObject(self_obj.?);
+            defer critical_section.end();
+            return method(self_obj, arg);
+        }
+    }.call;
+}
+
+fn connectionNeedsModuleLock(self_obj: ?*c.PyObject) bool {
+    const self: *ConnectionObject = @ptrCast(self_obj.?);
+    const engine = self.engine orelse return false;
+    return switch (engine.*) {
+        .h3 => |*h3_engine| h3_engine.needsTicketStore(),
+        else => false,
+    };
+}
+
+fn lockedConnectionAndModuleMethod(comptime method: anytype) *const @TypeOf(method) {
+    return &struct {
+        fn call(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+            var probe: py.CriticalSection = .{};
+            probe.beginObject(self_obj.?);
+            const needs_module_lock = connectionNeedsModuleLock(self_obj);
+            probe.end();
+
+            if (needs_module_lock) {
+                var critical_section: py.CriticalSection2 = .{};
+                critical_section.beginObjects(self_obj.?, module_lock_object);
+                defer critical_section.end();
+                return method(self_obj, arg);
+            }
+
+            var critical_section: py.CriticalSection = .{};
+            critical_section.beginObject(self_obj.?);
+            defer critical_section.end();
+            return method(self_obj, arg);
+        }
+    }.call;
+}
+
+fn lockedConnectionKeywordMethod(comptime method: anytype) *const @TypeOf(method) {
+    return &struct {
+        fn call(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+            var critical_section: py.CriticalSection = .{};
+            critical_section.beginObject(self_obj.?);
+            defer critical_section.end();
+            return method(self_obj, args, kwds);
+        }
+    }.call;
+}
+
+fn lockedConnectionGetter(comptime getter: anytype) *const @TypeOf(getter) {
+    return &struct {
+        fn call(self_obj: ?*c.PyObject, closure: ?*anyopaque) callconv(.c) py.Object {
+            var critical_section: py.CriticalSection = .{};
+            critical_section.beginObject(self_obj.?);
+            defer critical_section.end();
+            return getter(self_obj, closure);
+        }
+    }.call;
+}
+
+fn lockedStreamMethod(comptime method: anytype) *const @TypeOf(method) {
+    return &struct {
+        fn call(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
+            const self: *StreamObject = @ptrCast(self_obj.?);
+            const conn = self.conn orelse return py.raiseRuntime("connection is closed");
+            var critical_section: py.CriticalSection = .{};
+            critical_section.beginObject(conn);
+            defer critical_section.end();
+            return method(self_obj, arg);
+        }
+    }.call;
+}
+
+fn lockedStreamKeywordMethod(comptime method: anytype) *const @TypeOf(method) {
+    return &struct {
+        fn call(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwds: ?*c.PyObject) callconv(.c) py.Object {
+            const self: *StreamObject = @ptrCast(self_obj.?);
+            const conn = self.conn orelse return py.raiseRuntime("connection is closed");
+            var critical_section: py.CriticalSection = .{};
+            critical_section.beginObject(conn);
+            defer critical_section.end();
+            return method(self_obj, args, kwds);
+        }
+    }.call;
+}
+
+fn lockedStreamGetter(comptime getter: anytype) *const @TypeOf(getter) {
+    return &struct {
+        fn call(self_obj: ?*c.PyObject, closure: ?*anyopaque) callconv(.c) py.Object {
+            const self: *StreamObject = @ptrCast(self_obj.?);
+            const conn = self.conn orelse return py.raiseRuntime("connection is closed");
+            var critical_section: py.CriticalSection = .{};
+            critical_section.beginObject(conn);
+            defer critical_section.end();
+            return getter(self_obj, closure);
+        }
+    }.call;
+}
 
 /// Build a Stream handle for `stream_id` on `conn_obj` (a ConnectionObject). Holds
 /// an owned reference to the connection. Returns null with a Python error set on
@@ -1814,18 +1934,18 @@ fn stream_repr(self_obj: ?*c.PyObject) callconv(.c) py.Object {
 }
 
 var stream_methods = [_]py.MethodDef{
-    .{ .ml_name = "send_response", .ml_meth = @ptrCast(&stream_send_response), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Serialize a response head on this stream: send_response(status, headers=None, end_stream=False). Pass end_stream=True for a bodyless response (204 / 304 / HEAD) to ride END_STREAM on the HEADERS frame and skip the trailing empty DATA frame." },
-    .{ .ml_name = "send_informational", .ml_meth = stream_send_informational, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response head on this stream: send_informational(status, headers=None). The final response still follows on the same stream." },
-    .{ .ml_name = "send_data", .ml_meth = stream_send_data, .ml_flags = c.METH_O, .ml_doc = "Queue body bytes on this stream (flow-controlled; parked until the send window allows)." },
-    .{ .ml_name = "end_message", .ml_meth = stream_end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message on this stream: end_message(trailers=None). HTTP/3 sends a trailing HEADERS frame for trailers; HTTP/2 send-side trailers are not supported yet." },
-    .{ .ml_name = "reset", .ml_meth = stream_reset, .ml_flags = c.METH_VARARGS, .ml_doc = "Send RST_STREAM to cancel this stream: reset(error_code=CANCEL)." },
+    .{ .ml_name = "send_response", .ml_meth = @ptrCast(lockedStreamKeywordMethod(stream_send_response)), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Serialize a response head on this stream: send_response(status, headers=None, end_stream=False). Pass end_stream=True for a bodyless response (204 / 304 / HEAD) to ride END_STREAM on the HEADERS frame and skip the trailing empty DATA frame." },
+    .{ .ml_name = "send_informational", .ml_meth = lockedStreamMethod(stream_send_informational), .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response head on this stream: send_informational(status, headers=None). The final response still follows on the same stream." },
+    .{ .ml_name = "send_data", .ml_meth = lockedStreamMethod(stream_send_data), .ml_flags = c.METH_O, .ml_doc = "Queue body bytes on this stream (flow-controlled; parked until the send window allows)." },
+    .{ .ml_name = "end_message", .ml_meth = lockedStreamMethod(stream_end_message), .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message on this stream: end_message(trailers=None). HTTP/3 sends a trailing HEADERS frame for trailers; HTTP/2 send-side trailers are not supported yet." },
+    .{ .ml_name = "reset", .ml_meth = lockedStreamMethod(stream_reset), .ml_flags = c.METH_VARARGS, .ml_doc = "Send RST_STREAM to cancel this stream: reset(error_code=CANCEL)." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
 var stream_getset = [_]c.PyGetSetDef{
     .{ .name = "stream_id", .get = stream_id_get, .set = null, .doc = "The HTTP/2 stream id this handle addresses.", .closure = null },
-    .{ .name = "send_window", .get = stream_send_window_get, .set = null, .doc = "Body bytes that may still leave on this stream before a WINDOW_UPDATE (may be negative after a SETTINGS shrink), or None if the stream is no longer live.", .closure = null },
-    .{ .name = "pending_bytes", .get = stream_pending_bytes_get, .set = null, .doc = "Body bytes queued on this stream that the send window has not yet admitted, or None if the stream is no longer live.", .closure = null },
+    .{ .name = "send_window", .get = lockedStreamGetter(stream_send_window_get), .set = null, .doc = "Body bytes that may still leave on this stream before a WINDOW_UPDATE (may be negative after a SETTINGS shrink), or None if the stream is no longer live.", .closure = null },
+    .{ .name = "pending_bytes", .get = lockedStreamGetter(stream_pending_bytes_get), .set = null, .doc = "Body bytes queued on this stream that the send window has not yet admitted, or None if the stream is no longer live.", .closure = null },
     .{ .name = null, .get = null, .set = null, .doc = null, .closure = null },
 };
 
@@ -3244,25 +3364,25 @@ fn h2_has_pending_send(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.
 // H3Connection does not inherit an incompatible receive_data / data_to_send - the
 // type hierarchy states exactly what each transport supports (see issue #113).
 var base_methods = [_]py.MethodDef{
-    .{ .ml_name = "next_event", .ml_meth = next_event, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the next parse event, or NEED_DATA." },
+    .{ .ml_name = "next_event", .ml_meth = lockedConnectionMethod(next_event), .ml_flags = c.METH_NOARGS, .ml_doc = "Return the next parse event, or NEED_DATA." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
 // HTTP/1.1: the byte-stream read/write surface plus the message-scoped send API and
 // keep-alive / upgrade signals.
 var h1_methods = [_]py.MethodDef{
-    .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
-    .{ .ml_name = "receive_event", .ml_meth = receive_event, .ml_flags = c.METH_O, .ml_doc = "Feed received bytes and return the first available event, or NEED_DATA." },
-    .{ .ml_name = "_next_event_eager_for_benchmark", .ml_meth = next_event_eager_for_benchmark, .ml_flags = c.METH_NOARGS, .ml_doc = "Private benchmark control for comparing the legacy eager header list." },
-    .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
-    .{ .ml_name = "start_next_cycle", .ml_meth = next_message, .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
-    .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
-    .{ .ml_name = "send_response", .ml_meth = send_response, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(status, headers=None). The reason phrase is derived from the status; the version is 1.1. Bodyless framing (HEAD / 204 / 304) is derived automatically." },
-    .{ .ml_name = "send_informational", .ml_meth = send_informational, .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response: send_informational(status, headers=None). The real response still follows on the same cycle." },
-    .{ .ml_name = "send_data", .ml_meth = send_data, .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
-    .{ .ml_name = "end_message", .ml_meth = end_message, .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
-    .{ .ml_name = "should_close", .ml_meth = should_close, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request/response (Connection: close / HTTP/1.0 / close-delimited response). Covers both the head parsed from the peer and one serialized locally." },
-    .{ .ml_name = "upgrade", .ml_meth = upgrade, .ml_flags = c.METH_NOARGS, .ml_doc = "The last request's Upgrade value if it asked to upgrade (Connection: upgrade), else None." },
+    .{ .ml_name = "receive_data", .ml_meth = lockedConnectionMethod(receive_data), .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
+    .{ .ml_name = "receive_event", .ml_meth = lockedConnectionMethod(receive_event), .ml_flags = c.METH_O, .ml_doc = "Feed received bytes and return the first available event, or NEED_DATA." },
+    .{ .ml_name = "_next_event_eager_for_benchmark", .ml_meth = lockedConnectionMethod(next_event_eager_for_benchmark), .ml_flags = c.METH_NOARGS, .ml_doc = "Private benchmark control for comparing the legacy eager header list." },
+    .{ .ml_name = "data_to_send", .ml_meth = lockedConnectionMethod(data_to_send), .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
+    .{ .ml_name = "start_next_cycle", .ml_meth = lockedConnectionMethod(next_message), .ml_flags = c.METH_NOARGS, .ml_doc = "Reset to read the next message on a keep-alive connection." },
+    .{ .ml_name = "send_request", .ml_meth = lockedConnectionMethod(send_request), .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a request head: send_request(method, target, version, headers)." },
+    .{ .ml_name = "send_response", .ml_meth = lockedConnectionMethod(send_response), .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize a response head: send_response(status, headers=None). The reason phrase is derived from the status; the version is 1.1. Bodyless framing (HEAD / 204 / 304) is derived automatically." },
+    .{ .ml_name = "send_informational", .ml_meth = lockedConnectionMethod(send_informational), .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response: send_informational(status, headers=None). The real response still follows on the same cycle." },
+    .{ .ml_name = "send_data", .ml_meth = lockedConnectionMethod(send_data), .ml_flags = c.METH_O, .ml_doc = "Serialize a run of body bytes (chunk-framed if the head was chunked)." },
+    .{ .ml_name = "end_message", .ml_meth = lockedConnectionMethod(end_message), .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message: end_message(trailers=None)." },
+    .{ .ml_name = "should_close", .ml_meth = lockedConnectionMethod(should_close), .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection must close after the last request/response (Connection: close / HTTP/1.0 / close-delimited response). Covers both the head parsed from the peer and one serialized locally." },
+    .{ .ml_name = "upgrade", .ml_meth = lockedConnectionMethod(upgrade), .ml_flags = c.METH_NOARGS, .ml_doc = "The last request's Upgrade value if it asked to upgrade (Connection: upgrade), else None." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
@@ -3270,19 +3390,19 @@ var h1_methods = [_]py.MethodDef{
 // a request (returns a Stream); the server reaches one with stream(id). There is
 // no connection-level body send - that is what the Stream handle is for.
 var h2_methods = [_]py.MethodDef{
-    .{ .ml_name = "receive_data", .ml_meth = receive_data, .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
-    .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
-    .{ .ml_name = "initiate_connection", .ml_meth = h2_initiate, .ml_flags = c.METH_NOARGS, .ml_doc = "Emit the connection preface (client preface + SETTINGS, or the server's SETTINGS) now, rather than lazily on the first send. Idempotent." },
-    .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
-    .{ .ml_name = "initiate_upgrade_connection", .ml_meth = @ptrCast(&initiate_upgrade_connection), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Initialise an h2c-upgraded connection: initiate_upgrade_connection(method, target, headers, settings_header=None). Seeds the already-parsed HTTP/1.1 request as stream 1 and applies the client's base64url HTTP2-Settings, returning the stream's Stream. Call on a fresh server connection before feeding the client's HTTP/2 preface; next_event() then yields the request." },
-    .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id. The connection owns the stream state; the handle is a stream-scoped command surface (send_response / send_data / end_message)." },
-    .{ .ml_name = "close", .ml_meth = h2_close, .ml_flags = c.METH_VARARGS, .ml_doc = "Send GOAWAY to shut the connection down: close(error_code=NO_ERROR, last_stream_id=None). last_stream_id defaults to the highest peer stream processed." },
-    .{ .ml_name = "has_pending_send", .ml_meth = h2_has_pending_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether any stream still has body bytes (or a FIN) parked waiting for the send window." },
+    .{ .ml_name = "receive_data", .ml_meth = lockedConnectionMethod(receive_data), .ml_flags = c.METH_O, .ml_doc = "Append received bytes (empty bytes signals EOF)." },
+    .{ .ml_name = "data_to_send", .ml_meth = lockedConnectionMethod(data_to_send), .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing bytes." },
+    .{ .ml_name = "initiate_connection", .ml_meth = lockedConnectionMethod(h2_initiate), .ml_flags = c.METH_NOARGS, .ml_doc = "Emit the connection preface (client preface + SETTINGS, or the server's SETTINGS) now, rather than lazily on the first send. Idempotent." },
+    .{ .ml_name = "send_request", .ml_meth = lockedConnectionMethod(send_request), .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
+    .{ .ml_name = "initiate_upgrade_connection", .ml_meth = @ptrCast(lockedConnectionKeywordMethod(initiate_upgrade_connection)), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Initialise an h2c-upgraded connection: initiate_upgrade_connection(method, target, headers, settings_header=None). Seeds the already-parsed HTTP/1.1 request as stream 1 and applies the client's base64url HTTP2-Settings, returning the stream's Stream. Call on a fresh server connection before feeding the client's HTTP/2 preface; next_event() then yields the request." },
+    .{ .ml_name = "stream", .ml_meth = lockedConnectionMethod(stream), .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id. The connection owns the stream state; the handle is a stream-scoped command surface (send_response / send_data / end_message)." },
+    .{ .ml_name = "close", .ml_meth = lockedConnectionMethod(h2_close), .ml_flags = c.METH_VARARGS, .ml_doc = "Send GOAWAY to shut the connection down: close(error_code=NO_ERROR, last_stream_id=None). last_stream_id defaults to the highest peer stream processed." },
+    .{ .ml_name = "has_pending_send", .ml_meth = lockedConnectionMethod(h2_has_pending_send), .ml_flags = c.METH_NOARGS, .ml_doc = "Whether any stream still has body bytes (or a FIN) parked waiting for the send window." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
 var h2_getset = [_]c.PyGetSetDef{
-    .{ .name = "send_window", .get = h2_send_window_get, .set = null, .doc = "The connection-level send window: body bytes that may leave across all streams before a WINDOW_UPDATE (may be negative after a SETTINGS shrink).", .closure = null },
+    .{ .name = "send_window", .get = lockedConnectionGetter(h2_send_window_get), .set = null, .doc = "The connection-level send window: body bytes that may leave across all streams before a WINDOW_UPDATE (may be negative after a SETTINGS shrink).", .closure = null },
     .{ .name = null, .get = null, .set = null, .doc = null, .closure = null },
 };
 
@@ -3294,35 +3414,35 @@ var h2_getset = [_]c.PyGetSetDef{
 // data_to_send. `now` is the integrator's monotonic clock, in the same unit it later
 // feeds handle_timeout; a Stream send uses the most recent `now` the caller gave.
 var h3_methods = [_]py.MethodDef{
-    .{ .ml_name = "receive_datagram", .ml_meth = receive_datagram, .ml_flags = c.METH_VARARGS, .ml_doc = "Feed one received UDP datagram: receive_datagram(datagram, now=0, peer_address=None). peer_address is an optional opaque bytes key for QUIC path validation and migration." },
-    .{ .ml_name = "consume_data", .ml_meth = h3_consume_data, .ml_flags = c.METH_VARARGS, .ml_doc = "Acknowledge HTTP/3 DATA payload bytes after the application consumes them: consume_data(stream_id, length)." },
-    .{ .ml_name = "data_to_send", .ml_meth = data_to_send, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing UDP datagrams as a list of bytes (one per datagram - QUIC datagram boundaries are semantic)." },
-    .{ .ml_name = "data_to_send_with_addresses", .ml_meth = h3_data_to_send_with_addresses, .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams with their destination address keys." },
-    .{ .ml_name = "_set_endpoint_context", .ml_meth = h3_set_endpoint_context, .ml_flags = c.METH_VARARGS, .ml_doc = "Configure endpoint-selected connection IDs before receiving the first Initial." },
-    .{ .ml_name = "_endpoint_ready", .ml_meth = h3_endpoint_ready, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the endpoint connection authenticated its first Initial." },
-    .{ .ml_name = "_endpoint_connection_id_generation", .ml_meth = h3_endpoint_connection_id_generation, .ml_flags = c.METH_NOARGS, .ml_doc = "Return the active local connection ID generation." },
-    .{ .ml_name = "challenge_path", .ml_meth = h3_challenge_path, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC PATH_CHALLENGE for a peer address: challenge_path(peer_address, data). data must be 8 unpredictable bytes. Drain with data_to_send_with_addresses." },
-    .{ .ml_name = "use_peer_connection_id", .ml_meth = h3_use_peer_connection_id, .ml_flags = c.METH_O, .ml_doc = "Switch future QUIC packets to a peer-issued NEW_CONNECTION_ID sequence: use_peer_connection_id(sequence_number)." },
-    .{ .ml_name = "local_connection_ids", .ml_meth = h3_local_connection_ids, .ml_flags = c.METH_NOARGS, .ml_doc = "Return every active local QUIC connection ID and sequence number." },
-    .{ .ml_name = "issue_connection_id", .ml_meth = h3_issue_connection_id, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC NEW_CONNECTION_ID for a local CID: issue_connection_id(sequence_number, connection_id, stateless_reset_token, retire_prior_to=0). Drain with data_to_send." },
-    .{ .ml_name = "_endpoint_issue_connection_id", .ml_meth = h3_endpoint_issue_connection_id, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC NEW_CONNECTION_ID owned by QuicEndpoint." },
-    .{ .ml_name = "request_key_update", .ml_meth = h3_request_key_update, .ml_flags = c.METH_NOARGS, .ml_doc = "Advance QUIC 1-RTT send keys. The next application packet carries the new key phase." },
-    .{ .ml_name = "send_request", .ml_meth = send_request, .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
-    .{ .ml_name = "stream", .ml_meth = stream, .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id (the request's stream_id). The handle is the stream-scoped send surface: send_response / send_data / end_message." },
-    .{ .ml_name = "next_timeout", .ml_meth = h3_next_timeout, .ml_flags = c.METH_NOARGS, .ml_doc = "The next idle/loss/PTO deadline (same clock as now), or None if no timer is armed." },
-    .{ .ml_name = "handle_timeout", .ml_meth = h3_handle_timeout, .ml_flags = c.METH_O, .ml_doc = "Fire the timer at time now: handle_timeout(now). Closes on idle timeout or re-queues probes; drain them with data_to_send." },
-    .{ .ml_name = "initiate_connection", .ml_meth = h3_initiate, .ml_flags = c.METH_NOARGS, .ml_doc = "Open the control stream and send SETTINGS now (RFC 9114 6.2.1), rather than lazily on the first response. Idempotent. Drain it with data_to_send." },
-    .{ .ml_name = "is_closed", .ml_meth = h3_is_closed, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection has been closed (a peer CONNECTION_CLOSE, or the idle timeout fired)." },
-    .{ .ml_name = "idle_timed_out", .ml_meth = h3_idle_timed_out, .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection was silently closed by the idle timeout (RFC 9000 10.1), as opposed to a CONNECTION_CLOSE." },
-    .{ .ml_name = "send_session_ticket", .ml_meth = h3_send_session_ticket, .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a TLS NewSessionTicket on a confirmed HTTP/3 server connection and return its PSK when available: send_session_ticket(ticket, lifetime=0, age_add=0, nonce=b'', extensions=b'', max_early_data_size=None). Drain it with data_to_send." },
-    .{ .ml_name = "send_new_token", .ml_meth = h3_send_new_token, .ml_flags = c.METH_O, .ml_doc = "Queue a QUIC NEW_TOKEN address-validation token from a confirmed HTTP/3 server connection. Drain it with data_to_send." },
-    .{ .ml_name = "session_tickets", .ml_meth = h3_session_tickets, .ml_flags = c.METH_NOARGS, .ml_doc = "Return received TLS session tickets as a list of zttp.SessionTicket (fields: lifetime, age_add, nonce, ticket, extensions, max_early_data_size, psk)." },
-    .{ .ml_name = "validation_tokens", .ml_meth = h3_validation_tokens, .ml_flags = c.METH_NOARGS, .ml_doc = "Return NEW_TOKEN address-validation tokens received from the peer for use as validation_token on a future HTTP/3 client connection." },
-    .{ .ml_name = "close", .ml_meth = @ptrCast(&h3_close), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Send a QUIC CONNECTION_CLOSE: close(app=True, error_code=0, reason=b''). app=True sends an HTTP/3 application close once 1-RTT keys exist; app=False sends a transport close. Drain it with data_to_send." },
-    .{ .ml_name = "close_info", .ml_meth = h3_close_info, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's CONNECTION_CLOSE as a zttp.CloseInfo (fields: error_code, reason, is_application), or None if the peer has not closed." },
-    .{ .ml_name = "peer_settings", .ml_meth = h3_peer_settings, .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's HTTP/3 SETTINGS as a dict (max_field_section_size, qpack_max_table_capacity, qpack_blocked_streams), or None until its SETTINGS frame has been received." },
-    .{ .ml_name = "shutdown", .ml_meth = h3_shutdown, .ml_flags = c.METH_O, .ml_doc = "Begin a graceful shutdown: send a GOAWAY. Servers announce the first request stream not processed; clients announce the first push ID not accepted (RFC 9114 5.2). A later GOAWAY may only lower the id. Drain it with data_to_send." },
-    .{ .ml_name = "goaway_received", .ml_meth = h3_goaway_received, .ml_flags = c.METH_NOARGS, .ml_doc = "The id of a GOAWAY received from the peer (RFC 9114 5.2), or None - the peer is shutting down and will not process streams at or above this id." },
+    .{ .ml_name = "receive_datagram", .ml_meth = lockedConnectionAndModuleMethod(receive_datagram), .ml_flags = c.METH_VARARGS, .ml_doc = "Feed one received UDP datagram: receive_datagram(datagram, now=0, peer_address=None). peer_address is an optional opaque bytes key for QUIC path validation and migration." },
+    .{ .ml_name = "consume_data", .ml_meth = lockedConnectionMethod(h3_consume_data), .ml_flags = c.METH_VARARGS, .ml_doc = "Acknowledge HTTP/3 DATA payload bytes after the application consumes them: consume_data(stream_id, length)." },
+    .{ .ml_name = "data_to_send", .ml_meth = lockedConnectionMethod(data_to_send), .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear the pending outgoing UDP datagrams as a list of bytes (one per datagram - QUIC datagram boundaries are semantic)." },
+    .{ .ml_name = "data_to_send_with_addresses", .ml_meth = lockedConnectionMethod(h3_data_to_send_with_addresses), .ml_flags = c.METH_NOARGS, .ml_doc = "Return and clear pending HTTP/3 datagrams with their destination address keys." },
+    .{ .ml_name = "_set_endpoint_context", .ml_meth = lockedConnectionMethod(h3_set_endpoint_context), .ml_flags = c.METH_VARARGS, .ml_doc = "Configure endpoint-selected connection IDs before receiving the first Initial." },
+    .{ .ml_name = "_endpoint_ready", .ml_meth = lockedConnectionMethod(h3_endpoint_ready), .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the endpoint connection authenticated its first Initial." },
+    .{ .ml_name = "_endpoint_connection_id_generation", .ml_meth = lockedConnectionMethod(h3_endpoint_connection_id_generation), .ml_flags = c.METH_NOARGS, .ml_doc = "Return the active local connection ID generation." },
+    .{ .ml_name = "challenge_path", .ml_meth = lockedConnectionMethod(h3_challenge_path), .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC PATH_CHALLENGE for a peer address: challenge_path(peer_address, data). data must be 8 unpredictable bytes. Drain with data_to_send_with_addresses." },
+    .{ .ml_name = "use_peer_connection_id", .ml_meth = lockedConnectionMethod(h3_use_peer_connection_id), .ml_flags = c.METH_O, .ml_doc = "Switch future QUIC packets to a peer-issued NEW_CONNECTION_ID sequence: use_peer_connection_id(sequence_number)." },
+    .{ .ml_name = "local_connection_ids", .ml_meth = lockedConnectionMethod(h3_local_connection_ids), .ml_flags = c.METH_NOARGS, .ml_doc = "Return every active local QUIC connection ID and sequence number." },
+    .{ .ml_name = "issue_connection_id", .ml_meth = lockedConnectionMethod(h3_issue_connection_id), .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC NEW_CONNECTION_ID for a local CID: issue_connection_id(sequence_number, connection_id, stateless_reset_token, retire_prior_to=0). Drain with data_to_send." },
+    .{ .ml_name = "_endpoint_issue_connection_id", .ml_meth = lockedConnectionMethod(h3_endpoint_issue_connection_id), .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a QUIC NEW_CONNECTION_ID owned by QuicEndpoint." },
+    .{ .ml_name = "request_key_update", .ml_meth = lockedConnectionMethod(h3_request_key_update), .ml_flags = c.METH_NOARGS, .ml_doc = "Advance QUIC 1-RTT send keys. The next application packet carries the new key phase." },
+    .{ .ml_name = "send_request", .ml_meth = lockedConnectionMethod(send_request), .ml_flags = c.METH_VARARGS, .ml_doc = "Open a request stream and return its Stream: send_request(method, target, version, headers). :authority is derived from a host header; the version arg is ignored." },
+    .{ .ml_name = "stream", .ml_meth = lockedConnectionMethod(stream), .ml_flags = c.METH_O, .ml_doc = "Return a Stream handle for stream_id (the request's stream_id). The handle is the stream-scoped send surface: send_response / send_data / end_message." },
+    .{ .ml_name = "next_timeout", .ml_meth = lockedConnectionMethod(h3_next_timeout), .ml_flags = c.METH_NOARGS, .ml_doc = "The next idle/loss/PTO deadline (same clock as now), or None if no timer is armed." },
+    .{ .ml_name = "handle_timeout", .ml_meth = lockedConnectionMethod(h3_handle_timeout), .ml_flags = c.METH_O, .ml_doc = "Fire the timer at time now: handle_timeout(now). Closes on idle timeout or re-queues probes; drain them with data_to_send." },
+    .{ .ml_name = "initiate_connection", .ml_meth = lockedConnectionMethod(h3_initiate), .ml_flags = c.METH_NOARGS, .ml_doc = "Open the control stream and send SETTINGS now (RFC 9114 6.2.1), rather than lazily on the first response. Idempotent. Drain it with data_to_send." },
+    .{ .ml_name = "is_closed", .ml_meth = lockedConnectionMethod(h3_is_closed), .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection has been closed (a peer CONNECTION_CLOSE, or the idle timeout fired)." },
+    .{ .ml_name = "idle_timed_out", .ml_meth = lockedConnectionMethod(h3_idle_timed_out), .ml_flags = c.METH_NOARGS, .ml_doc = "Whether the connection was silently closed by the idle timeout (RFC 9000 10.1), as opposed to a CONNECTION_CLOSE." },
+    .{ .ml_name = "send_session_ticket", .ml_meth = lockedConnectionMethod(h3_send_session_ticket), .ml_flags = c.METH_VARARGS, .ml_doc = "Queue a TLS NewSessionTicket on a confirmed HTTP/3 server connection and return its PSK when available: send_session_ticket(ticket, lifetime=0, age_add=0, nonce=b'', extensions=b'', max_early_data_size=None). Drain it with data_to_send." },
+    .{ .ml_name = "send_new_token", .ml_meth = lockedConnectionMethod(h3_send_new_token), .ml_flags = c.METH_O, .ml_doc = "Queue a QUIC NEW_TOKEN address-validation token from a confirmed HTTP/3 server connection. Drain it with data_to_send." },
+    .{ .ml_name = "session_tickets", .ml_meth = lockedConnectionMethod(h3_session_tickets), .ml_flags = c.METH_NOARGS, .ml_doc = "Return received TLS session tickets as a list of zttp.SessionTicket (fields: lifetime, age_add, nonce, ticket, extensions, max_early_data_size, psk)." },
+    .{ .ml_name = "validation_tokens", .ml_meth = lockedConnectionMethod(h3_validation_tokens), .ml_flags = c.METH_NOARGS, .ml_doc = "Return NEW_TOKEN address-validation tokens received from the peer for use as validation_token on a future HTTP/3 client connection." },
+    .{ .ml_name = "close", .ml_meth = @ptrCast(lockedConnectionKeywordMethod(h3_close)), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Send a QUIC CONNECTION_CLOSE: close(app=True, error_code=0, reason=b''). app=True sends an HTTP/3 application close once 1-RTT keys exist; app=False sends a transport close. Drain it with data_to_send." },
+    .{ .ml_name = "close_info", .ml_meth = lockedConnectionMethod(h3_close_info), .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's CONNECTION_CLOSE as a zttp.CloseInfo (fields: error_code, reason, is_application), or None if the peer has not closed." },
+    .{ .ml_name = "peer_settings", .ml_meth = lockedConnectionMethod(h3_peer_settings), .ml_flags = c.METH_NOARGS, .ml_doc = "The peer's HTTP/3 SETTINGS as a dict (max_field_section_size, qpack_max_table_capacity, qpack_blocked_streams), or None until its SETTINGS frame has been received." },
+    .{ .ml_name = "shutdown", .ml_meth = lockedConnectionMethod(h3_shutdown), .ml_flags = c.METH_O, .ml_doc = "Begin a graceful shutdown: send a GOAWAY. Servers announce the first request stream not processed; clients announce the first push ID not accepted (RFC 9114 5.2). A later GOAWAY may only lower the id. Drain it with data_to_send." },
+    .{ .ml_name = "goaway_received", .ml_meth = lockedConnectionMethod(h3_goaway_received), .ml_flags = c.METH_NOARGS, .ml_doc = "The id of a GOAWAY received from the peer (RFC 9114 5.2), or None - the peer is shutting down and will not process streams at or above this id." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
@@ -3385,6 +3505,7 @@ var h3_spec = py.Spec{
 };
 
 pub fn register(module: py.Object) bool {
+    if (module_lock_object == null) module_lock_object = py.newRef(module);
     connection_type = py.typeFromSpec(&base_spec);
     if (connection_type == null) return false;
     h1_connection_type = py.typeFromSpecWithBase(&h1_spec, connection_type);

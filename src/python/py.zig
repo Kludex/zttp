@@ -16,6 +16,41 @@ pub const c = @import("pyc");
 pub const Object = [*c]c.PyObject;
 pub const ssize = c.Py_ssize_t;
 
+// -- free-threaded critical sections -----------------------------------------
+
+/// A CPython critical section on free-threaded builds and a no-op elsewhere.
+pub const CriticalSection = if (@hasDecl(c, "Py_GIL_DISABLED")) struct {
+    state: c.PyCriticalSection = undefined,
+
+    pub fn beginObject(self: *CriticalSection, object: Object) void {
+        c.PyCriticalSection_Begin(&self.state, object);
+    }
+
+    pub fn end(self: *CriticalSection) void {
+        c.PyCriticalSection_End(&self.state);
+    }
+} else struct {
+    pub fn beginObject(_: *CriticalSection, _: Object) void {}
+    pub fn end(_: *CriticalSection) void {}
+};
+
+/// A two-object critical section for operations that use connection state and
+/// process-global module state together.
+pub const CriticalSection2 = if (@hasDecl(c, "Py_GIL_DISABLED")) struct {
+    state: c.PyCriticalSection2 = undefined,
+
+    pub fn beginObjects(self: *CriticalSection2, first: Object, second: Object) void {
+        c.PyCriticalSection2_Begin(&self.state, first, second);
+    }
+
+    pub fn end(self: *CriticalSection2) void {
+        c.PyCriticalSection2_End(&self.state);
+    }
+} else struct {
+    pub fn beginObjects(_: *CriticalSection2, _: Object, _: Object) void {}
+    pub fn end(_: *CriticalSection2) void {}
+};
+
 // -- member-def constants (3.12 renamed these with a Py_ prefix) ---------------
 //
 // 3.12+ exposes Py_T_OBJECT_EX / Py_T_BOOL / Py_READONLY from Python.h; on
