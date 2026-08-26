@@ -145,6 +145,31 @@ def test_request_with_body() -> None:
     assert any(isinstance(e, zttp.EndOfMessage) for e in events)
 
 
+def test_discarded_data_replenishes_the_connection_window() -> None:
+    discarded = b"".join(frame(0x00, 0, 1, b"x" * length) for length in (16384, 16384, 16384, 16383))
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    conn.receive_data(
+        PREFACE
+        + frame(0x04, 0, 0, b"")
+        + frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK)
+        + discarded
+        + frame(0x01, END_HEADERS, 3, GET_BLOCK)
+        + frame(0x00, END_STREAM, 3, b"y")
+    )
+
+    events = list(drain_h2(conn))
+
+    data = next(event for event in events if isinstance(event, zttp.Data))
+    assert data.stream_id == 3
+    assert data.data == b"y"
+    updates = [
+        payload
+        for frame_type, _, stream_id, payload in _frames(conn.data_to_send())
+        if frame_type == 0x08 and stream_id == 0
+    ]
+    assert sum(int.from_bytes(payload, "big") for payload in updates) == 65535
+
+
 def test_two_multiplexed_streams_carry_their_ids() -> None:
     conn = server_with(
         frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK),
