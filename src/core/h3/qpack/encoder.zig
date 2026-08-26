@@ -13,6 +13,11 @@ const decoder = @import("decoder.zig");
 const DynamicEntry = struct { name: []u8, value: []u8, size: usize, abs: u64 };
 const Outstanding = struct { stream_id: u64, required_insert_count: u64 };
 
+/// Local cap on encoder dynamic-table bytes, independent of peer SETTINGS.
+pub const max_dynamic_capacity: usize = 4096;
+/// Local cap on field sections blocked on dynamic-table acknowledgments.
+pub const max_blocked_streams: u64 = 16;
+
 pub const Error = error{
     DecompressionFailed,
     NeedData,
@@ -103,13 +108,15 @@ pub const Encoder = struct {
         peer_capacity: u64,
         peer_blocked_streams: u64,
     ) !void {
-        const capacity: usize = std.math.cast(usize, peer_capacity) orelse std.math.maxInt(usize);
-        if (capacity == 0 or peer_blocked_streams == 0) {
+        const advertised_capacity = std.math.cast(usize, peer_capacity) orelse std.math.maxInt(usize);
+        const capacity = @min(advertised_capacity, max_dynamic_capacity);
+        const blocked_streams = @min(peer_blocked_streams, max_blocked_streams);
+        if (capacity == 0 or blocked_streams == 0) {
             try encode(field_block, self.gpa, headers);
             return;
         }
         const outstanding: u64 = @intCast(self.outstanding.items.len);
-        if (outstanding >= peer_blocked_streams) {
+        if (outstanding >= blocked_streams) {
             try encode(field_block, self.gpa, headers);
             return;
         }
@@ -528,6 +535,33 @@ test "stateful encoder avoids evicting a reused entry in the same field section"
     try testing.expectEqualStrings("v", out[0].value);
     try testing.expectEqualStrings("x-b", out[1].name);
     try testing.expectEqualStrings("v", out[1].value);
+}
+
+test "peer settings cannot raise local encoder state limits" {
+    var enc = Encoder.init(testing.allocator);
+    defer enc.deinit();
+
+    for (0..64) |index| {
+        var value = [_]u8{'x'} ** 256;
+        value[0] = @intCast('A' + index / 26);
+        value[1] = @intCast('A' + index % 26);
+        var block: std.ArrayList(u8) = .empty;
+        defer block.deinit(testing.allocator);
+        var encoder_stream: std.ArrayList(u8) = .empty;
+        defer encoder_stream.deinit(testing.allocator);
+        try enc.encodeFieldSection(
+            &block,
+            &encoder_stream,
+            @intCast(index * 4),
+            &.{.{ .name = "x-vary", .value = &value }},
+            std.math.maxInt(u64),
+            std.math.maxInt(u64),
+        );
+    }
+
+    try testing.expectEqual(max_dynamic_capacity, enc.dynamic_capacity);
+    try testing.expect(enc.dynamic_size <= max_dynamic_capacity);
+    try testing.expect(@as(u64, @intCast(enc.outstanding.items.len)) <= max_blocked_streams);
 }
 
 test "decoder stream acknowledgements allow dynamic table reuse" {

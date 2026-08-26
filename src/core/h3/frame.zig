@@ -47,7 +47,8 @@ pub fn decode(buf: []const u8) Error!Decoded {
     const t = varint.decode(buf) catch return error.NeedData;
     const l = varint.decode(buf[t.len..]) catch return error.NeedData;
     const start = t.len + l.len;
-    const end = start + @as(usize, @intCast(l.value));
+    const length = std.math.cast(usize, l.value) orelse return error.NeedData;
+    const end = std.math.add(usize, start, length) catch return error.NeedData;
     if (end > buf.len) return error.NeedData;
     return .{
         .frame = .{ .ftype = @enumFromInt(t.value), .payload = buf[start..end] },
@@ -103,6 +104,11 @@ test "an unknown frame type parses and is skippable" {
 test "a truncated frame needs more data" {
     try std.testing.expectError(error.NeedData, decode(&.{0x00})); // no length yet
     try std.testing.expectError(error.NeedData, decode(&.{ 0x00, 0x05, 'a' })); // claims 5, has 1
+}
+
+test "a four-gibibyte frame length needs more data" {
+    const encoded = [_]u8{ 0x00, 0xC0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+    try std.testing.expectError(error.NeedData, decode(&encoded));
 }
 
 test "append round-trips through decode" {

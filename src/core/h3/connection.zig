@@ -110,8 +110,8 @@ const UniStream = struct {
 const MAX_FIELD_SECTION_SIZE: u64 = 1 << 16;
 /// Decoder dynamic-table capacity we advertise to the peer. Keeping this modest
 /// limits per-connection QPACK state while still allowing dynamic references.
-const QPACK_MAX_TABLE_CAPACITY: usize = 4096;
-const QPACK_BLOCKED_STREAMS: u64 = 16;
+const QPACK_MAX_TABLE_CAPACITY = qpack_enc.max_dynamic_capacity;
+const QPACK_BLOCKED_STREAMS = qpack_enc.max_blocked_streams;
 
 pub const Connection = struct {
     gpa: std.mem.Allocator,

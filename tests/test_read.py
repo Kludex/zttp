@@ -354,6 +354,17 @@ def test_response_parsing() -> None:
     assert data.data == b"xyz"
 
 
+@pytest.mark.parametrize("status", [b"000", b"099", b"600", b"999"])
+def test_response_rejects_an_out_of_range_status(status: bytes) -> None:
+    conn = zttp.Connection(zttp.CLIENT)
+    conn.receive_data(b"HTTP/1.1 " + status + b" Invalid\r\nContent-Length: 0\r\n\r\n")
+
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
+
+
 @pytest.mark.parametrize(
     ("method", "status", "reason"),
     [(b"GET", 204, b"No Content"), (b"CONNECT", 200, b"OK")],

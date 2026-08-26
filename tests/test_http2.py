@@ -242,6 +242,21 @@ def test_client_reads_a_response() -> None:
     assert isinstance(eom, zttp.EndOfMessage)
 
 
+def test_client_rejects_a_switching_protocols_response() -> None:
+    conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    conn.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")])
+    conn.data_to_send()
+    status = bytes([0x00, 0x07]) + b":status" + bytes([0x03]) + b"101"
+    conn.receive_data(frame(0x04, 0, 0, b"") + frame(0x01, END_HEADERS, 1, status))
+
+    events = list(drain_h2(conn))
+
+    assert not any(isinstance(event, zttp.Response) for event in events)
+    reset = next(event for event in events if isinstance(event, zttp.RstStream))
+    assert reset.stream_id == 1
+    assert reset.error_code == 0x01
+
+
 def test_client_reads_a_response_with_a_body() -> None:
     conn = client_with(
         frame(0x01, END_HEADERS, 1, STATUS_200),
