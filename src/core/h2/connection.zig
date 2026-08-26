@@ -810,9 +810,9 @@ pub const Connection = struct {
                     if (d < '0' or d > '9') return error.Malformed;
                     code = code * 10 + (d - '0');
                 }
-                // Only the defined status classes (1xx-5xx) are valid; 000-099 and
-                // 600-999 are impossible codes (RFC 9110 15).
-                if (code < 100 or code > 599) return error.Malformed;
+                // Only the defined status classes (1xx-5xx) are valid; HTTP/2
+                // does not support 101 Switching Protocols (RFC 9113 8.6).
+                if (code < 100 or code > 599 or code == 101) return error.Malformed;
                 status = code;
                 continue;
             }

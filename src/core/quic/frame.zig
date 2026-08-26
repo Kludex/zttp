@@ -76,8 +76,9 @@ const Cursor = struct {
         return d.value;
     }
 
-    fn take(self: *Cursor, n: usize) Error![]const u8 {
-        if (self.pos + n > self.buf.len) return error.Truncated;
+    fn take(self: *Cursor, wire_len: u64) Error![]const u8 {
+        const n = std.math.cast(usize, wire_len) orelse return error.Truncated;
+        if (n > self.buf.len - self.pos) return error.Truncated;
         const s = self.buf[self.pos .. self.pos + n];
         self.pos += n;
         return s;
@@ -122,12 +123,12 @@ pub fn decode(buf: []const u8) Error!Decoded {
             const offset = try cur.vint();
             const dlen = try cur.vint();
             try validateOffsetLen(offset, dlen);
-            break :blk .{ .crypto = .{ .offset = offset, .data = try cur.take(@intCast(dlen)) } };
+            break :blk .{ .crypto = .{ .offset = offset, .data = try cur.take(dlen) } };
         },
         .new_token => blk: {
             const tlen = try cur.vint();
             if (tlen == 0) return error.FrameEncodingError; // RFC 9000 19.7: token MUST NOT be empty
-            break :blk .{ .new_token = .{ .token = try cur.take(@intCast(tlen)) } };
+            break :blk .{ .new_token = .{ .token = try cur.take(tlen) } };
         },
         .max_data => .{ .max_data = try cur.vint() },
         .max_stream_data => .{ .max_stream_data = .{ .stream_id = try cur.vint(), .max = try cur.vint() } },
@@ -158,7 +159,7 @@ fn decodeStream(cur: *Cursor, raw: u64) Error!Decoded {
     const data = if (has_len) blk: {
         const dlen = try cur.vint();
         try validateOffsetLen(offset, dlen);
-        break :blk try cur.take(@intCast(dlen));
+        break :blk try cur.take(dlen);
     } else cur.buf[cur.pos..]; // no length => the frame runs to the packet end
     if (!has_len) try validateOffsetLen(offset, @intCast(data.len));
     if (!has_len) cur.pos = cur.buf.len;
@@ -203,7 +204,7 @@ fn decodeClose(cur: *Cursor, app: bool) Error!Frame {
     const error_code = try cur.vint();
     const frame_type = if (app) 0 else try cur.vint();
     const rlen = try cur.vint();
-    const reason = try cur.take(@intCast(rlen));
+    const reason = try cur.take(rlen);
     return .{ .connection_close = .{ .app = app, .error_code = error_code, .frame_type = frame_type, .reason = reason } };
 }
 
@@ -536,6 +537,14 @@ test "decode a transport CONNECTION_CLOSE" {
 test "truncated frame is rejected" {
     try std.testing.expectError(error.Truncated, decode(&.{0x06})); // CRYPTO with no offset
     try std.testing.expectError(error.Truncated, decode(&.{ 0x06, 0x00, 0x05, 'h' })); // claims 5, has 1
+}
+
+test "four-gibibyte wire lengths are truncated" {
+    const huge = [_]u8{ 0xC0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+    try std.testing.expectError(error.Truncated, decode(&([_]u8{ 0x06, 0x00 } ++ huge)));
+    try std.testing.expectError(error.Truncated, decode(&([_]u8{0x07} ++ huge)));
+    try std.testing.expectError(error.Truncated, decode(&([_]u8{ 0x0A, 0x00 } ++ huge)));
+    try std.testing.expectError(error.Truncated, decode(&([_]u8{ 0x1C, 0x00, 0x00 } ++ huge)));
 }
 
 test "empty NEW_TOKEN is a frame encoding error" {
