@@ -101,7 +101,7 @@ Runner = Callable[[int], None]
 _TMP = tempfile.TemporaryDirectory()
 
 
-def _make_cert() -> tuple[str, str]:
+def _make_cert() -> tuple[str, str, bytes, bytes]:
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, AUTHORITY.decode())])
     now = dt.datetime.now(dt.timezone.utc)
@@ -126,15 +126,26 @@ def _make_cert() -> tuple[str, str]:
             serialization.NoEncryption(),
         )
     )
-    return str(cert_path), str(key_path)
+    private_scalar = key.private_numbers().private_value.to_bytes(32, "big")
+    return str(cert_path), str(key_path), cert.public_bytes(serialization.Encoding.DER), private_scalar
 
 
 # -- zttp ---------------------------------------------------------------------
 
 
 def make_zttp(w: Workload) -> Runner:
-    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=AUTHORITY)
-    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+    _cert_path, _key_path, certificate, private_key = _make_cert()
+    client = zttp.Connection(
+        zttp.CLIENT,
+        protocol=zttp.HTTP3,
+        server_name=AUTHORITY,
+        server_certificate=certificate,
+    )
+    server = zttp.Connection(
+        zttp.SERVER,
+        protocol=zttp.HTTP3,
+        credentials=zttp.TlsCredentials(certificate=certificate, private_key_scalar=private_key),
+    )
     now = [1000]
 
     def transfer(src: zttp.H3Connection, dst: zttp.H3Connection) -> None:
@@ -178,7 +189,7 @@ def make_zttp(w: Workload) -> Runner:
 
 
 def make_aioquic(w: Workload) -> Runner:
-    cert_path, key_path = _make_cert()
+    cert_path, key_path, _certificate, _private_key = _make_cert()
     server_config = QuicConfiguration(is_client=False, alpn_protocols=["h3"])
     server_config.load_cert_chain(cert_path, key_path)
     client_config = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
