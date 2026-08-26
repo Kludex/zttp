@@ -1127,6 +1127,12 @@ pub const Connection = struct {
         return !st.isUni() or !self.isPeerInitiated(id);
     }
 
+    fn localStreamWasOpened(self: *const Connection, id: u64) bool {
+        if (self.isPeerInitiated(id)) return false;
+        const limit = if (stream.StreamType.of(id).isUni()) self.local_uni_streams else self.local_bidi_streams;
+        return id >> 2 < limit.opened;
+    }
+
     fn checkPeerStreamLimit(self: *Connection, id: u64) Error!void {
         if (!self.isPeerInitiated(id)) return;
         const st = stream.StreamType.of(id);
@@ -2833,6 +2839,7 @@ pub const Connection = struct {
     fn onStreamFrame(self: *Connection, id: u64, offset: u64, data: []const u8, fin: bool) Error!void {
         if (self.isRetired(id)) return; // a late frame for a completed-and-dropped stream
         if (!self.peerCanSendOn(id)) return error.StreamStateError;
+        if (!self.isPeerInitiated(id) and !self.localStreamWasOpened(id)) return error.StreamStateError;
         const existing = self.streams.get(id);
         const end = std.math.add(u64, offset, data.len) catch return error.FlowControlError;
         const old_high = if (existing) |s| s.highest_received else 0;
@@ -2861,6 +2868,7 @@ pub const Connection = struct {
     fn onReset(self: *Connection, id: u64, error_code: u64, final_size: u64) Error!void {
         if (self.isRetired(id)) return; // a reset for an already-completed-and-dropped stream
         if (!self.peerCanSendOn(id)) return error.StreamStateError;
+        if (!self.isPeerInitiated(id) and !self.localStreamWasOpened(id)) return error.StreamStateError;
         const s = try self.recvStream(id);
         const new_high = @max(s.highest_received, final_size);
         const delta = new_high - s.highest_received;
@@ -3261,6 +3269,36 @@ test "server decrypts a 1-RTT packet and reassembles a stream" {
     try conn.receiveDatagram(dgram, 1000);
     try testing.expectEqualStrings("hi", conn.streamData(0));
     try testing.expect(conn.streamFinished(0));
+}
+
+test "peer cannot use an unopened locally initiated stream" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x09 };
+
+    {
+        var client = try Connection.init(gpa, .client, &dcid);
+        defer client.deinit();
+        testInstallAppKeys(&client);
+        const datagram = try testBuildApp(gpa, &dcid, 0, &.{ 0x0A, 0x00, 0x01, 'x' });
+        defer gpa.free(datagram);
+
+        try testing.expectError(error.StreamStateError, client.receiveDatagram(datagram, 1000));
+        try testing.expectEqual(@as(u32, 0), client.streams.count());
+    }
+
+    {
+        var client = try Connection.init(gpa, .client, &dcid);
+        defer client.deinit();
+        testInstallAppKeys(&client);
+        var frames: std.ArrayListUnmanaged(u8) = .empty;
+        defer frames.deinit(gpa);
+        try frame.encodeResetStream(&frames, gpa, 0, 0, 0);
+        const datagram = try testBuildApp(gpa, &dcid, 0, frames.items);
+        defer gpa.free(datagram);
+
+        try testing.expectError(error.StreamStateError, client.receiveDatagram(datagram, 1000));
+        try testing.expectEqual(@as(u32, 0), client.streams.count());
+    }
 }
 
 test "client sends queued STREAM data in a 0-RTT long-header packet" {
@@ -5111,6 +5149,7 @@ test "consuming stream data advertises raised MAX_DATA and MAX_STREAM_DATA" {
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
     testInstallAppKeys(&conn);
+    try conn.sendStreamData(1, &.{}, false);
     conn.conn_recv_window.limit = 100; // a small window so consuming half trips the update
     conn.conn_recv_window.initial = 100;
     conn.local_tp.initial_max_stream_data_bidi_local = 100; // stream 1 is server-bidi
@@ -5904,6 +5943,7 @@ test "a STOP_SENDING before the send stream exists still resets it" {
     var peer = try Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
     testInstallAppKeys(&peer);
+    try peer.sendStreamData(0, &.{}, false);
     try deliverAllExcept(&server, &peer, null, 3000);
     try testing.expect(peer.streamReset(0));
     try testing.expectEqualStrings("", peer.streamData(0)); // no data, just the reset
