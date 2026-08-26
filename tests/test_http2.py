@@ -758,6 +758,17 @@ def _request_block(*extra: tuple[bytes, bytes], method: bytes = b"GET") -> bytes
     return block
 
 
+def test_h2_rejects_conflicting_authority_and_host() -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, _request_block((b"host", b"other.example"))))
+
+    events = list(drain_h2(conn))
+
+    assert not any(isinstance(event, zttp.Request) for event in events)
+    reset = next(event for event in events if isinstance(event, zttp.RstStream))
+    assert reset.stream_id == 1
+    assert reset.error_code == 0x01
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -797,6 +808,14 @@ def test_h2_rejects_an_invalid_method(method: bytes) -> None:
     reset = next(event for event in events if isinstance(event, zttp.RstStream))
     assert reset.stream_id == 1
     assert reset.error_code == 0x01
+
+
+def test_h2_emits_one_host_for_matching_authority_and_host() -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, _request_block((b"host", b"x"))))
+
+    request = next(event for event in drain_h2(conn) if isinstance(event, zttp.Request))
+
+    assert sum(1 for name, value in request.headers if name == b"host" and value == b"x") == 1
 
 
 def test_h2_bodyless_request_with_content_length_is_reset() -> None:
