@@ -70,8 +70,8 @@ recursion, owned-copy event payloads) apply across all three.
 
 - **Content-Length + Transfer-Encoding together** → rejected outright
   (`framing.zig`), rather than the weaker "Transfer-Encoding wins, strip CL".
-- **Conflicting duplicate Content-Length** → rejected; identical duplicates are
-  accepted (RFC-permitted, unambiguous).
+- **Conflicting duplicate Content-Length** → field values must match byte-for-byte.
+  The parser accepts identical duplicates, but the writer never emits duplicates.
 - **Transfer-Encoding folding** → all `Transfer-Encoding` field-lines are combined
   into one ordered list; `chunked` must appear exactly once and be the final
   coding. `chunked, gzip`, `chunked` twice, or split across lines → rejected.
@@ -254,9 +254,10 @@ materialized.
 
 The QUIC transport (RFC 9000/9001/9002) - handshake, packet protection,
 amplification limits, loss recovery, and flow control - is in scope and held to
-the strict-reject bar, but its threat surface is broad and has had far less
-adversarial exposure than the H1/H2 paths. Treat HTTP/3 as experimental from a
-security standpoint.
+the strict-reject bar. HTTP/3 clients pin the exact server certificate or raw
+P-256 public key before accepting its TLS flight. The transport's threat surface
+is broad and has had far less adversarial exposure than the H1/H2 paths. Treat
+HTTP/3 as experimental from a security standpoint.
 
 ## Integrator responsibilities
 

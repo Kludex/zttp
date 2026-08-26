@@ -212,6 +212,14 @@ pub const Connection = struct {
         return e;
     }
 
+    /// Poison the connection after an adapter resource failure consumed an event.
+    pub fn poisonResourceFailure(self: *Connection) void {
+        if (self.phase == .failed) return;
+        self.phase = .failed;
+        self.failed_with = error.MessageTooLong;
+        self.goaway_owed = .enhance_your_calm;
+    }
+
     /// Produce the next event, or `.need_data`. A connection error poisons the
     /// engine: it is latched and re-raised on every later call (as H1 does). The
     /// first failure records the GOAWAY code in goaway_owed (RFC 9113 5.4.1); the
@@ -423,6 +431,9 @@ pub const Connection = struct {
         // Connection-window accounting against the FULL frame payload length.
         if (@as(i64, self.conn_recv_window) - @as(i64, f.header.length) < 0) return error.FlowControlError;
         self.conn_recv_window -= @intCast(f.header.length);
+        // Return connection credit even when stream validation later discards the payload.
+        self.conn_recv_window += @intCast(f.header.length);
+        self.conn_recv_credit +|= f.header.length;
 
         const s = self.streams.getPtr(f.header.stream_id) orelse {
             // No live stream: an idle id (never opened) is a connection error;
@@ -447,10 +458,7 @@ pub const Connection = struct {
             return;
         }
         s.recordData(content.len);
-        // Refill the receive windows immediately (the data is surfaced now) and
-        // accumulate the consumed length to advertise back via WINDOW_UPDATE.
-        self.conn_recv_window += @intCast(f.header.length);
-        self.conn_recv_credit +|= f.header.length;
+        // Refill the stream receive window immediately because the data is surfaced now.
         s.creditRecvWindow(f.header.length);
         // A response the request marked bodyless (HEAD, or a 204/304) must carry no
         // DATA; surfacing a body here would let a proxy forward one where none is
@@ -719,7 +727,7 @@ pub const Connection = struct {
             if (h.name[0] == ':') {
                 if (seen_regular) return error.Malformed; // pseudo after regular
                 if (eql(h.name, ":method")) {
-                    if (method != null) return error.Malformed;
+                    if (method != null or !fields.isValidToken(h.value)) return error.Malformed;
                     method = h.value;
                 } else if (eql(h.name, ":path")) {
                     if (path != null) return error.Malformed;
@@ -1468,6 +1476,17 @@ test "a fatal feed (max_buffer breach) poisons the connection and owes a GOAWAY"
     // A later feed re-raises the latched error without re-arming a GOAWAY.
     try testing.expectError(error.MessageTooLong, c.feed("more"));
     try testing.expectEqual(@as(?ErrorCode, null), c.takeGoAwayOwed());
+}
+
+test "an adapter resource failure poisons the connection" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+
+    c.poisonResourceFailure();
+
+    try testing.expectError(error.MessageTooLong, c.nextEvent());
+    try testing.expectError(error.MessageTooLong, c.nextEvent());
+    try testing.expectEqual(@as(?ErrorCode, .enhance_your_calm), c.takeGoAwayOwed());
 }
 
 test "localSettingsParams advertises the enforced limits" {
