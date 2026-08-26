@@ -44,6 +44,7 @@ class ClientConfig(TypedDict):
     connection_id: bytes
     alpn: bytes
     server_name: bytes
+    server_certificate: bytes
 
 
 class ResumedClientConfig(ClientConfig, total=False):
@@ -84,6 +85,7 @@ CLIENT_CONFIG: ResumedClientConfig = {
     "connection_id": b"\x11\x22\x33\x44",
     "alpn": b"h3",
     "server_name": b"example.test",
+    "server_certificate": SERVER_PUBLIC_KEY,
 }
 
 
@@ -359,16 +361,29 @@ def test_http3_validation_token_is_client_only() -> None:
         )
 
 
-def test_http3_client_defaults_transport_settings_and_connection_id() -> None:
-    conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
-    datagrams = conn.data_to_send()
-    assert len(datagrams) == 1
-    assert len(datagrams[0]) == 1200
-
-
-def test_http3_default_client_and_server_exchange_request() -> None:
+def test_http3_client_without_a_server_certificate_rejects_the_handshake() -> None:
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
-    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+    server = make_server()
+
+    assert transfer(client, server, 1000)
+    with pytest.raises(zttp.RemoteProtocolError):
+        transfer(server, client, 2000)
+
+
+def test_http3_client_rejects_an_unpinned_server_certificate() -> None:
+    config = CLIENT_CONFIG.copy()
+    config["server_certificate"] = b"other certificate"
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
+    server = make_server()
+
+    assert transfer(client, server, 1000)
+    with pytest.raises(zttp.RemoteProtocolError):
+        transfer(server, client, 2000)
+
+
+def test_http3_pinned_client_and_server_exchange_request() -> None:
+    client = make_client()
+    server = make_server()
 
     assert transfer(client, server, 1000)
     assert transfer(server, client, 2000)
@@ -1518,7 +1533,7 @@ def test_request_key_update_applies_to_next_http3_packet() -> None:
     assert req.path == b"/key-update"
 
 
-def test_disable_active_migration_rejects_new_peer_address_after_handshake() -> None:
+def test_disable_active_migration_drops_new_peer_address_after_handshake() -> None:
     client = make_client()
     config = SERVER_CONFIG.copy()
     transport_params = SERVER_CONFIG["transport_params"].copy()
@@ -1536,11 +1551,15 @@ def test_disable_active_migration_rejects_new_peer_address_after_handshake() -> 
         server.receive_datagram(dgram, 3000, addr_a)
     server.data_to_send()
 
-    client.send_request(b"GET", b"/moved", b"3", [(b"host", b"example.test")])
-    with pytest.raises(zttp.RemoteProtocolError):
-        server.receive_datagram(client.data_to_send()[0], 4000, addr_b)
-    assert server.is_closed() is True
-    assert server.data_to_send()
+    server.receive_datagram(b"spoofed", 4000, addr_b)
+    assert server.is_closed() is False
+
+    client.send_request(b"GET", b"/original-path", b"3", [(b"host", b"example.test")])
+    for datagram in client.data_to_send():
+        server.receive_datagram(datagram, 5000, addr_a)
+
+    request = next(event for event in drain_events(server) if isinstance(event, zttp.Request))
+    assert request.path == b"/original-path"
 
 
 def test_receive_datagram_peer_address_must_be_bytes() -> None:

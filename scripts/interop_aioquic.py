@@ -136,6 +136,9 @@ def obfuscated_ticket_age(age_add: int, issued_at: int, now: int) -> int:
 
 def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
     cert_path, key_path = make_cert_chain(tmp)
+    server_certificate = x509.load_pem_x509_certificate(cert_path.read_bytes()).public_bytes(
+        serialization.Encoding.DER
+    )
     server_config = QuicConfiguration(is_client=False, alpn_protocols=["h3"])
     server_config.load_cert_chain(str(cert_path), str(key_path))
     issued_tickets: list[object] = []
@@ -150,6 +153,7 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
         connection_id=dcid,
         alpn=b"h3",
         server_name=b"localhost",
+        server_certificate=server_certificate,
     )
 
     client_initial = client.data_to_send()[0]
@@ -193,6 +197,7 @@ def assert_zttp_client_to_aioquic_server(tmp: Path) -> None:
         connection_id=b"\x11\x22\x33\x45",
         alpn=b"h3",
         server_name=b"localhost",
+        server_certificate=server_certificate,
         resumption=zttp.SessionResumption(identity=ticket.ticket, psk=ticket.psk),
         obfuscated_ticket_age=obfuscated_ticket_age(ticket.age_add, 3_000, 10_000),
         early_data=True,
@@ -680,6 +685,9 @@ def assert_aioquic_client_to_zttp_server() -> None:
 
 def assert_udp_loopback_zttp_client_to_aioquic_server(tmp: Path, drop_first_server_datagram: bool = False) -> None:
     cert_path, key_path = make_cert_chain(tmp)
+    server_certificate = x509.load_pem_x509_certificate(cert_path.read_bytes()).public_bytes(
+        serialization.Encoding.DER
+    )
     server_config = QuicConfiguration(is_client=False, alpn_protocols=["h3"])
     server_config.load_cert_chain(str(cert_path), str(key_path))
 
@@ -692,6 +700,7 @@ def assert_udp_loopback_zttp_client_to_aioquic_server(tmp: Path, drop_first_serv
         connection_id=b"\x11\x22\x33\x46",
         alpn=b"h3",
         server_name=b"localhost",
+        server_certificate=server_certificate,
     )
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
