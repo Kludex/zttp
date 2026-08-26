@@ -8,4 +8,3 @@
 - For relevant HTTP behavior changes, add `## Other HTTP Parsers` with a `Parser | Language | Behavior | Reference` table. Link exact evidence.
 - Omit `## Other HTTP Parsers` when the comparison is not useful.
 - Do not include a `## Tests` section.
-- End with `## AI Disclaimer` and: `This PR was developed with the assistance of either Claude or Codex. I've reviewed and verified the changes.`
