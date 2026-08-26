@@ -1123,7 +1123,10 @@ pub const Connection = struct {
             }
         }
         const method_v = method orelse return self.failStream(.message_error);
-        if (method_v.len == 0) return self.failStream(.message_error);
+        if (!fields.isValidToken(method_v)) return self.failStream(.message_error);
+        if (authority) |auth| {
+            if (auth.len == 0 or std.mem.indexOfAny(u8, auth, " \t") != null) return self.failStream(.message_error);
+        }
         if (eql(method_v, "HEAD")) self.send_bodyless.put(self.gpa, id, {}) catch return error.OutOfMemory;
         const target_v = if (eql(method_v, "CONNECT")) blk: {
             if (path != null or scheme != null) return self.failStream(.message_error);
@@ -1413,12 +1416,13 @@ pub const Connection = struct {
         defer section.deinit(self.gpa);
         var all: std.ArrayList(Header) = .empty;
         defer all.deinit(self.gpa);
-        try validateSendValue(method);
-        if (method.len == 0) return error.H3Error;
+        if (!fields.isValidToken(method)) return error.H3Error;
         all.append(self.gpa, .{ .name = ":method", .value = method }) catch return error.OutOfMemory;
         const effective_authority = if (eql(method, "CONNECT") and authority.len == 0) target else authority;
+        if (effective_authority.len == 0 or std.mem.indexOfAny(u8, effective_authority, " \t") != null) {
+            return error.H3Error;
+        }
         if (eql(method, "CONNECT")) {
-            if (effective_authority.len == 0) return error.H3Error;
             if (authority.len > 0 and target.len > 0 and !eql(authority, target)) return error.H3Error;
             try validateSendValue(effective_authority);
             all.append(self.gpa, .{ .name = ":authority", .value = effective_authority }) catch return error.OutOfMemory;
@@ -1900,6 +1904,18 @@ fn pumpHeaders(gpa: std.mem.Allocator, qpack_block: []const u8) Error!bool {
     qc.receiveDatagram(dgram, 1000) catch return error.H3Error;
     try h3.pump(0);
     return h3.nextEvent() == .request;
+}
+
+test "a request method containing spaces is malformed" {
+    const block = [_]u8{ 0x00, 0x00, 0x27, 0x00 } ++ ":method".* ++ [_]u8{0x13} ++
+        "GET /admin HTTP/1.1".* ++ [_]u8{ 0xC0 | 23, 0xC0 | 1 };
+    try testing.expect(!try pumpHeaders(testing.allocator, &block));
+}
+
+test "a request authority containing spaces is malformed" {
+    const block = [_]u8{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1, 0x50, 0x16 } ++
+        "a.example evil.example".*;
+    try testing.expect(!try pumpHeaders(testing.allocator, &block));
 }
 
 test "a duplicate request pseudo-header is malformed" {
@@ -3245,9 +3261,12 @@ test "client request send validates HTTP/3 fields" {
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
+    try testing.expectError(error.H3Error, h3.sendRequest("GET /admin", "/", "https", "example.test", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/bad\r\nx", "https", "example.test", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https\r\nx", "example.test", &.{}, true));
+    try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", " example.test", &.{}, true));
+    try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "example .test", &.{}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "example.test", &.{.{ .name = "X-Bad", .value = "x" }}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("GET", "/", "https", "example.test", &.{.{ .name = "connection", .value = "close" }}, true));
     try testing.expectError(error.H3Error, h3.sendRequest("POST", "/", "https", "example.test", &.{.{ .name = "content-length", .value = "x" }}, false));
