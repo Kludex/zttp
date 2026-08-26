@@ -20,6 +20,10 @@ const hpack_encoder = core.h2.hpack_encoder;
 const HpackDecoder = core.h2.hpack_decoder.Decoder;
 const qpack_encoder = core.h3.qpack_encoder;
 const QpackDecoder = core.h3.qpack_decoder.Decoder;
+const quic_frame = core.quic.frame;
+const h3_frame = core.h3.frame;
+const quic_conn = core.quic.connection;
+const h3_conn = core.h3.connection;
 
 fn drive(input: []const u8) void {
     inline for (.{ Role.server, Role.client }) |role| {
@@ -141,21 +145,87 @@ fn driveQpackRoundtrip(input: []const u8) void {
     std.debug.assert(headersEqual(headers, out));
 }
 
+// Walk the mutated bytes as a run of QUIC transport frames, the packet payload a
+// receiver decrypts and parses. `decode` is the bounded, no-panic entry the
+// datagram path funnels every frame through; a truncated tail just ends the walk.
+fn driveQuicFrame(input: []const u8) void {
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const d = quic_frame.decode(input[pos..]) catch break;
+        if (d.len == 0) break; // never advance zero - a malformed run must terminate
+        pos += d.len;
+    }
+}
+
+// The same over the HTTP/3 frame layer, which reads the ordered bytes a request or
+// control stream carries. `decode` reports the consumed length; a NeedData tail
+// (an incomplete frame) ends the walk, as it would mid-stream.
+fn driveH3Frame(input: []const u8) void {
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const d = h3_frame.decode(input[pos..]) catch break;
+        if (d.len == 0) break;
+        pos += d.len;
+    }
+}
+
+// Drive the HTTP/3 connection state machine end to end: wrap the mutated bytes in
+// a QUIC STREAM frame, seal them into a 1-RTT packet with the test application
+// keys, and hand the datagram to a server connection - so arbitrary bytes reach
+// the real stream-typing, frame, and QPACK machinery behind `pumpAll`, not just an
+// isolated decoder. The first body byte picks the stream (a request stream, or a
+// control/push/QPACK unidirectional stream) so one corpus exercises every role.
+fn driveH3Conn(input: []const u8) void {
+    const gpa = std.heap.c_allocator;
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var qc = quic_conn.Connection.init(gpa, .server, &dcid) catch return;
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc); // 1-RTT data rides the Application space
+    var h3 = h3_conn.Connection.init(gpa, &qc);
+    defer h3.deinit();
+
+    // Client-initiated streams: 0 (request bidi), plus the unidirectional 2/6/10
+    // (control, push, QPACK encoder/decoder) whose first byte is the stream type.
+    const stream_ids = [_]u64{ 0, 4, 2, 6, 10 };
+    const sid = stream_ids[if (input.len == 0) 0 else input[0] % stream_ids.len];
+    const payload = if (input.len == 0) input else input[1..];
+
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(gpa);
+    quic_frame.encodeStream(&frames, gpa, sid, 0, payload, true) catch return;
+
+    const dgram = quic_conn.testBuildApp(gpa, &dcid, 0, frames.items) catch return;
+    defer gpa.free(dgram);
+    qc.receiveDatagram(dgram, 1000) catch return;
+    h3.pumpAll() catch {};
+    for (0..input.len + 4) |_| {
+        switch (h3.nextEvent()) {
+            .need_data, .connection_closed => break,
+            else => {},
+        }
+    }
+}
+
 export fn zttp_fuzz_drive(data: [*]const u8, size: usize) callconv(.c) void {
     const input = data[0..size];
-    // The low 2 bits of the first byte select the target so one corpus exercises
-    // every surface (H1 read, H2 read, HPACK and QPACK encode->decode); the rest
-    // is the mutated body. No build wiring changes: the `.fuzz` instrumentation
-    // already covers the whole `core` import.
+    // The low 3 bits of the first byte select the target so one corpus exercises
+    // every surface (H1 read, H2 read, HPACK and QPACK encode->decode, the QUIC and
+    // HTTP/3 frame decoders, and the HTTP/3 connection); the rest is the mutated
+    // body. No build wiring changes: the `.fuzz` instrumentation already covers the
+    // whole `core` import.
     if (input.len == 0) {
         drive(input);
         return;
     }
     const body = input[1..];
-    switch (@as(u2, @truncate(input[0]))) {
+    switch (@as(u3, @truncate(input[0]))) {
         0 => drive(body),
         1 => driveH2(body),
         2 => driveHpackRoundtrip(body),
         3 => driveQpackRoundtrip(body),
+        4 => driveQuicFrame(body),
+        5 => driveH3Frame(body),
+        6 => driveH3Conn(body),
+        7 => driveH3Conn(body), // 7 of 8 slots used; H3-conn double-weighted (widest surface)
     }
 }
