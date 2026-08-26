@@ -95,6 +95,7 @@ pub const Analyzer = struct {
     transfer_encoding: TransferEncoding = .{},
     has_transfer_encoding: bool = false,
     content_length: ?u64 = null,
+    content_length_value: ?[]const u8 = null,
 
     pub fn add(self: *Analyzer, h: Header) ParseError!void {
         if (eqIgnoreCase(h.name, "transfer-encoding")) {
@@ -102,10 +103,11 @@ pub const Analyzer = struct {
             self.transfer_encoding.add(h.value);
         } else if (eqIgnoreCase(h.name, "content-length")) {
             const n = try parseContentLength(h.value);
-            if (self.content_length) |prev| {
-                if (prev != n) return error.InvalidFraming;
+            if (self.content_length_value) |previous| {
+                if (!std.mem.eql(u8, previous, h.value)) return error.InvalidFraming;
             }
             self.content_length = n;
+            self.content_length_value = h.value;
         }
     }
 
@@ -204,6 +206,14 @@ test "conflicting duplicate content-length rejected" {
     const h = [_]Header{
         .{ .name = "Content-Length", .value = "10" },
         .{ .name = "Content-Length", .value = "20" },
+    };
+    try std.testing.expectError(error.InvalidFraming, determine(&h, .{}));
+}
+
+test "numerically equal content-length values must match textually" {
+    const h = [_]Header{
+        .{ .name = "Content-Length", .value = "010" },
+        .{ .name = "Content-Length", .value = "10" },
     };
     try std.testing.expectError(error.InvalidFraming, determine(&h, .{}));
 }
