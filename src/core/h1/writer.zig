@@ -187,7 +187,7 @@ fn hasHeader(hdrs: []const Header, name: []const u8) bool {
 /// Refuse to serialize ambiguous framing - the send-side mirror of the reader's
 /// smuggling guards. A message carrying both Transfer-Encoding and
 /// Content-Length, multiple Transfer-Encoding fields, unsupported TE codings, or
-/// conflicting duplicate Content-Lengths would let a downstream parser disagree
+/// duplicate Content-Lengths would let a downstream parser disagree
 /// about message boundaries (response splitting).
 fn validateFraming(hdrs: []const Header) WriteError!void {
     var has_te = false;
@@ -202,9 +202,7 @@ fn validateFraming(hdrs: []const Header) WriteError!void {
         } else if (eqIgnoreCase(h.name, "content-length")) {
             const v = trimOws(h.value);
             if (ascii.parseDecimal(u64, v) == null) return error.InvalidField; // non-empty digits, no overflow
-            if (content_length) |prev| {
-                if (!eqIgnoreCase(prev, v)) return error.InvalidField; // conflicting duplicate
-            }
+            if (content_length != null) return error.InvalidField;
             content_length = v;
         }
     }
@@ -770,6 +768,16 @@ test "send rejects conflicting duplicate Content-Length" {
     const h = [_]Header{
         .{ .name = "Content-Length", .value = "5" },
         .{ .name = "Content-Length", .value = "6" },
+    };
+    try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
+}
+
+test "send rejects identical duplicate Content-Length" {
+    var wr = Writer.init(t.allocator);
+    defer wr.deinit();
+    const h = [_]Header{
+        .{ .name = "Content-Length", .value = "5" },
+        .{ .name = "Content-Length", .value = "5" },
     };
     try t.expectError(error.InvalidField, wr.sendResponse("1.1", 200, "OK", &h, "GET"));
 }
