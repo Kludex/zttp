@@ -345,6 +345,7 @@ pub const Connection = struct {
     remembered_peer_tp: ?transport_params.TransportParameters = null,
     peer_scid_set: bool = false, // have we adopted the peer's scid from its first long header?
     initial_authenticated: bool = false,
+    peer_packet_authenticated: bool = false,
     handshake_confirmed: bool = false, // the client Finished verified; HANDSHAKE_DONE sent
     /// The connection-level recv window grew enough to advertise a new MAX_DATA
     /// (RFC 9000 4.1); flushSend emits it so the peer is not stalled at its grant.
@@ -2308,6 +2309,7 @@ pub const Connection = struct {
 
     fn receiveVersionNegotiation(self: *Connection, prefix: packet.LongPrefix, buf: []const u8) Error!usize {
         if (self.role != .client) return error.Dropped;
+        if (self.peer_packet_authenticated or self.retried) return buf.len;
         // VN is only valid if it is addressed to our source CID and names the peer's
         // CID as its source. Otherwise it is not for this connection.
         if (!std.mem.eql(u8, prefix.dcid, self.scid)) return error.Dropped;
@@ -2452,6 +2454,7 @@ pub const Connection = struct {
             try self.openPacket(pkt, pn_offset, space, long, st.recv_keys orelse return error.Dropped, null);
         defer self.gpa.free(opened.work);
         defer self.gpa.free(opened.plaintext);
+        self.peer_packet_authenticated = true;
         if (space == .initial) self.initial_authenticated = true;
         if (space == .application and !long) st.zero_rtt_recv_keys = null;
 
@@ -5501,6 +5504,31 @@ test "client fails when Version Negotiation offers no supported version" {
 
     try testing.expectError(error.ProtocolViolation, client.receiveDatagram(vn.items, 1000));
     try testing.expect(client.closed);
+}
+
+test "client ignores Version Negotiation after authenticating a peer packet" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xed, 0xee, 0xef, 0xf0 };
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+    testInstallAppKeys(&client);
+
+    const authenticated = try testBuildApp(gpa, &dcid, 0, &([_]u8{0x01} ++ [_]u8{0x00} ** 19));
+    defer gpa.free(authenticated);
+    try client.receiveDatagram(authenticated, 1000);
+
+    var vn: std.ArrayListUnmanaged(u8) = .empty;
+    defer vn.deinit(gpa);
+    try vn.append(gpa, constants.HEADER_FORM_LONG | constants.FIXED_BIT);
+    try vn.appendSlice(gpa, &.{ 0, 0, 0, 0 });
+    try vn.append(gpa, @intCast(client.scid.len));
+    try vn.appendSlice(gpa, client.scid);
+    try vn.append(gpa, @intCast(client.peer_scid.len));
+    try vn.appendSlice(gpa, client.peer_scid);
+    try vn.appendSlice(gpa, &.{ 0x0a, 0x0a, 0x0a, 0x0a });
+
+    try client.receiveDatagram(vn.items, 2000);
+    try testing.expect(!client.closed);
 }
 
 test "the client Finished confirms the handshake and discards the early spaces" {
