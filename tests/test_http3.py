@@ -44,6 +44,7 @@ class ClientConfig(TypedDict):
     connection_id: bytes
     alpn: bytes
     server_name: bytes
+    server_certificate: bytes
 
 
 class ResumedClientConfig(ClientConfig, total=False):
@@ -84,6 +85,7 @@ CLIENT_CONFIG: ResumedClientConfig = {
     "connection_id": b"\x11\x22\x33\x44",
     "alpn": b"h3",
     "server_name": b"example.test",
+    "server_certificate": SERVER_PUBLIC_KEY,
 }
 
 
@@ -359,16 +361,29 @@ def test_http3_validation_token_is_client_only() -> None:
         )
 
 
-def test_http3_client_defaults_transport_settings_and_connection_id() -> None:
-    conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
-    datagrams = conn.data_to_send()
-    assert len(datagrams) == 1
-    assert len(datagrams[0]) == 1200
-
-
-def test_http3_default_client_and_server_exchange_request() -> None:
+def test_http3_client_without_a_server_certificate_rejects_the_handshake() -> None:
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, server_name=b"example.test")
-    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP3)
+    server = make_server()
+
+    assert transfer(client, server, 1000)
+    with pytest.raises(zttp.RemoteProtocolError):
+        transfer(server, client, 2000)
+
+
+def test_http3_client_rejects_an_unpinned_server_certificate() -> None:
+    config = CLIENT_CONFIG.copy()
+    config["server_certificate"] = b"other certificate"
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **config)
+    server = make_server()
+
+    assert transfer(client, server, 1000)
+    with pytest.raises(zttp.RemoteProtocolError):
+        transfer(server, client, 2000)
+
+
+def test_http3_pinned_client_and_server_exchange_request() -> None:
+    client = make_client()
+    server = make_server()
 
     assert transfer(client, server, 1000)
     assert transfer(server, client, 2000)
