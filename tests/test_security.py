@@ -150,7 +150,8 @@ def test_start_next_cycle_cannot_unpoison_after_error() -> None:
     conn.receive_data(b"GET / HTTP/1.1\nX: 1\n\nGET /smuggled HTTP/1.1\r\nHost: y\r\n\r\n")
     with pytest.raises(zttp.RemoteProtocolError):
         drain_all(conn)
-    conn.start_next_cycle()
+    with pytest.raises(zttp.LocalProtocolError, match="before the current message is complete"):
+        conn.start_next_cycle()
     with pytest.raises(zttp.RemoteProtocolError):
         conn.next_event()
 
