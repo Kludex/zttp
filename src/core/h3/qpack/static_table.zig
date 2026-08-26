@@ -5,6 +5,8 @@
 
 const std = @import("std");
 
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
 pub const Entry = struct { name: []const u8, value: []const u8 };
 
 /// RFC 9204 appendix A, indices 0-98.
@@ -131,6 +133,27 @@ pub fn nameIndex(name: []const u8) ?usize {
         if (std.mem.eql(u8, e.name, name)) return i;
     }
     return null;
+}
+
+test "static table matches RFC 9204 appendix A" {
+    // Entries are serialized in index order as name + NUL + value + NUL.
+    const expected = [_]u8{
+        0x2f, 0x57, 0x57, 0xc3, 0x7c, 0xec, 0x2b, 0xf4,
+        0x6c, 0x4d, 0x9d, 0x85, 0x69, 0xfc, 0x52, 0xa3,
+        0x89, 0x41, 0x42, 0xfe, 0x31, 0x1d, 0x07, 0xdc,
+        0xf6, 0xbd, 0x20, 0xcd, 0x17, 0xf0, 0x4d, 0x3e,
+    };
+    var hasher = Sha256.init(.{});
+    for (TABLE) |entry| {
+        hasher.update(entry.name);
+        hasher.update(&.{0});
+        hasher.update(entry.value);
+        hasher.update(&.{0});
+    }
+    var actual: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&actual);
+
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
 }
 
 test "the table has the RFC 9204 appendix A length" {

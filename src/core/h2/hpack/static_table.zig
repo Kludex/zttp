@@ -5,6 +5,8 @@
 
 const std = @import("std");
 
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
 pub const Entry = struct { name: []const u8, value: []const u8 };
 
 pub const LENGTH: usize = 61;
@@ -81,6 +83,27 @@ pub fn lookup(index: usize) ?Entry {
 }
 
 const testing = std.testing;
+
+test "static table matches python-hpack 4.1.0" {
+    // HeaderTable.STATIC_TABLE, serialized as name + NUL + value + NUL.
+    const expected = [_]u8{
+        0xbc, 0xb7, 0x87, 0x46, 0x5f, 0x10, 0xf8, 0x7a,
+        0xa1, 0x6f, 0x8f, 0x17, 0x00, 0x70, 0xc3, 0x27,
+        0xc6, 0x7f, 0x17, 0x41, 0x11, 0x3c, 0x1a, 0xd4,
+        0x4a, 0xeb, 0xd1, 0xd7, 0x16, 0xb0, 0x97, 0x26,
+    };
+    var hasher = Sha256.init(.{});
+    for (TABLE) |entry| {
+        hasher.update(entry.name);
+        hasher.update(&.{0});
+        hasher.update(entry.value);
+        hasher.update(&.{0});
+    }
+    var actual: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&actual);
+
+    try testing.expectEqualSlices(u8, &expected, &actual);
+}
 
 test "static table has exactly 61 entries" {
     try testing.expectEqual(@as(usize, 61), TABLE.len);

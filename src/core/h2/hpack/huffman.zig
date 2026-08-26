@@ -7,6 +7,8 @@
 
 const std = @import("std");
 
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
 pub const HuffError = error{
     /// Padding longer than 7 bits, padding that is not all-ones, or an embedded
     /// EOS symbol (256) - all malformed per RFC 7541 5.2.
@@ -236,6 +238,27 @@ inline fn matchSymbol(acc: u32, nbits: u5) ?u16 {
 }
 
 const testing = std.testing;
+
+test "code table matches python-hpack 4.1.0" {
+    // REQUEST_CODES and REQUEST_CODES_LENGTH, serialized as big-endian u32 + u8.
+    const expected = [_]u8{
+        0x2c, 0xdc, 0x4c, 0x6f, 0xb1, 0xcc, 0x0a, 0xb4,
+        0x43, 0x43, 0xa2, 0x95, 0xf7, 0x3f, 0x5f, 0xf7,
+        0x80, 0xa0, 0x52, 0xd3, 0x09, 0xbd, 0xdf, 0x8f,
+        0x9c, 0xd2, 0x7f, 0x1e, 0x3d, 0xe8, 0xe6, 0x69,
+    };
+    var hasher = Sha256.init(.{});
+    for (CODES) |sym| {
+        var code: [4]u8 = undefined;
+        std.mem.writeInt(u32, &code, sym.code, .big);
+        hasher.update(&code);
+        hasher.update(&.{sym.bits});
+    }
+    var actual: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&actual);
+
+    try testing.expectEqualSlices(u8, &expected, &actual);
+}
 
 fn decodeAlloc(src: []const u8) ![]u8 {
     var buf: [256]u8 = undefined;
