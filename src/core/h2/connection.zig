@@ -212,6 +212,14 @@ pub const Connection = struct {
         return e;
     }
 
+    /// Poison the connection after an adapter resource failure consumed an event.
+    pub fn poisonResourceFailure(self: *Connection) void {
+        if (self.phase == .failed) return;
+        self.phase = .failed;
+        self.failed_with = error.MessageTooLong;
+        self.goaway_owed = .enhance_your_calm;
+    }
+
     /// Produce the next event, or `.need_data`. A connection error poisons the
     /// engine: it is latched and re-raised on every later call (as H1 does). The
     /// first failure records the GOAWAY code in goaway_owed (RFC 9113 5.4.1); the
@@ -1468,6 +1476,17 @@ test "a fatal feed (max_buffer breach) poisons the connection and owes a GOAWAY"
     // A later feed re-raises the latched error without re-arming a GOAWAY.
     try testing.expectError(error.MessageTooLong, c.feed("more"));
     try testing.expectEqual(@as(?ErrorCode, null), c.takeGoAwayOwed());
+}
+
+test "an adapter resource failure poisons the connection" {
+    var c = Connection.init(testing.allocator, .server);
+    defer c.deinit();
+
+    c.poisonResourceFailure();
+
+    try testing.expectError(error.MessageTooLong, c.nextEvent());
+    try testing.expectError(error.MessageTooLong, c.nextEvent());
+    try testing.expectEqual(@as(?ErrorCode, .enhance_your_calm), c.takeGoAwayOwed());
 }
 
 test "localSettingsParams advertises the enforced limits" {
