@@ -141,9 +141,10 @@ pub const Decoder = struct {
         if (ric > self.insert_count) return error.Blocked;
         self.last_required_insert_count = ric;
         const base = if (sign) blk: {
-            if (delta + 1 > ric) return error.DecompressionFailed;
-            break :blk ric - delta - 1;
-        } else ric + delta;
+            const distance = std.math.add(u64, delta, 1) catch return error.DecompressionFailed;
+            if (distance > ric) return error.DecompressionFailed;
+            break :blk ric - distance;
+        } else std.math.add(u64, ric, delta) catch return error.DecompressionFailed;
 
         var section_size: usize = 0;
         while (p.pos < block.len) {
@@ -199,13 +200,13 @@ pub const Decoder = struct {
 
     fn indexedPostBase(self: *Decoder, p: *Parser, base: u64, section_size: *usize) Error!void {
         const index = try p.integer(4);
-        const entry = self.dynamicPostBase(index, base) orelse return error.BadIndex;
+        const entry = (try self.dynamicPostBase(index, base)) orelse return error.BadIndex;
         try self.emit(try self.intern(entry.name), try self.intern(entry.value), section_size);
     }
 
     fn literalPostBaseNameRef(self: *Decoder, p: *Parser, base: u64, section_size: *usize) Error!void {
         const index = try p.integer(3);
-        const entry = self.dynamicPostBase(index, base) orelse return error.BadIndex;
+        const entry = (try self.dynamicPostBase(index, base)) orelse return error.BadIndex;
         const value = try self.string(p, 7);
         try self.emit(try self.intern(entry.name), value, section_size);
     }
@@ -252,11 +253,12 @@ pub const Decoder = struct {
     fn insertDynamic(self: *Decoder, name: []const u8, value: []const u8) Error!void {
         const size = name.len + value.len + 32;
         if (size > self.dynamic_capacity) return error.DecompressionFailed;
-        self.evictUntilFits(size);
+        // The source may borrow the dynamic entry that eviction frees.
         const name_copy = self.gpa.dupe(u8, name) catch return error.OutOfMemory;
         errdefer self.gpa.free(name_copy);
         const value_copy = self.gpa.dupe(u8, value) catch return error.OutOfMemory;
         errdefer self.gpa.free(value_copy);
+        self.evictUntilFits(size);
         self.dynamic.append(self.gpa, .{ .name = name_copy, .value = value_copy, .size = size, .abs = self.insert_count }) catch return error.OutOfMemory;
         self.dynamic_size += size;
         self.insert_count += 1;
@@ -305,8 +307,9 @@ pub const Decoder = struct {
         return self.dynamicAbsolute(base - index - 1);
     }
 
-    fn dynamicPostBase(self: *const Decoder, index: u64, base: u64) ?DynamicEntry {
-        return self.dynamicAbsolute(base + index);
+    fn dynamicPostBase(self: *const Decoder, index: u64, base: u64) Error!?DynamicEntry {
+        const absolute = std.math.add(u64, base, index) catch return error.DecompressionFailed;
+        return self.dynamicAbsolute(absolute);
     }
 
     fn dynamicAbsolute(self: *const Decoder, abs: u64) ?DynamicEntry {
@@ -520,6 +523,24 @@ test "decode a dynamic relative indexed field after encoder insert literal" {
     try testing.expectEqualStrings("y", hs[0].value);
 }
 
+test "duplicate copies an entry before evicting it" {
+    const gpa = testing.allocator;
+    var dec = Decoder.init(gpa, 1 << 20);
+    defer dec.deinit();
+    dec.setMaxDynamicCapacity(34); // room for exactly one entry: 1 + 1 + 32
+
+    // Insert a=b into a one-entry table, then duplicate index 0.
+    const progress = try dec.processEncoder(&.{ 0x3f, 0x03, 0x41, 'a', 0x01, 'b', 0x00 });
+    try testing.expectEqual(@as(usize, 7), progress.consumed);
+    try testing.expectEqual(@as(u64, 2), progress.inserts);
+
+    // The survivor is the duplicate; RIC=2, Base=2, dynamic relative index 0 -> a=b.
+    const hs = try dec.decode(&.{ 0x01, 0x00, 0x80 });
+    try testing.expectEqual(@as(usize, 1), hs.len);
+    try testing.expectEqualStrings("a", hs[0].name);
+    try testing.expectEqualStrings("b", hs[0].value);
+}
+
 test "encoder stream processing stops before an incomplete instruction" {
     const gpa = testing.allocator;
     var dec = Decoder.init(gpa, 1 << 20);
@@ -565,6 +586,22 @@ test "decode a dynamic post-base indexed field" {
     try testing.expectEqual(@as(usize, 1), hs.len);
     try testing.expectEqualStrings("b", hs[0].name);
     try testing.expectEqualStrings("2", hs[0].value);
+}
+
+test "field section base arithmetic rejects overflow" {
+    const gpa = testing.allocator;
+    var dec = Decoder.init(gpa, 1 << 20);
+    defer dec.deinit();
+    dec.setMaxDynamicCapacity(128);
+    const max = [_]u8{0x80} ++ [_]u8{0xFF} ** 8 ++ [_]u8{0x01};
+
+    try testing.expectError(error.DecompressionFailed, dec.decode(&([_]u8{ 0x00, 0xFF } ++ max)));
+
+    dec.insert_count = 1;
+    try testing.expectError(error.DecompressionFailed, dec.decode(&([_]u8{ 0x02, 0x7F } ++ max)));
+
+    dec.insert_count = 0;
+    try testing.expectError(error.DecompressionFailed, dec.decode(&([_]u8{ 0x00, 0x7F } ++ max ++ [_]u8{0x11})));
 }
 
 test "an out-of-range static index is rejected" {

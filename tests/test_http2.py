@@ -145,6 +145,31 @@ def test_request_with_body() -> None:
     assert any(isinstance(e, zttp.EndOfMessage) for e in events)
 
 
+def test_discarded_data_replenishes_the_connection_window() -> None:
+    discarded = b"".join(frame(0x00, 0, 1, b"x" * length) for length in (16384, 16384, 16384, 16383))
+    conn = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    conn.receive_data(
+        PREFACE
+        + frame(0x04, 0, 0, b"")
+        + frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK)
+        + discarded
+        + frame(0x01, END_HEADERS, 3, GET_BLOCK)
+        + frame(0x00, END_STREAM, 3, b"y")
+    )
+
+    events = list(drain_h2(conn))
+
+    data = next(event for event in events if isinstance(event, zttp.Data))
+    assert data.stream_id == 3
+    assert data.data == b"y"
+    updates = [
+        payload
+        for frame_type, _, stream_id, payload in _frames(conn.data_to_send())
+        if frame_type == 0x08 and stream_id == 0
+    ]
+    assert sum(int.from_bytes(payload, "big") for payload in updates) == 65535
+
+
 def test_two_multiplexed_streams_carry_their_ids() -> None:
     conn = server_with(
         frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK),
@@ -240,6 +265,21 @@ def test_client_reads_a_response() -> None:
     assert resp.http_version == b"2"
     assert resp.stream_id == 1
     assert isinstance(eom, zttp.EndOfMessage)
+
+
+def test_client_rejects_a_switching_protocols_response() -> None:
+    conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    conn.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")])
+    conn.data_to_send()
+    status = bytes([0x00, 0x07]) + b":status" + bytes([0x03]) + b"101"
+    conn.receive_data(frame(0x04, 0, 0, b"") + frame(0x01, END_HEADERS, 1, status))
+
+    events = list(drain_h2(conn))
+
+    assert not any(isinstance(event, zttp.Response) for event in events)
+    reset = next(event for event in events if isinstance(event, zttp.RstStream))
+    assert reset.stream_id == 1
+    assert reset.error_code == 0x01
 
 
 def test_client_reads_a_response_with_a_body() -> None:
@@ -681,6 +721,18 @@ def _request_block(*extra: tuple[bytes, bytes], method: bytes = b"GET") -> bytes
     for name, value in extra:
         block += _lit(name, value)
     return block
+
+
+@pytest.mark.parametrize("method", [b"", b"GET /admin HTTP/1.1", b"GE\tT"])
+def test_h2_rejects_an_invalid_method(method: bytes) -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, _request_block(method=method)))
+
+    events = list(drain_h2(conn))
+
+    assert not any(isinstance(event, zttp.Request) for event in events)
+    reset = next(event for event in events if isinstance(event, zttp.RstStream))
+    assert reset.stream_id == 1
+    assert reset.error_code == 0x01
 
 
 def test_h2_bodyless_request_with_content_length_is_reset() -> None:
