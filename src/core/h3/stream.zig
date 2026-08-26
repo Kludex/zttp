@@ -54,17 +54,23 @@ pub const Error = error{
 
 /// Parse a SETTINGS frame payload (a sequence of id/value varint pairs) into a
 /// `Settings`. A repeated identifier is a connection error (RFC 9114 7.2.4);
-/// unknown settings are ignored after duplicate detection.
+/// unknown settings are ignored after duplicate and resource-limit checks.
 pub fn parseSettings(payload: []const u8) Error!Settings {
     var s = Settings{};
+    var seen: [128]u64 = undefined;
+    var seen_len: usize = 0;
     var pos: usize = 0;
     while (pos < payload.len) {
-        const id_start = pos;
         const id = varint.decode(payload[pos..]) catch return error.SettingsError;
         pos += id.len;
         const val = varint.decode(payload[pos..]) catch return error.SettingsError;
         pos += val.len;
-        if (settingSeen(payload[0..id_start], id.value)) return error.SettingsError;
+        for (seen[0..seen_len]) |previous| {
+            if (previous == id.value) return error.SettingsError;
+        }
+        if (seen_len == seen.len) return error.SettingsError;
+        seen[seen_len] = id.value;
+        seen_len += 1;
         // The HTTP/2 setting ids 0x02-0x05 are reserved in HTTP/3 and their receipt
         // MUST be a connection error (RFC 9114 7.2.4.1), not ignored as unknown.
         if (id.value >= 0x02 and id.value <= 0x05) return error.SettingsError;
@@ -88,18 +94,6 @@ pub fn parseSettings(payload: []const u8) Error!Settings {
         }
     }
     return s;
-}
-
-fn settingSeen(prefix: []const u8, want: u64) bool {
-    var pos: usize = 0;
-    while (pos < prefix.len) {
-        const id = varint.decode(prefix[pos..]) catch return true;
-        pos += id.len;
-        const val = varint.decode(prefix[pos..]) catch return true;
-        pos += val.len;
-        if (id.value == want) return true;
-    }
-    return false;
 }
 
 test "decode the uni-stream type prefixes" {
@@ -134,6 +128,20 @@ test "many distinct unknown settings are accepted" {
     // Unknown ids are ignored and not capped (RFC 9114 7.2.4).
     const s = try parseSettings(&.{ 0x21, 0x00, 0x22, 0x00, 0x23, 0x00, 0x24, 0x00, 0x25, 0x00 });
     try std.testing.expectEqual(@as(u64, 0), s.qpack_max_table_capacity);
+}
+
+test "settings count is bounded" {
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    defer payload.deinit(std.testing.allocator);
+    for (0..128) |index| {
+        try varint.append(&payload, std.testing.allocator, 0x21 + index);
+        try varint.append(&payload, std.testing.allocator, 0);
+    }
+    _ = try parseSettings(payload.items);
+
+    try varint.append(&payload, std.testing.allocator, 0x21 + 128);
+    try varint.append(&payload, std.testing.allocator, 0);
+    try std.testing.expectError(error.SettingsError, parseSettings(payload.items));
 }
 
 test "a repeated unknown setting is an error" {

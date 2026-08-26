@@ -70,8 +70,8 @@ recursion, owned-copy event payloads) apply across all three.
 
 - **Content-Length + Transfer-Encoding together** → rejected outright
   (`framing.zig`), rather than the weaker "Transfer-Encoding wins, strip CL".
-- **Conflicting duplicate Content-Length** → rejected; identical duplicates are
-  accepted (RFC-permitted, unambiguous).
+- **Conflicting duplicate Content-Length** → field values must match byte-for-byte.
+  The parser accepts identical duplicates, but the writer never emits duplicates.
 - **Transfer-Encoding folding** → all `Transfer-Encoding` field-lines are combined
   into one ordered list; `chunked` must appear exactly once and be the final
   coding. `chunked, gzip`, `chunked` twice, or split across lines → rejected.

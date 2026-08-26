@@ -3,11 +3,25 @@
 # whose missing-wheel source build breaks cross-compiled macOS wheels on new
 # CPythons. The hatch-vcs chain is pure Python.
 #
-# hatch-ziglang is exactly pinned: it runs during the isolated wheel build and
-# invokes the native compiler, so a future version resolved from a lower bound
-# could execute unreviewed code into the wheels the publish job trusts. The
-# compiler (ziglang) is likewise pinned. Bump both deliberately.
-requires = ["hatchling", "hatch-vcs", "hatch-ziglang==0.2.1", "ziglang==0.16.0"]
+# Every isolated-build dependency is exactly pinned because it executes while
+# producing release artifacts. Bump the backend and its dependency closure
+# deliberately, together with hatch-ziglang and the Zig compiler.
+requires = [
+    "hatchling==1.32.0",
+    "hatch-vcs==0.5.0",
+    "setuptools-scm==10.2.1",
+    "vcs-versioning==2.3.1",
+    "setuptools==84.0.0",
+    "packaging==26.3",
+    "pathspec==1.1.1",
+    "pluggy==1.6.0",
+    "tomlkit==0.15.1",
+    "trove-classifiers==2026.6.1.19",
+    "tomli==2.4.1; python_version < '3.11'",
+    "typing-extensions==4.16.0; python_version < '3.11'",
+    "hatch-ziglang==0.2.1",
+    "ziglang==0.16.0",
+]
 build-backend = "hatchling.build"
 
 [project]

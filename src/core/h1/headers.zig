@@ -62,6 +62,7 @@ pub fn parseStatusLine(line: []const u8) ParseError!StatusLine {
         if (d < '0' or d > '9') return error.InvalidLine;
         code = code * 10 + (d - '0');
     }
+    if (code < 100 or code > 599) return error.InvalidLine;
     // A space and reason phrase are optional after the code.
     var reason: []const u8 = "";
     if (sc.peek() == ' ') {
