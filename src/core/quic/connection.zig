@@ -766,14 +766,11 @@ pub const Connection = struct {
         packet.writePacketNumber(&hdr, self.gpa, pn, pn_len) catch return error.OutOfMemory;
 
         // Anti-amplification (RFC 9000 8.1): before the client's address is
-        // validated, refuse to send more than AMPLIFICATION_FACTOR x bytes received.
-        // This applies only to the handshake (long-header) spaces - sending 1-RTT
-        // (Application) packets means the handshake completed, which validates the
-        // address. The flight stalls here and resumes as the client's later packets
-        // raise the budget; the caller treats AmplificationLimited as "stop", not fatal.
+        // validated, every packet space shares the same 3x received-byte budget.
+        // The flight stalls and resumes as later packets raise that budget.
         const datagram_len = hdr.items.len + frames.len + crypto.TAG_LEN;
         if (datagram_len > self.peer_tp.max_udp_payload_size) return error.ProtocolViolation;
-        if (!self.canSendDatagram(datagram_len, long)) {
+        if (!self.canSendDatagram(datagram_len)) {
             return error.AmplificationLimited;
         }
 
@@ -2295,7 +2292,7 @@ pub const Connection = struct {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(self.gpa);
         packet.writeVersionNegotiation(&out, self.gpa, prefix.scid, prefix.dcid) catch return error.OutOfMemory;
-        if (!self.canSendDatagram(out.items.len, true)) {
+        if (!self.canSendDatagram(out.items.len)) {
             return;
         }
         self.out.appendSlice(self.gpa, out.items) catch return error.OutOfMemory;
@@ -2738,14 +2735,14 @@ pub const Connection = struct {
         }
     }
 
-    fn canSendDatagram(self: *Connection, datagram_len: usize, long: bool) bool {
+    fn canSendDatagram(self: *Connection, datagram_len: usize) bool {
         if (self.role != .server) return true;
         if (self.sendPathToken()) |pt| {
             const p = self.paths.get(pt) orelse return false;
             if (p.validated) return true;
             return withinAmplificationBudget(p.sent_bytes, p.recv_bytes, datagram_len);
         }
-        if (!long or self.address_validated) return true;
+        if (self.address_validated) return true;
         return withinAmplificationBudget(self.sent_bytes, self.recv_bytes, datagram_len);
     }
 
@@ -3144,10 +3141,10 @@ fn testAppKeys() crypto.Keys {
     return crypto.Keys.fromSecret(TEST_APP_SECRET);
 }
 
-// Install Application-space keys on `conn` (both directions the same fixed keys,
-// which is all the recv path needs) so it can decrypt a testBuildApp datagram.
+// Install Application-space keys and mark the test connection established.
 pub fn testInstallAppKeys(conn: *Connection) void {
     conn.installApplicationSecrets(TEST_APP_SECRET, TEST_APP_SECRET);
+    conn.address_validated = true;
     conn.peer_tp.initial_max_stream_data_bidi_local = 1 << 20;
     conn.peer_tp.initial_max_stream_data_bidi_remote = 1 << 20;
     conn.peer_tp.initial_max_stream_data_uni = 1 << 20;
@@ -3490,6 +3487,24 @@ test "negotiated idle timeout is armed by packet activity and silently closes" {
     try testing.expect(conn.nextTimeout() == null);
 }
 
+test "1-RTT packets obey the anti-amplification budget" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x07 };
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    testInstallAppKeys(&server);
+    server.address_validated = false;
+    server.recv_bytes = 10;
+    server.sent_bytes = 30;
+
+    try server.sendPing(.application, 1000);
+    try testing.expectEqual(@as(usize, 0), server.datagramLengths().len);
+
+    server.recv_bytes = 100;
+    try server.sendPing(.application, 2000);
+    try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+}
+
 test "PATH_CHALLENGE elicits a matching PATH_RESPONSE" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
@@ -3614,6 +3629,7 @@ test "PATH_CHALLENGE response is accounted to the receiving path" {
     var conn = try Connection.init(gpa, .server, &dcid);
     defer conn.deinit();
     testInstallAppKeys(&conn);
+    conn.address_validated = false;
 
     const data = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 3 };
     var frames: std.ArrayListUnmanaged(u8) = .empty;
