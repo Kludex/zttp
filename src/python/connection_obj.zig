@@ -50,7 +50,13 @@ const DEFAULT_CLIENT_TRANSPORT_PARAMS = [_]u8{
     0x09, 0x01, 0x10, // initial_max_streams_uni = 16
 };
 
-var server_ticket_store: std.ArrayListUnmanaged(ResumptionCredential) = .empty;
+// Fixed backing keeps per-handshake slices valid while tickets rotate.
+var server_ticket_store: [MAX_SERVER_TICKET_STORE]ResumptionCredential = undefined;
+var server_ticket_store_len: usize = 0;
+
+fn serverTickets() []ResumptionCredential {
+    return server_ticket_store[0..server_ticket_store_len];
+}
 
 /// A Python-owned receive span retained outside the pure-Zig reader. Keeping
 /// the owner and slice behind one adapter state centralises every reference
@@ -413,7 +419,7 @@ fn randomSigner() ?Signer {
 
 fn rememberServerTicket(identity: []const u8, psk: [32]u8, lifetime: u32, age_add: u32, issued_at_ms: u64, max_early_data_size: ?u32) !void {
     if (lifetime == 0) return;
-    for (server_ticket_store.items) |*entry| {
+    for (serverTickets()) |*entry| {
         if (std.mem.eql(u8, entry.identity, identity)) {
             entry.psk = psk;
             entry.ticket_lifetime = lifetime;
@@ -426,18 +432,25 @@ fn rememberServerTicket(identity: []const u8, psk: [32]u8, lifetime: u32, age_ad
     }
     const owned_identity = try gpa.dupe(u8, identity);
     errdefer gpa.free(owned_identity);
-    if (server_ticket_store.items.len == MAX_SERVER_TICKET_STORE) {
-        const oldest = server_ticket_store.orderedRemove(0);
+    if (server_ticket_store_len == MAX_SERVER_TICKET_STORE) {
+        const oldest = server_ticket_store[0];
+        std.mem.copyForwards(
+            ResumptionCredential,
+            server_ticket_store[0 .. MAX_SERVER_TICKET_STORE - 1],
+            server_ticket_store[1..MAX_SERVER_TICKET_STORE],
+        );
+        server_ticket_store_len -= 1;
         gpa.free(oldest.identity);
     }
-    try server_ticket_store.append(gpa, .{
+    server_ticket_store[server_ticket_store_len] = .{
         .identity = owned_identity,
         .psk = psk,
         .ticket_lifetime = lifetime,
         .ticket_age_add = age_add,
         .issued_at_ms = issued_at_ms,
         .max_early_data_size = max_early_data_size,
-    });
+    };
+    server_ticket_store_len += 1;
 }
 
 /// The HTTP/1.1 engine: the pull-API reader, the writer, and the per-connection
@@ -759,7 +772,7 @@ const ServerConfig = struct {
             .alpn = self.alpn,
             .transport_params = self.transport_params,
             .resumption = if (self.resumption_identity) |identity| .{ .identity = identity, .psk = self.resumption_psk.? } else null,
-            .resumption_store = server_ticket_store.items,
+            .resumption_store = serverTickets(),
             .now_ms = now / std.time.us_per_ms,
         };
     }
@@ -2456,7 +2469,14 @@ fn nextEventImpl(self_obj: ?*c.PyObject, eager_headers: bool) py.Object {
                 e.emitGoAwayIfOwed(); // queue one GOAWAY for the next data_to_send
                 return exceptions.raiseH2(err);
             };
-            e.autoRespond(ev) catch |err| return h2RaiseWrite(err);
+            const handshake_sent = e.handshake_sent;
+            e.autoRespond(ev) catch |err| {
+                e.writer.clear();
+                e.handshake_sent = handshake_sent;
+                e.conn.poisonResourceFailure();
+                e.emitGoAwayIfOwed();
+                return h2RaiseWrite(err);
+            };
             return events_obj.fromH2Event(ev);
         },
         .h1 => |*e| {

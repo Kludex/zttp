@@ -532,6 +532,45 @@ def test_http3_received_session_ticket_psk_resumes_later_connection() -> None:
     assert req.path == b"/ticket-resumed"
 
 
+def test_http3_server_ticket_store_remains_valid_after_eviction() -> None:
+    first_client = make_client()
+    first_server = make_server()
+
+    assert transfer(first_client, first_server, 1000)
+    assert transfer(first_server, first_client, 2000)
+    assert transfer(first_client, first_server, 3000)
+    assert transfer(first_server, first_client, 4000)
+
+    identity = b""
+    psk = b""
+    age_add = 0x01020304
+    for index in range(65):
+        identity = f"store-rotation-{index}".encode()
+        issued = first_server.send_session_ticket(identity, 7200, age_add, bytes([index]), b"", 4096)
+        assert isinstance(issued, bytes)
+        psk = issued
+
+    client_config: ResumedClientConfig = CLIENT_CONFIG.copy()
+    client_config.update(
+        {
+            "connection_id": b"\x11\x22\x33\x57",
+            "resumption": zttp.SessionResumption(identity=identity, psk=psk),
+            "obfuscated_ticket_age": obfuscated_ticket_age(age_add, 3000, 6000),
+            "early_data": True,
+            "remembered_transport_params": SERVER_TRANSPORT_PARAMS,
+        }
+    )
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP3, **client_config)
+    server = make_server()
+    client.send_request(b"GET", b"/after-rotation", b"3", [(b"host", b"example.test")])
+
+    for datagram in client.data_to_send():
+        server.receive_datagram(datagram, 6000)
+
+    events = drain_events(server)
+    assert any(isinstance(event, zttp.Request) and event.path == b"/after-rotation" for event in events)
+
+
 def test_http3_ticket_age_mismatch_does_not_accept_zero_rtt() -> None:
     first_client = make_client()
     first_server = make_server()
