@@ -164,8 +164,8 @@ pub fn parseLong(buf: []const u8) Error!LongHeader {
     if (ltype == .initial) {
         const tlen_d = varint.decode(buf[pos..]) catch return error.Truncated;
         pos += tlen_d.len;
-        const tlen: usize = @intCast(tlen_d.value);
-        if (pos + tlen > buf.len) return error.Truncated;
+        const tlen = std.math.cast(usize, tlen_d.value) orelse return error.Truncated;
+        if (tlen > buf.len - pos) return error.Truncated;
         token = buf[pos .. pos + tlen];
         pos += tlen;
     }
@@ -381,6 +381,12 @@ test "parseLong reads an Initial header" {
     try std.testing.expectEqual(@as(usize, 0), h.scid.len);
     try std.testing.expectEqual(@as(u64, 2), h.length);
     try std.testing.expectEqual(@as(usize, 13), h.pn_offset);
+}
+
+test "parseLong rejects a four-gibibyte token length" {
+    const huge = [_]u8{ 0xC0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+    const packet = [_]u8{ 0xC0, 0, 0, 0, 1, 0, 0 } ++ huge;
+    try std.testing.expectError(error.Truncated, parseLong(&packet));
 }
 
 test "parseLong rejects a clear fixed bit" {
