@@ -2279,20 +2279,12 @@ pub const Connection = struct {
         if (self.role == .server and hdr.ltype == .initial and datagram_len < constants.MIN_INITIAL_DATAGRAM) {
             return error.Dropped;
         }
-        // Adopt the peer's source connection id (from its first long header) as the
-        // destination of everything we send (RFC 9000 7.2). Until this, peer_scid
-        // defaults to the client dcid - fine for tests that use one shared id.
-        if (!self.peer_scid_set and hdr.scid.len > 0) {
-            const sc = self.gpa.dupe(u8, hdr.scid) catch return error.OutOfMemory;
-            self.gpa.free(self.peer_scid);
-            self.peer_scid = sc;
-            self.peer_scid_set = true;
-        }
         // A long header's length is known, so a packet we cannot decrypt (no keys
         // for the space yet, or a bad tag) is SKIPPED, not fatal: we return its
         // length so the caller keeps walking any coalesced packets behind it
         // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2.
-        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, now) catch |e| switch (e) {
+        const peer_scid_candidate = if (hdr.ltype == .initial) hdr.scid else null;
+        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, peer_scid_candidate, now) catch |e| switch (e) {
             error.Dropped => return total,
             else => return e,
         };
@@ -2376,7 +2368,7 @@ pub const Connection = struct {
         self.current_packet_local_cid_seq = parsed.local_cid_seq;
         defer self.current_packet_local_cid_seq = previous_cid_seq;
         // A short-header packet is the rest of the datagram (no length field).
-        self.decryptAndDispatch(buf, parsed.hdr.pn_offset, .application, false, now) catch |e| switch (e) {
+        self.decryptAndDispatch(buf, parsed.hdr.pn_offset, .application, false, null, now) catch |e| switch (e) {
             error.Dropped => {
                 if (self.detectStatelessReset(buf)) return buf.len;
                 return error.Dropped;
@@ -2450,7 +2442,15 @@ pub const Connection = struct {
         return count;
     }
 
-    fn decryptAndDispatch(self: *Connection, pkt: []const u8, pn_offset: usize, space: Space, long: bool, now: u64) Error!void {
+    fn decryptAndDispatch(
+        self: *Connection,
+        pkt: []const u8,
+        pn_offset: usize,
+        space: Space,
+        long: bool,
+        peer_scid_candidate: ?[]const u8,
+        now: u64,
+    ) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
         const opened = if (space == .application and !long)
             try self.openApplicationPacket(pkt, pn_offset)
@@ -2460,6 +2460,15 @@ pub const Connection = struct {
             try self.openPacket(pkt, pn_offset, space, long, st.recv_keys orelse return error.Dropped, null);
         defer self.gpa.free(opened.work);
         defer self.gpa.free(opened.plaintext);
+        if (peer_scid_candidate) |candidate| {
+            // RFC 9000 7.2 permits adoption only after packet authentication.
+            if (!self.peer_scid_set and candidate.len > 0) {
+                const sc = self.gpa.dupe(u8, candidate) catch return error.OutOfMemory;
+                self.gpa.free(self.peer_scid);
+                self.peer_scid = sc;
+                self.peer_scid_set = true;
+            }
+        }
         self.peer_packet_authenticated = true;
         if (space == .initial) self.initial_authenticated = true;
         if (space == .application and !long) st.zero_rtt_recv_keys = null;
@@ -2469,6 +2478,7 @@ pub const Connection = struct {
         // (RFC 9000 8.1).
         if (space == .handshake) self.validateCurrentPath();
 
+        if (st.recv_ranges.shouldIgnore(opened.pn)) return;
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, opened.pn) else opened.pn;
         st.recv_ranges.add(self.gpa, opened.pn) catch return error.OutOfMemory; // for accurate ACKs
         try self.dispatchFrames(opened.payload, space, long, now);
@@ -2710,7 +2720,7 @@ pub const Connection = struct {
 
     fn onPathResponse(self: *Connection, data: [8]u8) Error!void {
         const token = pathToken(data);
-        const pending = self.pending_path_challenges.get(token) orelse return error.ProtocolViolation;
+        const pending = self.pending_path_challenges.get(token) orelse return;
         if (pending.path_token) |pt| {
             if (self.current_path_token == null or self.current_path_token.? != pt) return error.ProtocolViolation;
         }
@@ -3583,6 +3593,9 @@ test "PATH_CHALLENGE elicits a matching PATH_RESPONSE" {
 
     try conn.receiveDatagram(dgram, 1000);
     try testing.expect(conn.datagramLengths().len >= 1);
+    const response_count = conn.datagramLengths().len;
+    try conn.receiveDatagram(dgram, 1001);
+    try testing.expectEqual(response_count, conn.datagramLengths().len);
 
     const response = conn.datagramsToSend()[0..conn.datagramLengths()[0]];
     var work = try gpa.dupe(u8, response);
@@ -3632,6 +3645,12 @@ test "challengePath emits PATH_CHALLENGE and matching PATH_RESPONSE validates th
     try testing.expectEqual(@as(usize, 0), conn.pending_path_challenges.count());
     try testing.expectEqual(@as(usize, 0), conn.path_challenge_inflight.count());
     try expectFirstQueuedAppFrameTag(&conn, .ack);
+
+    try conn.receiveDatagram(dgram, 2001);
+    const late = try testBuildApp(gpa, &dcid, 1, frames.items);
+    defer gpa.free(late);
+    try conn.receiveDatagram(late, 2002);
+    try testing.expect(!conn.closed);
 }
 
 test "address-aware PATH_RESPONSE validates only the challenged path" {
@@ -3922,7 +3941,7 @@ test "PATH_RESPONSE is ack-eliciting" {
     try expectFirstQueuedAppFrameTag(&conn, .ack);
 }
 
-test "unmatched PATH_RESPONSE is a protocol violation" {
+test "unmatched PATH_RESPONSE is ignored" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     var conn = try Connection.init(gpa, .server, &dcid);
@@ -3935,7 +3954,8 @@ test "unmatched PATH_RESPONSE is a protocol violation" {
     const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
     defer gpa.free(dgram);
 
-    try testing.expectError(error.ProtocolViolation, conn.receiveDatagram(dgram, 1000));
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expect(!conn.closed);
 }
 
 test "NEW_TOKEN received by a server is a protocol violation" {
@@ -5512,6 +5532,32 @@ test "server accepts a token-bearing Initial after Retry" {
     try server.receiveDatagramFrom(client.datagramsToSend(), 3000, "peer-address");
     try testing.expect(server.datagramsToSend().len > 0);
     try testing.expect(server.paths.get(std.hash.Wyhash.hash(0, "peer-address")).?.validated);
+}
+
+test "an unauthenticated long header cannot replace the peer connection id" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe0, 0xe1, 0xe2, 0xe3 };
+    var client = try Connection.init(gpa, .client, &dcid);
+    defer client.deinit();
+
+    var forged: std.ArrayListUnmanaged(u8) = .empty;
+    defer forged.deinit(gpa);
+    _ = try packet.writeLongHeader(
+        &forged,
+        gpa,
+        .initial,
+        constants.VERSION_1,
+        client.scid,
+        "attacker-cid",
+        &.{},
+        21,
+        1,
+    );
+    try forged.appendNTimes(gpa, 0, 21);
+
+    try client.receiveDatagram(forged.items, 1000);
+    try testing.expectEqualSlices(u8, &dcid, client.peer_scid);
+    try testing.expect(!client.peer_scid_set);
 }
 
 test "server answers an unsupported long-header version with Version Negotiation" {

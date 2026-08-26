@@ -408,7 +408,7 @@ pub const Connection = struct {
         const t = s.creditSendWindow(increment);
         switch (t.action) {
             .ok => self.push(.{ .window_update = .{ .stream_id = f.header.stream_id, .increment = increment } }),
-            .stream_error => self.pushRst(f.header.stream_id, t.code),
+            .stream_error => try self.resetStream(s, f.header.stream_id, t.code),
             .connection_error => return error.FlowControlError,
         }
     }
@@ -451,6 +451,10 @@ pub const Connection = struct {
                 return;
             },
             .connection_error => return error.ProtocolError,
+        }
+        if (self.role == .client and !s.headers_done) {
+            try self.resetStream(s, f.header.stream_id, .protocol_error);
+            return;
         }
         const wt = s.debitRecvWindow(f.header.length);
         if (wt.action == .stream_error) {
@@ -546,7 +550,7 @@ pub const Connection = struct {
             if (id <= self.highest_local_id) {
                 ignored = true;
             } else {
-                try self.openPeerStream(id);
+                return error.ProtocolError;
             }
         } else {
             // A new request stream. Its id must be odd and exceed the highest peer
@@ -718,6 +722,7 @@ pub const Connection = struct {
         var path: ?[]const u8 = null;
         var scheme: ?[]const u8 = null;
         var authority: ?[]const u8 = null;
+        var host: ?[]const u8 = null;
         var content_length: ?u64 = null;
         var seen_regular = false;
 
@@ -747,6 +752,12 @@ pub const Connection = struct {
             if (!fields.isValidFieldName(h.name)) return error.Malformed; // uppercase / non-token byte
             if (fields.isConnectionSpecific(h.name)) return error.Malformed;
             if (eql(h.name, "te") and !eql(h.value, "trailers")) return error.Malformed;
+            if (eql(h.name, "host")) {
+                if (host) |previous| {
+                    if (!eql(previous, h.value)) return error.Malformed;
+                } else host = h.value;
+                continue;
+            }
             if (eql(h.name, "content-length")) {
                 const cl = ascii.parseDecimal(u64, h.value) orelse return error.Malformed;
                 // A repeated content-length is malformed unless it agrees (RFC 9110).
@@ -765,12 +776,15 @@ pub const Connection = struct {
         const q = std.mem.indexOfScalar(u8, target, '?');
         const req_path = if (q) |i| target[0..i] else target;
         const req_query = if (q) |i| target[i + 1 ..] else target[target.len..];
-        // Synthesize a host header from :authority (copied into req_scratch).
         if (authority) |a| {
+            if (host) |h| if (!eql(a, h)) return error.Malformed;
+        }
+        const canonical_host: ?[]const u8 = if (authority) |a| a else host;
+        if (canonical_host) |value| {
             const start = self.req_scratch.items.len;
-            self.req_scratch.appendSlice(self.gpa, a) catch return error.OutOfMemory;
-            const host_val = self.req_scratch.items[start..];
-            self.req_headers.append(self.gpa, .{ .name = "host", .value = host_val }) catch return error.OutOfMemory;
+            self.req_scratch.appendSlice(self.gpa, value) catch return error.OutOfMemory;
+            const host_value = self.req_scratch.items[start..];
+            self.req_headers.append(self.gpa, .{ .name = "host", .value = host_value }) catch return error.OutOfMemory;
         }
 
         return .{
@@ -1234,6 +1248,7 @@ fn validTrailers(headers: []const events.Header) bool {
         if (!fields.isValidFieldName(h.name)) return false;
         if (!fields.validValue(h.value)) return false;
         if (fields.isConnectionSpecific(h.name)) return false;
+        if (!fields.trailerFieldAllowed(h.name)) return false;
     }
     return true;
 }
@@ -1827,6 +1842,7 @@ test "client rejects a body on a bodyless (HEAD) response" {
 // A client's inbound handshake is just the server's SETTINGS - no preface to
 // consume - so it differs from the server `handshook` helper.
 fn clientHandshook(c: *Connection, extra: []const u8) !void {
+    try c.registerSendStream(1);
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(testing.allocator);
     try frameBytes(&input, .settings, 0, 0, &.{});
