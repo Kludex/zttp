@@ -252,6 +252,8 @@ STATUS_200 = bytes([0x88])
 def client_with(*extra: bytes) -> zttp.H2Connection:
     """A client sees only the server's SETTINGS (no preface to consume)."""
     conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    conn.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")])
+    conn.data_to_send()
     conn.receive_data(frame(0x04, 0, 0, b"") + b"".join(extra))
     return conn
 
@@ -267,6 +269,17 @@ def test_client_reads_a_response() -> None:
     assert isinstance(eom, zttp.EndOfMessage)
 
 
+def test_client_rejects_data_before_response_headers() -> None:
+    conn = client_with(frame(0x00, END_STREAM, 1, b"body"))
+
+    events = list(drain_h2(conn))
+
+    assert not any(isinstance(event, (zttp.Response, zttp.Data, zttp.EndOfMessage)) for event in events)
+    reset = next(event for event in events if isinstance(event, zttp.RstStream))
+    assert reset.stream_id == 1
+    assert reset.error_code == 0x01
+
+
 def test_client_rejects_a_switching_protocols_response() -> None:
     conn = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
     conn.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")])
@@ -280,6 +293,13 @@ def test_client_rejects_a_switching_protocols_response() -> None:
     reset = next(event for event in events if isinstance(event, zttp.RstStream))
     assert reset.stream_id == 1
     assert reset.error_code == 0x01
+
+
+def test_client_rejects_a_response_on_an_unopened_stream() -> None:
+    conn = client_with(frame(0x01, END_HEADERS | END_STREAM, 3, STATUS_200))
+
+    with pytest.raises(zttp.RemoteProtocolError):
+        list(drain_h2(conn))
 
 
 def test_client_reads_a_response_with_a_body() -> None:
@@ -520,6 +540,8 @@ def test_full_body_round_trips_across_window_updates() -> None:
     body = bytearray()
     # Read the head + first window's worth on a fresh client.
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    client.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")])
+    client.data_to_send()
     client.receive_data(frame(0x04, 0, 0, b""))  # server SETTINGS stand-in
     # Feed the server output in, granting more window until the body completes.
     rounds = 0
