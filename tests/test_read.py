@@ -11,7 +11,7 @@ from tests.conftest import drain, drain_all, parse_request
 
 def test_receive_event_feeds_and_returns_first_available_http1_event() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    event = conn.receive_event(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+    event = conn.receive_event(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello")
 
     assert isinstance(event, zttp.Request)
     data = conn.next_event()
@@ -22,7 +22,7 @@ def test_receive_event_feeds_and_returns_first_available_http1_event() -> None:
 
 def test_receive_event_accepts_bytearray_input() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    incoming = bytearray(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+    incoming = bytearray(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello")
 
     event = conn.receive_event(incoming)
     incoming[-5:] = b"other"
@@ -79,8 +79,39 @@ def test_simple_get() -> None:
     assert req.end_stream is True
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: one.example\r\nHost: two.example\r\n\r\n",
+    ],
+)
+@pytest.mark.parametrize("fragmented", [False, True])
+def test_http11_rejects_missing_or_duplicate_host(raw: bytes, fragmented: bool) -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    for chunk in [raw] if not fragmented else (raw[index : index + 1] for index in range(len(raw))):
+        conn.receive_data(chunk)
+
+    with pytest.raises(zttp.RemoteProtocolError):
+        conn.next_event()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"GET / HTTP/1.1\r\nHost:\r\n\r\n",
+        b"GET / HTTP/1.0\r\n\r\n",
+    ],
+)
+def test_host_requirement_accepts_empty_http11_host_and_missing_http10_host(raw: bytes) -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(raw)
+
+    assert isinstance(conn.next_event(), zttp.Request)
+
+
 def test_post_content_length() -> None:
-    events = parse_request(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+    events = parse_request(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello")
     assert isinstance(events[0], zttp.Request)
     body = b"".join(e.data for e in events if isinstance(e, zttp.Data))
     assert body == b"hello"
@@ -88,7 +119,7 @@ def test_post_content_length() -> None:
 
 
 def test_zero_content_length_has_no_data() -> None:
-    events = parse_request(b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+    events = parse_request(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n")
     assert not any(isinstance(e, zttp.Data) for e in events)
     request = events[-1]
     assert isinstance(request, zttp.Request)
@@ -105,7 +136,8 @@ def test_no_body_get_completes_on_request() -> None:
 
 def test_chunked_body() -> None:
     events = parse_request(
-        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+        b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n"
+        b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
     )
     body = b"".join(e.data for e in events if isinstance(e, zttp.Data))
     assert body == b"hello world"
@@ -113,7 +145,9 @@ def test_chunked_body() -> None:
 
 def test_chunked_with_trailers() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-T: v\r\n\r\n")
+    conn.receive_data(
+        b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-T: v\r\n\r\n"
+    )
     events = list(drain(conn))
     eom = events[-1]
     assert isinstance(eom, zttp.EndOfMessage)
@@ -121,10 +155,10 @@ def test_chunked_with_trailers() -> None:
 
 
 def test_multiple_headers_preserved_in_order() -> None:
-    events = parse_request(b"GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nA: 3\r\n\r\n")
+    events = parse_request(b"GET / HTTP/1.1\r\nHost: example.com\r\nA: 1\r\nB: 2\r\nA: 3\r\n\r\n")
     req = events[0]
     assert isinstance(req, zttp.Request)
-    assert req.headers == [(b"A", b"1"), (b"B", b"2"), (b"A", b"3")]
+    assert req.headers == [(b"Host", b"example.com"), (b"A", b"1"), (b"B", b"2"), (b"A", b"3")]
 
 
 def test_headers_are_owned_and_sequence_compatible() -> None:
@@ -198,10 +232,10 @@ def test_h1_headers_are_immutable_by_default() -> None:
 
 
 def test_header_value_whitespace_stripped() -> None:
-    events = parse_request(b"GET / HTTP/1.1\r\nX:   spaced   \r\n\r\n")
+    events = parse_request(b"GET / HTTP/1.1\r\nHost: example.com\r\nX:   spaced   \r\n\r\n")
     req = events[0]
     assert isinstance(req, zttp.Request)
-    assert req.headers == [(b"X", b"spaced")]
+    assert req.headers == [(b"Host", b"example.com"), (b"X", b"spaced")]
 
 
 def test_partial_head_then_complete() -> None:
@@ -216,7 +250,7 @@ def test_partial_head_then_complete() -> None:
 
 def test_body_split_across_feeds() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nhel")
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\nhel")
     assert isinstance(conn.next_event(), zttp.Request)
     first = conn.next_event()
     assert isinstance(first, zttp.Data)
@@ -244,7 +278,7 @@ def test_large_content_length_body_reuses_exact_received_bytes() -> None:
 
 def test_pending_body_owner_is_released_with_the_connection() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 1024\r\n\r\n")
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1024\r\n\r\n")
     assert isinstance(conn.next_event(), zttp.Request)
     body = bytes(bytearray(b"x" * 1024))
     before = sys.getrefcount(body)
@@ -256,7 +290,7 @@ def test_pending_body_owner_is_released_with_the_connection() -> None:
 
 def test_pending_body_owner_is_released_when_a_second_feed_flushes_it() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n")
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\n")
     assert isinstance(conn.next_event(), zttp.Request)
     first = bytes(bytearray(b"hello"))
     before = sys.getrefcount(first)
@@ -281,7 +315,7 @@ def test_pending_input_owner_is_released_after_a_head_parse_error() -> None:
 def test_small_content_length_body_keeps_copy_path() -> None:
     conn = zttp.Connection(zttp.SERVER)
     body = b"small body"
-    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n")
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\n")
     assert isinstance(conn.next_event(), zttp.Request)
 
     conn.receive_data(body)
@@ -295,7 +329,9 @@ def test_body_buffer_with_pipelined_bytes_keeps_copy_path() -> None:
     conn = zttp.Connection(zttp.SERVER)
     body = b"x" * 1024
     conn.receive_data(
-        b"POST / HTTP/1.1\r\nContent-Length: 1024\r\n\r\n" + body + b"GET /next HTTP/1.1\r\nHost: x\r\n\r\n"
+        b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1024\r\n\r\n"
+        + body
+        + b"GET /next HTTP/1.1\r\nHost: x\r\n\r\n"
     )
     assert isinstance(conn.next_event(), zttp.Request)
     event = conn.next_event()
@@ -314,7 +350,7 @@ def test_start_next_cycle_rejects_a_stashed_body() -> None:
     conn = zttp.Connection(zttp.SERVER)
     prefix = b"GET /smuggled HTTP/1.1\r\nHost: example.com\r\n\r\n"
     body = prefix + b"x" * (2048 - len(prefix))
-    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 2048\r\n\r\n" + body)
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2048\r\n\r\n" + body)
     assert isinstance(conn.next_event(), zttp.Request)
 
     with pytest.raises(zttp.LocalProtocolError, match="before the current message is complete"):
@@ -448,6 +484,10 @@ def test_drain_reaches_need_data_on_partial() -> None:
     assert list(drain(conn)) == []
     drain_all(conn)  # returns cleanly (NEED_DATA), no exception
 
+    conn = zttp.Connection(zttp.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    drain_all(conn)
+
 
 def test_invalid_role_rejected() -> None:
     with pytest.raises(ValueError):
@@ -462,7 +502,8 @@ def test_remote_is_subclass_of_protocol_error() -> None:
 def test_body_and_pipelined_request_in_one_feed() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.receive_data(
-        b"POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nfirstPOST /b HTTP/1.1\r\nContent-Length: 6\r\n\r\nsecond"
+        b"POST /a HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nfirst"
+        b"POST /b HTTP/1.1\r\nHost: example.com\r\nContent-Length: 6\r\n\r\nsecond"
     )
     events = list(drain(conn))
     first = events[0]
@@ -479,7 +520,7 @@ def test_body_and_pipelined_request_in_one_feed() -> None:
 
 def test_second_feed_arrives_before_first_is_drained() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nhello")
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\nhello")
     conn.receive_data(b"world")
     events = list(drain(conn))
     assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == b"helloworld"
@@ -488,7 +529,7 @@ def test_second_feed_arrives_before_first_is_drained() -> None:
 
 def test_body_fed_in_pieces_with_draining_between() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n")
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 9\r\n\r\n")
     assert isinstance(next(drain(conn)), zttp.Request)
     body = b""
     for piece in (b"abc", b"def", b"ghi"):
@@ -499,7 +540,7 @@ def test_body_fed_in_pieces_with_draining_between() -> None:
 
 def test_garbage_after_complete_message_raises_on_next_cycle() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nokNOT HTTP\x00\r\n\r\n")
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2\r\n\r\nokNOT HTTP\x00\r\n\r\n")
     events = list(drain(conn))
     assert isinstance(events[-1], zttp.EndOfMessage)
     conn.start_next_cycle()
@@ -537,7 +578,7 @@ def test_standard_methods_are_interned() -> None:
 
 def test_large_body_round_trips_unchanged() -> None:
     body = bytes(range(256)) * 256  # 64KB, every byte value
-    raw = b"POST /up HTTP/1.1\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    raw = b"POST /up HTTP/1.1\r\nHost: example.com\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
     events = parse_request(raw)
     assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == body
     assert isinstance(events[-1], zttp.EndOfMessage)

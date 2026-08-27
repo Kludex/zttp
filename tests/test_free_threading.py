@@ -25,7 +25,7 @@ def test_free_threaded_build_keeps_gil_disabled() -> None:  # pragma: no cover -
 
 def test_shared_connection_serializes_calls() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    request = b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+    request = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
     count = 300
     conn.receive_data(request * count)
     barrier = threading.Barrier(2)

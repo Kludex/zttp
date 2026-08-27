@@ -21,11 +21,14 @@ def test_h2_synthesizing_sequence_headers_roundtrip() -> None:
             self.n = n
 
         def __len__(self) -> int:
-            return self.n
+            return self.n + 1
 
         def __getitem__(self, i: int) -> tuple[bytes, bytes]:
-            if i >= self.n:  # pragma: no cover - sequence-protocol guard, not hit via __len__-bounded access
+            if i > self.n:  # pragma: no cover - sequence-protocol guard, not hit via __len__-bounded access
                 raise IndexError
+            if i == 0:
+                return (b"Host", b"example.com")
+            i -= 1
             return (b"Header-%02d" % i, b"value-%02d-%s" % (i, b"x" * 24))
 
     n = 40
@@ -60,7 +63,7 @@ def test_h3_split_transfer_encoding_rejected(headers: bytes) -> None:
 
 def test_h4_trailer_flood_rejected() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n")
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n")
     assert isinstance(conn.next_event(), zttp.Request)
     flood = b"".join(b"X-%d: y\r\n" % i for i in range(500))
     conn.receive_data(flood)
@@ -71,7 +74,7 @@ def test_h4_trailer_flood_rejected() -> None:
 def test_trailer_survives_large_followup_feed() -> None:
     # H-1: store a trailer, then force a buffer realloc before EndOfMessage.
     conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n")
     assert isinstance(conn.next_event(), zttp.Request)
     conn.receive_data(b"0\r\nX-Trailer: SECRET\r\n")
     assert conn.next_event() is zttp.NEED_DATA
@@ -115,7 +118,7 @@ def test_event_cycle_is_collectable() -> None:
 
     def make_cycle() -> None:
         c = zttp.Connection(zttp.SERVER)
-        c.receive_data(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+        c.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
         c.next_event()  # Request
         # HeaderBlock is immutable and holds only bytes, so put the cycle
         # through the still-mutable EndOfMessage.trailers list.
@@ -215,7 +218,9 @@ def test_content_length_fast_path_respects_max_buffer_on_single_feed() -> None:
 def test_content_length_fast_path_respects_max_buffer_on_later_body_feed() -> None:
     body = b"A" * (9 * 1024 * 1024)
     conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n")
+    conn.receive_data(
+        b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n"
+    )
     assert isinstance(conn.next_event(), zttp.Request)
     with pytest.raises(zttp.RemoteProtocolError):
         conn.receive_data(body)

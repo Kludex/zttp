@@ -54,6 +54,7 @@ import zttp
 conn = zttp.Connection(zttp.SERVER)
 conn.receive_data(
     b"POST / HTTP/1.1\r\n"
+    b"Host: example.com\r\n"
     b"Content-Length: 11\r\n"
     b"\r\n"
     b"hello world"
@@ -129,6 +130,7 @@ ending with a `0` chunk; you never see it, you get the decoded `hello world`:
 conn = zttp.Connection(zttp.SERVER)
 conn.receive_data(
     b"POST / HTTP/1.1\r\n"
+    b"Host: example.com\r\n"
     b"Transfer-Encoding: chunked\r\n"
     b"\r\n"
     b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
@@ -157,6 +159,7 @@ the `EndOfMessage` event:
 conn = zttp.Connection(zttp.SERVER)
 conn.receive_data(
     b"POST / HTTP/1.1\r\n"
+    b"Host: example.com\r\n"
     b"Transfer-Encoding: chunked\r\n"
     b"\r\n"
     b"3\r\nabc\r\n"
