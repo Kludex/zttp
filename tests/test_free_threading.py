@@ -4,6 +4,7 @@ import concurrent.futures
 import sys
 import sysconfig
 import threading
+from collections.abc import Callable
 from typing import cast
 
 import pytest
@@ -13,10 +14,10 @@ import zttp
 
 
 class FreeThreadedSys(Protocol):
-    def _is_gil_enabled(self) -> bool: ...
+    _is_gil_enabled: Callable[[], bool]
 
 
-def test_free_threaded_build_keeps_gil_disabled() -> None:
+def test_free_threaded_build_keeps_gil_disabled() -> None:  # pragma: no cover - requires free-threaded CPython
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
         pytest.skip("requires a free-threaded CPython build")
     assert not cast(FreeThreadedSys, sys)._is_gil_enabled()
