@@ -768,6 +768,8 @@ pub const Connection = struct {
     /// fit one datagram. A long header (Initial/Handshake) carries our scid + a
     /// length field; a short header (Application) runs to the datagram end.
     fn buildPacket(self: *Connection, space: Space, frames: []const u8, ack_eliciting: bool, now: u64) Error!u64 {
+        if (self.receive_failure) |err| return err;
+        if (self.closed) return error.ProtocolViolation;
         const st = &self.spaces[@intFromEnum(space)];
         const use_zero_rtt = space == .application and st.send_keys == null and st.zero_rtt_send_keys != null;
         assertFramesAllowedIn(space, use_zero_rtt, frames); // no illegal frames for the packet type
@@ -2568,7 +2570,8 @@ pub const Connection = struct {
                 // Frame handlers may have committed state, so this packet must never be replayed or acknowledged.
                 self.receive_failure = err;
                 self.closed = true;
-                st.ack_pending = false;
+                for (&self.spaces) |*state| state.ack_pending = false;
+                self.clearSend();
             }
             return err;
         };
@@ -3366,6 +3369,7 @@ fn receiveStreamUnderAllocationFailure(gpa: std.mem.Allocator) !void {
     const previous_total = conn.conn_received_total;
     var head_frame: std.ArrayListUnmanaged(u8) = .empty;
     defer head_frame.deinit(gpa);
+    try frame.encodePathChallenge(&head_frame, gpa, .{ 1, 2, 3, 4, 5, 6, 7, 8 });
     try frame.encodeStream(&head_frame, gpa, 0, 0, "hello ", false);
     const head = try testBuildApp(gpa, &dcid, 1, head_frame.items);
     defer gpa.free(head);
@@ -3385,6 +3389,12 @@ fn receiveStreamUnderAllocationFailure(gpa: std.mem.Allocator) !void {
             try testing.expectEqual(@as(usize, 0), s.pending.items.len);
             try testing.expect(s.isFinished());
             try testing.expect(conn.spaces[@intFromEnum(Space.application)].recv_ranges.contains(1));
+        }
+        if (conn.receive_failure != null) {
+            try testing.expectEqual(@as(usize, 0), conn.datagramLengths().len);
+            for (&conn.spaces) |*state| try testing.expect(!state.ack_pending);
+            conn.handshake_confirmed = true;
+            try testing.expectError(error.OutOfMemory, conn.sendNewToken("token", 3000));
         }
         return err;
     };
