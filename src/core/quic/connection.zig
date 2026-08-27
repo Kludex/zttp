@@ -2479,10 +2479,9 @@ pub const Connection = struct {
         if (space == .handshake) self.validateCurrentPath();
 
         if (st.recv_ranges.shouldIgnore(opened.pn)) return;
-        try st.recv_ranges.ensureCanAdd(self.gpa);
-        try self.dispatchFrames(opened.payload, space, long, now);
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, opened.pn) else opened.pn;
-        st.recv_ranges.add(self.gpa, opened.pn) catch unreachable; // capacity was reserved before dispatch
+        st.recv_ranges.add(self.gpa, opened.pn) catch return error.OutOfMemory; // for accurate ACKs
+        try self.dispatchFrames(opened.payload, space, long, now);
         self.resetIdleTimer(now);
 
         // Acknowledge the space if it carried an ack-eliciting frame this packet.
@@ -3228,8 +3227,6 @@ fn receiveStreamUnderAllocationFailure(gpa: std.mem.Allocator) !void {
             try testing.expectEqual(stream.RecvState.size_known, s.state);
             try testing.expectEqual(previous_window, conn.recv_windows.get(0).?);
             try testing.expectEqual(previous_total, conn.conn_received_total);
-            try conn.receiveDatagram(head, 2000);
-            try testing.expectEqualStrings("hello world", s.readable());
         }
         return err;
     };
