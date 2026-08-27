@@ -108,6 +108,8 @@ const SpaceState = struct {
     recv_key_phase: bool = false,
     send_key_phase: bool = false,
     next_pn: u64 = 0,
+    /// The largest authenticated packet number, used only to decode truncated packet numbers.
+    largest_authenticated_pn: ?u64 = null,
     largest_recv_pn: ?u64 = null,
     rec: recovery.Space = .{},
     crypto: crypto_stream.CryptoStream,
@@ -400,6 +402,8 @@ pub const Connection = struct {
     /// non-zero max_idle_timeout.
     idle_deadline: ?u64 = null,
     idle_timed_out: bool = false,
+    /// A mid-dispatch allocation failure leaves the receive state terminal.
+    receive_failure: ?Error = null,
     closed: bool = false,
     /// The details of a CONNECTION_CLOSE received from the peer (RFC 9000 19.19),
     /// captured so the integrator can report why the peer closed - not just that it
@@ -764,6 +768,8 @@ pub const Connection = struct {
     /// fit one datagram. A long header (Initial/Handshake) carries our scid + a
     /// length field; a short header (Application) runs to the datagram end.
     fn buildPacket(self: *Connection, space: Space, frames: []const u8, ack_eliciting: bool, now: u64) Error!u64 {
+        if (self.receive_failure) |err| return err;
+        if (self.closed) return error.ProtocolViolation;
         const st = &self.spaces[@intFromEnum(space)];
         const use_zero_rtt = space == .application and st.send_keys == null and st.zero_rtt_send_keys != null;
         assertFramesAllowedIn(space, use_zero_rtt, frames); // no illegal frames for the packet type
@@ -1370,6 +1376,7 @@ pub const Connection = struct {
     /// detection routes lost pns back into SendStream.onLost, and the PTO timer
     /// probes tail packets that have no later ACK to trigger threshold loss.
     pub fn flushSend(self: *Connection, now: u64) Error!void {
+        if (self.receive_failure) |err| return err;
         if (self.closed) return;
         const space = Space.application;
         const st = &self.spaces[@intFromEnum(space)];
@@ -1745,6 +1752,7 @@ pub const Connection = struct {
     }
 
     pub fn nextTimeout(self: *Connection) ?u64 {
+        if (self.receive_failure != null) return null;
         if (self.closed) return null;
         var earliest: ?u64 = null;
         if (self.idle_deadline) |t| earliest = minOpt(earliest, t);
@@ -1761,6 +1769,7 @@ pub const Connection = struct {
     /// oldest unacked STREAM range so the next flushSend resends it (or a PING). No
     /// I/O happens here - the next flushSend emits whatever was queued.
     pub fn onTimeout(self: *Connection, now: u64) Error!void {
+        if (self.receive_failure) |err| return err;
         if (self.closed) return error.ProtocolViolation;
         if (self.idle_deadline) |deadline| {
             if (now >= deadline) {
@@ -2221,8 +2230,8 @@ pub const Connection = struct {
 
     /// Process one received UDP datagram: walk the coalesced packets, decrypt and
     /// dispatch each. `now` is a monotonic microsecond timestamp. A packet that
-    /// fails authentication is skipped (not fatal); a protocol violation poisons
-    /// the connection.
+    /// fails authentication is skipped (not fatal); a protocol violation or a
+    /// mid-dispatch allocation failure poisons the connection.
     pub fn receiveDatagram(self: *Connection, datagram: []const u8, now: u64) Error!void {
         self.receiveDatagramOn(datagram, now, null) catch |err| return self.closeForReceiveError(err);
     }
@@ -2254,6 +2263,7 @@ pub const Connection = struct {
     }
 
     fn receiveDatagramOn(self: *Connection, datagram: []const u8, now: u64, peer_address: ?[]const u8) Error!void {
+        if (self.receive_failure) |err| return err;
         if (self.closed) return error.ProtocolViolation;
         if (peer_address) |addr| {
             // A spoofable path change is silently dropped, never connection-fatal.
@@ -2530,6 +2540,10 @@ pub const Connection = struct {
             try self.openPacket(pkt, pn_offset, space, long, st.recv_keys orelse return error.Dropped, null);
         defer self.gpa.free(opened.work);
         defer self.gpa.free(opened.plaintext);
+        st.largest_authenticated_pn = if (st.largest_authenticated_pn) |largest|
+            @max(largest, opened.pn)
+        else
+            opened.pn;
         if (st.recv_ranges.shouldIgnore(opened.pn)) return;
         try self.recordAuthenticatedPath(context);
         if (peer_scid_candidate) |candidate| {
@@ -2550,9 +2564,19 @@ pub const Connection = struct {
         // (RFC 9000 8.1).
         if (space == .handshake) self.validateCurrentPath();
 
-        st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, opened.pn) else opened.pn;
-        st.recv_ranges.add(self.gpa, opened.pn) catch return error.OutOfMemory; // for accurate ACKs
-        try self.dispatchFrames(opened.payload, space, long, context.now);
+        st.recv_ranges.ensureCanAdd(self.gpa, opened.pn) catch return error.OutOfMemory;
+        self.dispatchFrames(opened.payload, space, long, context.now) catch |err| {
+            if (err == error.OutOfMemory) {
+                // Frame handlers may have committed state, so this packet must never be replayed or acknowledged.
+                self.receive_failure = err;
+                self.closed = true;
+                for (&self.spaces) |*state| state.ack_pending = false;
+                self.clearSend();
+            }
+            return err;
+        };
+        st.recv_ranges.add(self.gpa, opened.pn) catch unreachable; // ensureCanAdd reserved the only possible allocation.
+        st.largest_recv_pn = if (st.largest_recv_pn) |largest| @max(largest, opened.pn) else opened.pn;
         self.resetIdleTimer(context.now);
 
         // Acknowledge the space if it carried an ack-eliciting frame this packet.
@@ -2658,7 +2682,7 @@ pub const Connection = struct {
         var truncated: u64 = 0;
         for (work[pn_offset .. pn_offset + pn_len]) |b| truncated = (truncated << 8) | b;
         const st = &self.spaces[@intFromEnum(space)];
-        const pn = packet.decodePacketNumber(st.largest_recv_pn orelse 0, truncated, pn_len);
+        const pn = packet.decodePacketNumber(st.largest_authenticated_pn orelse 0, truncated, pn_len);
 
         const header = work[0 .. pn_offset + pn_len];
         const ciphertext = work[pn_offset + pn_len ..];
@@ -3320,6 +3344,62 @@ fn testRequiredServerTransportParameters(conn: *const Connection) !transport_par
 // space, so stream-reassembly tests use the space STREAM is actually legal in.
 pub fn testBuildApp(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8) ![]u8 {
     return testBuildAppWithSecret(gpa, dcid, pn, frames, TEST_APP_SECRET, false);
+}
+
+fn receiveStreamUnderAllocationFailure(gpa: std.mem.Allocator) !void {
+    const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x16 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var tail_frame: std.ArrayListUnmanaged(u8) = .empty;
+    defer tail_frame.deinit(gpa);
+    try frame.encodeStream(&tail_frame, gpa, 0, 6, "world", true);
+    const tail = try testBuildApp(gpa, &dcid, 0, tail_frame.items);
+    defer gpa.free(tail);
+    try conn.receiveDatagram(tail, 1000);
+    conn.clearSend();
+
+    const s = conn.streams.get(0).?;
+    try testing.expectEqual(@as(usize, 1), s.pending.items.len);
+    const previous_pending_offset = s.pending.items[0].offset;
+    const previous_pending_data = try gpa.dupe(u8, s.pending.items[0].data);
+    defer gpa.free(previous_pending_data);
+    const previous_window = conn.recv_windows.get(0).?;
+    const previous_total = conn.conn_received_total;
+    var head_frame: std.ArrayListUnmanaged(u8) = .empty;
+    defer head_frame.deinit(gpa);
+    try frame.encodePathChallenge(&head_frame, gpa, .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try frame.encodeStream(&head_frame, gpa, 0, 0, "hello ", false);
+    const head = try testBuildApp(gpa, &dcid, 1, head_frame.items);
+    defer gpa.free(head);
+    conn.receiveDatagram(head, 2000) catch |err| {
+        try testing.expectEqual(@as(u64, 11), s.highest_received);
+        try testing.expectEqual(@as(?u64, 11), s.final_size);
+        try testing.expectEqual(stream.RecvState.size_known, s.state);
+        try testing.expectEqual(previous_window, conn.recv_windows.get(0).?);
+        try testing.expectEqual(previous_total, conn.conn_received_total);
+        if (s.readable().len == 0) {
+            try testing.expectEqual(@as(usize, 1), s.pending.items.len);
+            try testing.expectEqual(previous_pending_offset, s.pending.items[0].offset);
+            try testing.expectEqualStrings(previous_pending_data, s.pending.items[0].data);
+            try testing.expect(!conn.spaces[@intFromEnum(Space.application)].recv_ranges.contains(1));
+        } else {
+            try testing.expectEqualStrings("hello world", s.readable());
+            try testing.expectEqual(@as(usize, 0), s.pending.items.len);
+            try testing.expect(s.isFinished());
+            try testing.expect(conn.spaces[@intFromEnum(Space.application)].recv_ranges.contains(1));
+        }
+        if (conn.receive_failure != null) {
+            try testing.expectEqual(@as(usize, 0), conn.datagramLengths().len);
+            for (&conn.spaces) |*state| try testing.expect(!state.ack_pending);
+            conn.handshake_confirmed = true;
+            try testing.expectError(error.OutOfMemory, conn.sendNewToken("token", 3000));
+        }
+        return err;
+    };
+    try testing.expectEqualStrings("hello world", s.readable());
+    try testing.expect(s.isFinished());
 }
 
 fn testBuildAppWithSecret(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8, secret: [32]u8, key_phase: bool) ![]u8 {
@@ -5167,6 +5247,10 @@ test "per-stream receive flow control rejects data past the stream limit" {
     try testing.expectEqualStrings("", conn.streamData(0));
     try testing.expect(!conn.hasStream(0));
     try testing.expect(!conn.recv_windows.contains(0));
+}
+
+test "receive stream updates are atomic on allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, receiveStreamUnderAllocationFailure, .{});
 }
 
 test "receive stream fragment count is bounded" {

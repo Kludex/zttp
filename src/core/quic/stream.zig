@@ -105,23 +105,31 @@ pub const RecvStream = struct {
         }
         const new_high = @max(self.highest_received, end);
         const delta = new_high - self.highest_received;
-        self.highest_received = new_high;
-        if (fin) {
-            if (self.final_size) |fs| {
-                if (fs != end) return error.FinalSizeError;
-            } else self.final_size = end;
-            if (self.state == .recv) self.state = .size_known;
+
+        if (end > self.contiguous) {
+            if (offset <= self.contiguous) {
+                var frontier = end;
+                for (self.pending.items) |f| {
+                    if (f.offset > frontier) break;
+                    frontier = @max(frontier, f.offset + f.data.len);
+                }
+                const growth = std.math.cast(usize, frontier - self.contiguous) orelse
+                    return error.StreamBufferExceeded;
+                try self.ready.ensureUnusedCapacity(self.gpa, growth);
+
+                const skip: usize = @intCast(self.contiguous - offset);
+                self.ready.appendSliceAssumeCapacity(data[skip..]);
+                self.contiguous = end;
+                self.drainPendingAssumeCapacity();
+            } else {
+                try self.buffer(offset, data);
+            }
         }
 
-        if (end <= self.contiguous) return delta; // wholly duplicate
-
-        if (offset <= self.contiguous) {
-            const skip = self.contiguous - offset;
-            try self.ready.appendSlice(self.gpa, data[skip..]);
-            self.contiguous = end;
-            try self.drainPending();
-        } else {
-            try self.buffer(offset, data);
+        self.highest_received = new_high;
+        if (fin) {
+            self.final_size = end;
+            if (self.state == .recv) self.state = .size_known;
         }
         return delta;
     }
@@ -136,14 +144,14 @@ pub const RecvStream = struct {
         try self.pending.insert(self.gpa, idx, .{ .offset = offset, .data = copy });
     }
 
-    fn drainPending(self: *RecvStream) Error!void {
+    fn drainPendingAssumeCapacity(self: *RecvStream) void {
         var progressed = true;
         while (progressed) {
             progressed = false;
             var i: usize = 0;
             while (i < self.pending.items.len) {
                 const f = self.pending.items[i];
-                const fend = std.math.add(u64, f.offset, f.data.len) catch return error.FinalSizeError;
+                const fend = f.offset + f.data.len;
                 if (fend <= self.contiguous) {
                     self.gpa.free(f.data);
                     _ = self.pending.orderedRemove(i);
@@ -151,8 +159,8 @@ pub const RecvStream = struct {
                     continue;
                 }
                 if (f.offset <= self.contiguous) {
-                    const skip = self.contiguous - f.offset;
-                    try self.ready.appendSlice(self.gpa, f.data[skip..]);
+                    const skip: usize = @intCast(self.contiguous - f.offset);
+                    self.ready.appendSliceAssumeCapacity(f.data[skip..]);
                     self.contiguous = fend;
                     self.gpa.free(f.data);
                     _ = self.pending.orderedRemove(i);

@@ -45,6 +45,15 @@ pub const AckRanges = struct {
         return pn < self.ignore_below;
     }
 
+    /// Reserve any storage `add` will need for `pn` without recording it.
+    pub fn ensureCanAdd(self: *AckRanges, gpa: std.mem.Allocator, pn: u64) !void {
+        for (self.ranges.items) |range| {
+            if (pn >= range.lo and pn <= range.hi) return;
+            if (pn == range.hi + 1 or pn + 1 == range.lo) return;
+        }
+        if (self.ranges.items.len < MAX_RANGES) try self.ranges.ensureUnusedCapacity(gpa, 1);
+    }
+
     /// Record that packet number `pn` was received. Extends or merges an existing
     /// range, or inserts a new one in descending order. If the list is at capacity
     /// the oldest (smallest) range is dropped - the peer will simply re-send those
