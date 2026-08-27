@@ -69,6 +69,23 @@ pub fn build(b: *std.Build) void {
     const fuzz_obj_step = b.step("fuzz-obj", "Emit the libFuzzer object (zig-out/bin/zttp_fuzz_reader.o)");
     fuzz_obj_step.dependOn(&install_fuzz.step);
 
+    const stream_benchmark = b.addExecutable(.{
+        .name = "quic_stream_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/quic_stream.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    stream_benchmark.root_module.addImport("quic_stream", b.createModule(.{
+        .root_source_file = b.path("src/core/quic/stream.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const run_stream_benchmark = b.addRunArtifact(stream_benchmark);
+    const stream_benchmark_step = b.step("bench-stream", "Benchmark QUIC stream buffer compaction");
+    stream_benchmark_step.dependOn(&run_stream_benchmark.step);
+
     // Python build configuration is discovered by the hatch-ziglang hook and
     // passed in as -D options or environment variables. Resolved lazily so the
     // test step above never requires a Python toolchain.
