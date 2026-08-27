@@ -269,7 +269,7 @@ def pieces_of(w: Workload) -> list[bytes]:
 def make_zttp(w: Workload) -> Runner:
     role = zttp.SERVER if w.kind == "request" else zttp.CLIENT
     pieces, messages = pieces_of(w), w.messages
-    Connection, NEED_DATA, EndOfMessage = zttp.Connection, zttp.NEED_DATA, zttp.EndOfMessage
+    Connection, NEED_DATA, Request, EndOfMessage = zttp.Connection, zttp.NEED_DATA, zttp.Request, zttp.EndOfMessage
 
     def run(n: int) -> None:
         for _ in range(n):
@@ -281,7 +281,7 @@ def make_zttp(w: Workload) -> Runner:
                     ev = conn.next_event()
                     if ev is NEED_DATA:
                         break
-                    if type(ev) is EndOfMessage:
+                    if (type(ev) is Request and ev.end_stream) or type(ev) is EndOfMessage:
                         done += 1
                         if done < messages:
                             conn.start_next_cycle()
@@ -493,7 +493,7 @@ def bench(w: Workload, batch: int, repeats: int) -> dict[str, float]:
         for label, fn in parsers:
             samples[label].append(timed(fn, batch))
 
-    per_batch = {label: [batch / dt for dt in batches] for label, batches in samples.items()}
+    per_batch = {label: [batch * w.messages / dt for dt in batches] for label, batches in samples.items()}
     rates: dict[str, float] = {}
     for label, values in per_batch.items():
         p25, median, p75 = _quartiles(values)

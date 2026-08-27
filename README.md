@@ -147,18 +147,18 @@ not a production server identity.
 
 ## Performance
 
-Against [httptools](https://github.com/MagicStack/httptools) — the C parser
-uvicorn uses — on the same requests, with both verified to extract identical
-data:
+Against [httptools](https://github.com/MagicStack/httptools), the C parser
+Uvicorn uses, on the same requests with each parser's default API:
 
 | Workload          | zttp         | httptools    | zttp vs httptools |
 | ----------------- | -----------: | -----------: | ----------------: |
-| Simple GET        | ~1.24M req/s | ~1.07M req/s | **~1.16x**        |
-| POST + JSON body  | ~1.42M req/s | ~1.25M req/s | **~1.14x**        |
+| Simple GET        | ~1.55M req/s | ~1.07M req/s | **~1.45x**        |
+| POST + JSON body  | ~1.40M req/s | ~1.24M req/s | **~1.13x**        |
 
-zttp beats httptools on 13 of the benchmark suite's 14 workloads while staying
-sans-IO and event-based, and is roughly 15x faster than the pure-Python
-alternative. Run it yourself with `./scripts/bench`.
+zttp beats httptools on all 14 workloads while staying sans-IO and event-based.
+It is roughly 22x faster than the pure-Python alternative. A Uvicorn-shaped
+benchmark that materializes equivalent ASGI scopes measures a 1.16x to 1.52x
+lead. Run the benchmarks yourself with `./scripts/bench`.
 
 These are parser microbenchmarks, and single-digit-percent edges are close to
 run-to-run noise — see
@@ -167,12 +167,10 @@ run-to-run noise — see
 
 ### Why it is fast
 
-- A SWAR newline scanner and comptime-built character-class tables in the Zig
-  core, so the hot loops are branch-light array lookups.
-- The body is emitted as a single `Data` event slicing the parse buffer, rather
-  than copied per callback the way httptools does.
-- The header list is built directly in Zig as `list[tuple[bytes, bytes]]`, with
-  no per-header Python callback.
+- SIMD-accelerated line and field scans with comptime-built character tables.
+- Headers stay in a compact `HeaderBlock` until you access their Python values.
+- The receive path emits one `Data` event per body span and can reuse
+  Python-owned input for large standalone bodies.
 
 ## Correctness & security
 
