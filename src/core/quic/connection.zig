@@ -166,6 +166,14 @@ const OpenedPacket = struct {
     key_phase: bool,
 };
 
+const ReceiveContext = struct {
+    now: u64,
+    datagram_len: usize,
+    peer_address: ?[]const u8,
+    path_recorded: bool = false,
+    auto_path_challenge_queued: bool = false,
+};
+
 /// A STOP_SENDING owed to the peer: the error code, and whether a frame carrying it is
 /// currently in flight (so flushSend does not re-send while one is unacked).
 const StopSending = struct { code: u64, in_flight: bool = false };
@@ -2212,26 +2220,13 @@ pub const Connection = struct {
         self.recv_bytes += datagram.len;
         const previous_path = self.current_path_token;
         defer self.current_path_token = previous_path;
-        var auto_path_challenge_queued = false;
+        var context = ReceiveContext{ .now = now, .datagram_len = datagram.len, .peer_address = peer_address };
         if (peer_address) |addr| {
-            const pt = try self.pathTokenForAddress(addr);
-            const new_peer_path = self.default_path_token != null and self.default_path_token.? != pt;
-            self.current_path_token = pt;
-            if (self.default_path_token == null) {
-                self.default_path_token = pt;
-                if (self.address_validated) self.paths.getPtr(pt).?.validated = true;
-            }
-            if (self.paths.getPtr(pt)) |p| {
-                p.recv_bytes += datagram.len;
-                if (self.handshake_confirmed and new_peer_path and !p.validated) {
-                    try self.queueAutomaticPathChallenge(pt, now);
-                    auto_path_challenge_queued = true;
-                }
-            }
+            self.current_path_token = std.hash.Wyhash.hash(0, addr);
         }
         var rest = datagram;
         while (rest.len > 0) {
-            const consumed = self.receivePacket(rest, now, datagram.len) catch |e| switch (e) {
+            const consumed = self.receivePacket(rest, &context) catch |e| switch (e) {
                 // A short-header packet has no length field, so an undecryptable one
                 // ends the walk (its boundary is the datagram end). A long-header
                 // packet whose boundary IS known returns its length from receiveLong
@@ -2246,7 +2241,7 @@ pub const Connection = struct {
         // CRYPTO that stalled on the limit (RFC 9000 8.1).
         try self.flushCrypto(.initial, now);
         try self.flushCrypto(.handshake, now);
-        if (auto_path_challenge_queued) {
+        if (context.auto_path_challenge_queued) {
             self.flushPathChallenges(.application, now) catch |e| switch (e) {
                 error.AmplificationLimited => {},
                 else => return e,
@@ -2254,12 +2249,12 @@ pub const Connection = struct {
         }
     }
 
-    fn receivePacket(self: *Connection, buf: []const u8, now: u64, datagram_len: usize) Error!usize {
-        if (packet.isLong(buf[0])) return self.receiveLong(buf, now, datagram_len);
-        return self.receiveShort(buf, now);
+    fn receivePacket(self: *Connection, buf: []const u8, context: *ReceiveContext) Error!usize {
+        if (packet.isLong(buf[0])) return self.receiveLong(buf, context);
+        return self.receiveShort(buf, context);
     }
 
-    fn receiveLong(self: *Connection, buf: []const u8, now: u64, datagram_len: usize) Error!usize {
+    fn receiveLong(self: *Connection, buf: []const u8, context: *ReceiveContext) Error!usize {
         const prefix = packet.parseLongPrefix(buf) catch return error.Dropped;
         if (prefix.version == 0) return self.receiveVersionNegotiation(prefix, buf);
         if (prefix.version != constants.VERSION_1) {
@@ -2267,7 +2262,7 @@ pub const Connection = struct {
             return buf.len;
         }
         const hdr = packet.parseLong(buf) catch return error.Dropped;
-        if (hdr.ltype == .retry) return self.receiveRetry(hdr, buf, now);
+        if (hdr.ltype == .retry) return self.receiveRetry(hdr, buf, context);
         const space: Space = switch (hdr.ltype) {
             .initial => .initial,
             .handshake => .handshake,
@@ -2276,7 +2271,7 @@ pub const Connection = struct {
         };
         const total = hdr.pn_offset + @as(usize, @intCast(hdr.length));
         if (total > buf.len) return error.Dropped;
-        if (self.role == .server and hdr.ltype == .initial and datagram_len < constants.MIN_INITIAL_DATAGRAM) {
+        if (self.role == .server and hdr.ltype == .initial and context.datagram_len < constants.MIN_INITIAL_DATAGRAM) {
             return error.Dropped;
         }
         // A long header's length is known, so a packet we cannot decrypt (no keys
@@ -2284,7 +2279,7 @@ pub const Connection = struct {
         // length so the caller keeps walking any coalesced packets behind it
         // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2.
         const peer_scid_candidate = if (hdr.ltype == .initial) hdr.scid else null;
-        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, peer_scid_candidate, now) catch |e| switch (e) {
+        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, peer_scid_candidate, context) catch |e| switch (e) {
             error.Dropped => return total,
             else => return e,
         };
@@ -2326,12 +2321,13 @@ pub const Connection = struct {
         return error.ProtocolViolation;
     }
 
-    fn receiveRetry(self: *Connection, hdr: packet.LongHeader, buf: []const u8, now: u64) Error!usize {
+    fn receiveRetry(self: *Connection, hdr: packet.LongHeader, buf: []const u8, context: *ReceiveContext) Error!usize {
         if (self.role != .client) return error.Dropped;
         if (self.retried or self.spaces[@intFromEnum(Space.handshake)].recv_keys != null) return error.Dropped;
         if (!std.mem.eql(u8, hdr.dcid, self.scid)) return error.Dropped;
         if (hdr.scid.len == 0 or hdr.token.len == 0) return error.Dropped;
         if (!(packet.validateRetryIntegrity(self.gpa, buf, self.peer_scid) catch return error.OutOfMemory)) return error.Dropped;
+        try self.recordAuthenticatedPath(context);
 
         const token = self.gpa.dupe(u8, hdr.token) catch return error.OutOfMemory;
         errdefer self.gpa.free(token);
@@ -2355,11 +2351,11 @@ pub const Connection = struct {
         st.send_keys = initial.client;
         if (st.crypto_send.end() > 0) try st.crypto_send.onLost(0, st.crypto_send.end(), false);
         st.crypto_sent.clearRetainingCapacity();
-        try self.flushCrypto(.initial, now);
+        try self.flushCrypto(.initial, context.now);
         return buf.len;
     }
 
-    fn receiveShort(self: *Connection, buf: []const u8, now: u64) Error!usize {
+    fn receiveShort(self: *Connection, buf: []const u8, context: *ReceiveContext) Error!usize {
         const parsed = self.parseShortForLocalCid(buf) catch {
             if (self.detectStatelessReset(buf)) return buf.len;
             return error.Dropped;
@@ -2368,7 +2364,7 @@ pub const Connection = struct {
         self.current_packet_local_cid_seq = parsed.local_cid_seq;
         defer self.current_packet_local_cid_seq = previous_cid_seq;
         // A short-header packet is the rest of the datagram (no length field).
-        self.decryptAndDispatch(buf, parsed.hdr.pn_offset, .application, false, null, now) catch |e| switch (e) {
+        self.decryptAndDispatch(buf, parsed.hdr.pn_offset, .application, false, null, context) catch |e| switch (e) {
             error.Dropped => {
                 if (self.detectStatelessReset(buf)) return buf.len;
                 return error.Dropped;
@@ -2449,7 +2445,7 @@ pub const Connection = struct {
         space: Space,
         long: bool,
         peer_scid_candidate: ?[]const u8,
-        now: u64,
+        context: *ReceiveContext,
     ) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
         const opened = if (space == .application and !long)
@@ -2460,6 +2456,7 @@ pub const Connection = struct {
             try self.openPacket(pkt, pn_offset, space, long, st.recv_keys orelse return error.Dropped, null);
         defer self.gpa.free(opened.work);
         defer self.gpa.free(opened.plaintext);
+        try self.recordAuthenticatedPath(context);
         if (peer_scid_candidate) |candidate| {
             // RFC 9000 7.2 permits adoption only after packet authentication.
             if (!self.peer_scid_set and candidate.len > 0) {
@@ -2481,11 +2478,30 @@ pub const Connection = struct {
         if (st.recv_ranges.shouldIgnore(opened.pn)) return;
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, opened.pn) else opened.pn;
         st.recv_ranges.add(self.gpa, opened.pn) catch return error.OutOfMemory; // for accurate ACKs
-        try self.dispatchFrames(opened.payload, space, long, now);
-        self.resetIdleTimer(now);
+        try self.dispatchFrames(opened.payload, space, long, context.now);
+        self.resetIdleTimer(context.now);
 
         // Acknowledge the space if it carried an ack-eliciting frame this packet.
-        if (st.ack_pending) try self.sendAck(space, now);
+        if (st.ack_pending) try self.sendAck(space, context.now);
+    }
+
+    fn recordAuthenticatedPath(self: *Connection, context: *ReceiveContext) Error!void {
+        if (context.path_recorded) return;
+        const addr = context.peer_address orelse return;
+        const pt = try self.pathTokenForAddress(addr);
+        const new_peer_path = self.default_path_token != null and self.default_path_token.? != pt;
+        self.current_path_token = pt;
+        const p = self.paths.getPtr(pt).?;
+        p.recv_bytes += context.datagram_len;
+        if (self.default_path_token == null) {
+            self.default_path_token = pt;
+            if (self.address_validated) p.validated = true;
+        }
+        if (self.handshake_confirmed and new_peer_path and !p.validated) {
+            try self.queueAutomaticPathChallenge(pt, context.now);
+            context.auto_path_challenge_queued = true;
+        }
+        context.path_recorded = true;
     }
 
     fn openApplicationPacket(self: *Connection, pkt: []const u8, pn_offset: usize) Error!OpenedPacket {
@@ -3575,6 +3591,24 @@ test "1-RTT packets obey the anti-amplification budget" {
     server.recv_bytes = 100;
     try server.sendPing(.application, 2000);
     try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+}
+
+test "unauthenticated datagram does not retain path state" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const peer_address = "203.0.113.1:4433";
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const frames = [_]u8{ 0x01, 0x00, 0x00 };
+    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(dgram);
+    dgram[dgram.len - 1] ^= 1;
+
+    try conn.receiveDatagramFrom(dgram, 1000, peer_address);
+    const token = std.hash.Wyhash.hash(0, peer_address);
+    try testing.expect(conn.pathAddress(token) == null);
 }
 
 test "PATH_CHALLENGE elicits a matching PATH_RESPONSE" {
