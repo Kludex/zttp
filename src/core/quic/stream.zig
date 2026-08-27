@@ -105,23 +105,31 @@ pub const RecvStream = struct {
         }
         const new_high = @max(self.highest_received, end);
         const delta = new_high - self.highest_received;
-        self.highest_received = new_high;
-        if (fin) {
-            if (self.final_size) |fs| {
-                if (fs != end) return error.FinalSizeError;
-            } else self.final_size = end;
-            if (self.state == .recv) self.state = .size_known;
+
+        if (end > self.contiguous) {
+            if (offset <= self.contiguous) {
+                var frontier = end;
+                for (self.pending.items) |f| {
+                    if (f.offset > frontier) break;
+                    frontier = @max(frontier, f.offset + f.data.len);
+                }
+                const growth = std.math.cast(usize, frontier - self.contiguous) orelse
+                    return error.StreamBufferExceeded;
+                try self.ready.ensureUnusedCapacity(self.gpa, growth);
+
+                const skip: usize = @intCast(self.contiguous - offset);
+                self.ready.appendSliceAssumeCapacity(data[skip..]);
+                self.contiguous = end;
+                self.drainPendingAssumeCapacity();
+            } else {
+                try self.buffer(offset, data);
+            }
         }
 
-        if (end <= self.contiguous) return delta; // wholly duplicate
-
-        if (offset <= self.contiguous) {
-            const skip = self.contiguous - offset;
-            try self.ready.appendSlice(self.gpa, data[skip..]);
-            self.contiguous = end;
-            try self.drainPending();
-        } else {
-            try self.buffer(offset, data);
+        self.highest_received = new_high;
+        if (fin) {
+            self.final_size = end;
+            if (self.state == .recv) self.state = .size_known;
         }
         return delta;
     }
@@ -136,14 +144,14 @@ pub const RecvStream = struct {
         try self.pending.insert(self.gpa, idx, .{ .offset = offset, .data = copy });
     }
 
-    fn drainPending(self: *RecvStream) Error!void {
+    fn drainPendingAssumeCapacity(self: *RecvStream) void {
         var progressed = true;
         while (progressed) {
             progressed = false;
             var i: usize = 0;
             while (i < self.pending.items.len) {
                 const f = self.pending.items[i];
-                const fend = std.math.add(u64, f.offset, f.data.len) catch return error.FinalSizeError;
+                const fend = f.offset + f.data.len;
                 if (fend <= self.contiguous) {
                     self.gpa.free(f.data);
                     _ = self.pending.orderedRemove(i);
@@ -151,8 +159,8 @@ pub const RecvStream = struct {
                     continue;
                 }
                 if (f.offset <= self.contiguous) {
-                    const skip = self.contiguous - f.offset;
-                    try self.ready.appendSlice(self.gpa, f.data[skip..]);
+                    const skip: usize = @intCast(self.contiguous - f.offset);
+                    self.ready.appendSliceAssumeCapacity(f.data[skip..]);
                     self.contiguous = fend;
                     self.gpa.free(f.data);
                     _ = self.pending.orderedRemove(i);
@@ -491,6 +499,28 @@ pub const SendStream = struct {
     }
 };
 
+fn pushUnderAllocationFailure(gpa: std.mem.Allocator) !void {
+    var s = RecvStream.init(gpa);
+    defer s.deinit();
+
+    _ = s.push(6, "world", true) catch |err| {
+        try std.testing.expectEqual(@as(u64, 0), s.highest_received);
+        try std.testing.expectEqual(@as(?u64, null), s.final_size);
+        try std.testing.expectEqual(RecvState.recv, s.state);
+        try std.testing.expectEqualStrings("", s.readable());
+        return err;
+    };
+    _ = s.push(0, "hello ", false) catch |err| {
+        try std.testing.expectEqual(@as(u64, 11), s.highest_received);
+        try std.testing.expectEqual(@as(?u64, 11), s.final_size);
+        try std.testing.expectEqual(RecvState.size_known, s.state);
+        try std.testing.expectEqualStrings("", s.readable());
+        return err;
+    };
+    try std.testing.expectEqualStrings("hello world", s.readable());
+    try std.testing.expect(s.isFinished());
+}
+
 test "stream-id typing reads the low two bits" {
     try std.testing.expectEqual(StreamType.client_bidi, StreamType.of(0));
     try std.testing.expectEqual(StreamType.server_bidi, StreamType.of(1));
@@ -519,6 +549,10 @@ test "out-of-order fragments are buffered then drained" {
     _ = try s.push(0, "hello ", false); // unlocks the buffered tail
     try std.testing.expectEqualStrings("hello world", s.readable());
     try std.testing.expect(s.isFinished());
+}
+
+test "receive stream updates are atomic on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, pushUnderAllocationFailure, .{});
 }
 
 test "overlapping and duplicate data is handled" {
