@@ -338,6 +338,8 @@ pub const Connection = struct {
     /// The unauthenticated route for queued Version Negotiation output. It is
     /// bounded to one address and released when the output queue is drained.
     provisional_path: ?ProvisionalPath = null,
+    /// The single peer path awaiting automatic validation after migration.
+    peer_candidate_path_token: ?u64 = null,
     current_path_token: ?u64 = null,
     default_path_token: ?u64 = null,
     /// Local CID sequence number matched by the short-header packet currently
@@ -957,6 +959,24 @@ pub const Connection = struct {
         self.out_path_tokens.clearRetainingCapacity();
         if (self.provisional_path) |path| self.gpa.free(path.state.address);
         self.provisional_path = null;
+        while (true) {
+            var removed = false;
+            var iterator = self.paths.iterator();
+            while (iterator.next()) |entry| {
+                const token = entry.key_ptr.*;
+                if (self.default_path_token == token or self.peer_candidate_path_token == token or
+                    self.pathHasPendingChallenge(token))
+                {
+                    continue;
+                }
+                const address = entry.value_ptr.address;
+                _ = self.paths.remove(token);
+                self.gpa.free(address);
+                removed = true;
+                break;
+            }
+            if (!removed) break;
+        }
     }
 
     // ---- STREAM send -----------------------------------------------------------
@@ -2496,6 +2516,7 @@ pub const Connection = struct {
             try self.openPacket(pkt, pn_offset, space, long, st.recv_keys orelse return error.Dropped, null);
         defer self.gpa.free(opened.work);
         defer self.gpa.free(opened.plaintext);
+        if (st.recv_ranges.shouldIgnore(opened.pn)) return;
         try self.recordAuthenticatedPath(context);
         if (peer_scid_candidate) |candidate| {
             // RFC 9000 7.2 permits adoption only after packet authentication.
@@ -2515,7 +2536,6 @@ pub const Connection = struct {
         // (RFC 9000 8.1).
         if (space == .handshake) self.validateCurrentPath();
 
-        if (st.recv_ranges.shouldIgnore(opened.pn)) return;
         st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, opened.pn) else opened.pn;
         st.recv_ranges.add(self.gpa, opened.pn) catch return error.OutOfMemory; // for accurate ACKs
         try self.dispatchFrames(opened.payload, space, long, context.now);
@@ -2528,14 +2548,39 @@ pub const Connection = struct {
     fn recordAuthenticatedPath(self: *Connection, context: *ReceiveContext) Error!void {
         if (context.path_recorded) return;
         const addr = context.peer_address orelse return;
+        const candidate = std.hash.Wyhash.hash(0, addr);
+        if (!self.paths.contains(candidate) and self.default_path_token != null and
+            self.default_path_token.? != candidate)
+        {
+            if (self.peer_candidate_path_token) |previous| {
+                if (previous != candidate) {
+                    for (self.out_path_tokens.items) |queued| {
+                        if (queued == previous) return error.Dropped;
+                    }
+                    self.removePendingPathChallengesFor(previous);
+                    if (self.paths.fetchRemove(previous)) |entry| self.gpa.free(entry.value.address);
+                    self.peer_candidate_path_token = null;
+                }
+            }
+        }
         const pt = try self.pathTokenForAddress(addr);
         const new_peer_path = self.default_path_token != null and self.default_path_token.? != pt;
         self.current_path_token = pt;
         const p = self.paths.getPtr(pt).?;
-        p.recv_bytes += context.datagram_len;
+        if (self.provisional_path) |*provisional| {
+            if (provisional.token == pt and std.mem.eql(u8, provisional.state.address, addr)) {
+                p.recv_bytes = p.recv_bytes +| provisional.state.recv_bytes;
+                p.sent_bytes = p.sent_bytes +| provisional.state.sent_bytes;
+                provisional.state.recv_bytes = 0;
+                provisional.state.sent_bytes = 0;
+            }
+        }
+        p.recv_bytes = p.recv_bytes +| context.datagram_len;
         if (self.default_path_token == null) {
             self.default_path_token = pt;
             if (self.address_validated) p.validated = true;
+        } else if (new_peer_path and !p.validated and self.peer_candidate_path_token == null) {
+            self.peer_candidate_path_token = pt;
         }
         if (self.handshake_confirmed and new_peer_path and !p.validated) {
             try self.queueAutomaticPathChallenge(pt, context.now);
@@ -2844,6 +2889,7 @@ pub const Connection = struct {
         if (self.current_path_token) |pt| {
             if (self.paths.getPtr(pt)) |p| p.validated = true;
             self.default_path_token = pt;
+            if (self.peer_candidate_path_token == pt) self.peer_candidate_path_token = null;
         }
         self.address_validated = true;
     }
@@ -3657,6 +3703,88 @@ test "unauthenticated datagram does not retain path state" {
     try conn.receiveDatagramFrom(dgram, 1000, peer_address);
     const token = std.hash.Wyhash.hash(0, peer_address);
     try testing.expect(conn.pathAddress(token) == null);
+}
+
+test "replayed authenticated datagrams do not retain new path state" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x09 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const frames = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
+    const datagram = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(datagram);
+
+    try conn.receiveDatagramFrom(datagram, 1000, "203.0.113.1:4433");
+    conn.clearSend();
+    try conn.receiveDatagramFrom(datagram, 2000, "203.0.113.2:4433");
+    try conn.receiveDatagramFrom(datagram, 3000, "203.0.113.3:4433");
+
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, "203.0.113.1:4433")) != null);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, "203.0.113.2:4433")) == null);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, "203.0.113.3:4433")) == null);
+}
+
+test "authenticated migration retains one unvalidated peer path" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x0a };
+    const addr_a = "198.51.100.1:4433";
+    const addr_b = "198.51.100.2:4433";
+    const addr_c = "198.51.100.3:4433";
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.handshake_confirmed = true;
+
+    const frames = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
+    const first = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(first);
+    const second = try testBuildApp(gpa, &dcid, 1, &frames);
+    defer gpa.free(second);
+    const third = try testBuildApp(gpa, &dcid, 2, &frames);
+    defer gpa.free(third);
+
+    try conn.receiveDatagramFrom(first, 1000, addr_a);
+    conn.clearSend();
+    try conn.receiveDatagramFrom(second, 2000, addr_b);
+    try conn.receiveDatagramFrom(third, 3000, addr_c);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, addr_b)) != null);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, addr_c)) == null);
+
+    conn.clearSend();
+    try conn.receiveDatagramFrom(third, 4000, addr_c);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, addr_b)) == null);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, addr_c)) != null);
+}
+
+test "authenticated path promotion preserves provisional amplification credit" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4 };
+    const peer_address = "203.0.113.1:4433";
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    testInstallAppKeys(&server);
+    server.address_validated = false;
+
+    var unsupported: std.ArrayListUnmanaged(u8) = .empty;
+    defer unsupported.deinit(gpa);
+    _ = try packet.writeLongHeader(&unsupported, gpa, .initial, 0x0a0a_0a0a, &dcid, "cli", "", 1, 1);
+    try unsupported.appendNTimes(gpa, 0, constants.MIN_INITIAL_DATAGRAM - unsupported.items.len);
+    try server.receiveDatagramFrom(unsupported.items, 1000, peer_address);
+
+    const frames = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
+    const authenticated = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(authenticated);
+    try server.receiveDatagramFrom(authenticated, 2000, peer_address);
+
+    const before = server.datagramLengths().len;
+    try server.sendStreamData(1, &([_]u8{0x42} ** 1000), false);
+    try server.flushSend(3000);
+    try testing.expect(server.datagramLengths().len > before);
+    var sent_bytes: usize = 0;
+    for (server.datagramLengths()) |len| sent_bytes += len;
+    try testing.expect(sent_bytes <= (unsupported.items.len + authenticated.len) * constants.AMPLIFICATION_FACTOR);
 }
 
 test "PATH_CHALLENGE elicits a matching PATH_RESPONSE" {
