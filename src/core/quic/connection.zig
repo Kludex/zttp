@@ -347,8 +347,8 @@ pub const Connection = struct {
     /// A peer STOP_SENDING received before we created the matching send stream (id ->
     /// error code), applied when the stream is lazily created so it is born reset.
     peer_stop_sending: std.AutoHashMapUnmanaged(u64, u64) = .empty,
-    /// Send streams materialized from deferred peer STOP_SENDING requests, retained
-    /// until RESET_STREAM acknowledgement and capped against peer-driven churn.
+    /// Peer-triggered resets, tracked from STOP_SENDING receipt through the matching
+    /// RESET_STREAM acknowledgement and capped against peer-driven churn.
     peer_reset_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// RETIRE_CONNECTION_ID frames owed to the peer (seq -> in-flight state), queued
     /// when NEW_CONNECTION_ID.retire_prior_to asks us to retire older peer CIDs.
@@ -990,8 +990,28 @@ pub const Connection = struct {
 
     // ---- STREAM send -----------------------------------------------------------
 
+    fn trackPeerResetStream(self: *Connection, id: u64) !void {
+        if (self.peer_reset_streams.contains(id)) return;
+        if (self.peer_reset_streams.count() >= max_peer_reset_streams) {
+            self.close(
+                false,
+                @intFromEnum(constants.TransportError.internal_error),
+                "peer reset stream limit",
+            ) catch {
+                self.closed = true;
+            };
+            return error.StreamLimitError;
+        }
+        try self.peer_reset_streams.ensureUnusedCapacity(self.gpa, 1);
+        self.peer_reset_streams.putAssumeCapacity(id, {});
+    }
+
     fn sendStream(self: *Connection, id: u64) Error!*stream.SendStream {
-        if (self.send_streams.get(id)) |s| return s;
+        if (self.peer_stop_sending.contains(id)) try self.trackPeerResetStream(id);
+        if (self.send_streams.get(id)) |s| {
+            if (self.peer_stop_sending.fetchRemove(id)) |e| s.reset(e.value);
+            return s;
+        }
         try self.checkLocalStreamLimit(id);
         const s = try self.gpa.create(stream.SendStream);
         s.* = stream.SendStream.init(self.gpa);
@@ -2955,10 +2975,16 @@ pub const Connection = struct {
     fn onStopSending(self: *Connection, id: u64, error_code: u64) Error!void {
         if (!self.localCanSendOn(id)) return error.StreamStateError;
         if (stream.StreamType.of(id) != .client_bidi) return;
+        try self.checkPeerStreamLimit(id);
+        const was_tracked = self.peer_reset_streams.contains(id);
+        try self.trackPeerResetStream(id);
         if (self.send_streams.get(id)) |s| {
             s.reset(error_code);
         } else {
-            self.peer_stop_sending.put(self.gpa, id, error_code) catch return error.OutOfMemory;
+            self.peer_stop_sending.put(self.gpa, id, error_code) catch {
+                if (!was_tracked) _ = self.peer_reset_streams.remove(id);
+                return error.OutOfMemory;
+            };
         }
     }
 
@@ -3000,19 +3026,7 @@ pub const Connection = struct {
         const s = self.streams.get(id) orelse return false;
         if (!s.isTerminal()) return false;
         if (self.peer_stop_sending.contains(id) and !self.send_streams.contains(id)) {
-            if (self.peer_reset_streams.count() >= max_peer_reset_streams) {
-                self.close(
-                    false,
-                    @intFromEnum(constants.TransportError.internal_error),
-                    "peer reset stream limit",
-                ) catch {
-                    self.closed = true;
-                };
-                return false;
-            }
-            self.peer_reset_streams.ensureUnusedCapacity(self.gpa, 1) catch return false;
             _ = self.sendStream(id) catch return false;
-            self.peer_reset_streams.putAssumeCapacity(id, {});
         }
         // Remember the id as retired BEFORE freeing, so a failure to record it leaves
         // the stream in place rather than dropped-but-resurrectable.
@@ -5157,22 +5171,25 @@ test "peer reset send state is bounded" {
         {
             const dgram = try testBuildApp(gpa, &dcid, sequence, frames.items);
             defer gpa.free(dgram);
-            try conn.receiveDatagram(dgram, 1000 + sequence);
+            if (sequence < max_peer_reset_streams) {
+                try conn.receiveDatagram(dgram, 1000 + sequence);
+            } else {
+                try testing.expectError(error.StreamLimitError, conn.receiveDatagram(dgram, 1000 + sequence));
+                continue;
+            }
         }
         try testing.expect(conn.streamReset(id));
-        if (sequence < max_peer_reset_streams) {
-            try testing.expect(conn.dropStream(id));
-            try conn.flushSend(2000 + sequence);
-            conn.clearSend();
-        } else {
-            try testing.expect(!conn.dropStream(id));
-        }
+        try testing.expectError(error.FinalSizeError, conn.sendStreamData(id, "ignored body", false));
+        try testing.expect(conn.dropStream(id));
+        try conn.flushSend(2000 + sequence);
+        conn.clearSend();
     }
 
     try testing.expect(conn.closed);
     try testing.expectEqual(max_peer_reset_streams, conn.peer_reset_streams.count());
     try testing.expectEqual(max_peer_reset_streams, conn.send_streams.count());
-    try testing.expectEqual(@as(usize, 1), conn.streams.count());
+    try testing.expectEqual(@as(usize, 0), conn.streams.count());
+    try testing.expectEqual(@as(usize, 0), conn.peer_stop_sending.count());
 }
 
 test "RESET_STREAM final size past the stream receive limit is rejected" {
@@ -5227,6 +5244,25 @@ test "peer stream limits reject streams past the advertised count" {
     const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
     defer gpa.free(dgram);
     try testing.expectError(error.StreamLimitError, conn.receiveDatagram(dgram, 1000));
+}
+
+test "STOP_SENDING rejects streams past the advertised count" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x12, 0x13, 0x14, 0x16 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.peer_bidi_streams = flow.StreamLimit.init(1);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeStopSending(&frames, gpa, 4, 0x010c);
+    const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(dgram);
+
+    try testing.expectError(error.StreamLimitError, conn.receiveDatagram(dgram, 1000));
+    try testing.expectEqual(@as(usize, 0), conn.peer_stop_sending.count());
+    try testing.expectEqual(@as(usize, 0), conn.peer_reset_streams.count());
 }
 
 test "opening enough peer streams advertises a raised MAX_STREAMS" {
