@@ -34,6 +34,7 @@ pub const Role = enum { server, client };
 
 const MAX_SESSION_TICKETS: usize = 8;
 const MAX_NEW_TOKENS: usize = 8;
+const max_peer_reset_streams: usize = 256;
 
 fn defaultLocalTransportParameters() transport_params.TransportParameters {
     return .{
@@ -346,6 +347,9 @@ pub const Connection = struct {
     /// A peer STOP_SENDING received before we created the matching send stream (id ->
     /// error code), applied when the stream is lazily created so it is born reset.
     peer_stop_sending: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// Send streams materialized from deferred peer STOP_SENDING requests, retained
+    /// until RESET_STREAM acknowledgement and capped against peer-driven churn.
+    peer_reset_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// RETIRE_CONNECTION_ID frames owed to the peer (seq -> in-flight state), queued
     /// when NEW_CONNECTION_ID.retire_prior_to asks us to retire older peer CIDs.
     pending_retire_cids: std.AutoHashMapUnmanaged(u64, PendingRetireCid) = .empty,
@@ -714,6 +718,7 @@ pub const Connection = struct {
         self.stop_sending.deinit(self.gpa);
         self.stop_sending_inflight.deinit(self.gpa);
         self.peer_stop_sending.deinit(self.gpa);
+        self.peer_reset_streams.deinit(self.gpa);
         self.pending_retire_cids.deinit(self.gpa);
         self.retire_cid_inflight.deinit(self.gpa);
         self.pending_new_cids.deinit(self.gpa);
@@ -1577,6 +1582,7 @@ pub const Connection = struct {
                     if (s.fullyAcked()) {
                         _ = self.send_streams.remove(e.value.id);
                         _ = self.send_windows.remove(e.value.id);
+                        _ = self.peer_reset_streams.remove(e.value.id);
                         s.deinit();
                         self.gpa.destroy(s);
                     }
@@ -1589,6 +1595,7 @@ pub const Connection = struct {
                     if (s.fullyAcked()) {
                         _ = self.send_streams.remove(e.value);
                         _ = self.send_windows.remove(e.value);
+                        _ = self.peer_reset_streams.remove(e.value);
                         s.deinit();
                         self.gpa.destroy(s);
                     }
@@ -2985,6 +2992,7 @@ pub const Connection = struct {
             if (ss.fullyAcked()) {
                 _ = self.send_streams.remove(id);
                 _ = self.send_windows.remove(id);
+                _ = self.peer_reset_streams.remove(id);
                 ss.deinit();
                 self.gpa.destroy(ss);
             }
@@ -2992,7 +3000,19 @@ pub const Connection = struct {
         const s = self.streams.get(id) orelse return false;
         if (!s.isTerminal()) return false;
         if (self.peer_stop_sending.contains(id) and !self.send_streams.contains(id)) {
+            if (self.peer_reset_streams.count() >= max_peer_reset_streams) {
+                self.close(
+                    false,
+                    @intFromEnum(constants.TransportError.internal_error),
+                    "peer reset stream limit",
+                ) catch {
+                    self.closed = true;
+                };
+                return false;
+            }
+            self.peer_reset_streams.ensureUnusedCapacity(self.gpa, 1) catch return false;
             _ = self.sendStream(id) catch return false;
+            self.peer_reset_streams.putAssumeCapacity(id, {});
         }
         // Remember the id as retired BEFORE freeing, so a failure to record it leaves
         // the stream in place rather than dropped-but-resurrectable.
@@ -5045,7 +5065,6 @@ test "completed stream churn retains compact history" {
         for (first..end) |sequence| {
             const id: u64 = @intCast(sequence * 4);
             try frame.encodeStreamDataBlocked(&frames, gpa, id, 0);
-            try frame.encodeStopSending(&frames, gpa, id, 0x010c);
             try frame.encodeResetStream(&frames, gpa, id, 0x010c, 0);
         }
         {
@@ -5118,6 +5137,41 @@ test "sparse completed stream history is bounded" {
         RetiredStreamIds.max_ranges_per_class,
         conn.retired_recv.classes[@intFromEnum(stream.StreamType.client_bidi)].items.len,
     );
+    try testing.expectEqual(@as(usize, 1), conn.streams.count());
+}
+
+test "peer reset send state is bounded" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x24 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    for (0..max_peer_reset_streams + 1) |sequence| {
+        frames.clearRetainingCapacity();
+        const id: u64 = @intCast(sequence * 4);
+        try frame.encodeStopSending(&frames, gpa, id, 0x010c);
+        try frame.encodeResetStream(&frames, gpa, id, 0x010c, 0);
+        {
+            const dgram = try testBuildApp(gpa, &dcid, sequence, frames.items);
+            defer gpa.free(dgram);
+            try conn.receiveDatagram(dgram, 1000 + sequence);
+        }
+        try testing.expect(conn.streamReset(id));
+        if (sequence < max_peer_reset_streams) {
+            try testing.expect(conn.dropStream(id));
+            try conn.flushSend(2000 + sequence);
+            conn.clearSend();
+        } else {
+            try testing.expect(!conn.dropStream(id));
+        }
+    }
+
+    try testing.expect(conn.closed);
+    try testing.expectEqual(max_peer_reset_streams, conn.peer_reset_streams.count());
+    try testing.expectEqual(max_peer_reset_streams, conn.send_streams.count());
     try testing.expectEqual(@as(usize, 1), conn.streams.count());
 }
 
