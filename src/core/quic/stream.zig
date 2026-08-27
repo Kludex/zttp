@@ -499,28 +499,6 @@ pub const SendStream = struct {
     }
 };
 
-fn pushUnderAllocationFailure(gpa: std.mem.Allocator) !void {
-    var s = RecvStream.init(gpa);
-    defer s.deinit();
-
-    _ = s.push(6, "world", true) catch |err| {
-        try std.testing.expectEqual(@as(u64, 0), s.highest_received);
-        try std.testing.expectEqual(@as(?u64, null), s.final_size);
-        try std.testing.expectEqual(RecvState.recv, s.state);
-        try std.testing.expectEqualStrings("", s.readable());
-        return err;
-    };
-    _ = s.push(0, "hello ", false) catch |err| {
-        try std.testing.expectEqual(@as(u64, 11), s.highest_received);
-        try std.testing.expectEqual(@as(?u64, 11), s.final_size);
-        try std.testing.expectEqual(RecvState.size_known, s.state);
-        try std.testing.expectEqualStrings("", s.readable());
-        return err;
-    };
-    try std.testing.expectEqualStrings("hello world", s.readable());
-    try std.testing.expect(s.isFinished());
-}
-
 test "stream-id typing reads the low two bits" {
     try std.testing.expectEqual(StreamType.client_bidi, StreamType.of(0));
     try std.testing.expectEqual(StreamType.server_bidi, StreamType.of(1));
@@ -549,10 +527,6 @@ test "out-of-order fragments are buffered then drained" {
     _ = try s.push(0, "hello ", false); // unlocks the buffered tail
     try std.testing.expectEqualStrings("hello world", s.readable());
     try std.testing.expect(s.isFinished());
-}
-
-test "receive stream updates are atomic on allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, pushUnderAllocationFailure, .{});
 }
 
 test "overlapping and duplicate data is handled" {

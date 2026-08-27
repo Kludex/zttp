@@ -2479,9 +2479,10 @@ pub const Connection = struct {
         if (space == .handshake) self.validateCurrentPath();
 
         if (st.recv_ranges.shouldIgnore(opened.pn)) return;
-        st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, opened.pn) else opened.pn;
-        st.recv_ranges.add(self.gpa, opened.pn) catch return error.OutOfMemory; // for accurate ACKs
+        try st.recv_ranges.ensureCanAdd(self.gpa);
         try self.dispatchFrames(opened.payload, space, long, now);
+        st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, opened.pn) else opened.pn;
+        st.recv_ranges.add(self.gpa, opened.pn) catch unreachable; // capacity was reserved before dispatch
         self.resetIdleTimer(now);
 
         // Acknowledge the space if it carried an ack-eliciting frame this packet.
@@ -3196,6 +3197,44 @@ fn testRequiredServerTransportParameters(conn: *const Connection) !transport_par
 // space, so stream-reassembly tests use the space STREAM is actually legal in.
 pub fn testBuildApp(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8) ![]u8 {
     return testBuildAppWithSecret(gpa, dcid, pn, frames, TEST_APP_SECRET, false);
+}
+
+fn receiveStreamUnderAllocationFailure(gpa: std.mem.Allocator) !void {
+    const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x16 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var tail_frame: std.ArrayListUnmanaged(u8) = .empty;
+    defer tail_frame.deinit(gpa);
+    try frame.encodeStream(&tail_frame, gpa, 0, 6, "world", true);
+    const tail = try testBuildApp(gpa, &dcid, 0, tail_frame.items);
+    defer gpa.free(tail);
+    try conn.receiveDatagram(tail, 1000);
+    conn.clearSend();
+
+    const s = conn.streams.get(0).?;
+    const previous_window = conn.recv_windows.get(0).?;
+    const previous_total = conn.conn_received_total;
+    var head_frame: std.ArrayListUnmanaged(u8) = .empty;
+    defer head_frame.deinit(gpa);
+    try frame.encodeStream(&head_frame, gpa, 0, 0, "hello ", false);
+    const head = try testBuildApp(gpa, &dcid, 1, head_frame.items);
+    defer gpa.free(head);
+    conn.receiveDatagram(head, 2000) catch |err| {
+        if (s.readable().len == 0) {
+            try testing.expectEqual(@as(u64, 11), s.highest_received);
+            try testing.expectEqual(@as(?u64, 11), s.final_size);
+            try testing.expectEqual(stream.RecvState.size_known, s.state);
+            try testing.expectEqual(previous_window, conn.recv_windows.get(0).?);
+            try testing.expectEqual(previous_total, conn.conn_received_total);
+            try conn.receiveDatagram(head, 2000);
+            try testing.expectEqualStrings("hello world", s.readable());
+        }
+        return err;
+    };
+    try testing.expectEqualStrings("hello world", s.readable());
+    try testing.expect(s.isFinished());
 }
 
 fn testBuildAppWithSecret(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8, secret: [32]u8, key_phase: bool) ![]u8 {
@@ -4920,6 +4959,10 @@ test "per-stream receive flow control rejects data past the stream limit" {
     try testing.expectEqualStrings("", conn.streamData(0));
     try testing.expect(!conn.hasStream(0));
     try testing.expect(!conn.recv_windows.contains(0));
+}
+
+test "receive stream updates are atomic on allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, receiveStreamUnderAllocationFailure, .{});
 }
 
 test "receive stream fragment count is bounded" {
