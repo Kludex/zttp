@@ -228,6 +228,8 @@ const RetiredRange = struct {
 };
 
 const RetiredStreamIds = struct {
+    const max_ranges_per_class = 256;
+
     classes: [4]std.ArrayListUnmanaged(RetiredRange) = .{ .empty, .empty, .empty, .empty },
 
     fn deinit(self: *RetiredStreamIds, gpa: std.mem.Allocator) void {
@@ -244,7 +246,7 @@ const RetiredStreamIds = struct {
         return false;
     }
 
-    fn retire(self: *RetiredStreamIds, gpa: std.mem.Allocator, id: u64) error{OutOfMemory}!void {
+    fn retire(self: *RetiredStreamIds, gpa: std.mem.Allocator, id: u64) error{ OutOfMemory, RangeLimitExceeded }!void {
         const ranges = &self.classes[@intFromEnum(stream.StreamType.of(id))];
         const sequence = id >> 2;
         var index: usize = 0;
@@ -263,6 +265,7 @@ const RetiredStreamIds = struct {
         } else if (joins_next) {
             ranges.items[index].first = sequence;
         } else {
+            if (ranges.items.len >= max_ranges_per_class) return error.RangeLimitExceeded;
             try ranges.insert(gpa, index, .{ .first = sequence, .end = sequence + 1 });
         }
     }
@@ -2988,14 +2991,28 @@ pub const Connection = struct {
         }
         const s = self.streams.get(id) orelse return false;
         if (!s.isTerminal()) return false;
+        if (self.peer_stop_sending.contains(id) and !self.send_streams.contains(id)) {
+            _ = self.sendStream(id) catch return false;
+        }
         // Remember the id as retired BEFORE freeing, so a failure to record it leaves
         // the stream in place rather than dropped-but-resurrectable.
-        self.retired_recv.retire(self.gpa, id) catch return false;
+        self.retired_recv.retire(self.gpa, id) catch |err| switch (err) {
+            error.OutOfMemory => return false,
+            error.RangeLimitExceeded => {
+                self.close(
+                    false,
+                    @intFromEnum(constants.TransportError.internal_error),
+                    "retired stream history limit",
+                ) catch {
+                    self.closed = true;
+                };
+                return false;
+            },
+        };
         _ = self.streams.remove(id);
         _ = self.recv_windows.remove(id);
         _ = self.max_stream_data_pending.remove(id);
         _ = self.peer_stream_data_blocked.remove(id);
-        _ = self.peer_stop_sending.remove(id);
         s.deinit();
         self.gpa.destroy(s);
         return true;
@@ -5069,6 +5086,41 @@ test "completed stream churn retains compact history" {
     try testing.expect(!conn.hasStream(1024));
 }
 
+test "sparse completed stream history is bounded" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x23 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    for (0..RetiredStreamIds.max_ranges_per_class + 1) |sequence| {
+        frames.clearRetainingCapacity();
+        const id: u64 = @intCast(sequence * 8);
+        try frame.encodeResetStream(&frames, gpa, id, 0x010c, 0);
+        {
+            const dgram = try testBuildApp(gpa, &dcid, sequence, frames.items);
+            defer gpa.free(dgram);
+            try conn.receiveDatagram(dgram, 1000 + sequence);
+        }
+        try testing.expect(conn.streamReset(id));
+        if (sequence < RetiredStreamIds.max_ranges_per_class) {
+            try testing.expect(conn.dropStream(id));
+        } else {
+            try testing.expect(!conn.dropStream(id));
+        }
+        conn.clearSend();
+    }
+
+    try testing.expect(conn.closed);
+    try testing.expectEqual(
+        RetiredStreamIds.max_ranges_per_class,
+        conn.retired_recv.classes[@intFromEnum(stream.StreamType.client_bidi)].items.len,
+    );
+    try testing.expectEqual(@as(usize, 1), conn.streams.count());
+}
+
 test "RESET_STREAM final size past the stream receive limit is rejected" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x13 };
@@ -6055,7 +6107,7 @@ test "a PTO retransmits a reset-only stream, not a bare PING" {
     try testing.expect(peer.streamReset(1)); // the resent reset reached the peer
 }
 
-test "a STOP_SENDING before the send stream exists still resets it" {
+test "a STOP_SENDING survives receive stream cleanup" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x84, 0x85, 0x86, 0x87 };
     var server = try Connection.init(gpa, .server, &dcid);
@@ -6069,12 +6121,15 @@ test "a STOP_SENDING before the send stream exists still resets it" {
     try sframe.append(gpa, 0x05);
     try varint.append(&sframe, gpa, 0);
     try varint.append(&sframe, gpa, 0x10);
+    try frame.encodeResetStream(&sframe, gpa, 0, 0x10, 0);
     const dgram = try testBuildApp(gpa, &dcid, 0, sframe.items);
     defer gpa.free(dgram);
     try server.receiveDatagram(dgram, 1000);
+    try testing.expect(server.streamReset(0));
+    try testing.expect(server.dropStream(0));
 
-    // The stream is born reset, so writing data to it is rejected (final-size error):
-    // the server cannot send a response the peer already cancelled.
+    // Receive cleanup preserves the reset send side, so the server cannot send a
+    // response the peer already cancelled.
     try testing.expectError(error.FinalSizeError, server.sendStreamData(0, "ignored body", false));
 
     // Flushing sends the RESET_STREAM after the ACK owed for STOP_SENDING; the peer
