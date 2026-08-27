@@ -127,10 +127,8 @@ include = ["zttp", "src", "tools", "build.zig"]
 # toolchain install is needed. The sans-IO core has no OS dependencies, so it
 # builds for glibc, musl, macOS, and Windows alike. PyPy is excluded by the cp-only
 # `build` list; `skip` only has to drop 32-bit.
-# cp314t/cp315t are the free-threaded builds. The extension does NOT yet declare
-# Py_MOD_GIL_NOT_USED (it isn't synchronized - #151), so on these interpreters
-# CPython re-enables the compatibility GIL at import; the wheels still load and run.
-# Their Windows variants need Py_GIL_DISABLED passed to translate-c by build.zig -
+# cp314t/cp315t are the free-threaded builds. Their Windows variants need
+# Py_GIL_DISABLED passed to translate-c by build.zig -
 # PC/pyconfig.h only tests the macro, where POSIX pyconfig.h defines it itself.
 build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-* cp315-* cp315t-*"
 skip = "*_i686"
@@ -160,14 +158,7 @@ archs = ["AMD64"]
 addopts = "-rxXs --strict-config --strict-markers"
 xfail_strict = true
 testpaths = ["tests"]
-filterwarnings = [
-    "error",
-    # Free-threaded builds (3.13t+): the extension deliberately does not declare
-    # Py_MOD_GIL_NOT_USED until it is synchronized (#151), so CPython re-enables the
-    # GIL at import and warns. That is the intended, safe behavior - don't let the
-    # expected warning fail the suite when running under a free-threaded interpreter.
-    "ignore:The global interpreter lock:RuntimeWarning",
-]
+filterwarnings = ["error"]
 markers = [
     "http3_interop: optional HTTP/3 interop checks that require external protocol stacks",
 ]
