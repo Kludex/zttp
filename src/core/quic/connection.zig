@@ -795,20 +795,34 @@ pub const Connection = struct {
             return error.AmplificationLimited;
         }
 
+        self.out.ensureUnusedCapacity(self.gpa, datagram_len) catch return error.OutOfMemory;
+        self.out_lengths.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+        self.out_path_tokens.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+        st.rec.ensureSentCapacity(self.gpa) catch return error.OutOfMemory;
+
         const start = self.out.items.len;
-        self.out.appendSlice(self.gpa, hdr.items) catch return error.OutOfMemory;
-        const ct = self.out.addManyAsSlice(self.gpa, frames.len + crypto.TAG_LEN) catch return error.OutOfMemory;
+        self.out.appendSliceAssumeCapacity(hdr.items);
+        const ct = self.out.addManyAsSliceAssumeCapacity(frames.len + crypto.TAG_LEN);
         _ = crypto.seal(keys, pn, hdr.items, frames, ct);
-        crypto.protectHeader(keys.hp, self.out.items[start..], pn_offset, long) catch return error.ProtocolViolation;
+        crypto.protectHeader(keys.hp, self.out.items[start..], pn_offset, long) catch {
+            self.out.shrinkRetainingCapacity(start);
+            return error.ProtocolViolation;
+        };
         self.sent_bytes += datagram_len;
         self.recordPathSent(datagram_len);
-        self.out_lengths.append(self.gpa, datagram_len) catch return error.OutOfMemory;
-        self.out_path_tokens.append(self.gpa, self.sendPathToken()) catch return error.OutOfMemory;
+        self.out_lengths.appendAssumeCapacity(datagram_len);
+        self.out_path_tokens.appendAssumeCapacity(self.sendPathToken());
         // A pure-ACK packet is not ack-eliciting, so it is not in flight: not
         // congestion-controlled or retransmitted (RFC 9002 2, 7). Only in-flight
         // packets count toward bytes_in_flight - charging a pure ACK would inflate it
         // permanently, since the ACK/loss paths only credit back in-flight packets.
-        st.rec.onSent(self.gpa, .{ .pn = pn, .sent_time = now, .size = datagram_len, .ack_eliciting = ack_eliciting, .in_flight = ack_eliciting }) catch return error.OutOfMemory;
+        st.rec.onSentAssumeCapacity(.{
+            .pn = pn,
+            .sent_time = now,
+            .size = datagram_len,
+            .ack_eliciting = ack_eliciting,
+            .in_flight = ack_eliciting,
+        });
         if (ack_eliciting) {
             self.cc.onSent(datagram_len);
             self.resetIdleTimer(now);
@@ -3370,6 +3384,29 @@ fn decodeQueuedAppFrame(conn: *Connection, index: usize) !DecodedQueuedAppFrame 
     const payload = try crypto.open(testAppKeys(), pn, header, ciphertext, plaintext);
     const decoded = try frame.decode(payload);
     return .{ .work = work, .plaintext = plaintext, .frame = decoded.frame };
+}
+
+fn sendPacketUnderAllocationFailure(gpa: std.mem.Allocator) !void {
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    try conn.sendStreamData(0, &[_]u8{0x5a} ** 1024, true);
+    conn.flushSend(1000) catch |err| {
+        try testing.expectEqual(conn.datagramLengths().len, conn.datagramPathTokens().len);
+        var queued: usize = 0;
+        for (conn.datagramLengths()) |len| queued += len;
+        try testing.expectEqual(queued, conn.datagramsToSend().len);
+        return err;
+    };
+    try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len);
+    try testing.expectEqual(conn.datagramLengths().len, conn.datagramPathTokens().len);
+    try testing.expectEqual(conn.datagramLengths()[0], conn.datagramsToSend().len);
+}
+
+test "packet construction is atomic on allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, sendPacketUnderAllocationFailure, .{});
 }
 
 test "server decrypts a 1-RTT packet and reassembles a stream" {
