@@ -264,6 +264,8 @@ pub const Connection = struct {
     conn_received_total: u64 = 0,
     conn_consumed_total: u64 = 0,
     streams: std.AutoHashMapUnmanaged(u64, *stream.RecvStream) = .empty,
+    /// Receive-stream ids changed by the current datagram, in first-seen order.
+    changed_streams: std.ArrayListUnmanaged(u64) = .empty,
     /// Per-stream receive flow-control windows, keyed by stream id.
     recv_windows: std.AutoHashMapUnmanaged(u64, flow.Window) = .empty,
     send_streams: std.AutoHashMapUnmanaged(u64, *stream.SendStream) = .empty,
@@ -652,6 +654,7 @@ pub const Connection = struct {
             self.gpa.destroy(s.*);
         }
         self.streams.deinit(self.gpa);
+        self.changed_streams.deinit(self.gpa);
         self.recv_windows.deinit(self.gpa);
         var sit = self.send_streams.valueIterator();
         while (sit.next()) |s| {
@@ -2198,6 +2201,7 @@ pub const Connection = struct {
     }
 
     fn receiveDatagramOn(self: *Connection, datagram: []const u8, now: u64, peer_address: ?[]const u8) Error!void {
+        self.changed_streams.clearRetainingCapacity();
         if (self.closed) return error.ProtocolViolation;
         if (peer_address) |addr| {
             // A spoofable path change is silently dropped, never connection-fatal.
@@ -2858,6 +2862,7 @@ pub const Connection = struct {
         if (new_high > recv_limit) return error.FlowControlError;
         const new_total = std.math.add(u64, self.conn_received_total, expected_delta) catch return error.FlowControlError;
         if (new_total > self.conn_recv_window.limit) return error.FlowControlError;
+        try self.markStreamChanged(id);
         const s = existing orelse try self.recvStream(id);
         const rw = try self.recvWindow(id);
         const delta = s.push(offset, data, fin) catch |e| switch (e) {
@@ -2885,6 +2890,7 @@ pub const Connection = struct {
         if (new_high > rw.limit) return error.FlowControlError;
         const new_total = std.math.add(u64, self.conn_received_total, delta) catch return error.FlowControlError;
         if (new_total > self.conn_recv_window.limit) return error.FlowControlError;
+        try self.markStreamChanged(id);
         const charged = s.onReset(error_code, final_size) catch return error.FinalSizeError;
         std.debug.assert(charged == delta);
         rw.onReceived(s.highest_received) catch return error.FlowControlError;
@@ -2914,6 +2920,11 @@ pub const Connection = struct {
     /// stream's offset accounting is gone, so re-creating it would re-deliver data).
     fn isRetired(self: *const Connection, id: u64) bool {
         return self.retired_recv.contains(id);
+    }
+
+    fn markStreamChanged(self: *Connection, id: u64) Error!void {
+        if (std.mem.indexOfScalar(u64, self.changed_streams.items, id) != null) return;
+        self.changed_streams.append(self.gpa, id) catch return error.OutOfMemory;
     }
 
     fn recvStream(self: *Connection, id: u64) Error!*stream.RecvStream {
@@ -3020,6 +3031,12 @@ pub const Connection = struct {
     /// never-seen id returns false, so the H3 layer does not recreate state for it.
     pub fn hasStream(self: *Connection, id: u64) bool {
         return self.streams.contains(id);
+    }
+
+    /// The receive-stream ids changed by the last datagram. The slice remains valid
+    /// until the next receive call.
+    pub fn changedStreamIds(self: *const Connection) []const u64 {
+        return self.changed_streams.items;
     }
 
     /// Snapshot the ids of every stream the transport currently knows about, into
@@ -3278,6 +3295,31 @@ test "server decrypts a 1-RTT packet and reassembles a stream" {
     try conn.receiveDatagram(dgram, 1000);
     try testing.expectEqualStrings("hi", conn.streamData(0));
     try testing.expect(conn.streamFinished(0));
+}
+
+test "receive datagrams expose only changed stream ids" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x18 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeStream(&frames, gpa, 0, 0, "a", false);
+    try frame.encodeStream(&frames, gpa, 4, 0, "b", true);
+    try frame.encodeStream(&frames, gpa, 0, 1, "c", true);
+    try frame.encodeResetStream(&frames, gpa, 8, 0x010c, 0);
+    const streams = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(streams);
+    try conn.receiveDatagram(streams, 1000);
+    try testing.expectEqualSlices(u64, &.{ 0, 4, 8 }, conn.changedStreamIds());
+
+    const ping = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
+    const no_streams = try testBuildApp(gpa, &dcid, 1, &ping);
+    defer gpa.free(no_streams);
+    try conn.receiveDatagram(no_streams, 2000);
+    try testing.expectEqual(@as(usize, 0), conn.changedStreamIds().len);
 }
 
 test "peer cannot use an unopened locally initiated stream" {

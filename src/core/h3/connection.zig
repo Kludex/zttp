@@ -15,6 +15,7 @@ const ascii = @import("../ascii.zig");
 const events = @import("../events.zig");
 const fields = @import("../fields.zig");
 const quic_conn = @import("../quic/connection.zig");
+const quic_frame = @import("../quic/frame.zig");
 const quic_stream = @import("../quic/stream.zig");
 const varint = @import("../quic/varint.zig");
 const h3_frame = @import("frame.zig");
@@ -307,14 +308,12 @@ pub const Connection = struct {
         return if (self.qc.role == .client) 10 else 11;
     }
 
-    /// Advance the parse of request stream `id` from whatever ordered bytes the
-    /// QUIC transport now has. Newly completed events are appended to the queue.
-    /// The caller (the adapter) calls this when it knows a stream got data; a
-    /// production driver would call it for every stream that advanced.
-    /// Advance the parse of every stream the transport currently knows about.
-    /// The adapter calls this after each datagram so it need not track which
-    /// streams advanced. Take a snapshot first so streams can be reclaimed while
-    /// pumping without invalidating the transport map iterator.
+    /// Advance only the streams changed by the datagram the transport just handled.
+    pub fn pumpStreams(self: *Connection, ids: []const u64) Error!void {
+        try self.pumpStreamSnapshot(ids);
+    }
+
+    /// Advance every stream the transport currently knows about.
     pub fn pumpAll(self: *Connection) Error!void {
         var stack_ids: [64]u64 = undefined;
         const count = self.qc.streamCount();
@@ -2513,6 +2512,41 @@ fn buildRequestOnFin(gpa: std.mem.Allocator, dcid: []const u8, stream_id: u64, p
     try varint.append(&sframe, gpa, h3_bytes.len);
     try sframe.appendSlice(gpa, h3_bytes);
     return @import("../quic/connection.zig").testBuildApp(gpa, dcid, pn, sframe.items);
+}
+
+test "pumpStreams advances a request changed by each datagram" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xa6, 0xa7, 0xa8, 0xb9 };
+    var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
+    defer qc.deinit();
+    quic_conn.testInstallAppKeys(&qc);
+    var h3 = Connection.init(gpa, &qc);
+    defer h3.deinit();
+    h3.peer_settings = .{};
+
+    var headers: std.ArrayListUnmanaged(u8) = .empty;
+    defer headers.deinit(gpa);
+    const qpack_block = [_]u8{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1 }; // POST https /
+    try h3_frame.append(&headers, gpa, .headers, &qpack_block);
+    var stream_frame: std.ArrayListUnmanaged(u8) = .empty;
+    defer stream_frame.deinit(gpa);
+    try quic_frame.encodeStream(&stream_frame, gpa, 0, 0, headers.items, false);
+    const first = try quic_conn.testBuildApp(gpa, &dcid, 0, stream_frame.items);
+    defer gpa.free(first);
+    try qc.receiveDatagram(first, 1000);
+    try h3.pumpStreams(qc.changedStreamIds());
+    try testing.expect(h3.nextEvent() == .request);
+
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(gpa);
+    try h3_frame.append(&data, gpa, .data, "x");
+    stream_frame.clearRetainingCapacity();
+    try quic_frame.encodeStream(&stream_frame, gpa, 0, headers.items.len, data.items, false);
+    const second = try quic_conn.testBuildApp(gpa, &dcid, 1, stream_frame.items);
+    defer gpa.free(second);
+    try qc.receiveDatagram(second, 2000);
+    try h3.pumpStreams(qc.changedStreamIds());
+    try testing.expect(h3.nextEvent() == .data);
 }
 
 test "pumpAll advances more than the small stack stream snapshot" {

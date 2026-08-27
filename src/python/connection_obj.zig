@@ -848,7 +848,7 @@ const H3Engine = struct {
         } else {
             self.qc.?.receiveDatagram(dgram, now) catch |e| return exceptions.raiseQuic(e);
         }
-        self.h3.?.pumpAll() catch |e| return exceptions.raiseH3(e);
+        self.h3.?.pumpStreams(self.qc.?.changedStreamIds()) catch |e| return exceptions.raiseH3(e);
         return py.none();
     }
 
