@@ -171,6 +171,7 @@ const ReceiveContext = struct {
     datagram_len: usize,
     peer_address: ?[]const u8,
     path_recorded: bool = false,
+    provisional_path_recorded: bool = false,
     auto_path_challenge_queued: bool = false,
 };
 
@@ -201,6 +202,11 @@ const PathState = struct {
     recv_bytes: u64 = 0,
     sent_bytes: u64 = 0,
     validated: bool = false,
+};
+
+const ProvisionalPath = struct {
+    token: u64,
+    state: PathState,
 };
 
 /// A connection id the peer issued in NEW_CONNECTION_ID, retained for future path
@@ -329,6 +335,9 @@ pub const Connection = struct {
     /// retains the most recent peer path so application writes queued after
     /// receive_datagram still have a routable destination.
     paths: std.AutoHashMapUnmanaged(u64, PathState) = .empty,
+    /// The unauthenticated route for queued Version Negotiation output. It is
+    /// bounded to one address and released when the output queue is drained.
+    provisional_path: ?ProvisionalPath = null,
     current_path_token: ?u64 = null,
     default_path_token: ?u64 = null,
     /// Local CID sequence number matched by the short-header packet currently
@@ -685,6 +694,7 @@ pub const Connection = struct {
         var path_it = self.paths.valueIterator();
         while (path_it.next()) |p| self.gpa.free(p.address);
         self.paths.deinit(self.gpa);
+        if (self.provisional_path) |path| self.gpa.free(path.state.address);
         if (self.initial_token) |t| self.gpa.free(t);
         for (self.new_tokens.items) |t| self.gpa.free(t);
         self.new_tokens.deinit(self.gpa);
@@ -865,8 +875,10 @@ pub const Connection = struct {
     /// Resolve an address-aware path token to the opaque peer address supplied by
     /// the integrator.
     pub fn pathAddress(self: *const Connection, token: u64) ?[]const u8 {
-        const p = self.paths.get(token) orelse return null;
-        return p.address;
+        if (self.paths.get(token)) |path| return path.address;
+        const provisional = self.provisional_path orelse return null;
+        if (provisional.token != token) return null;
+        return provisional.state.address;
     }
 
     /// Switch subsequent packets to a peer-issued connection id (RFC 9000 5.1).
@@ -943,6 +955,8 @@ pub const Connection = struct {
         self.out.clearRetainingCapacity();
         self.out_lengths.clearRetainingCapacity();
         self.out_path_tokens.clearRetainingCapacity();
+        if (self.provisional_path) |path| self.gpa.free(path.state.address);
+        self.provisional_path = null;
     }
 
     // ---- STREAM send -----------------------------------------------------------
@@ -2258,7 +2272,7 @@ pub const Connection = struct {
         const prefix = packet.parseLongPrefix(buf) catch return error.Dropped;
         if (prefix.version == 0) return self.receiveVersionNegotiation(prefix, buf);
         if (prefix.version != constants.VERSION_1) {
-            if (self.role == .server) try self.sendVersionNegotiation(prefix);
+            if (self.role == .server) try self.sendVersionNegotiation(prefix, context);
             return buf.len;
         }
         const hdr = packet.parseLong(buf) catch return error.Dropped;
@@ -2286,11 +2300,37 @@ pub const Connection = struct {
         return total;
     }
 
-    fn sendVersionNegotiation(self: *Connection, prefix: packet.LongPrefix) Error!void {
+    fn sendVersionNegotiation(self: *Connection, prefix: packet.LongPrefix, context: *ReceiveContext) Error!void {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(self.gpa);
         packet.writeVersionNegotiation(&out, self.gpa, prefix.scid, prefix.dcid) catch return error.OutOfMemory;
+        var provisional_created = false;
+        if (context.peer_address) |address| {
+            const token = self.current_path_token.?;
+            if (!self.paths.contains(token)) {
+                if (self.provisional_path) |*path| {
+                    if (path.token != token or !std.mem.eql(u8, path.state.address, address)) return;
+                    if (!context.provisional_path_recorded) path.state.recv_bytes += context.datagram_len;
+                } else {
+                    const owned = self.gpa.dupe(u8, address) catch return error.OutOfMemory;
+                    self.provisional_path = .{
+                        .token = token,
+                        .state = .{ .address = owned, .recv_bytes = context.datagram_len },
+                    };
+                    provisional_created = true;
+                }
+                context.provisional_path_recorded = true;
+            }
+        }
+        errdefer if (provisional_created) {
+            self.gpa.free(self.provisional_path.?.state.address);
+            self.provisional_path = null;
+        };
         if (!self.canSendDatagram(out.items.len)) {
+            if (provisional_created) {
+                self.gpa.free(self.provisional_path.?.state.address);
+                self.provisional_path = null;
+            }
             return;
         }
         self.out.appendSlice(self.gpa, out.items) catch return error.OutOfMemory;
@@ -2774,7 +2814,11 @@ pub const Connection = struct {
     fn canSendDatagram(self: *Connection, datagram_len: usize) bool {
         if (self.role != .server) return true;
         if (self.sendPathToken()) |pt| {
-            const p = self.paths.get(pt) orelse return false;
+            const p = self.paths.get(pt) orelse blk: {
+                const provisional = self.provisional_path orelse return false;
+                if (provisional.token != pt) return false;
+                break :blk provisional.state;
+            };
             if (p.validated) return true;
             return withinAmplificationBudget(p.sent_bytes, p.recv_bytes, datagram_len);
         }
@@ -2784,7 +2828,11 @@ pub const Connection = struct {
 
     fn recordPathSent(self: *Connection, datagram_len: usize) void {
         if (self.sendPathToken()) |pt| {
-            if (self.paths.getPtr(pt)) |p| p.sent_bytes += datagram_len;
+            if (self.paths.getPtr(pt)) |p| {
+                p.sent_bytes += datagram_len;
+            } else if (self.provisional_path) |*path| {
+                if (path.token == pt) path.state.sent_bytes += datagram_len;
+            }
         }
     }
 
@@ -5597,6 +5645,7 @@ test "an unauthenticated long header cannot replace the peer connection id" {
 test "server answers an unsupported long-header version with Version Negotiation" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4 };
+    const peer_address = "203.0.113.1:4433";
     var server = try Connection.initServer(gpa, &dcid, testServerConfig());
     defer server.deinit();
 
@@ -5604,9 +5653,11 @@ test "server answers an unsupported long-header version with Version Negotiation
     defer bad.deinit(gpa);
     _ = try packet.writeLongHeader(&bad, gpa, .initial, 0x0a0a_0a0a, &dcid, "cli", "", 1, 1);
     try bad.append(gpa, 0x00);
-    try server.receiveDatagram(bad.items, 1000);
+    try server.receiveDatagramFrom(bad.items, 1000, peer_address);
 
     try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+    const token = server.datagramPathTokens()[0].?;
+    try testing.expectEqualStrings(peer_address, server.pathAddress(token).?);
     const vn = server.datagramsToSend()[0..server.datagramLengths()[0]];
     const p = try packet.parseLongPrefix(vn);
     try testing.expectEqual(@as(u32, 0), p.version);
@@ -5614,6 +5665,31 @@ test "server answers an unsupported long-header version with Version Negotiation
     try testing.expectEqualSlices(u8, &dcid, p.scid);
     try testing.expectEqual(@as(usize, 4), vn[p.header_len..].len);
     try testing.expectEqual(constants.VERSION_1, std.mem.readInt(u32, vn[p.header_len..][0..4], .big));
+
+    server.clearSend();
+    try testing.expect(server.pathAddress(token) == null);
+}
+
+test "server bounds provisional Version Negotiation routes until send clear" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4 };
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    var bad: std.ArrayListUnmanaged(u8) = .empty;
+    defer bad.deinit(gpa);
+    _ = try packet.writeLongHeader(&bad, gpa, .initial, 0x0a0a_0a0a, &dcid, "cli", "", 1, 1);
+    try bad.append(gpa, 0x00);
+
+    try server.receiveDatagramFrom(bad.items, 1000, "203.0.113.1:4433");
+    try server.receiveDatagramFrom(bad.items, 2000, "203.0.113.2:4433");
+    try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+
+    server.clearSend();
+    try server.receiveDatagramFrom(bad.items, 3000, "203.0.113.2:4433");
+    try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+    const token = server.datagramPathTokens()[0].?;
+    try testing.expectEqualStrings("203.0.113.2:4433", server.pathAddress(token).?);
 }
 
 test "client ignores Version Negotiation that still advertises QUIC v1" {
