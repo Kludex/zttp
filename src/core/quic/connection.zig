@@ -222,6 +222,52 @@ const ParsedShortForLocalCid = struct {
     local_cid_seq: u64,
 };
 
+const RetiredRange = struct {
+    first: u64,
+    end: u64,
+};
+
+const RetiredStreamIds = struct {
+    classes: [4]std.ArrayListUnmanaged(RetiredRange) = .{ .empty, .empty, .empty, .empty },
+
+    fn deinit(self: *RetiredStreamIds, gpa: std.mem.Allocator) void {
+        for (&self.classes) |*ranges| ranges.deinit(gpa);
+    }
+
+    fn contains(self: *const RetiredStreamIds, id: u64) bool {
+        const ranges = &self.classes[@intFromEnum(stream.StreamType.of(id))];
+        const sequence = id >> 2;
+        for (ranges.items) |range| {
+            if (sequence < range.first) return false;
+            if (sequence < range.end) return true;
+        }
+        return false;
+    }
+
+    fn retire(self: *RetiredStreamIds, gpa: std.mem.Allocator, id: u64) error{OutOfMemory}!void {
+        const ranges = &self.classes[@intFromEnum(stream.StreamType.of(id))];
+        const sequence = id >> 2;
+        var index: usize = 0;
+        while (index < ranges.items.len and ranges.items[index].first <= sequence) : (index += 1) {
+            if (sequence < ranges.items[index].end) return;
+        }
+
+        const joins_previous = index > 0 and ranges.items[index - 1].end == sequence;
+        const joins_next = index < ranges.items.len and ranges.items[index].first == sequence + 1;
+        if (joins_previous) {
+            ranges.items[index - 1].end = sequence + 1;
+            if (joins_next) {
+                ranges.items[index - 1].end = ranges.items[index].end;
+                _ = ranges.orderedRemove(index);
+            }
+        } else if (joins_next) {
+            ranges.items[index].first = sequence;
+        } else {
+            try ranges.insert(gpa, index, .{ .first = sequence, .end = sequence + 1 });
+        }
+    }
+};
+
 /// A CONNECTION_CLOSE the peer sent (RFC 9000 19.19), retained so the integrator can
 /// surface why the connection ended. `app` distinguishes the application-error
 /// variant; `reason` is an owned, length-capped copy of the human-readable phrase.
@@ -387,12 +433,9 @@ pub const Connection = struct {
     /// did. Null until a close arrives. `reason` is an owned copy (the decoded slice
     /// points into the datagram), capped so a hostile reason cannot grow it.
     peer_close: ?PeerClose = null,
-    /// The receive-stream ids that completed and were dropped (see dropStream). A late
-    /// frame for one of these is ignored rather than resurrecting the stream. A set,
-    /// not a watermark: stream ids complete out of order, so a watermark would treat a
-    /// legitimate new lower id as retired. One u64 per retired stream is far smaller
-    /// than the RecvStream it replaces, so this still bounds the per-stream memory.
-    retired_recv: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Completed receive-stream ids retained as ranges per stream-id class, so late
+    /// frames cannot resurrect streams without one allocation per historical stream.
+    retired_recv: RetiredStreamIds = .{},
 
     /// `client_dcid` is the destination connection id on the client's first
     /// Initial: both endpoints derive the Initial keys from it. The server picks
@@ -2947,10 +2990,12 @@ pub const Connection = struct {
         if (!s.isTerminal()) return false;
         // Remember the id as retired BEFORE freeing, so a failure to record it leaves
         // the stream in place rather than dropped-but-resurrectable.
-        self.retired_recv.put(self.gpa, id, {}) catch return false;
+        self.retired_recv.retire(self.gpa, id) catch return false;
         _ = self.streams.remove(id);
         _ = self.recv_windows.remove(id);
         _ = self.max_stream_data_pending.remove(id);
+        _ = self.peer_stream_data_blocked.remove(id);
+        _ = self.peer_stop_sending.remove(id);
         s.deinit();
         self.gpa.destroy(s);
         return true;
@@ -4962,6 +5007,66 @@ test "RESET_STREAM final size is charged to receive flow control" {
     try testing.expect(conn.streamReset(0));
     try testing.expectEqual(@as(u64, 5), conn.conn_received_total);
     try testing.expectEqual(@as(u64, 5), conn.recv_windows.get(0).?.received);
+}
+
+test "completed stream churn retains compact history" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x22 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const stream_count = 2048;
+    const streams_per_packet = 32;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    var first: usize = 0;
+    var pn: u64 = 0;
+    while (first < stream_count) : (first += streams_per_packet) {
+        frames.clearRetainingCapacity();
+        const end = @min(first + streams_per_packet, stream_count);
+        for (first..end) |sequence| {
+            const id: u64 = @intCast(sequence * 4);
+            try frame.encodeStreamDataBlocked(&frames, gpa, id, 0);
+            try frame.encodeStopSending(&frames, gpa, id, 0x010c);
+            try frame.encodeResetStream(&frames, gpa, id, 0x010c, 0);
+        }
+        {
+            const dgram = try testBuildApp(gpa, &dcid, pn, frames.items);
+            defer gpa.free(dgram);
+            try conn.receiveDatagram(dgram, 1000 + pn);
+        }
+        conn.clearSend();
+        pn += 1;
+
+        for (first..end) |sequence| {
+            if (sequence % 2 == 0) continue;
+            const id: u64 = @intCast(sequence * 4);
+            try testing.expect(conn.streamReset(id));
+            try testing.expect(conn.dropStream(id));
+        }
+        for (first..end) |sequence| {
+            if (sequence % 2 != 0) continue;
+            const id: u64 = @intCast(sequence * 4);
+            try testing.expect(conn.streamReset(id));
+            try testing.expect(conn.dropStream(id));
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 0), conn.streams.count());
+    try testing.expectEqual(@as(usize, 0), conn.peer_stream_data_blocked.count());
+    try testing.expectEqual(@as(usize, 0), conn.peer_stop_sending.count());
+    try testing.expectEqual(
+        @as(usize, 1),
+        conn.retired_recv.classes[@intFromEnum(stream.StreamType.client_bidi)].items.len,
+    );
+
+    frames.clearRetainingCapacity();
+    try frame.encodeStream(&frames, gpa, 1024, 0, "late", false);
+    const late = try testBuildApp(gpa, &dcid, pn, frames.items);
+    defer gpa.free(late);
+    try conn.receiveDatagram(late, 2000 + pn);
+    try testing.expect(!conn.hasStream(1024));
 }
 
 test "RESET_STREAM final size past the stream receive limit is rejected" {
