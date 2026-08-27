@@ -137,7 +137,7 @@ skip = "*_i686"
 # only guaranteed stable from rc1 onward.
 enable = ["cpython-prerelease"]
 build-frontend = "build[uv]"
-test-command = 'python -c "import zttp; c = zttp.Connection(zttp.SERVER); c.receive_data(b\"GET / HTTP/1.1\r\n\r\n\"); assert type(c.next_event()).__name__ == \"Request\""'
+test-command = 'python -c "import zttp; c = zttp.Connection(zttp.SERVER); c.receive_data(b\"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n\"); assert type(c.next_event()).__name__ == \"Request\""'
 
 [tool.cibuildwheel.linux]
 # Both glibc (manylinux) and musl (musllinux) on each native arch.
