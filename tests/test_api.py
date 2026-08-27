@@ -52,7 +52,7 @@ def test_request_path_without_query() -> None:
 
 def test_endofmessage_and_data_repr() -> None:
     conn = zttp.Connection(zttp.SERVER)
-    conn.receive_data(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi")
+    conn.receive_data(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2\r\n\r\nhi")
     conn.next_event()  # Request
     assert repr(conn.next_event()) == "Data(data=b'hi')"
     assert repr(conn.next_event()) == "EndOfMessage(trailers=[])"

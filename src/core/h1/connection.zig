@@ -35,11 +35,14 @@ pub const HeadSemantics = struct {
     has_upgrade_token: bool = false,
     upgrade_value: ?[]const u8 = null,
     expect_continue: bool = false,
+    host_count: usize = 0,
 
     pub fn add(self: *HeadSemantics, h: Header) ParseError!void {
         try self.framing.add(h);
 
-        if (eqIgnoreCase(h.name, "connection")) {
+        if (eqIgnoreCase(h.name, "host")) {
+            self.host_count += 1;
+        } else if (eqIgnoreCase(h.name, "connection")) {
             var it = std.mem.splitScalar(u8, h.value, ',');
             while (it.next()) |raw| {
                 const token = trimOws(raw);
@@ -61,6 +64,11 @@ pub const HeadSemantics = struct {
     pub fn shouldClose(self: HeadSemantics, http_version: []const u8) bool {
         if (self.has_close) return true;
         return eqIgnoreCase(http_version, "1.0") and !self.has_keep_alive;
+    }
+
+    /// Reject HTTP/1.1 requests without exactly one Host field (RFC 9112 3.2).
+    pub fn validateRequestHost(self: HeadSemantics, http_version: []const u8) ParseError!void {
+        if (eqIgnoreCase(http_version, "1.1") and self.host_count != 1) return error.InvalidHeader;
     }
 
     pub fn upgrade(self: HeadSemantics) ?[]const u8 {

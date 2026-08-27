@@ -374,6 +374,7 @@ pub const Reader = struct {
 
         if (self.role == .server) {
             const rl = try headers_mod.parseRequestLine(first);
+            try semantics.validateRequestHost(rl.http_version);
             const framing = try semantics.framing.finish(.{ .until_close_default = false });
             const end_stream = framing == .none;
             if (end_stream) {
@@ -606,8 +607,34 @@ test "simple GET no body" {
     try t.expectEqual(EvTag.request, r.ev.items[0]);
 }
 
+test "HTTP/1.1 request requires exactly one Host field" {
+    const invalid = [_][]const u8{
+        "GET / HTTP/1.1\r\nUser-Agent: zttp\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: one.example\r\nHost: two.example\r\n\r\n",
+    };
+    for (invalid) |request| {
+        var r = Reader.init(t.allocator, .server);
+        defer r.deinit();
+        try r.feed(request);
+        try t.expectError(error.InvalidHeader, r.nextEvent());
+    }
+}
+
+test "Host requirement permits empty HTTP/1.1 and missing HTTP/1.0 values" {
+    const valid = [_][]const u8{
+        "GET / HTTP/1.1\r\nHost:\r\n\r\n",
+        "GET / HTTP/1.0\r\n\r\n",
+    };
+    for (valid) |request| {
+        var r = Reader.init(t.allocator, .server);
+        defer r.deinit();
+        try r.feed(request);
+        try expectTag(.request, try r.nextEvent());
+    }
+}
+
 test "POST content-length body" {
-    var r = try drainServer("POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+    var r = try drainServer("POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello");
     defer r.ev.deinit(t.allocator);
     defer r.body.deinit(t.allocator);
     try t.expectEqualStrings("hello", r.body.items);
@@ -615,7 +642,7 @@ test "POST content-length body" {
 }
 
 test "POST chunked body with trailers" {
-    var r = try drainServer("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-T: v\r\n\r\n");
+    var r = try drainServer("POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-T: v\r\n\r\n");
     defer r.ev.deinit(t.allocator);
     defer r.body.deinit(t.allocator);
     try t.expectEqualStrings("abc", r.body.items);
@@ -664,7 +691,7 @@ test "EOF during an incomplete head is a terminal protocol error" {
 test "split body across feeds" {
     var r = Reader.init(t.allocator, .server);
     defer r.deinit();
-    try r.feed("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nhel");
+    try r.feed("POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\nhel");
     _ = try r.nextEvent(); // request
     const d1 = try r.nextEvent();
     try t.expectEqualStrings("hel", d1.data.data);
@@ -813,7 +840,7 @@ test "client exposes response connection close signal" {
 test "server head info is an immediate one-shot snapshot" {
     var r = Reader.init(t.allocator, .server);
     defer r.deinit();
-    try r.feed("GET / HTTP/1.1\r\nConnection: close, Upgrade\r\nUpgrade: websocket\r\n\r\n");
+    try r.feed("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close, Upgrade\r\nUpgrade: websocket\r\n\r\n");
     try expectTag(.request, try r.nextEvent());
 
     const info = r.takeHeadInfo();
@@ -844,7 +871,7 @@ test "client marks close-delimited response as closing" {
 test "truncated content-length body errors at EOF" {
     var r = Reader.init(t.allocator, .server);
     defer r.deinit();
-    try r.feed("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nshort");
+    try r.feed("POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\nshort");
     _ = try r.nextEvent();
     _ = try r.nextEvent(); // "short"
     try r.feed("");
@@ -859,7 +886,7 @@ test "H-1: trailer survives buffer realloc across feeds" {
     // trailer must still read back correctly (was a use-after-free).
     var r = Reader.init(t.allocator, .server);
     defer r.deinit();
-    try r.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+    try r.feed("POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n");
     try expectTag(.request, try r.nextEvent());
     try r.feed("0\r\nX-Trailer: SECRET\r\n");
     try expectTag(.need_data, try r.nextEvent()); // trailer stored, no blank line yet
@@ -874,7 +901,7 @@ test "H-1: trailer survives buffer realloc across feeds" {
 test "H-1: multiple trailers survive trailer_store growth" {
     var r = Reader.init(t.allocator, .server);
     defer r.deinit();
-    try r.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+    try r.feed("POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
     try expectTag(.request, try r.nextEvent());
     try r.feed("A: 1\r\nBee: 22\r\nCee: 333\r\n\r\n");
     var eom: Event = undefined;
@@ -900,7 +927,7 @@ test "H-4: trailer count cap rejected" {
     var r = Reader.init(t.allocator, .server);
     r.limits.max_trailers = 4;
     defer r.deinit();
-    try r.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+    try r.feed("POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
     _ = try r.nextEvent();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(t.allocator);
@@ -917,7 +944,7 @@ test "H-4: trailer byte cap rejected" {
     var r = Reader.init(t.allocator, .server);
     r.limits.max_trailer_bytes = 32;
     defer r.deinit();
-    try r.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+    try r.feed("POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
     _ = try r.nextEvent();
     try r.feed("X-Long-Trailer-Header: aaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
     try t.expectError(error.MessageTooLong, r.nextEvent());
@@ -927,7 +954,7 @@ test "prohibited trailers are rejected" {
     inline for (.{ "Content-Length: 0", "Trailer: Content-Length", "Content-Type: text/plain" }) |trailer| {
         var r = Reader.init(t.allocator, .server);
         defer r.deinit();
-        try r.feed("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n" ++ trailer ++ "\r\n\r\n");
+        try r.feed("POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n" ++ trailer ++ "\r\n\r\n");
         try expectTag(.request, try r.nextEvent());
         try t.expectError(error.InvalidHeader, r.nextEvent());
     }
