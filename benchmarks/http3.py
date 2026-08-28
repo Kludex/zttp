@@ -230,6 +230,7 @@ def make_zttp_multiplexed(active_streams: int) -> Runner:
 
     def run(n: int) -> None:
         received = 0
+        completed = 0
         for _ in range(n):
             now[0] += 100
             stream = client.send_request(
@@ -243,9 +244,15 @@ def make_zttp_multiplexed(active_streams: int) -> Runner:
             while (event := server.next_event()) is not zttp.NEED_DATA:
                 if isinstance(event, zttp.Request):
                     received += 1
+                    response = server.stream(event.stream_id)
+                    response.send_response(200, [])
+                    response.end_message()
             transfer(server, client)
-        if received != n:
-            raise RuntimeError(f"zttp delivered {received}/{n} multiplexed requests")
+            while (event := client.next_event()) is not zttp.NEED_DATA:
+                if isinstance(event, zttp.Response) and event.status_code == 200:
+                    completed += 1
+        if received != n or completed != n:
+            raise RuntimeError(f"zttp completed {completed}/{received}/{n} multiplexed round-trips")
 
     return run
 
