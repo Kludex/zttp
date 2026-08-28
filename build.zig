@@ -1,10 +1,16 @@
 const std = @import("std");
 
+fn defaultTarget(b: *std.Build) std.Target.Query {
+    const triple = b.graph.environ_map.get("HATCH_ZIG_TARGET") orelse return .{ .cpu_model = .baseline };
+    if (triple.len == 0) return .{ .cpu_model = .baseline };
+    return std.Target.Query.parse(.{ .arch_os_abi = triple }) catch @panic("invalid HATCH_ZIG_TARGET");
+}
+
 pub fn build(b: *std.Build) void {
     // Wheels must run on CPUs other than the machine that built them. Keep a
     // conservative default while still allowing an explicit -Dcpu override.
     const target = b.standardTargetOptions(.{
-        .default_target = .{ .cpu_model = .baseline },
+        .default_target = defaultTarget(b),
     });
     const optimize = b.standardOptimizeOption(.{});
     // DWARF debug info is ~3 MB per extension (vs ~450 KB of code); shipped

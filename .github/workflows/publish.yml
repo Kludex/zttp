@@ -23,13 +23,14 @@ jobs:
         # Zig cross-compiles, but cibuildwheel still needs a native runner per OS
         # to build the manylinux/musllinux containers and the macOS/Windows
         # wheels. aarch64 Linux uses the native ARM runner; macOS arm64 + x86_64
-        # build on the arm runner; Windows builds run natively on amd64 and arm64.
-        os:
-          - "ubuntu-latest"
-          - "ubuntu-24.04-arm"
-          - "macos-latest"
-          - "windows-latest"
-          - "windows-11-vs2026-arm"
+        # build on the arm runner; Windows wheels are tested natively on both arches.
+        include:
+          - os: "ubuntu-latest"
+          - os: "ubuntu-24.04-arm"
+          - os: "macos-latest"
+          - os: "windows-latest"
+          - os: "windows-11-vs2026-arm"
+            zig_target: "aarch64-windows-msvc"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -45,14 +46,28 @@ jobs:
         with:
           enable-cache: false
 
+      # Native Zig 0.16 exits during Windows ARM64 builds; x64 Zig cross-compiles under emulation.
+      - name: Install x64 Zig on Windows ARM64
+        if: matrix.os == 'windows-11-vs2026-arm'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "zig-x86_64-windows-0.16.0.zip"
+          Invoke-WebRequest -Uri "https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip" -OutFile $archive
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e") {
+            throw "Zig archive checksum mismatch"
+          }
+          Expand-Archive -Path $archive -DestinationPath $env:RUNNER_TEMP
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:RUNNER_TEMP "zig-x86_64-windows-0.16.0")
+
       - name: Test Zig on Windows ARM64
         if: matrix.os == 'windows-11-vs2026-arm'
-        run: |
-          uvx --from ziglang==0.16.0 python-zig version
-          uvx --from ziglang==0.16.0 python-zig build test
+        run: zig build test -Dtarget=aarch64-windows-msvc
 
       - name: Build wheels
         uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55 # v4.1.0
+        env:
+          HATCH_ZIG_TARGET: "${{ matrix.zig_target }}"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
