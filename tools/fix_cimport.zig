@@ -32,6 +32,7 @@ pub fn main(init: std.process.Init) !void {
         var declaration_it = std.mem.splitScalar(u8, src, '\n');
         while (declaration_it.next()) |line| {
             const declaration = externVariable(line) orelse continue;
+            if (!isPythonData(declaration.name)) continue;
             try imported_data.put(declaration.name, {});
         }
     }
@@ -71,15 +72,18 @@ pub fn main(init: std.process.Init) !void {
         }
         if (dll_import_data) {
             if (externVariable(line)) |declaration| {
-                const replacement = try std.fmt.allocPrint(
-                    gpa,
-                    "pub inline fn {s}() *{s} {{ return @extern(*{s}, .{{ .name = \"{s}\", .is_dll_import = true }}); }}",
-                    .{ declaration.name, declaration.type, declaration.type, declaration.name },
-                );
-                try out.appendSlice(gpa, replacement);
-            } else {
-                try appendImportedDataLine(gpa, &out, line, &imported_data);
+                if (imported_data.contains(declaration.name)) {
+                    const replacement = try std.fmt.allocPrint(
+                        gpa,
+                        "pub inline fn {s}() *{s} {{ return @extern(*{s}, .{{ .name = \"{s}\", .is_dll_import = true }}); }}",
+                        .{ declaration.name, declaration.type, declaration.type, declaration.name },
+                    );
+                    try out.appendSlice(gpa, replacement);
+                    try out.append(gpa, '\n');
+                    continue;
+                }
             }
+            try appendImportedDataLine(gpa, &out, line, &imported_data);
         } else {
             try out.appendSlice(gpa, line);
         }
@@ -158,6 +162,10 @@ fn isIdentifierStart(byte: u8) bool {
 
 fn isIdentifierContinue(byte: u8) bool {
     return isIdentifierStart(byte) or std.ascii.isDigit(byte);
+}
+
+fn isPythonData(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "Py") or std.mem.startsWith(u8, name, "_Py");
 }
 
 /// A line that opens an unused secure-CRT extern block, e.g.
