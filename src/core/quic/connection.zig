@@ -3335,11 +3335,24 @@ pub const Connection = struct {
 
 const testing = std.testing;
 
+/// Packet and connection fixtures for cross-module tests and fuzz targets.
+pub const test_support = struct {
+    /// Build an Initial packet that a peer connection can decrypt.
+    pub const buildInitial = testBuildInitial;
+    /// Install deterministic Application-space keys on a connection.
+    pub const installAppKeys = testInstallAppKeys;
+    /// Mark a connection's handshake as confirmed without running TLS.
+    pub const confirmHandshake = testConfirmHandshake;
+    /// Set the next Application-space packet number.
+    pub const setAppNextPn = testSetAppNextPn;
+    /// Build a 1-RTT packet that a peer connection can decrypt.
+    pub const buildApp = testBuildApp;
+};
+
 // Build one Initial packet the way a peer would, so the connection can decrypt
 // it: frame the payload, seal it with the sender's Initial keys, and apply header
-// protection. Returns an owned datagram the caller frees. Exposed (test-only) so
-// the HTTP/3 layer's tests can drive a request through the real transport.
-pub fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
+// protection. Returns an owned datagram the caller frees.
+fn testBuildInitial(gpa: std.mem.Allocator, dcid: []const u8, sender: Role, pn: u64, frames: []const u8) ![]u8 {
     return testBuildInitialWithPadding(gpa, dcid, sender, pn, frames, sender == .client);
 }
 
@@ -3455,8 +3468,7 @@ fn testAppKeys() crypto.Keys {
     return crypto.Keys.fromSecret(TEST_APP_SECRET);
 }
 
-// Install Application-space keys and mark the test connection established.
-pub fn testInstallAppKeys(conn: *Connection) void {
+fn testInstallAppKeys(conn: *Connection) void {
     conn.installApplicationSecrets(TEST_APP_SECRET, TEST_APP_SECRET);
     conn.address_validated = true;
     conn.peer_tp.initial_max_stream_data_bidi_local = 1 << 20;
@@ -3472,12 +3484,11 @@ pub fn testInstallAppKeys(conn: *Connection) void {
     conn.peer_uni_streams = flow.StreamLimit.init(conn.local_tp.initial_max_streams_uni);
 }
 
-/// Mark a test connection's handshake as confirmed without running TLS.
-pub fn testConfirmHandshake(conn: *Connection) void {
+fn testConfirmHandshake(conn: *Connection) void {
     conn.handshake_confirmed = true;
 }
 
-pub fn testSetAppNextPn(conn: *Connection, next_pn: u64) void {
+fn testSetAppNextPn(conn: *Connection, next_pn: u64) void {
     conn.spaces[@intFromEnum(Space.application)].next_pn = next_pn;
 }
 
@@ -3491,7 +3502,7 @@ fn testRequiredServerTransportParameters(conn: *const Connection) !transport_par
 // Build a 1-RTT (short-header) Application packet carrying `frames`, sealed with
 // the test Application keys. The mirror of testBuildInitial for the post-handshake
 // space, so stream-reassembly tests use the space STREAM is actually legal in.
-pub fn testBuildApp(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8) ![]u8 {
+fn testBuildApp(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8) ![]u8 {
     return testBuildAppWithSecret(gpa, dcid, pn, frames, TEST_APP_SECRET, false);
 }
 
