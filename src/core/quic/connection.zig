@@ -3180,6 +3180,11 @@ pub fn testInstallAppKeys(conn: *Connection) void {
     conn.peer_uni_streams = flow.StreamLimit.init(conn.local_tp.initial_max_streams_uni);
 }
 
+/// Mark a test connection's handshake as confirmed without running TLS.
+pub fn testConfirmHandshake(conn: *Connection) void {
+    conn.handshake_confirmed = true;
+}
+
 pub fn testSetAppNextPn(conn: *Connection, next_pn: u64) void {
     conn.spaces[@intFromEnum(Space.application)].next_pn = next_pn;
 }

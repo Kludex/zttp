@@ -165,6 +165,7 @@ fn driveQuic(input: []const u8) void {
     var conn = QuicConnection.init(std.heap.c_allocator, .server, &FUZZ_DCID) catch return;
     defer conn.deinit();
     core.quic.connection.testInstallAppKeys(&conn);
+    core.quic.connection.testConfirmHandshake(&conn);
 
     const split = if (body.len == 0) 0 else @as(usize, body[0]) % (body.len + 1);
     var frames: std.ArrayListUnmanaged(u8) = .empty;
@@ -194,6 +195,7 @@ fn driveH3(input: []const u8) void {
     var qc = QuicConnection.init(std.heap.c_allocator, .server, &FUZZ_DCID) catch return;
     defer qc.deinit();
     core.quic.connection.testInstallAppKeys(&qc);
+    core.quic.connection.testConfirmHandshake(&qc);
     var h3 = H3Connection.init(std.heap.c_allocator, &qc);
     defer h3.deinit();
 
