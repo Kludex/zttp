@@ -95,11 +95,32 @@ def test_should_close_for_locally_sent_request_close() -> None:
     assert conn.should_close() is True
 
 
-def test_peer_close_survives_a_response_without_close() -> None:
-    conn = _parse(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+def test_peer_close_is_added_to_response() -> None:
+    conn = _parse(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: Close\r\n\r\n")
     conn.send_response(200, [(b"content-length", b"0")])
     conn.end_message()
     assert conn.should_close() is True
+    assert conn.data_to_send() == b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nConnection: close\r\n\r\n"
+
+
+def test_peer_close_is_not_duplicated_in_response() -> None:
+    conn = _parse(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    conn.send_response(200, [(b"content-length", b"0"), (b"connection", b"keep-alive, close")])
+    assert conn.data_to_send().lower().count(b"connection:") == 1
+
+
+def test_peer_close_is_added_after_many_response_headers() -> None:
+    conn = _parse(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    headers = [(f"x-{index}".encode(), b"value") for index in range(17)]
+    conn.send_response(204, headers)
+    assert conn.data_to_send().endswith(b"Connection: close\r\n\r\n")
+
+
+def test_peer_close_is_added_only_to_the_final_response() -> None:
+    conn = _parse(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    conn.send_informational(100)
+    conn.send_response(204)
+    assert conn.data_to_send() == b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
 
 
 def test_rejected_response_does_not_set_should_close() -> None:

@@ -2958,7 +2958,24 @@ fn send_response(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Obj
     if (hdrs_seq != null and !py.isNone(hdrs_seq)) {
         if (!hdrs.borrow(hdrs_seq)) return null;
     }
-    const header_slice = hdrs.headers;
+
+    var close_headers_inline: [BorrowedHeaders.inline_capacity + 1]events.Header = undefined;
+    var close_headers_heap: ?[]events.Header = null;
+    defer if (close_headers_heap) |headers| gpa.free(headers);
+    var header_slice = hdrs.headers;
+    if (e.message.should_close and !core.h1.connection.connectionHasClose(header_slice)) {
+        const expanded = if (header_slice.len < close_headers_inline.len)
+            close_headers_inline[0 .. header_slice.len + 1]
+        else
+            gpa.alloc(events.Header, header_slice.len + 1) catch {
+                _ = c.PyErr_NoMemory();
+                return null;
+            };
+        if (header_slice.len >= close_headers_inline.len) close_headers_heap = expanded;
+        @memcpy(expanded[0..header_slice.len], header_slice);
+        expanded[header_slice.len] = .{ .name = "Connection", .value = "close" };
+        header_slice = expanded;
+    }
 
     const rb = core.h1.writer.reasonPhrase(@intCast(status));
     const w = e.ensureWriter() orelse return null;
