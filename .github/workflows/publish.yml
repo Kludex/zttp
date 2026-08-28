@@ -47,7 +47,9 @@ jobs:
 
       - name: Test Zig on Windows ARM64
         if: matrix.os == 'windows-11-vs2026-arm'
-        run: uvx --from ziglang==0.16.0 python-zig build test
+        run: |
+          uvx --from ziglang==0.16.0 python-zig version
+          uvx --from ziglang==0.16.0 python-zig build test
 
       - name: Build wheels
         uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55 # v4.1.0
