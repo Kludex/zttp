@@ -110,6 +110,8 @@ const SpaceState = struct {
     recv_key_phase: bool = false,
     send_key_phase: bool = false,
     next_pn: u64 = 0,
+    /// The largest authenticated packet number, used only to decode truncated packet numbers.
+    largest_authenticated_pn: ?u64 = null,
     largest_recv_pn: ?u64 = null,
     rec: recovery.Space = .{},
     crypto: crypto_stream.CryptoStream,
@@ -168,6 +170,15 @@ const OpenedPacket = struct {
     key_phase: bool,
 };
 
+const ReceiveContext = struct {
+    now: u64,
+    datagram_len: usize,
+    peer_address: ?[]const u8,
+    path_recorded: bool = false,
+    provisional_path_recorded: bool = false,
+    auto_path_challenge_queued: bool = false,
+};
+
 /// A STOP_SENDING owed to the peer: the error code, and whether a frame carrying it is
 /// currently in flight (so flushSend does not re-send while one is unacked).
 const StopSending = struct { code: u64, in_flight: bool = false };
@@ -195,6 +206,11 @@ const PathState = struct {
     recv_bytes: u64 = 0,
     sent_bytes: u64 = 0,
     validated: bool = false,
+};
+
+const ProvisionalPath = struct {
+    token: u64,
+    state: PathState,
 };
 
 /// A connection id the peer issued in NEW_CONNECTION_ID, retained for future path
@@ -375,6 +391,11 @@ pub const Connection = struct {
     /// retains the most recent peer path so application writes queued after
     /// receive_datagram still have a routable destination.
     paths: std.AutoHashMapUnmanaged(u64, PathState) = .empty,
+    /// The unauthenticated route for queued Version Negotiation output. It is
+    /// bounded to one address and released when the output queue is drained.
+    provisional_path: ?ProvisionalPath = null,
+    /// The single peer path awaiting automatic validation after migration.
+    peer_candidate_path_token: ?u64 = null,
     current_path_token: ?u64 = null,
     default_path_token: ?u64 = null,
     /// Local CID sequence number matched by the short-header packet currently
@@ -435,6 +456,8 @@ pub const Connection = struct {
     /// non-zero max_idle_timeout.
     idle_deadline: ?u64 = null,
     idle_timed_out: bool = false,
+    /// A mid-dispatch allocation failure leaves the receive state terminal.
+    receive_failure: ?Error = null,
     closed: bool = false,
     /// The details of a CONNECTION_CLOSE received from the peer (RFC 9000 19.19),
     /// captured so the integrator can report why the peer closed - not just that it
@@ -729,6 +752,7 @@ pub const Connection = struct {
         var path_it = self.paths.valueIterator();
         while (path_it.next()) |p| self.gpa.free(p.address);
         self.paths.deinit(self.gpa);
+        if (self.provisional_path) |path| self.gpa.free(path.state.address);
         if (self.initial_token) |t| self.gpa.free(t);
         for (self.new_tokens.items) |t| self.gpa.free(t);
         self.new_tokens.deinit(self.gpa);
@@ -796,6 +820,8 @@ pub const Connection = struct {
     /// fit one datagram. A long header (Initial/Handshake) carries our scid + a
     /// length field; a short header (Application) runs to the datagram end.
     fn buildPacket(self: *Connection, space: Space, frames: []const u8, ack_eliciting: bool, now: u64) Error!u64 {
+        if (self.receive_failure) |err| return err;
+        if (self.closed) return error.ProtocolViolation;
         const st = &self.spaces[@intFromEnum(space)];
         const use_zero_rtt = space == .application and st.send_keys == null and st.zero_rtt_send_keys != null;
         assertFramesAllowedIn(space, use_zero_rtt, frames); // no illegal frames for the packet type
@@ -827,20 +853,34 @@ pub const Connection = struct {
             return error.AmplificationLimited;
         }
 
+        self.out.ensureUnusedCapacity(self.gpa, datagram_len) catch return error.OutOfMemory;
+        self.out_lengths.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+        self.out_path_tokens.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+        st.rec.ensureSentCapacity(self.gpa) catch return error.OutOfMemory;
+
         const start = self.out.items.len;
-        self.out.appendSlice(self.gpa, hdr.items) catch return error.OutOfMemory;
-        const ct = self.out.addManyAsSlice(self.gpa, frames.len + crypto.TAG_LEN) catch return error.OutOfMemory;
+        self.out.appendSliceAssumeCapacity(hdr.items);
+        const ct = self.out.addManyAsSliceAssumeCapacity(frames.len + crypto.TAG_LEN);
         _ = crypto.seal(keys, pn, hdr.items, frames, ct);
-        crypto.protectHeader(keys.hp, self.out.items[start..], pn_offset, long) catch return error.ProtocolViolation;
+        crypto.protectHeader(keys.hp, self.out.items[start..], pn_offset, long) catch {
+            self.out.shrinkRetainingCapacity(start);
+            return error.ProtocolViolation;
+        };
         self.sent_bytes += datagram_len;
         self.recordPathSent(datagram_len);
-        self.out_lengths.append(self.gpa, datagram_len) catch return error.OutOfMemory;
-        self.out_path_tokens.append(self.gpa, self.sendPathToken()) catch return error.OutOfMemory;
+        self.out_lengths.appendAssumeCapacity(datagram_len);
+        self.out_path_tokens.appendAssumeCapacity(self.sendPathToken());
         // A pure-ACK packet is not ack-eliciting, so it is not in flight: not
         // congestion-controlled or retransmitted (RFC 9002 2, 7). Only in-flight
         // packets count toward bytes_in_flight - charging a pure ACK would inflate it
         // permanently, since the ACK/loss paths only credit back in-flight packets.
-        st.rec.onSent(self.gpa, .{ .pn = pn, .sent_time = now, .size = datagram_len, .ack_eliciting = ack_eliciting, .in_flight = ack_eliciting }) catch return error.OutOfMemory;
+        st.rec.onSentAssumeCapacity(.{
+            .pn = pn,
+            .sent_time = now,
+            .size = datagram_len,
+            .ack_eliciting = ack_eliciting,
+            .in_flight = ack_eliciting,
+        });
         if (ack_eliciting) {
             self.cc.onSent(datagram_len);
             self.resetIdleTimer(now);
@@ -909,8 +949,10 @@ pub const Connection = struct {
     /// Resolve an address-aware path token to the opaque peer address supplied by
     /// the integrator.
     pub fn pathAddress(self: *const Connection, token: u64) ?[]const u8 {
-        const p = self.paths.get(token) orelse return null;
-        return p.address;
+        if (self.paths.get(token)) |path| return path.address;
+        const provisional = self.provisional_path orelse return null;
+        if (provisional.token != token) return null;
+        return provisional.state.address;
     }
 
     /// Switch subsequent packets to a peer-issued connection id (RFC 9000 5.1).
@@ -987,6 +1029,26 @@ pub const Connection = struct {
         self.out.clearRetainingCapacity();
         self.out_lengths.clearRetainingCapacity();
         self.out_path_tokens.clearRetainingCapacity();
+        if (self.provisional_path) |path| self.gpa.free(path.state.address);
+        self.provisional_path = null;
+        while (true) {
+            var removed = false;
+            var iterator = self.paths.iterator();
+            while (iterator.next()) |entry| {
+                const token = entry.key_ptr.*;
+                if (self.default_path_token == token or self.peer_candidate_path_token == token or
+                    self.pathHasPendingChallenge(token))
+                {
+                    continue;
+                }
+                const address = entry.value_ptr.address;
+                _ = self.paths.remove(token);
+                self.gpa.free(address);
+                removed = true;
+                break;
+            }
+            if (!removed) break;
+        }
     }
 
     // ---- STREAM send -----------------------------------------------------------
@@ -1402,6 +1464,7 @@ pub const Connection = struct {
     /// detection routes lost pns back into SendStream.onLost, and the PTO timer
     /// probes tail packets that have no later ACK to trigger threshold loss.
     pub fn flushSend(self: *Connection, now: u64) Error!void {
+        if (self.receive_failure) |err| return err;
         if (self.closed) return;
         const space = Space.application;
         const st = &self.spaces[@intFromEnum(space)];
@@ -1779,6 +1842,7 @@ pub const Connection = struct {
     }
 
     pub fn nextTimeout(self: *Connection) ?u64 {
+        if (self.receive_failure != null) return null;
         if (self.closed) return null;
         var earliest: ?u64 = null;
         if (self.idle_deadline) |t| earliest = minOpt(earliest, t);
@@ -1795,6 +1859,7 @@ pub const Connection = struct {
     /// oldest unacked STREAM range so the next flushSend resends it (or a PING). No
     /// I/O happens here - the next flushSend emits whatever was queued.
     pub fn onTimeout(self: *Connection, now: u64) Error!void {
+        if (self.receive_failure) |err| return err;
         if (self.closed) return error.ProtocolViolation;
         if (self.idle_deadline) |deadline| {
             if (now >= deadline) {
@@ -2255,8 +2320,8 @@ pub const Connection = struct {
 
     /// Process one received UDP datagram: walk the coalesced packets, decrypt and
     /// dispatch each. `now` is a monotonic microsecond timestamp. A packet that
-    /// fails authentication is skipped (not fatal); a protocol violation poisons
-    /// the connection.
+    /// fails authentication is skipped (not fatal); a protocol violation or a
+    /// mid-dispatch allocation failure poisons the connection.
     pub fn receiveDatagram(self: *Connection, datagram: []const u8, now: u64) Error!void {
         self.receiveDatagramOn(datagram, now, null) catch |err| return self.closeForReceiveError(err);
     }
@@ -2288,6 +2353,7 @@ pub const Connection = struct {
     }
 
     fn receiveDatagramOn(self: *Connection, datagram: []const u8, now: u64, peer_address: ?[]const u8) Error!void {
+        if (self.receive_failure) |err| return err;
         if (self.closed) return error.ProtocolViolation;
         if (peer_address) |addr| {
             // A spoofable path change is silently dropped, never connection-fatal.
@@ -2302,26 +2368,13 @@ pub const Connection = struct {
         self.recv_bytes += datagram.len;
         const previous_path = self.current_path_token;
         defer self.current_path_token = previous_path;
-        var auto_path_challenge_queued = false;
+        var context = ReceiveContext{ .now = now, .datagram_len = datagram.len, .peer_address = peer_address };
         if (peer_address) |addr| {
-            const pt = try self.pathTokenForAddress(addr);
-            const new_peer_path = self.default_path_token != null and self.default_path_token.? != pt;
-            self.current_path_token = pt;
-            if (self.default_path_token == null) {
-                self.default_path_token = pt;
-                if (self.address_validated) self.paths.getPtr(pt).?.validated = true;
-            }
-            if (self.paths.getPtr(pt)) |p| {
-                p.recv_bytes += datagram.len;
-                if (self.handshake_confirmed and new_peer_path and !p.validated) {
-                    try self.queueAutomaticPathChallenge(pt, now);
-                    auto_path_challenge_queued = true;
-                }
-            }
+            self.current_path_token = std.hash.Wyhash.hash(0, addr);
         }
         var rest = datagram;
         while (rest.len > 0) {
-            const consumed = self.receivePacket(rest, now, datagram.len) catch |e| switch (e) {
+            const consumed = self.receivePacket(rest, &context) catch |e| switch (e) {
                 // A short-header packet has no length field, so an undecryptable one
                 // ends the walk (its boundary is the datagram end). A long-header
                 // packet whose boundary IS known returns its length from receiveLong
@@ -2336,7 +2389,7 @@ pub const Connection = struct {
         // CRYPTO that stalled on the limit (RFC 9000 8.1).
         try self.flushCrypto(.initial, now);
         try self.flushCrypto(.handshake, now);
-        if (auto_path_challenge_queued) {
+        if (context.auto_path_challenge_queued) {
             self.flushPathChallenges(.application, now) catch |e| switch (e) {
                 error.AmplificationLimited => {},
                 else => return e,
@@ -2344,20 +2397,20 @@ pub const Connection = struct {
         }
     }
 
-    fn receivePacket(self: *Connection, buf: []const u8, now: u64, datagram_len: usize) Error!usize {
-        if (packet.isLong(buf[0])) return self.receiveLong(buf, now, datagram_len);
-        return self.receiveShort(buf, now);
+    fn receivePacket(self: *Connection, buf: []const u8, context: *ReceiveContext) Error!usize {
+        if (packet.isLong(buf[0])) return self.receiveLong(buf, context);
+        return self.receiveShort(buf, context);
     }
 
-    fn receiveLong(self: *Connection, buf: []const u8, now: u64, datagram_len: usize) Error!usize {
+    fn receiveLong(self: *Connection, buf: []const u8, context: *ReceiveContext) Error!usize {
         const prefix = packet.parseLongPrefix(buf) catch return error.Dropped;
         if (prefix.version == 0) return self.receiveVersionNegotiation(prefix, buf);
         if (prefix.version != constants.VERSION_1) {
-            if (self.role == .server) try self.sendVersionNegotiation(prefix);
+            if (self.role == .server) try self.sendVersionNegotiation(prefix, context);
             return buf.len;
         }
         const hdr = packet.parseLong(buf) catch return error.Dropped;
-        if (hdr.ltype == .retry) return self.receiveRetry(hdr, buf, now);
+        if (hdr.ltype == .retry) return self.receiveRetry(hdr, buf, context);
         const space: Space = switch (hdr.ltype) {
             .initial => .initial,
             .handshake => .handshake,
@@ -2366,7 +2419,7 @@ pub const Connection = struct {
         };
         const total = hdr.pn_offset + @as(usize, @intCast(hdr.length));
         if (total > buf.len) return error.Dropped;
-        if (self.role == .server and hdr.ltype == .initial and datagram_len < constants.MIN_INITIAL_DATAGRAM) {
+        if (self.role == .server and hdr.ltype == .initial and context.datagram_len < constants.MIN_INITIAL_DATAGRAM) {
             return error.Dropped;
         }
         // A long header's length is known, so a packet we cannot decrypt (no keys
@@ -2374,18 +2427,44 @@ pub const Connection = struct {
         // length so the caller keeps walking any coalesced packets behind it
         // (e.g. a Handshake packet coalesced after an Initial). RFC 9000 12.2.
         const peer_scid_candidate = if (hdr.ltype == .initial) hdr.scid else null;
-        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, peer_scid_candidate, now) catch |e| switch (e) {
+        self.decryptAndDispatch(buf[0..total], hdr.pn_offset, space, true, peer_scid_candidate, context) catch |e| switch (e) {
             error.Dropped => return total,
             else => return e,
         };
         return total;
     }
 
-    fn sendVersionNegotiation(self: *Connection, prefix: packet.LongPrefix) Error!void {
+    fn sendVersionNegotiation(self: *Connection, prefix: packet.LongPrefix, context: *ReceiveContext) Error!void {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(self.gpa);
         packet.writeVersionNegotiation(&out, self.gpa, prefix.scid, prefix.dcid) catch return error.OutOfMemory;
+        var provisional_created = false;
+        if (context.peer_address) |address| {
+            const token = self.current_path_token.?;
+            if (!self.paths.contains(token)) {
+                if (self.provisional_path) |*path| {
+                    if (path.token != token or !std.mem.eql(u8, path.state.address, address)) return;
+                    if (!context.provisional_path_recorded) path.state.recv_bytes += context.datagram_len;
+                } else {
+                    const owned = self.gpa.dupe(u8, address) catch return error.OutOfMemory;
+                    self.provisional_path = .{
+                        .token = token,
+                        .state = .{ .address = owned, .recv_bytes = context.datagram_len },
+                    };
+                    provisional_created = true;
+                }
+                context.provisional_path_recorded = true;
+            }
+        }
+        errdefer if (provisional_created) {
+            self.gpa.free(self.provisional_path.?.state.address);
+            self.provisional_path = null;
+        };
         if (!self.canSendDatagram(out.items.len)) {
+            if (provisional_created) {
+                self.gpa.free(self.provisional_path.?.state.address);
+                self.provisional_path = null;
+            }
             return;
         }
         self.out.appendSlice(self.gpa, out.items) catch return error.OutOfMemory;
@@ -2416,12 +2495,13 @@ pub const Connection = struct {
         return error.ProtocolViolation;
     }
 
-    fn receiveRetry(self: *Connection, hdr: packet.LongHeader, buf: []const u8, now: u64) Error!usize {
+    fn receiveRetry(self: *Connection, hdr: packet.LongHeader, buf: []const u8, context: *ReceiveContext) Error!usize {
         if (self.role != .client) return error.Dropped;
         if (self.retried or self.spaces[@intFromEnum(Space.handshake)].recv_keys != null) return error.Dropped;
         if (!std.mem.eql(u8, hdr.dcid, self.scid)) return error.Dropped;
         if (hdr.scid.len == 0 or hdr.token.len == 0) return error.Dropped;
         if (!(packet.validateRetryIntegrity(self.gpa, buf, self.peer_scid) catch return error.OutOfMemory)) return error.Dropped;
+        try self.recordAuthenticatedPath(context);
 
         const token = self.gpa.dupe(u8, hdr.token) catch return error.OutOfMemory;
         errdefer self.gpa.free(token);
@@ -2445,11 +2525,11 @@ pub const Connection = struct {
         st.send_keys = initial.client;
         if (st.crypto_send.end() > 0) try st.crypto_send.onLost(0, st.crypto_send.end(), false);
         st.crypto_sent.clearRetainingCapacity();
-        try self.flushCrypto(.initial, now);
+        try self.flushCrypto(.initial, context.now);
         return buf.len;
     }
 
-    fn receiveShort(self: *Connection, buf: []const u8, now: u64) Error!usize {
+    fn receiveShort(self: *Connection, buf: []const u8, context: *ReceiveContext) Error!usize {
         const parsed = self.parseShortForLocalCid(buf) catch {
             if (self.detectStatelessReset(buf)) return buf.len;
             return error.Dropped;
@@ -2458,7 +2538,7 @@ pub const Connection = struct {
         self.current_packet_local_cid_seq = parsed.local_cid_seq;
         defer self.current_packet_local_cid_seq = previous_cid_seq;
         // A short-header packet is the rest of the datagram (no length field).
-        self.decryptAndDispatch(buf, parsed.hdr.pn_offset, .application, false, null, now) catch |e| switch (e) {
+        self.decryptAndDispatch(buf, parsed.hdr.pn_offset, .application, false, null, context) catch |e| switch (e) {
             error.Dropped => {
                 if (self.detectStatelessReset(buf)) return buf.len;
                 return error.Dropped;
@@ -2539,7 +2619,7 @@ pub const Connection = struct {
         space: Space,
         long: bool,
         peer_scid_candidate: ?[]const u8,
-        now: u64,
+        context: *ReceiveContext,
     ) Error!void {
         const st = &self.spaces[@intFromEnum(space)];
         const opened = if (space == .application and !long)
@@ -2550,6 +2630,12 @@ pub const Connection = struct {
             try self.openPacket(pkt, pn_offset, space, long, st.recv_keys orelse return error.Dropped, null);
         defer self.gpa.free(opened.work);
         defer self.gpa.free(opened.plaintext);
+        st.largest_authenticated_pn = if (st.largest_authenticated_pn) |largest|
+            @max(largest, opened.pn)
+        else
+            opened.pn;
+        if (st.recv_ranges.shouldIgnore(opened.pn)) return;
+        try self.recordAuthenticatedPath(context);
         if (peer_scid_candidate) |candidate| {
             // RFC 9000 7.2 permits adoption only after packet authentication.
             if (!self.peer_scid_set and candidate.len > 0) {
@@ -2568,14 +2654,67 @@ pub const Connection = struct {
         // (RFC 9000 8.1).
         if (space == .handshake) self.validateCurrentPath();
 
-        if (st.recv_ranges.shouldIgnore(opened.pn)) return;
-        st.largest_recv_pn = if (st.largest_recv_pn) |l| @max(l, opened.pn) else opened.pn;
-        st.recv_ranges.add(self.gpa, opened.pn) catch return error.OutOfMemory; // for accurate ACKs
-        try self.dispatchFrames(opened.payload, space, long, now);
-        self.resetIdleTimer(now);
+        st.recv_ranges.ensureCanAdd(self.gpa, opened.pn) catch return error.OutOfMemory;
+        self.dispatchFrames(opened.payload, space, long, context.now) catch |err| {
+            if (err == error.OutOfMemory) {
+                // Frame handlers may have committed state, so this packet must never be replayed or acknowledged.
+                self.receive_failure = err;
+                self.closed = true;
+                for (&self.spaces) |*state| state.ack_pending = false;
+                self.clearSend();
+            }
+            return err;
+        };
+        st.recv_ranges.add(self.gpa, opened.pn) catch unreachable; // ensureCanAdd reserved the only possible allocation.
+        st.largest_recv_pn = if (st.largest_recv_pn) |largest| @max(largest, opened.pn) else opened.pn;
+        self.resetIdleTimer(context.now);
 
         // Acknowledge the space if it carried an ack-eliciting frame this packet.
-        if (st.ack_pending) try self.sendAck(space, now);
+        if (st.ack_pending) try self.sendAck(space, context.now);
+    }
+
+    fn recordAuthenticatedPath(self: *Connection, context: *ReceiveContext) Error!void {
+        if (context.path_recorded) return;
+        const addr = context.peer_address orelse return;
+        const candidate = std.hash.Wyhash.hash(0, addr);
+        if (!self.paths.contains(candidate) and self.default_path_token != null and
+            self.default_path_token.? != candidate)
+        {
+            if (self.peer_candidate_path_token) |previous| {
+                if (previous != candidate) {
+                    for (self.out_path_tokens.items) |queued| {
+                        if (queued == previous) return error.Dropped;
+                    }
+                    self.removePendingPathChallengesFor(previous);
+                    if (self.paths.fetchRemove(previous)) |entry| self.gpa.free(entry.value.address);
+                    self.peer_candidate_path_token = null;
+                }
+            }
+        }
+        const pt = try self.pathTokenForAddress(addr);
+        const new_peer_path = self.default_path_token != null and self.default_path_token.? != pt;
+        self.current_path_token = pt;
+        const p = self.paths.getPtr(pt).?;
+        if (self.provisional_path) |*provisional| {
+            if (provisional.token == pt and std.mem.eql(u8, provisional.state.address, addr)) {
+                p.recv_bytes = p.recv_bytes +| provisional.state.recv_bytes;
+                p.sent_bytes = p.sent_bytes +| provisional.state.sent_bytes;
+                provisional.state.recv_bytes = 0;
+                provisional.state.sent_bytes = 0;
+            }
+        }
+        p.recv_bytes = p.recv_bytes +| context.datagram_len;
+        if (self.default_path_token == null) {
+            self.default_path_token = pt;
+            if (self.address_validated) p.validated = true;
+        } else if (new_peer_path and !p.validated and self.peer_candidate_path_token == null) {
+            self.peer_candidate_path_token = pt;
+        }
+        if (self.handshake_confirmed and new_peer_path and !p.validated) {
+            try self.queueAutomaticPathChallenge(pt, context.now);
+            context.auto_path_challenge_queued = true;
+        }
+        context.path_recorded = true;
     }
 
     fn openApplicationPacket(self: *Connection, pkt: []const u8, pn_offset: usize) Error!OpenedPacket {
@@ -2633,7 +2772,7 @@ pub const Connection = struct {
         var truncated: u64 = 0;
         for (work[pn_offset .. pn_offset + pn_len]) |b| truncated = (truncated << 8) | b;
         const st = &self.spaces[@intFromEnum(space)];
-        const pn = packet.decodePacketNumber(st.largest_recv_pn orelse 0, truncated, pn_len);
+        const pn = packet.decodePacketNumber(st.largest_authenticated_pn orelse 0, truncated, pn_len);
 
         const header = work[0 .. pn_offset + pn_len];
         const ciphertext = work[pn_offset + pn_len ..];
@@ -2848,7 +2987,11 @@ pub const Connection = struct {
     fn canSendDatagram(self: *Connection, datagram_len: usize) bool {
         if (self.role != .server) return true;
         if (self.sendPathToken()) |pt| {
-            const p = self.paths.get(pt) orelse return false;
+            const p = self.paths.get(pt) orelse blk: {
+                const provisional = self.provisional_path orelse return false;
+                if (provisional.token != pt) return false;
+                break :blk provisional.state;
+            };
             if (p.validated) return true;
             return withinAmplificationBudget(p.sent_bytes, p.recv_bytes, datagram_len);
         }
@@ -2858,7 +3001,11 @@ pub const Connection = struct {
 
     fn recordPathSent(self: *Connection, datagram_len: usize) void {
         if (self.sendPathToken()) |pt| {
-            if (self.paths.getPtr(pt)) |p| p.sent_bytes += datagram_len;
+            if (self.paths.getPtr(pt)) |p| {
+                p.sent_bytes += datagram_len;
+            } else if (self.provisional_path) |*path| {
+                if (path.token == pt) path.state.sent_bytes += datagram_len;
+            }
         }
     }
 
@@ -2870,6 +3017,7 @@ pub const Connection = struct {
         if (self.current_path_token) |pt| {
             if (self.paths.getPtr(pt)) |p| p.validated = true;
             self.default_path_token = pt;
+            if (self.peer_candidate_path_token == pt) self.peer_candidate_path_token = null;
         }
         self.address_validated = true;
     }
@@ -3294,6 +3442,11 @@ pub fn testInstallAppKeys(conn: *Connection) void {
     conn.peer_uni_streams = flow.StreamLimit.init(conn.local_tp.initial_max_streams_uni);
 }
 
+/// Mark a test connection's handshake as confirmed without running TLS.
+pub fn testConfirmHandshake(conn: *Connection) void {
+    conn.handshake_confirmed = true;
+}
+
 pub fn testSetAppNextPn(conn: *Connection, next_pn: u64) void {
     conn.spaces[@intFromEnum(Space.application)].next_pn = next_pn;
 }
@@ -3310,6 +3463,62 @@ fn testRequiredServerTransportParameters(conn: *const Connection) !transport_par
 // space, so stream-reassembly tests use the space STREAM is actually legal in.
 pub fn testBuildApp(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8) ![]u8 {
     return testBuildAppWithSecret(gpa, dcid, pn, frames, TEST_APP_SECRET, false);
+}
+
+fn receiveStreamUnderAllocationFailure(gpa: std.mem.Allocator) !void {
+    const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x16 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    var tail_frame: std.ArrayListUnmanaged(u8) = .empty;
+    defer tail_frame.deinit(gpa);
+    try frame.encodeStream(&tail_frame, gpa, 0, 6, "world", true);
+    const tail = try testBuildApp(gpa, &dcid, 0, tail_frame.items);
+    defer gpa.free(tail);
+    try conn.receiveDatagram(tail, 1000);
+    conn.clearSend();
+
+    const s = conn.streams.get(0).?;
+    try testing.expectEqual(@as(usize, 1), s.pending.items.len);
+    const previous_pending_offset = s.pending.items[0].offset;
+    const previous_pending_data = try gpa.dupe(u8, s.pending.items[0].data);
+    defer gpa.free(previous_pending_data);
+    const previous_window = conn.recv_windows.get(0).?;
+    const previous_total = conn.conn_received_total;
+    var head_frame: std.ArrayListUnmanaged(u8) = .empty;
+    defer head_frame.deinit(gpa);
+    try frame.encodePathChallenge(&head_frame, gpa, .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try frame.encodeStream(&head_frame, gpa, 0, 0, "hello ", false);
+    const head = try testBuildApp(gpa, &dcid, 1, head_frame.items);
+    defer gpa.free(head);
+    conn.receiveDatagram(head, 2000) catch |err| {
+        try testing.expectEqual(@as(u64, 11), s.highest_received);
+        try testing.expectEqual(@as(?u64, 11), s.final_size);
+        try testing.expectEqual(stream.RecvState.size_known, s.state);
+        try testing.expectEqual(previous_window, conn.recv_windows.get(0).?);
+        try testing.expectEqual(previous_total, conn.conn_received_total);
+        if (s.readable().len == 0) {
+            try testing.expectEqual(@as(usize, 1), s.pending.items.len);
+            try testing.expectEqual(previous_pending_offset, s.pending.items[0].offset);
+            try testing.expectEqualStrings(previous_pending_data, s.pending.items[0].data);
+            try testing.expect(!conn.spaces[@intFromEnum(Space.application)].recv_ranges.contains(1));
+        } else {
+            try testing.expectEqualStrings("hello world", s.readable());
+            try testing.expectEqual(@as(usize, 0), s.pending.items.len);
+            try testing.expect(s.isFinished());
+            try testing.expect(conn.spaces[@intFromEnum(Space.application)].recv_ranges.contains(1));
+        }
+        if (conn.receive_failure != null) {
+            try testing.expectEqual(@as(usize, 0), conn.datagramLengths().len);
+            for (&conn.spaces) |*state| try testing.expect(!state.ack_pending);
+            conn.handshake_confirmed = true;
+            try testing.expectError(error.OutOfMemory, conn.sendNewToken("token", 3000));
+        }
+        return err;
+    };
+    try testing.expectEqualStrings("hello world", s.readable());
+    try testing.expect(s.isFinished());
 }
 
 fn testBuildAppWithSecret(gpa: std.mem.Allocator, dcid: []const u8, pn: u64, frames: []const u8, secret: [32]u8, key_phase: bool) ![]u8 {
@@ -3374,6 +3583,29 @@ fn decodeQueuedAppFrame(conn: *Connection, index: usize) !DecodedQueuedAppFrame 
     const payload = try crypto.open(testAppKeys(), pn, header, ciphertext, plaintext);
     const decoded = try frame.decode(payload);
     return .{ .work = work, .plaintext = plaintext, .frame = decoded.frame };
+}
+
+fn sendPacketUnderAllocationFailure(gpa: std.mem.Allocator) !void {
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    try conn.sendStreamData(0, &[_]u8{0x5a} ** 1024, true);
+    conn.flushSend(1000) catch |err| {
+        try testing.expectEqual(conn.datagramLengths().len, conn.datagramPathTokens().len);
+        var queued: usize = 0;
+        for (conn.datagramLengths()) |len| queued += len;
+        try testing.expectEqual(queued, conn.datagramsToSend().len);
+        return err;
+    };
+    try testing.expectEqual(@as(usize, 1), conn.datagramLengths().len);
+    try testing.expectEqual(conn.datagramLengths().len, conn.datagramPathTokens().len);
+    try testing.expectEqual(conn.datagramLengths()[0], conn.datagramsToSend().len);
+}
+
+test "packet construction is atomic on allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, sendPacketUnderAllocationFailure, .{});
 }
 
 test "server decrypts a 1-RTT packet and reassembles a stream" {
@@ -3689,6 +3921,106 @@ test "1-RTT packets obey the anti-amplification budget" {
     server.recv_bytes = 100;
     try server.sendPing(.application, 2000);
     try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+}
+
+test "unauthenticated datagram does not retain path state" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const peer_address = "203.0.113.1:4433";
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const frames = [_]u8{ 0x01, 0x00, 0x00 };
+    const dgram = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(dgram);
+    dgram[dgram.len - 1] ^= 1;
+
+    try conn.receiveDatagramFrom(dgram, 1000, peer_address);
+    const token = std.hash.Wyhash.hash(0, peer_address);
+    try testing.expect(conn.pathAddress(token) == null);
+}
+
+test "replayed authenticated datagrams do not retain new path state" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x09 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+
+    const frames = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
+    const datagram = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(datagram);
+
+    try conn.receiveDatagramFrom(datagram, 1000, "203.0.113.1:4433");
+    conn.clearSend();
+    try conn.receiveDatagramFrom(datagram, 2000, "203.0.113.2:4433");
+    try conn.receiveDatagramFrom(datagram, 3000, "203.0.113.3:4433");
+
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, "203.0.113.1:4433")) != null);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, "203.0.113.2:4433")) == null);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, "203.0.113.3:4433")) == null);
+}
+
+test "authenticated migration retains one unvalidated peer path" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x0a };
+    const addr_a = "198.51.100.1:4433";
+    const addr_b = "198.51.100.2:4433";
+    const addr_c = "198.51.100.3:4433";
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.handshake_confirmed = true;
+
+    const frames = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
+    const first = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(first);
+    const second = try testBuildApp(gpa, &dcid, 1, &frames);
+    defer gpa.free(second);
+    const third = try testBuildApp(gpa, &dcid, 2, &frames);
+    defer gpa.free(third);
+
+    try conn.receiveDatagramFrom(first, 1000, addr_a);
+    conn.clearSend();
+    try conn.receiveDatagramFrom(second, 2000, addr_b);
+    try conn.receiveDatagramFrom(third, 3000, addr_c);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, addr_b)) != null);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, addr_c)) == null);
+
+    conn.clearSend();
+    try conn.receiveDatagramFrom(third, 4000, addr_c);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, addr_b)) == null);
+    try testing.expect(conn.pathAddress(std.hash.Wyhash.hash(0, addr_c)) != null);
+}
+
+test "authenticated path promotion preserves provisional amplification credit" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4 };
+    const peer_address = "203.0.113.1:4433";
+    var server = try Connection.init(gpa, .server, &dcid);
+    defer server.deinit();
+    testInstallAppKeys(&server);
+    server.address_validated = false;
+
+    var unsupported: std.ArrayListUnmanaged(u8) = .empty;
+    defer unsupported.deinit(gpa);
+    _ = try packet.writeLongHeader(&unsupported, gpa, .initial, 0x0a0a_0a0a, &dcid, "cli", "", 1, 1);
+    try unsupported.appendNTimes(gpa, 0, constants.MIN_INITIAL_DATAGRAM - unsupported.items.len);
+    try server.receiveDatagramFrom(unsupported.items, 1000, peer_address);
+
+    const frames = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
+    const authenticated = try testBuildApp(gpa, &dcid, 0, &frames);
+    defer gpa.free(authenticated);
+    try server.receiveDatagramFrom(authenticated, 2000, peer_address);
+
+    const before = server.datagramLengths().len;
+    try server.sendStreamData(1, &([_]u8{0x42} ** 1000), false);
+    try server.flushSend(3000);
+    try testing.expect(server.datagramLengths().len > before);
+    var sent_bytes: usize = 0;
+    for (server.datagramLengths()) |len| sent_bytes += len;
+    try testing.expect(sent_bytes <= (unsupported.items.len + authenticated.len) * constants.AMPLIFICATION_FACTOR);
 }
 
 test "PATH_CHALLENGE elicits a matching PATH_RESPONSE" {
@@ -5088,6 +5420,10 @@ test "per-stream receive flow control rejects data past the stream limit" {
     try testing.expect(!conn.recv_windows.contains(0));
 }
 
+test "receive stream updates are atomic on allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, receiveStreamUnderAllocationFailure, .{});
+}
+
 test "receive stream fragment count is bounded" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x0e, 0x0f, 0x10, 0x15 };
@@ -5927,6 +6263,7 @@ test "an unauthenticated long header cannot replace the peer connection id" {
 test "server answers an unsupported long-header version with Version Negotiation" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4 };
+    const peer_address = "203.0.113.1:4433";
     var server = try Connection.initServer(gpa, &dcid, testServerConfig());
     defer server.deinit();
 
@@ -5934,9 +6271,11 @@ test "server answers an unsupported long-header version with Version Negotiation
     defer bad.deinit(gpa);
     _ = try packet.writeLongHeader(&bad, gpa, .initial, 0x0a0a_0a0a, &dcid, "cli", "", 1, 1);
     try bad.append(gpa, 0x00);
-    try server.receiveDatagram(bad.items, 1000);
+    try server.receiveDatagramFrom(bad.items, 1000, peer_address);
 
     try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+    const token = server.datagramPathTokens()[0].?;
+    try testing.expectEqualStrings(peer_address, server.pathAddress(token).?);
     const vn = server.datagramsToSend()[0..server.datagramLengths()[0]];
     const p = try packet.parseLongPrefix(vn);
     try testing.expectEqual(@as(u32, 0), p.version);
@@ -5944,6 +6283,31 @@ test "server answers an unsupported long-header version with Version Negotiation
     try testing.expectEqualSlices(u8, &dcid, p.scid);
     try testing.expectEqual(@as(usize, 4), vn[p.header_len..].len);
     try testing.expectEqual(constants.VERSION_1, std.mem.readInt(u32, vn[p.header_len..][0..4], .big));
+
+    server.clearSend();
+    try testing.expect(server.pathAddress(token) == null);
+}
+
+test "server bounds provisional Version Negotiation routes until send clear" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4 };
+    var server = try Connection.initServer(gpa, &dcid, testServerConfig());
+    defer server.deinit();
+
+    var bad: std.ArrayListUnmanaged(u8) = .empty;
+    defer bad.deinit(gpa);
+    _ = try packet.writeLongHeader(&bad, gpa, .initial, 0x0a0a_0a0a, &dcid, "cli", "", 1, 1);
+    try bad.append(gpa, 0x00);
+
+    try server.receiveDatagramFrom(bad.items, 1000, "203.0.113.1:4433");
+    try server.receiveDatagramFrom(bad.items, 2000, "203.0.113.2:4433");
+    try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+
+    server.clearSend();
+    try server.receiveDatagramFrom(bad.items, 3000, "203.0.113.2:4433");
+    try testing.expectEqual(@as(usize, 1), server.datagramLengths().len);
+    const token = server.datagramPathTokens()[0].?;
+    try testing.expectEqualStrings("203.0.113.2:4433", server.pathAddress(token).?);
 }
 
 test "client ignores Version Negotiation that still advertises QUIC v1" {

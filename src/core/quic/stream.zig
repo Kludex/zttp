@@ -12,6 +12,7 @@ const std = @import("std");
 /// Flow control already caps bytes; this caps allocator/list pressure from a peer
 /// sending one-byte fragments in reverse order.
 pub const MAX_RECV_FRAGMENTS: usize = 1024;
+const COMPACT_THRESHOLD: usize = 64 * 1024;
 
 /// The four stream-id classes (RFC 9000 2.1), the low two bits of the id.
 pub const StreamType = enum(u2) {
@@ -82,6 +83,7 @@ pub const RecvStream = struct {
     pending: std.ArrayListUnmanaged(Fragment) = .empty,
     /// The in-order, not-yet-read bytes [read_offset, contiguous).
     ready: std.ArrayListUnmanaged(u8) = .empty,
+    ready_head: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator) RecvStream {
         return .{ .gpa = gpa };
@@ -105,23 +107,33 @@ pub const RecvStream = struct {
         }
         const new_high = @max(self.highest_received, end);
         const delta = new_high - self.highest_received;
-        self.highest_received = new_high;
-        if (fin) {
-            if (self.final_size) |fs| {
-                if (fs != end) return error.FinalSizeError;
-            } else self.final_size = end;
-            if (self.state == .recv) self.state = .size_known;
+
+        if (end > self.contiguous) {
+            if (offset <= self.contiguous) {
+                var frontier = end;
+                for (self.pending.items) |f| {
+                    if (f.offset > frontier) break;
+                    frontier = @max(frontier, f.offset + f.data.len);
+                }
+                const growth = std.math.cast(usize, frontier - self.contiguous) orelse
+                    return error.StreamBufferExceeded;
+                try self.ready.ensureUnusedCapacity(self.gpa, growth);
+
+                const skip: usize = @intCast(self.contiguous - offset);
+                self.ready.appendSliceAssumeCapacity(data[skip..]);
+                self.contiguous = end;
+                self.drainPendingAssumeCapacity();
+            } else {
+                try self.buffer(offset, data);
+            }
         }
 
-        if (end <= self.contiguous) return delta; // wholly duplicate
-
-        if (offset <= self.contiguous) {
-            const skip = self.contiguous - offset;
-            try self.ready.appendSlice(self.gpa, data[skip..]);
-            self.contiguous = end;
-            try self.drainPending();
-        } else {
-            try self.buffer(offset, data);
+        self.highest_received = new_high;
+        if (fin) {
+            self.final_size = end;
+            if (self.state == .recv) {
+                self.state = if (self.isFinished() and self.readable().len == 0) .data_read else .size_known;
+            }
         }
         return delta;
     }
@@ -136,14 +148,14 @@ pub const RecvStream = struct {
         try self.pending.insert(self.gpa, idx, .{ .offset = offset, .data = copy });
     }
 
-    fn drainPending(self: *RecvStream) Error!void {
+    fn drainPendingAssumeCapacity(self: *RecvStream) void {
         var progressed = true;
         while (progressed) {
             progressed = false;
             var i: usize = 0;
             while (i < self.pending.items.len) {
                 const f = self.pending.items[i];
-                const fend = std.math.add(u64, f.offset, f.data.len) catch return error.FinalSizeError;
+                const fend = f.offset + f.data.len;
                 if (fend <= self.contiguous) {
                     self.gpa.free(f.data);
                     _ = self.pending.orderedRemove(i);
@@ -151,8 +163,8 @@ pub const RecvStream = struct {
                     continue;
                 }
                 if (f.offset <= self.contiguous) {
-                    const skip = self.contiguous - f.offset;
-                    try self.ready.appendSlice(self.gpa, f.data[skip..]);
+                    const skip: usize = @intCast(self.contiguous - f.offset);
+                    self.ready.appendSliceAssumeCapacity(f.data[skip..]);
                     self.contiguous = fend;
                     self.gpa.free(f.data);
                     _ = self.pending.orderedRemove(i);
@@ -167,19 +179,25 @@ pub const RecvStream = struct {
     /// The in-order bytes available to read right now (a borrow valid until the
     /// next `consume`).
     pub fn readable(self: *const RecvStream) []const u8 {
-        return self.ready.items;
+        return self.ready.items[self.ready_head..];
     }
 
     /// Mark `n` readable bytes consumed, sliding the read offset. The transport
     /// uses this to know how much connection/stream flow-control credit to re-grant.
     pub fn consume(self: *RecvStream, n: usize) void {
-        const take = @min(n, self.ready.items.len);
+        const take = @min(n, self.ready.items.len - self.ready_head);
         self.read_offset += take;
-        // Shift the remaining ready bytes down.
-        const rest = self.ready.items.len - take;
-        std.mem.copyForwards(u8, self.ready.items[0..rest], self.ready.items[take..]);
-        self.ready.shrinkRetainingCapacity(rest);
-        if (self.isFinished() and self.ready.items.len == 0) self.state = .data_read;
+        self.ready_head += take;
+        const remaining = self.ready.items.len - self.ready_head;
+        if (remaining == 0) {
+            self.ready.clearRetainingCapacity();
+            self.ready_head = 0;
+        } else if (self.ready_head >= COMPACT_THRESHOLD and self.ready_head >= remaining) {
+            std.mem.copyForwards(u8, self.ready.items[0..remaining], self.ready.items[self.ready_head..]);
+            self.ready.shrinkRetainingCapacity(remaining);
+            self.ready_head = 0;
+        }
+        if (self.isFinished() and remaining == 0) self.state = .data_read;
     }
 
     /// Return up to `n` bytes of parsed data to flow control.
@@ -222,15 +240,15 @@ pub const RecvStream = struct {
 
 /// The send side of one stream: a retain buffer of all unacked bytes the
 /// connection drains into STREAM frames, plus the bookkeeping to retransmit a
-/// range whose packet was lost. One contiguous `buf` holds [base_offset, end);
-/// the `sent` cursor splits already-framed bytes (left) from never-framed bytes
-/// (right). Lost ranges are re-framed before new bytes (RFC 9002 13.3); acked
-/// bytes are freed off the front. Mirrors RecvStream, but for the write direction.
+/// range whose packet was lost. `buf_head` separates a lazily discarded prefix
+/// from [base_offset, end); the `sent` cursor splits already-framed bytes from new
+/// bytes. Lost ranges are re-framed before new bytes (RFC 9002 13.3).
 pub const SendStream = struct {
     gpa: std.mem.Allocator,
-    /// Every written, not-yet-acked byte: [base_offset, base_offset + buf.len).
+    /// Written bytes, including a lazily discarded prefix before `buf_head`.
     buf: std.ArrayListUnmanaged(u8) = .empty,
-    /// Offset of buf.items[0]; everything below is acked and freed.
+    buf_head: usize = 0,
+    /// Offset of buf.items[buf_head]; everything below is acknowledged.
     base_offset: u64 = 0,
     /// Bytes in [base_offset, sent) have ridden a frame; [sent, end) are new. The
     /// cursor only moves forward (commit); a loss records a `lost` range instead.
@@ -267,7 +285,7 @@ pub const SendStream = struct {
     }
 
     pub fn end(self: *const SendStream) u64 {
-        return self.base_offset + self.buf.items.len;
+        return self.base_offset + self.buf.items.len - self.buf_head;
     }
 
     /// Every written byte (and the FIN, if one was written) has been acknowledged,
@@ -276,7 +294,7 @@ pub const SendStream = struct {
     /// stream is done once its RESET_STREAM is acked (the unsent data is abandoned).
     pub fn fullyAcked(self: *const SendStream) bool {
         if (self.reset_code != null) return self.reset_acked;
-        return self.buf.items.len == 0 and (!self.fin or self.fin_acked);
+        return self.buf.items.len == self.buf_head and (!self.fin or self.fin_acked);
     }
 
     /// Abort the sending part with `error_code` (RFC 9000 19.4). The first reset wins;
@@ -352,7 +370,7 @@ pub const SendStream = struct {
         if (self.lost.items.len > 0) {
             const r = self.lost.items[0];
             const n: usize = @intCast(@min(@as(u64, max), r.len));
-            const lo: usize = @intCast(r.offset - self.base_offset);
+            const lo = self.buf_head + @as(usize, @intCast(r.offset - self.base_offset));
             const carries_fin = self.fin_lost and n == r.len and r.offset + r.len == self.end();
             return .{ .offset = r.offset, .data = self.buf.items[lo .. lo + n], .fin = carries_fin };
         }
@@ -365,7 +383,7 @@ pub const SendStream = struct {
         const n: usize = @intCast(@min(@as(u64, max), avail));
         const carries_fin = self.finOwedAtEnd() and @as(u64, n) == avail;
         if (n == 0 and !carries_fin) return null;
-        const lo: usize = @intCast(self.sent - self.base_offset);
+        const lo = self.buf_head + @as(usize, @intCast(self.sent - self.base_offset));
         return .{ .offset = self.sent, .data = self.buf.items[lo .. lo + n], .fin = carries_fin };
     }
 
@@ -433,12 +451,18 @@ pub const SendStream = struct {
                 i = 0; // a merge can unlock an earlier-skipped gap; rescan
             } else i += 1;
         }
-        const drop: usize = @intCast(new_base - self.base_offset);
-        const keep = self.buf.items.len - drop;
-        std.mem.copyForwards(u8, self.buf.items[0..keep], self.buf.items[drop..]);
-        self.buf.shrinkRetainingCapacity(keep);
+        self.buf_head += @intCast(new_base - self.base_offset);
         self.base_offset = new_base;
         if (self.sent < self.base_offset) self.sent = self.base_offset;
+        const remaining = self.buf.items.len - self.buf_head;
+        if (remaining == 0) {
+            self.buf.clearRetainingCapacity();
+            self.buf_head = 0;
+        } else if (self.buf_head >= COMPACT_THRESHOLD and self.buf_head >= remaining) {
+            std.mem.copyForwards(u8, self.buf.items[0..remaining], self.buf.items[self.buf_head..]);
+            self.buf.shrinkRetainingCapacity(remaining);
+            self.buf_head = 0;
+        }
     }
 
     fn insertLost(self: *SendStream, offset: u64, len: u64) Error!void {
@@ -543,6 +567,39 @@ test "consume slides the read offset" {
     try std.testing.expectEqual(RecvState.data_read, s.state);
 }
 
+test "fin-only frame completes an already consumed receive stream" {
+    const gpa = std.testing.allocator;
+    var s = RecvStream.init(gpa);
+    defer s.deinit();
+    _ = try s.push(0, "abc", false);
+    s.consume(3);
+    try std.testing.expect(!s.isTerminal());
+    _ = try s.push(3, "", true);
+    try std.testing.expectEqual(RecvState.data_read, s.state);
+    try std.testing.expect(s.isTerminal());
+}
+
+test "receive stream batches prefix compaction" {
+    const gpa = std.testing.allocator;
+    const size = COMPACT_THRESHOLD * 4;
+    const data = try gpa.alloc(u8, size);
+    defer gpa.free(data);
+    @memset(data, 'x');
+    var s = RecvStream.init(gpa);
+    defer s.deinit();
+    _ = try s.push(0, data, true);
+
+    const physical_len = s.ready.items.len;
+    s.consume(1200);
+    try std.testing.expectEqual(physical_len, s.ready.items.len);
+    try std.testing.expectEqual(@as(usize, 1200), s.ready_head);
+    try std.testing.expectEqual(size - 1200, s.readable().len);
+
+    while (s.readable().len > 0) s.consume(@min(1200, s.readable().len));
+    try std.testing.expectEqual(RecvState.data_read, s.state);
+    try std.testing.expectEqual(@as(usize, 0), s.ready.items.len);
+}
+
 test "data past a known final size is a final-size error" {
     const gpa = std.testing.allocator;
     var s = RecvStream.init(gpa);
@@ -638,13 +695,39 @@ test "SendStream retains sent bytes until acked, then frees the prefix" {
     const c = s.peek(100).?;
     s.commit(c.offset, c.data.len, false);
     try std.testing.expect(!s.pending()); // all sent
-    try std.testing.expectEqual(@as(usize, 10), s.buf.items.len); // but retained
+    try std.testing.expectEqual(@as(u64, 10), s.end() - s.base_offset); // but retained
 
     try s.onAck(0, 4, false); // first 4 bytes acked
     try std.testing.expectEqual(@as(u64, 4), s.base_offset);
-    try std.testing.expectEqual(@as(usize, 6), s.buf.items.len); // prefix freed
+    try std.testing.expectEqual(@as(u64, 6), s.end() - s.base_offset); // prefix freed
     try s.onAck(4, 6, false);
-    try std.testing.expectEqual(@as(usize, 0), s.buf.items.len); // fully freed
+    try std.testing.expectEqual(@as(u64, 0), s.end() - s.base_offset); // fully freed
+}
+
+test "SendStream batches prefix compaction across sequential acknowledgements" {
+    const gpa = std.testing.allocator;
+    const size = COMPACT_THRESHOLD * 4;
+    const data = try gpa.alloc(u8, size);
+    defer gpa.free(data);
+    @memset(data, 'x');
+    var s = SendStream.init(gpa);
+    defer s.deinit();
+    try s.write(data, true);
+
+    while (s.peek(1200)) |chunk| s.commit(chunk.offset, chunk.data.len, chunk.fin);
+    const physical_len = s.buf.items.len;
+    try s.onAck(0, 1200, false);
+    try std.testing.expectEqual(physical_len, s.buf.items.len);
+    try std.testing.expectEqual(@as(usize, 1200), s.buf_head);
+
+    var offset: u64 = 1200;
+    while (offset < size) {
+        const len = @min(@as(u64, 1200), size - offset);
+        try s.onAck(offset, len, offset + len == size);
+        offset += len;
+    }
+    try std.testing.expect(s.fullyAcked());
+    try std.testing.expectEqual(@as(usize, 0), s.buf.items.len);
 }
 
 test "SendStream re-frames a lost range before new bytes" {
@@ -677,10 +760,10 @@ test "SendStream frees out-of-order acks once the gap fills" {
 
     try s.onAck(5, 5, false); // ack the LATER half first (out of order)
     try std.testing.expectEqual(@as(u64, 0), s.base_offset); // cannot free yet
-    try std.testing.expectEqual(@as(usize, 10), s.buf.items.len);
+    try std.testing.expectEqual(@as(u64, 10), s.end() - s.base_offset);
     try s.onAck(0, 5, false); // the filling ack lets base slide through the held gap
     try std.testing.expectEqual(@as(u64, 10), s.base_offset);
-    try std.testing.expectEqual(@as(usize, 0), s.buf.items.len);
+    try std.testing.expectEqual(@as(u64, 0), s.end() - s.base_offset);
 }
 
 test "SendStream re-sends a lost FIN exactly once" {

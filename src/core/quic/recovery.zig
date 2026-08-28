@@ -114,6 +114,17 @@ pub const Space = struct {
         if (pkt.ack_eliciting) self.last_ack_eliciting_sent_time = pkt.sent_time;
     }
 
+    /// Reserve one packet record so a caller can commit related state atomically.
+    pub fn ensureSentCapacity(self: *Space, gpa: std.mem.Allocator) !void {
+        try self.sent.ensureUnusedCapacity(gpa, 1);
+    }
+
+    /// Record a packet after `ensureSentCapacity` has reserved its slot.
+    pub fn onSentAssumeCapacity(self: *Space, pkt: SentPacket) void {
+        self.sent.appendAssumeCapacity(pkt);
+        if (pkt.ack_eliciting) self.last_ack_eliciting_sent_time = pkt.sent_time;
+    }
+
     /// The armed PTO deadline (RFC 9002 6.2.1), or null when no ack-eliciting packet
     /// is in flight (PTO is not armed) or the backoff has saturated (a black-holed
     /// connection: stop arming and let the integrator's idle timeout close it).

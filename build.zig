@@ -24,11 +24,24 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run pure-Zig core unit tests");
     test_step.dependOn(&run_core_tests.step);
 
-    // The parser-core property test ("fuzz: reader never panics ...") runs as
-    // part of `zig build test`; `zig build fuzz` is an alias that runs the same
-    // suite, kept as an explicit entry point for the adversarial-input net.
-    const fuzz_step = b.step("fuzz", "Run the parser-core adversarial-input property test");
+    const fuzz_driver_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("fuzz/target.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    fuzz_driver_tests.root_module.addImport("core", b.createModule(.{
+        .root_source_file = b.path("src/core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }));
+    const run_fuzz_driver_tests = b.addRunArtifact(fuzz_driver_tests);
+    const fuzz_step = b.step("fuzz", "Run core property tests and fuzz-driver smoke tests");
     fuzz_step.dependOn(&run_core_tests.step);
+    fuzz_step.dependOn(&run_fuzz_driver_tests.step);
 
     // A coverage-instrumented object exporting the `zttp_fuzz_drive` C ABI. The
     // C shim (fuzz/target.c) owns the libFuzzer entry point and registers this
@@ -68,6 +81,23 @@ pub fn build(b: *std.Build) void {
     const install_fuzz = b.addInstallBinFile(fuzz_obj.getEmittedBin(), "zttp_fuzz_reader.o");
     const fuzz_obj_step = b.step("fuzz-obj", "Emit the libFuzzer object (zig-out/bin/zttp_fuzz_reader.o)");
     fuzz_obj_step.dependOn(&install_fuzz.step);
+
+    const stream_benchmark = b.addExecutable(.{
+        .name = "quic_stream_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/quic_stream.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    stream_benchmark.root_module.addImport("quic_stream", b.createModule(.{
+        .root_source_file = b.path("src/core/quic/stream.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const run_stream_benchmark = b.addRunArtifact(stream_benchmark);
+    const stream_benchmark_step = b.step("bench-stream", "Benchmark QUIC stream buffer compaction");
+    stream_benchmark_step.dependOn(&run_stream_benchmark.step);
 
     // Python build configuration is discovered by the hatch-ziglang hook and
     // passed in as -D options or environment variables. Resolved lazily so the

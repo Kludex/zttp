@@ -51,10 +51,13 @@ jobs:
           uv run --no-sync python -m fuzz.run --runs "$FUZZ_RUNS" --seed "$GITHUB_RUN_ID"
           uv run --no-sync python -m fuzz.run --runs "$FUZZ_RUNS" --seed 0
 
+      - name: Fuzz the Zig core under sanitizers
+        run: scripts/fuzz-libfuzzer -artifact_prefix=fuzz/corpus/ -runs=200000 fuzz/corpus
+
       - name: Upload reproducers
         if: failure()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
           name: fuzz-reproducers
-          path: fuzz/corpus/crash-*.bin
+          path: fuzz/corpus/crash-*
           if-no-files-found: ignore
