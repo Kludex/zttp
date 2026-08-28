@@ -223,6 +223,9 @@ def test_quic_endpoint_completes_retry_and_routes_the_connection() -> None:
     assert routed
     assert all(connection is server for connection in routed)
 
+    spoofed = b"\x40" + replacement_connection_id + b"\x00" * 32
+    assert endpoint.receive_datagram(spoofed, b"spoofed-address", 11_500) is server
+
     endpoint.issue_token(server, 12_000)
     for datagram in endpoint.data_to_send():
         client.receive_datagram(datagram.data, 13_000)

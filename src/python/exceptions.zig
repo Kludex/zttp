@@ -87,8 +87,6 @@ pub fn raiseH3(e: H3Error) py.Object {
             LocalProtocolError,
             "drain pending HTTP/3 events before receiving more data",
         ),
-        // A stream-level error is handled inside the pump (it resets one stream), so it
-        // never escapes to here; mapped only to keep the switch exhaustive.
-        error.StreamError, error.Blocked => py.raise(RemoteProtocolError, "HTTP/3 stream error"),
+        error.Blocked => py.raise(RemoteProtocolError, "HTTP/3 stream blocked"),
     };
 }

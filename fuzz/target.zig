@@ -147,7 +147,7 @@ fn driveQpackRoundtrip(input: []const u8) void {
 }
 
 fn deliverAppPacket(conn: *QuicConnection, pn: u64, frames: []const u8, address: []const u8) bool {
-    const datagram = core.quic.connection.testBuildApp(std.heap.c_allocator, &FUZZ_DCID, pn, frames) catch return false;
+    const datagram = core.quic.connection.test_support.buildApp(std.heap.c_allocator, &FUZZ_DCID, pn, frames) catch return false;
     defer std.heap.c_allocator.free(datagram);
     conn.receiveDatagramFrom(datagram, pn + 1, address) catch return false;
     conn.clearSend();
@@ -159,13 +159,13 @@ fn driveQuic(input: []const u8) void {
 
     var unauthenticated = QuicConnection.init(std.heap.c_allocator, .server, &FUZZ_DCID) catch return;
     defer unauthenticated.deinit();
-    core.quic.connection.testInstallAppKeys(&unauthenticated);
+    core.quic.connection.test_support.installAppKeys(&unauthenticated);
     unauthenticated.receiveDatagramFrom(body, 0, FUZZ_ADDRESSES[0]) catch {};
 
     var conn = QuicConnection.init(std.heap.c_allocator, .server, &FUZZ_DCID) catch return;
     defer conn.deinit();
-    core.quic.connection.testInstallAppKeys(&conn);
-    core.quic.connection.testConfirmHandshake(&conn);
+    core.quic.connection.test_support.installAppKeys(&conn);
+    core.quic.connection.test_support.confirmHandshake(&conn);
 
     const split = if (body.len == 0) 0 else @as(usize, body[0]) % (body.len + 1);
     var frames: std.ArrayListUnmanaged(u8) = .empty;
@@ -184,7 +184,7 @@ fn driveQuic(input: []const u8) void {
     if (!deliverAppPacket(&conn, 2, frames.items, FUZZ_ADDRESSES[2])) return;
 
     const ping = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
-    const tampered = core.quic.connection.testBuildApp(std.heap.c_allocator, &FUZZ_DCID, 3, &ping) catch return;
+    const tampered = core.quic.connection.test_support.buildApp(std.heap.c_allocator, &FUZZ_DCID, 3, &ping) catch return;
     defer std.heap.c_allocator.free(tampered);
     tampered[tampered.len - 1] ^= if (body.len == 0) 1 else body[0] | 1;
     conn.receiveDatagramFrom(tampered, 4, FUZZ_ADDRESSES[3]) catch {};
@@ -194,8 +194,8 @@ fn driveH3(input: []const u8) void {
     const body = input[0..@min(input.len, MAX_STATE_INPUT)];
     var qc = QuicConnection.init(std.heap.c_allocator, .server, &FUZZ_DCID) catch return;
     defer qc.deinit();
-    core.quic.connection.testInstallAppKeys(&qc);
-    core.quic.connection.testConfirmHandshake(&qc);
+    core.quic.connection.test_support.installAppKeys(&qc);
+    core.quic.connection.test_support.confirmHandshake(&qc);
     var h3 = H3Connection.init(std.heap.c_allocator, &qc);
     defer h3.deinit();
 
