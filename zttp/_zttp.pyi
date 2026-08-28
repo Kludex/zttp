@@ -424,7 +424,11 @@ class H3Connection(Connection):
         """
 
     def receive_datagram(self, datagram: Buffer, now: int = ..., peer_address: bytes | None = ..., /) -> None:
-        """Feed one received UDP datagram. `peer_address` is an opaque key for path validation."""
+        """Feed one received UDP datagram. `peer_address` is an opaque key for path validation.
+
+        Drain events regularly. Once 1024 events are pending, this raises
+        `LocalProtocolError` until `next_event()` reduces the backlog.
+        """
 
     def data_to_send_with_addresses(self) -> list[OutboundDatagram]:
         """Return queued datagrams with their opaque destination address keys."""

@@ -37,7 +37,15 @@ pub const Error = error{
     /// Internal signal: a QPACK field section is waiting for more encoder-stream
     /// inserts and has been stored on the stream for later retry.
     Blocked,
+    /// The integrator must drain queued events before pumping more transport data.
+    EventQueueFull,
     OutOfMemory,
+};
+
+/// Resource limits for one HTTP/3 connection.
+pub const Limits = struct {
+    /// Require the integrator to drain before the next pump batch once this many events are waiting.
+    max_pending_events: usize = 1024,
 };
 
 const MsgState = enum { idle, headers_done, trailers_done, done, rejected };
@@ -117,6 +125,7 @@ const QPACK_BLOCKED_STREAMS = qpack_enc.max_blocked_streams;
 pub const Connection = struct {
     gpa: std.mem.Allocator,
     qc: *quic_conn.Connection,
+    limits: Limits,
     streams: std.AutoHashMapUnmanaged(u64, RequestStream) = .empty,
     send_state: std.AutoHashMapUnmanaged(u64, SendState) = .empty,
     send_content_length: std.AutoHashMapUnmanaged(u64, u64) = .empty,
@@ -170,11 +179,17 @@ pub const Connection = struct {
     pending_reject: ?h3_error.ErrorCode = null,
 
     pub fn init(gpa: std.mem.Allocator, qc: *quic_conn.Connection) Connection {
+        return initWithLimits(gpa, qc, .{});
+    }
+
+    /// Initialize a connection with explicit resource limits.
+    pub fn initWithLimits(gpa: std.mem.Allocator, qc: *quic_conn.Connection, limits: Limits) Connection {
         var dec = qpack.Decoder.init(gpa, MAX_FIELD_SECTION_SIZE);
         dec.setMaxDynamicCapacity(QPACK_MAX_TABLE_CAPACITY);
         return .{
             .gpa = gpa,
             .qc = qc,
+            .limits = limits,
             .qpack_dec = dec,
             .qpack_enc_state = qpack_enc.Encoder.init(gpa),
             .arena = std.heap.ArenaAllocator.init(gpa),
@@ -310,11 +325,13 @@ pub const Connection = struct {
 
     /// Advance only the streams changed by the datagram the transport just handled.
     pub fn pumpStreams(self: *Connection, ids: []const u64) Error!void {
+        if (self.eventQueueFull()) return error.EventQueueFull;
         try self.pumpStreamSnapshot(ids);
     }
 
     /// Advance every stream the transport currently knows about.
     pub fn pumpAll(self: *Connection) Error!void {
+        if (self.eventQueueFull()) return error.EventQueueFull;
         var stack_ids: [64]u64 = undefined;
         const count = self.qc.streamCount();
         if (count <= stack_ids.len) {
@@ -361,7 +378,7 @@ pub const Connection = struct {
         return quic_stream.StreamType.of(id) == .client_bidi;
     }
 
-    pub fn pump(self: *Connection, id: u64) Error!void {
+    fn pump(self: *Connection, id: u64) Error!void {
         switch (self.qc.role) {
             .server => switch (quic_stream.StreamType.of(id)) {
                 .client_bidi => try self.pumpRequest(id),
@@ -1314,6 +1331,11 @@ pub const Connection = struct {
         const ev = self.queue.items[self.qpos];
         self.qpos += 1;
         return ev;
+    }
+
+    /// Whether the integrator must drain events before pumping another batch.
+    pub fn eventQueueFull(self: *const Connection) bool {
+        return self.queue.items.len - self.qpos >= self.limits.max_pending_events;
     }
 
     // ---- response send path (RFC 9114 4.1) -------------------------------------
@@ -3424,8 +3446,9 @@ test "a request split across two datagrams parses correctly (parsed-offset regre
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
     quic_conn.testInstallAppKeys(&qc); // H3 request data rides the Application space
-    var h3 = Connection.init(gpa, &qc);
+    var h3 = Connection.initWithLimits(gpa, &qc, .{ .max_pending_events = 1 });
     defer h3.deinit();
+    h3.peer_settings = .{};
 
     const qpack_block = [_]u8{ 0x00, 0x00, 0xC0 | 20, 0xC0 | 23, 0xC0 | 1 }; // POST https /
     var headers_bytes: std.ArrayListUnmanaged(u8) = .empty;
@@ -3439,15 +3462,17 @@ test "a request split across two datagrams parses correctly (parsed-offset regre
     const dg1 = try buildRequestAt(gpa, &dcid, 0, 0, headers_bytes.items);
     defer gpa.free(dg1);
     try qc.receiveDatagram(dg1, 1000);
-    try h3.pump(0);
-    try testing.expect(h3.nextEvent() == .request);
-    try testing.expect(h3.nextEvent() == .need_data);
+    try h3.pumpStreams(&.{0});
+    try testing.expect(h3.eventQueueFull());
 
     // Datagram 2: the DATA frame at the offset right after the HEADERS frame.
     const dg2 = try buildRequestAt(gpa, &dcid, headers_bytes.items.len, 1, data_bytes.items);
     defer gpa.free(dg2);
     try qc.receiveDatagram(dg2, 2000);
-    try h3.pump(0);
+    try testing.expectError(error.EventQueueFull, h3.pumpStreams(&.{0}));
+    try testing.expect(h3.nextEvent() == .request);
+    try testing.expect(h3.nextEvent() == .need_data);
+    try h3.pumpStreams(&.{0});
     const data_ev = h3.nextEvent();
     try testing.expect(data_ev == .data);
     try testing.expectEqualStrings("second-datagram-body", data_ev.data.data);

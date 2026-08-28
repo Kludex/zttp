@@ -805,6 +805,14 @@ const H3Engine = struct {
     }
 
     fn receiveDatagram(self: *H3Engine, dgram: []const u8, now: u64, peer_address: ?[]const u8) py.Object {
+        if (self.h3) |h| {
+            if (h.eventQueueFull()) {
+                return py.raise(
+                    exceptions.LocalProtocolError,
+                    "drain pending HTTP/3 events before receiving more data",
+                );
+            }
+        }
         self.now = now;
         if (self.qc == null) {
             // Build the transport from the connection id in the client's first

@@ -83,6 +83,10 @@ pub fn raiseH3(e: H3Error) py.Object {
     return switch (e) {
         error.OutOfMemory => c.PyErr_NoMemory(),
         error.H3Error => py.raise(RemoteProtocolError, "HTTP/3 protocol error"),
+        error.EventQueueFull => py.raise(
+            LocalProtocolError,
+            "drain pending HTTP/3 events before receiving more data",
+        ),
         // A stream-level error is handled inside the pump (it resets one stream), so it
         // never escapes to here; mapped only to keep the switch exhaustive.
         error.StreamError, error.Blocked => py.raise(RemoteProtocolError, "HTTP/3 stream error"),
