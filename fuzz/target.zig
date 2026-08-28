@@ -210,7 +210,7 @@ fn driveH3(input: []const u8) void {
     h3_bytes.clearRetainingCapacity();
     const qpack_block = [_]u8{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 };
     h3_frame.append(&h3_bytes, std.heap.c_allocator, .headers, &qpack_block) catch return;
-    h3_bytes.appendSlice(std.heap.c_allocator, body) catch return;
+    h3_frame.append(&h3_bytes, std.heap.c_allocator, .data, body) catch return;
     const split = (if (body.len == 0) 0 else @as(usize, body[0])) %
         (h3_bytes.items.len + 1);
 
