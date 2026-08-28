@@ -814,7 +814,7 @@ fn headerBlockItem(obj: ?*c.PyObject, raw_idx: py.ssize) callconv(.c) py.Object 
     var idx = raw_idx;
     if (idx < 0) idx += @intCast(self.count);
     if (idx < 0 or idx >= self.count) {
-        c.PyErr_SetString(c.PyExc_IndexError, "header index out of range");
+        c.PyErr_SetString(py.data("PyExc_IndexError").*, "header index out of range");
         return null;
     }
     return headerPair(self, @intCast(idx), false);
@@ -836,7 +836,7 @@ fn headerBlockSubscript(obj: ?*c.PyObject, key: ?*c.PyObject) callconv(.c) py.Ob
     // PySlice_Check expands through _PyObject_CAST_CONST on CPython 3.10;
     // translate-c cannot lower that macro. Exact type comparison is sufficient
     // because slice is final and keeps the extension buildable on 3.10.
-    if (@intFromPtr(c.Py_TYPE(key)) == @intFromPtr(&c.PySlice_Type)) {
+    if (@intFromPtr(c.Py_TYPE(key)) == @intFromPtr(py.data("PySlice_Type"))) {
         const self: *HeaderBlockObject = @ptrCast(obj.?);
         var start: py.ssize = 0;
         var stop: py.ssize = 0;

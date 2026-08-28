@@ -18,6 +18,10 @@ pub const c = @import("pyc");
 pub const Object = [*c]c.PyObject;
 pub const ssize = c.Py_ssize_t;
 
+pub inline fn data(comptime name: []const u8) @TypeOf(if (windows_arm64) @field(c, name)() else &@field(c, name)) {
+    return if (windows_arm64) @field(c, name)() else &@field(c, name);
+}
+
 // -- free-threaded critical sections -----------------------------------------
 
 /// A CPython critical section on free-threaded builds and a no-op elsewhere.
@@ -122,13 +126,13 @@ pub fn raise(exc: Object, msg: [*c]const u8) Object {
     return null;
 }
 pub fn raiseType(msg: [*c]const u8) Object {
-    return raise(if (windows_arm64) c.PyExc_TypeError().* else c.PyExc_TypeError, msg);
+    return raise(data("PyExc_TypeError").*, msg);
 }
 pub fn raiseValue(msg: [*c]const u8) Object {
-    return raise(if (windows_arm64) c.PyExc_ValueError().* else c.PyExc_ValueError, msg);
+    return raise(data("PyExc_ValueError").*, msg);
 }
 pub fn raiseRuntime(msg: [*c]const u8) Object {
-    return raise(if (windows_arm64) c.PyExc_RuntimeError().* else c.PyExc_RuntimeError, msg);
+    return raise(data("PyExc_RuntimeError").*, msg);
 }
 pub fn errOccurred() bool {
     return c.PyErr_Occurred() != null;
@@ -171,8 +175,7 @@ pub const BorrowedBuffer = struct {
     acquired: bool = false,
 
     pub fn init(o: Object) ?BorrowedBuffer {
-        const bytes_type = if (windows_arm64) c.PyBytes_Type() else &c.PyBytes_Type;
-        if (@intFromPtr(c.Py_TYPE(o)) == @intFromPtr(bytes_type)) {
+        if (@intFromPtr(c.Py_TYPE(o)) == @intFromPtr(data("PyBytes_Type"))) {
             return .{ .bytes = asBytes(o) orelse return null, .stable_owner = o };
         }
 

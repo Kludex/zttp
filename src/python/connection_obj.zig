@@ -221,7 +221,7 @@ fn optionalBytes(obj: ?*c.PyObject, default: []const u8) ?[]const u8 {
 fn readTransportInteger(dict: py.Object, key: [*c]const u8, target: *?u64, found: *usize) bool {
     const value = c.PyDict_GetItemString(dict, key) orelse return true;
     found.* += 1;
-    if (@intFromPtr(c.Py_TYPE(value)) != @intFromPtr(&c.PyLong_Type)) {
+    if (@intFromPtr(c.Py_TYPE(value)) != @intFromPtr(py.data("PyLong_Type"))) {
         _ = py.raiseValue("transport parameter integer values must be non-negative integers");
         return false;
     }
@@ -244,7 +244,7 @@ fn transportParameters(
         return if (role == SERVER) &DEFAULT_SERVER_TRANSPORT_PARAMS else &DEFAULT_CLIENT_TRANSPORT_PARAMS;
     }
 
-    const is_dict = c.PyObject_IsInstance(obj, @ptrCast(&c.PyDict_Type));
+    const is_dict = c.PyObject_IsInstance(obj, @ptrCast(py.data("PyDict_Type")));
     if (is_dict < 0) return null;
     if (is_dict == 0) {
         _ = py.raiseType("transport_params must be a QuicTransportParameters dictionary");
@@ -369,7 +369,7 @@ const TlsCredentialObjects = struct {
 
 fn parseTlsCredentials(obj: ?*c.PyObject) ?TlsCredentialObjects {
     if (obj == null or py.isNone(obj)) return .{};
-    const is_dict = c.PyObject_IsInstance(obj, @ptrCast(&c.PyDict_Type));
+    const is_dict = c.PyObject_IsInstance(obj, @ptrCast(py.data("PyDict_Type")));
     if (is_dict < 0) return null;
     if (is_dict == 0) {
         _ = py.raiseType("credentials must be a TlsCredentials dictionary");
@@ -2758,14 +2758,14 @@ const BorrowedHeaders = struct {
                 c.PySequence_GetItem(seq, @intCast(i));
             if (pair == null) return .failure;
             const pair_owned = !outer_tuple;
-            if (!exactType(pair, &c.PyTuple_Type) or c.PyTuple_Size(pair) < 2) {
+            if (!exactType(pair, py.data("PyTuple_Type")) or c.PyTuple_Size(pair) < 2) {
                 if (pair_owned) py.decref(pair);
                 return .{ .fallback = i };
             }
 
             const name = c.PyTuple_GetItem(pair, 0);
             const value = c.PyTuple_GetItem(pair, 1);
-            if (!exactType(name, &c.PyBytes_Type) or !exactType(value, &c.PyBytes_Type)) {
+            if (!exactType(name, py.data("PyBytes_Type")) or !exactType(value, py.data("PyBytes_Type"))) {
                 if (pair_owned) py.decref(pair);
                 return .{ .fallback = i };
             }
@@ -2820,8 +2820,8 @@ const BorrowedHeaders = struct {
         }
         if (!self.prepare(@intCast(n))) return false;
 
-        const outer_tuple = exactType(seq, &c.PyTuple_Type);
-        if (outer_tuple or exactType(seq, &c.PyList_Type)) {
+        const outer_tuple = exactType(seq, py.data("PyTuple_Type"));
+        if (outer_tuple or exactType(seq, py.data("PyList_Type"))) {
             switch (self.borrowExact(seq, outer_tuple)) {
                 .success => return true,
                 .failure => return false,
