@@ -2878,8 +2878,7 @@ fn h2RaiseWrite(e: core.h2.writer.WriteError) py.Object {
 fn h3RaiseLocal(e: core.h3.connection.Error) py.Object {
     return switch (e) {
         error.OutOfMemory => c.PyErr_NoMemory(),
-        error.H3Error, error.EventQueueFull, error.Blocked =>
-            py.raise(exceptions.LocalProtocolError, "invalid HTTP/3 send"),
+        error.H3Error, error.EventQueueFull, error.Blocked => py.raise(exceptions.LocalProtocolError, "invalid HTTP/3 send"),
     };
 }
 
