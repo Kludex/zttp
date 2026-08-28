@@ -443,6 +443,9 @@ class H3Connection(Connection):
     def _endpoint_connection_id_generation(self) -> int:
         """Return the active local connection ID generation."""
 
+    def _endpoint_peer_address(self) -> bytes | None:
+        """Return the authenticated default peer address."""
+
     def _endpoint_issue_connection_id(
         self,
         sequence_number: int,

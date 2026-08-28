@@ -300,9 +300,12 @@ class QuicEndpoint:
         peer_address: bytes,
         now: int,
     ) -> H3Connection:
-        state.peer_address = peer_address
         try:
             state.connection.receive_datagram(datagram, now, peer_address)
+            authenticated_address = state.connection._endpoint_peer_address()
+            if authenticated_address is None:  # pragma: no cover - accepted connections have an authenticated Initial
+                raise RuntimeError("endpoint connection has no authenticated peer address")
+            state.peer_address = authenticated_address
         finally:
             if state.connection_id_generation != state.connection._endpoint_connection_id_generation():
                 self._sync_routes(state)
