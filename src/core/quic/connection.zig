@@ -1272,12 +1272,16 @@ pub const Connection = struct {
 
     fn checkPeerStreamLimit(self: *Connection, id: u64) Error!void {
         if (!self.isPeerInitiated(id)) return;
-        const st = stream.StreamType.of(id);
+        const is_uni = stream.StreamType.of(id).isUni();
         const idx = id >> 2;
-        if (st.isUni()) {
-            self.peer_uni_streams.onOpened(idx) catch return error.StreamLimitError;
-        } else {
-            self.peer_bidi_streams.onOpened(idx) catch return error.StreamLimitError;
+        const limit = if (is_uni) &self.peer_uni_streams else &self.peer_bidi_streams;
+        limit.onOpened(idx) catch return error.StreamLimitError;
+        if (limit.shouldUpdate()) {
+            if (is_uni) {
+                self.max_streams_uni_pending = true;
+            } else {
+                self.max_streams_bidi_pending = true;
+            }
         }
     }
 
@@ -5792,6 +5796,39 @@ test "closing a peer stream advertises a raised MAX_STREAMS" {
     try conn.flushSend(2000);
     try testing.expect(!conn.max_streams_bidi_pending);
     try testing.expect(conn.datagramLengths().len >= 1);
+}
+
+test "opening later peer streams advertises previously closed capacity" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x16, 0x17, 0x18, 0x1a };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.peer_bidi_streams = flow.StreamLimit.init(4);
+
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try frame.encodeStream(&frames, gpa, 0, 0, "x", true);
+    const closed = try testBuildApp(gpa, &dcid, 0, frames.items);
+    defer gpa.free(closed);
+    try conn.receiveDatagram(closed, 1000);
+    conn.consumeStream(0, 1);
+    try testing.expect(conn.dropStream(0));
+
+    conn.clearSend();
+    frames.clearRetainingCapacity();
+    for ([_]u64{ 4, 8, 12 }) |id| try frame.encodeStream(&frames, gpa, id, 0, "", false);
+    const opened = try testBuildApp(gpa, &dcid, 1, frames.items);
+    defer gpa.free(opened);
+    try conn.receiveDatagram(opened, 2000);
+    try conn.flushSend(3000);
+
+    const decoded = try decodeQueuedAppFrame(&conn, 1);
+    defer gpa.free(decoded.work);
+    defer gpa.free(decoded.plaintext);
+    try testing.expectEqual(@as(std.meta.Tag(frame.Frame), .max_streams), std.meta.activeTag(decoded.frame));
+    try testing.expect(decoded.frame.max_streams.bidi);
+    try testing.expectEqual(@as(u64, 5), decoded.frame.max_streams.max);
 }
 
 test "local stream creation is limited by peer initial_max_streams" {
