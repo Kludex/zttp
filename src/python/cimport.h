@@ -19,6 +19,14 @@
 #ifndef _Py_ALIGNED_DEF
 #define _Py_ALIGNED_DEF(N, T) __attribute__((aligned(N))) T
 #endif
+#if defined(_WIN32) && defined(_M_ARM64)
+/* Skip MSVC pointer qualifiers and ARM intrinsics unsupported by translate-c. */
+#define __ptr32
+#define __ptr64
+#define _M_CEE
+#include <wchar.h>
+#undef _M_CEE
+#endif
 #include <Python.h>
 /* The Py_T_* / Py_READONLY member-def constants are 3.12+. On 3.10/3.11 the
  * equivalents (T_OBJECT_EX / T_BOOL / READONLY) live in structmember.h, which
