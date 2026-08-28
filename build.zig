@@ -159,6 +159,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const fix = b.addRunArtifact(fixer);
+    // Aro drops dllimport from data declarations; restore it before MSVC linking.
+    if (target.result.os.tag == .windows) fix.addArg("--dll-import-data");
     fix.addFileArg(translate.getOutput());
     // The patched copy fix_cimport writes out, used as the `pyc` module source.
     const pyc_file = fix.addOutputFileArg("cimport.zig");
