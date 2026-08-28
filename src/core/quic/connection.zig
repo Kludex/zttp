@@ -1276,10 +1276,8 @@ pub const Connection = struct {
         const idx = id >> 2;
         if (st.isUni()) {
             self.peer_uni_streams.onOpened(idx) catch return error.StreamLimitError;
-            if (self.peer_uni_streams.shouldUpdate()) self.max_streams_uni_pending = true;
         } else {
             self.peer_bidi_streams.onOpened(idx) catch return error.StreamLimitError;
-            if (self.peer_bidi_streams.shouldUpdate()) self.max_streams_bidi_pending = true;
         }
     }
 
@@ -3224,6 +3222,17 @@ pub const Connection = struct {
         _ = self.recv_windows.remove(id);
         _ = self.max_stream_data_pending.remove(id);
         _ = self.peer_stream_data_blocked.remove(id);
+        if (self.isPeerInitiated(id)) {
+            const limit = if (stream.StreamType.of(id).isUni()) &self.peer_uni_streams else &self.peer_bidi_streams;
+            limit.onClosed();
+            if (limit.shouldUpdate()) {
+                if (stream.StreamType.of(id).isUni()) {
+                    self.max_streams_uni_pending = true;
+                } else {
+                    self.max_streams_bidi_pending = true;
+                }
+            }
+        }
         s.deinit();
         self.gpa.destroy(s);
         return true;
@@ -5760,7 +5769,7 @@ test "STOP_SENDING rejects streams past the advertised count" {
     try testing.expectEqual(@as(usize, 0), conn.peer_reset_streams.count());
 }
 
-test "opening enough peer streams advertises a raised MAX_STREAMS" {
+test "closing a peer stream advertises a raised MAX_STREAMS" {
     const gpa = testing.allocator;
     const dcid = [_]u8{ 0x16, 0x17, 0x18, 0x19 };
     var conn = try Connection.init(gpa, .server, &dcid);
@@ -5770,10 +5779,13 @@ test "opening enough peer streams advertises a raised MAX_STREAMS" {
 
     var frames: std.ArrayListUnmanaged(u8) = .empty;
     defer frames.deinit(gpa);
-    try frame.encodeStream(&frames, gpa, 4, 0, "x", false); // opens index 1 of 2
+    try frame.encodeStream(&frames, gpa, 4, 0, "x", true); // opens index 1 of 2
     const dgram = try testBuildApp(gpa, &dcid, 0, frames.items);
     defer gpa.free(dgram);
     try conn.receiveDatagram(dgram, 1000);
+    try testing.expect(!conn.max_streams_bidi_pending);
+    conn.consumeStream(4, 1);
+    try testing.expect(conn.dropStream(4));
     try testing.expect(conn.max_streams_bidi_pending);
 
     conn.clearSend(); // discard ACK bytes from receiving the STREAM
