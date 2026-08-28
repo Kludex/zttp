@@ -185,6 +185,78 @@ def make_zttp(w: Workload) -> Runner:
     return run
 
 
+def make_zttp_multiplexed(active_streams: int) -> Runner:
+    _cert_path, _key_path, certificate, private_key = _make_cert()
+    transport_params = zttp.QuicTransportParameters(initial_max_streams_bidi=256)
+    client = zttp.Connection(
+        zttp.CLIENT,
+        protocol=zttp.HTTP3,
+        server_name=AUTHORITY,
+        server_certificate=certificate,
+        transport_params=transport_params,
+    )
+    server = zttp.Connection(
+        zttp.SERVER,
+        protocol=zttp.HTTP3,
+        credentials=zttp.TlsCredentials(certificate=certificate, private_key_scalar=private_key),
+        transport_params=transport_params,
+    )
+    now = [1000]
+
+    def transfer(src: zttp.H3Connection, dst: zttp.H3Connection) -> None:
+        for datagram in src.data_to_send():
+            dst.receive_datagram(datagram, now[0])
+
+    for _ in range(6):
+        transfer(client, server)
+        transfer(server, client)
+        now[0] += 1000
+
+    requests = 0
+    for _ in range(active_streams - 1):
+        client.send_request(
+            b"POST",
+            b"/",
+            b"3",
+            [(b"host", AUTHORITY)],
+        )
+        transfer(client, server)
+        while (event := server.next_event()) is not zttp.NEED_DATA:
+            if isinstance(event, zttp.Request):
+                requests += 1
+        transfer(server, client)
+    if requests != active_streams - 1:
+        raise RuntimeError(f"zttp opened {requests}/{active_streams - 1} held request streams")
+
+    def run(n: int) -> None:
+        received = 0
+        completed = 0
+        for _ in range(n):
+            now[0] += 100
+            stream = client.send_request(
+                b"GET",
+                b"/",
+                b"3",
+                [(b"host", AUTHORITY)],
+            )
+            stream.end_message()
+            transfer(client, server)
+            while (event := server.next_event()) is not zttp.NEED_DATA:
+                if isinstance(event, zttp.Request):
+                    received += 1
+                    response = server.stream(event.stream_id)
+                    response.send_response(200, [])
+                    response.end_message()
+            transfer(server, client)
+            while (event := client.next_event()) is not zttp.NEED_DATA:
+                if isinstance(event, zttp.Response) and event.status_code == 200:
+                    completed += 1
+        if received != n or completed != n:
+            raise RuntimeError(f"zttp completed {completed}/{received}/{n} multiplexed round-trips")
+
+    return run
+
+
 # -- aioquic ------------------------------------------------------------------
 
 
@@ -331,16 +403,34 @@ def bench(w: Workload, batch: int, repeats: int) -> dict[str, float]:
     return rates
 
 
+def bench_active_stream_scaling(batch: int, repeats: int) -> None:
+    print(f"\n== one changed stream by active stream count ({repeats} batches of {batch:,} requests) ==")
+    for active_streams in (1, 16, 64):
+        run = make_zttp_multiplexed(active_streams)
+        run(max(1, batch // 10))
+        samples = [batch / timed(run, batch) for _ in range(repeats)]
+        p25, median, p75 = _quartiles(samples)
+        print(f"  {active_streams:>3} active: {median:12,.0f} requests/s  (p25-p75 {p25:,.0f}-{p75:,.0f})")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=2_000, help="round-trips per timed batch")
     parser.add_argument("--repeats", type=int, default=15, help="timed batches per stack")
     parser.add_argument("--only", type=str, default=None, help="substring filter on workload names")
+    parser.add_argument(
+        "--active-stream-scaling",
+        action="store_true",
+        help="measure one changed stream with 1, 16, and 64 active streams",
+    )
     args = parser.parse_args()
 
     print(
         f"CPython {sys.version.split()[0]}, zttp {version('zttp')}, aioquic {version('aioquic')} (Python QUIC, C QPACK)"
     )
+    if args.active_stream_scaling:
+        bench_active_stream_scaling(args.batch, args.repeats)
+        return
     selected = [w for w in WORKLOADS if args.only is None or args.only.lower() in w.name.lower()]
     results = {w.name: bench(w, args.batch, args.repeats) for w in selected}
 
