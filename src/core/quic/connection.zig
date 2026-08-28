@@ -958,6 +958,12 @@ pub const Connection = struct {
         return provisional.state.address;
     }
 
+    /// The authenticated default path address, or null before an addressed packet authenticates.
+    pub fn defaultPathAddress(self: *const Connection) ?[]const u8 {
+        const token = self.default_path_token orelse return null;
+        return self.pathAddress(token);
+    }
+
     /// Switch subsequent packets to a peer-issued connection id (RFC 9000 5.1).
     /// The id must have arrived in NEW_CONNECTION_ID and must not have been retired.
     pub fn usePeerConnectionId(self: *Connection, seq: u64) Error!void {
