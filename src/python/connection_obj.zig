@@ -805,6 +805,14 @@ const H3Engine = struct {
     }
 
     fn receiveDatagram(self: *H3Engine, dgram: []const u8, now: u64, peer_address: ?[]const u8) py.Object {
+        if (self.h3) |h| {
+            if (h.eventQueueFull()) {
+                return py.raise(
+                    exceptions.LocalProtocolError,
+                    "drain pending HTTP/3 events before receiving more data",
+                );
+            }
+        }
         self.now = now;
         if (self.qc == null) {
             // Build the transport from the connection id in the client's first
@@ -2870,7 +2878,7 @@ fn h2RaiseWrite(e: core.h2.writer.WriteError) py.Object {
 fn h3RaiseLocal(e: core.h3.connection.Error) py.Object {
     return switch (e) {
         error.OutOfMemory => c.PyErr_NoMemory(),
-        error.H3Error, error.Blocked => py.raise(exceptions.LocalProtocolError, "invalid HTTP/3 send"),
+        error.H3Error, error.EventQueueFull, error.Blocked => py.raise(exceptions.LocalProtocolError, "invalid HTTP/3 send"),
     };
 }
 

@@ -207,7 +207,7 @@ fn driveH3(input: []const u8) void {
     defer frames.deinit(std.heap.c_allocator);
     quic_frame.encodeStream(&frames, std.heap.c_allocator, 2, 0, h3_bytes.items, false) catch return;
     if (!deliverAppPacket(&qc, 0, frames.items, FUZZ_ADDRESSES[0])) return;
-    h3.pump(2) catch return;
+    h3.pumpStreams(&.{2}) catch return;
 
     h3_bytes.clearRetainingCapacity();
     const qpack_block = [_]u8{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 };
@@ -226,16 +226,16 @@ fn driveH3(input: []const u8) void {
         false,
     ) catch return;
     if (!deliverAppPacket(&qc, 1, frames.items, FUZZ_ADDRESSES[1])) return;
-    h3.pump(0) catch return;
+    h3.pumpStreams(&.{0}) catch return;
     frames.clearRetainingCapacity();
     quic_frame.encodeStream(&frames, std.heap.c_allocator, 0, 0, h3_bytes.items[0..split], false) catch return;
     if (!deliverAppPacket(&qc, 2, frames.items, FUZZ_ADDRESSES[2])) return;
-    h3.pump(0) catch return;
+    h3.pumpStreams(&.{0}) catch return;
 
     frames.clearRetainingCapacity();
     const reset_code = if (body.len < 2) 0 else body[1];
     quic_frame.encodeResetStream(&frames, std.heap.c_allocator, 0, reset_code, h3_bytes.items.len) catch return;
-    if (deliverAppPacket(&qc, 3, frames.items, FUZZ_ADDRESSES[3])) h3.pump(0) catch {};
+    if (deliverAppPacket(&qc, 3, frames.items, FUZZ_ADDRESSES[3])) h3.pumpStreams(&.{0}) catch {};
 
     for (0..64) |_| switch (h3.nextEvent()) {
         .need_data => break,
