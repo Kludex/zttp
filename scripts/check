@@ -17,4 +17,4 @@ uv run --no-sync python -m mypy.stubtest zttp._zttp --allowlist tests/stubtest_a
 uv run --no-sync ruff check $SOURCE_FILES
 
 # Zig.
-zig fmt --check src build.zig
+zig fmt --check src fuzz/target.zig build.zig

@@ -1,11 +1,7 @@
-//! Coverage-instrumented drive function for the sans-IO reader, exported under
-//! a C ABI as `zttp_fuzz_drive`. The libFuzzer/AFL++ entry point and the sancov
-//! section registration live in the C shim (`fuzz/target.c`), which OSS-Fuzz's
-//! own clang compiles and links against this object's `.fuzz` instrumentation.
-//!
-//! The drive loop mirrors the `driveReader` property test in `reader.zig`, but
-//! uses the C allocator so the sanitizer the engine links (ASan/UBSan)
-//! intercepts every allocation.
+//! Coverage-instrumented drivers for the sans-IO protocol core, exported through
+//! the `zttp_fuzz_drive` C ABI. The C shim owns the libFuzzer/AFL++ entry point
+//! and registers this object's sanitizer-coverage counters. Every driver uses
+//! the C allocator so ASan and LeakSanitizer intercept its allocations.
 
 const std = @import("std");
 const core = @import("core");
@@ -20,6 +16,15 @@ const hpack_encoder = core.h2.hpack_encoder;
 const HpackDecoder = core.h2.hpack_decoder.Decoder;
 const qpack_encoder = core.h3.qpack_encoder;
 const QpackDecoder = core.h3.qpack_decoder.Decoder;
+const QuicConnection = core.quic.connection.Connection;
+const quic_frame = core.quic.frame;
+const H3Connection = core.h3.connection.Connection;
+const h3_frame = core.h3.frame;
+
+const MAX_FUZZ_INPUT: usize = 64 * 1024;
+const MAX_STATE_INPUT: usize = 4 * 1024;
+const FUZZ_DCID = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+const FUZZ_ADDRESSES = [_][]const u8{ "path-a", "path-b", "path-c", "path-d" };
 
 fn drive(input: []const u8) void {
     inline for (.{ Role.server, Role.client }) |role| {
@@ -35,7 +40,7 @@ fn drive(input: []const u8) void {
                 switch (ev) {
                     .need_data, .connection_closed => break,
                     .end_of_message => {
-                        r.reset();
+                        r.reset() catch continue :outer;
                         break;
                     },
                     else => {},
@@ -141,21 +146,124 @@ fn driveQpackRoundtrip(input: []const u8) void {
     std.debug.assert(headersEqual(headers, out));
 }
 
+fn deliverAppPacket(conn: *QuicConnection, pn: u64, frames: []const u8, address: []const u8) bool {
+    const datagram = core.quic.connection.testBuildApp(std.heap.c_allocator, &FUZZ_DCID, pn, frames) catch return false;
+    defer std.heap.c_allocator.free(datagram);
+    conn.receiveDatagramFrom(datagram, pn + 1, address) catch return false;
+    conn.clearSend();
+    return true;
+}
+
+fn driveQuic(input: []const u8) void {
+    const body = input[0..@min(input.len, MAX_STATE_INPUT)];
+
+    var unauthenticated = QuicConnection.init(std.heap.c_allocator, .server, &FUZZ_DCID) catch return;
+    defer unauthenticated.deinit();
+    core.quic.connection.testInstallAppKeys(&unauthenticated);
+    unauthenticated.receiveDatagramFrom(body, 0, FUZZ_ADDRESSES[0]) catch {};
+
+    var conn = QuicConnection.init(std.heap.c_allocator, .server, &FUZZ_DCID) catch return;
+    defer conn.deinit();
+    core.quic.connection.testInstallAppKeys(&conn);
+    core.quic.connection.testConfirmHandshake(&conn);
+
+    const split = if (body.len == 0) 0 else @as(usize, body[0]) % (body.len + 1);
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(std.heap.c_allocator);
+
+    quic_frame.encodeStream(&frames, std.heap.c_allocator, 0, split, body[split..], true) catch return;
+    if (!deliverAppPacket(&conn, 0, frames.items, FUZZ_ADDRESSES[0])) return;
+    frames.clearRetainingCapacity();
+    quic_frame.encodeStream(&frames, std.heap.c_allocator, 0, 0, body[0..split], false) catch return;
+    if (!deliverAppPacket(&conn, 1, frames.items, FUZZ_ADDRESSES[1])) return;
+
+    frames.clearRetainingCapacity();
+    const reset_code = if (body.len == 0) 0 else body[0];
+    const reset_size = if (body.len < 2) body.len else @as(u64, body[1]) * 16;
+    quic_frame.encodeResetStream(&frames, std.heap.c_allocator, 4, reset_code, reset_size) catch return;
+    if (!deliverAppPacket(&conn, 2, frames.items, FUZZ_ADDRESSES[2])) return;
+
+    const ping = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
+    const tampered = core.quic.connection.testBuildApp(std.heap.c_allocator, &FUZZ_DCID, 3, &ping) catch return;
+    defer std.heap.c_allocator.free(tampered);
+    tampered[tampered.len - 1] ^= if (body.len == 0) 1 else body[0] | 1;
+    conn.receiveDatagramFrom(tampered, 4, FUZZ_ADDRESSES[3]) catch {};
+}
+
+fn driveH3(input: []const u8) void {
+    const body = input[0..@min(input.len, MAX_STATE_INPUT)];
+    var qc = QuicConnection.init(std.heap.c_allocator, .server, &FUZZ_DCID) catch return;
+    defer qc.deinit();
+    core.quic.connection.testInstallAppKeys(&qc);
+    core.quic.connection.testConfirmHandshake(&qc);
+    var h3 = H3Connection.init(std.heap.c_allocator, &qc);
+    defer h3.deinit();
+
+    var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer h3_bytes.deinit(std.heap.c_allocator);
+    h3_bytes.append(std.heap.c_allocator, 0) catch return;
+    h3_frame.append(&h3_bytes, std.heap.c_allocator, .settings, &.{}) catch return;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(std.heap.c_allocator);
+    quic_frame.encodeStream(&frames, std.heap.c_allocator, 2, 0, h3_bytes.items, false) catch return;
+    if (!deliverAppPacket(&qc, 0, frames.items, FUZZ_ADDRESSES[0])) return;
+    h3.pump(2) catch return;
+
+    h3_bytes.clearRetainingCapacity();
+    const qpack_block = [_]u8{ 0x00, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1 };
+    h3_frame.append(&h3_bytes, std.heap.c_allocator, .headers, &qpack_block) catch return;
+    h3_frame.append(&h3_bytes, std.heap.c_allocator, .data, body) catch return;
+    const split = (if (body.len == 0) 0 else @as(usize, body[0])) %
+        (h3_bytes.items.len + 1);
+
+    frames.clearRetainingCapacity();
+    quic_frame.encodeStream(
+        &frames,
+        std.heap.c_allocator,
+        0,
+        split,
+        h3_bytes.items[split..],
+        false,
+    ) catch return;
+    if (!deliverAppPacket(&qc, 1, frames.items, FUZZ_ADDRESSES[1])) return;
+    h3.pump(0) catch return;
+    frames.clearRetainingCapacity();
+    quic_frame.encodeStream(&frames, std.heap.c_allocator, 0, 0, h3_bytes.items[0..split], false) catch return;
+    if (!deliverAppPacket(&qc, 2, frames.items, FUZZ_ADDRESSES[2])) return;
+    h3.pump(0) catch return;
+
+    frames.clearRetainingCapacity();
+    const reset_code = if (body.len < 2) 0 else body[1];
+    quic_frame.encodeResetStream(&frames, std.heap.c_allocator, 0, reset_code, h3_bytes.items.len) catch return;
+    if (deliverAppPacket(&qc, 3, frames.items, FUZZ_ADDRESSES[3])) h3.pump(0) catch {};
+
+    for (0..64) |_| switch (h3.nextEvent()) {
+        .need_data => break,
+        else => {},
+    };
+}
+
 export fn zttp_fuzz_drive(data: [*]const u8, size: usize) callconv(.c) void {
     const input = data[0..size];
-    // The low 2 bits of the first byte select the target so one corpus exercises
-    // every surface (H1 read, H2 read, HPACK and QPACK encode->decode); the rest
-    // is the mutated body. No build wiring changes: the `.fuzz` instrumentation
-    // already covers the whole `core` import.
     if (input.len == 0) {
         drive(input);
         return;
     }
-    const body = input[1..];
-    switch (@as(u2, @truncate(input[0]))) {
+    const body = input[1..@min(input.len, MAX_FUZZ_INPUT + 1)];
+    switch (input[0] % 6) {
         0 => drive(body),
         1 => driveH2(body),
         2 => driveHpackRoundtrip(body),
         3 => driveQpackRoundtrip(body),
+        4 => driveQuic(body),
+        5 => driveH3(body),
+        else => unreachable,
     }
+}
+
+test "stateful fuzz drivers accept bounded seeds" {
+    const quic_seed = "(reordered stream data and a reset";
+    zttp_fuzz_drive(quic_seed.ptr, quic_seed.len);
+    const h3_seed = ")headers, data, reset, and path changes";
+    zttp_fuzz_drive(h3_seed.ptr, h3_seed.len);
 }
