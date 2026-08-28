@@ -27,6 +27,9 @@
 #define _M_CEE
 #include <wchar.h>
 #undef _M_CEE
+#include <stdint.h>
+#undef UINT32_MAX
+#define UINT32_MAX 0xffffffffU
 #endif
 #include <Python.h>
 /* The Py_T_* / Py_READONLY member-def constants are 3.12+. On 3.10/3.11 the
