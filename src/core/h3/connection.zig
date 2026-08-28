@@ -30,10 +30,6 @@ const H3Event = events.H3Event;
 pub const Error = error{
     /// A connection-fatal HTTP/3 error (RFC 9114 7): the connection is closed.
     H3Error,
-    /// A stream-level HTTP/3 error (RFC 9114 4.1.2): a malformed request that resets
-    /// just that stream, leaving the connection up. Caught in the pump, never escapes
-    /// to the integrator.
-    StreamError,
     /// Internal signal: a QPACK field section is waiting for more encoder-stream
     /// inserts and has been stored on the stream for later retry.
     Blocked,
@@ -42,6 +38,13 @@ pub const Error = error{
 
 const MsgState = enum { idle, headers_done, trailers_done, done, rejected };
 const BlockedSection = enum { initial, trailers };
+
+fn StreamOutcome(comptime T: type) type {
+    return union(enum) {
+        value: T,
+        rejected: h3_error.ErrorCode,
+    };
+}
 
 const RequestStream = struct {
     state: MsgState = .idle,
@@ -164,11 +167,6 @@ pub const Connection = struct {
     /// Largest MAX_PUSH_ID received from a client. Null means push is not allowed.
     /// We still do not initiate pushes, but RFC 9114 requires rejecting decreases.
     max_push_id_recv: ?u64 = null,
-    /// The H3 error code a stream-level rejection (failStream) wants the pump to reset
-    /// the current stream with; consumed by pumpRequest. Carries the code across the
-    /// error.StreamError return (Zig errors hold no payload).
-    pending_reject: ?h3_error.ErrorCode = null,
-
     pub fn init(gpa: std.mem.Allocator, qc: *quic_conn.Connection) Connection {
         var dec = qpack.Decoder.init(gpa, MAX_FIELD_SECTION_SIZE);
         dec.setMaxDynamicCapacity(QPACK_MAX_TABLE_CAPACITY);
@@ -206,14 +204,6 @@ pub const Connection = struct {
         return error.H3Error;
     }
 
-    /// Reject one request stream without closing the connection (RFC 9114 4.1.2): the
-    /// pump catches error.StreamError, reads this code, and resets the stream. A
-    /// malformed request thus costs one stream, not the whole connection.
-    fn failStream(self: *Connection, code: h3_error.ErrorCode) Error {
-        self.pending_reject = code;
-        return error.StreamError;
-    }
-
     fn removeStreamState(self: *Connection, id: u64) void {
         if (self.streams.getPtr(id)) |rs| rs.deinit(self.gpa);
         _ = self.streams.remove(id);
@@ -226,7 +216,7 @@ pub const Connection = struct {
 
     /// Reset request stream `id` with `code` and drop its state: RESET_STREAM the
     /// response, STOP_SENDING the request, drain and reclaim. Used both for a
-    /// malformed request (failStream) and a request covered by our GOAWAY.
+    /// malformed request and a request covered by our GOAWAY.
     fn rejectStream(self: *Connection, id: u64, code: h3_error.ErrorCode) Error!void {
         if (self.streams.getPtr(id)) |rs| try self.cancelQpackSectionIfPending(id, rs);
         _ = self.send_bodyless.remove(id);
@@ -442,16 +432,10 @@ pub const Connection = struct {
             const rest = ready[consumed_total..];
             const d = h3_frame.decode(rest) catch break; // NeedData: wait for more
             const frame_ends_stream = self.qc.streamFinished(id) and consumed_total + d.len == ready.len;
-            self.onFrame(id, rs, d.frame, frame_ends_stream) catch |e| switch (e) {
-                // A stream-level error (a malformed request): reset just this stream
-                // and stop processing it, rather than poisoning the whole connection.
-                error.StreamError => {
-                    const code = self.pending_reject orelse h3_error.ErrorCode.message_error;
-                    self.pending_reject = null;
-                    return self.rejectStream(id, code); // rs dangles after the drop inside
-                },
-                else => return e,
-            };
+            switch (try self.onFrame(id, rs, d.frame, frame_ends_stream)) {
+                .value => {},
+                .rejected => |code| return self.rejectStream(id, code), // rs dangles after the drop inside
+            }
             consumed_total += d.len;
             credited_total += if (d.frame.ftype == .data) d.len - d.frame.payload.len else d.len;
             if (rs.blocked_headers != null) break;
@@ -531,14 +515,10 @@ pub const Connection = struct {
         while (consumed_total < ready.len) {
             const rest = ready[consumed_total..];
             const d = h3_frame.decode(rest) catch break;
-            self.onResponseFrame(id, rs, d.frame) catch |e| switch (e) {
-                error.StreamError => {
-                    const code = self.pending_reject orelse h3_error.ErrorCode.message_error;
-                    self.pending_reject = null;
-                    return self.rejectStream(id, code);
-                },
-                else => return e,
-            };
+            switch (try self.onResponseFrame(id, rs, d.frame)) {
+                .value => {},
+                .rejected => |code| return self.rejectStream(id, code),
+            }
             consumed_total += d.len;
             credited_total += if (d.frame.ftype == .data) d.len - d.frame.payload.len else d.len;
             if (rs.blocked_headers != null) break;
@@ -884,29 +864,31 @@ pub const Connection = struct {
             .server => {
                 if (quic_stream.StreamType.of(id) != .client_bidi) return false;
                 if (rs.blocked_section == .trailers) {
-                    self.decodeTrailers(id, block, rs) catch |e| switch (e) {
+                    const outcome = self.decodeTrailers(id, block, rs) catch |e| switch (e) {
                         error.Blocked => return false,
-                        error.StreamError => {
-                            const code = self.pending_reject orelse h3_error.ErrorCode.message_error;
-                            self.pending_reject = null;
+                        else => return e,
+                    };
+                    switch (outcome) {
+                        .value => {},
+                        .rejected => |code| {
                             try self.rejectStream(id, code);
                             return false;
                         },
-                        else => return e,
-                    };
+                    }
                     self.clearBlockedHeaders(rs);
                     rs.state = .trailers_done;
                     return true;
                 }
-                var req = self.decodeRequest(id, block, rs) catch |e| switch (e) {
+                const outcome = self.decodeRequest(id, block, rs) catch |e| switch (e) {
                     error.Blocked => return false,
-                    error.StreamError => {
-                        const code = self.pending_reject orelse h3_error.ErrorCode.message_error;
-                        self.pending_reject = null;
+                    else => return e,
+                };
+                var req = switch (outcome) {
+                    .value => |request| request,
+                    .rejected => |code| {
                         try self.rejectStream(id, code);
                         return false;
                     },
-                    else => return e,
                 };
                 self.clearBlockedHeaders(rs);
                 // A QPACK-blocked request whose headers only just unblocked is still
@@ -937,29 +919,31 @@ pub const Connection = struct {
             .client => {
                 if (quic_stream.StreamType.of(id) != .client_bidi) return false;
                 if (rs.blocked_section == .trailers) {
-                    self.decodeTrailers(id, block, rs) catch |e| switch (e) {
+                    const outcome = self.decodeTrailers(id, block, rs) catch |e| switch (e) {
                         error.Blocked => return false,
-                        error.StreamError => {
-                            const code = self.pending_reject orelse h3_error.ErrorCode.message_error;
-                            self.pending_reject = null;
+                        else => return e,
+                    };
+                    switch (outcome) {
+                        .value => {},
+                        .rejected => |code| {
                             try self.rejectStream(id, code);
                             return false;
                         },
-                        else => return e,
-                    };
+                    }
                     self.clearBlockedHeaders(rs);
                     rs.state = .trailers_done;
                     return true;
                 }
-                const resp = self.decodeResponse(id, block, rs) catch |e| switch (e) {
+                const outcome = self.decodeResponse(id, block, rs) catch |e| switch (e) {
                     error.Blocked => return false,
-                    error.StreamError => {
-                        const code = self.pending_reject orelse h3_error.ErrorCode.message_error;
-                        self.pending_reject = null;
+                    else => return e,
+                };
+                const resp = switch (outcome) {
+                    .value => |response| response,
+                    .rejected => |code| {
                         try self.rejectStream(id, code);
                         return false;
                     },
-                    else => return e,
                 };
                 self.clearBlockedHeaders(rs);
                 try self.push(.{ .response = resp.event });
@@ -972,41 +956,56 @@ pub const Connection = struct {
         }
     }
 
-    fn onFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame, frame_ends_stream: bool) Error!void {
+    fn onFrame(
+        self: *Connection,
+        id: u64,
+        rs: *RequestStream,
+        f: h3_frame.Frame,
+        frame_ends_stream: bool,
+    ) Error!StreamOutcome(void) {
         if (h3_frame.isReservedHttp2(f.ftype)) return self.fail(.frame_unexpected, "HTTP/2-only frame type");
         switch (f.ftype) {
             .headers => {
                 if (rs.state == .idle) {
-                    var req = self.decodeRequest(id, f.payload, rs) catch |e| switch (e) {
+                    const outcome = self.decodeRequest(id, f.payload, rs) catch |e| switch (e) {
                         error.Blocked => {
                             try self.blockHeaders(rs, f.payload, .initial);
-                            return;
+                            return .{ .value = {} };
                         },
                         else => return e,
                     };
+                    var req = switch (outcome) {
+                        .value => |request| request,
+                        .rejected => |code| return .{ .rejected = code },
+                    };
                     if (frame_ends_stream) {
-                        if (rs.content_length) |cl| if (cl != 0) return self.failStream(.message_error);
+                        if (rs.content_length) |cl| if (cl != 0) return .{ .rejected = .message_error };
                         req.end_stream = true;
                         rs.head_ended_stream = true;
                     }
                     try self.push(.{ .request = req });
                     rs.state = .headers_done;
                 } else if (rs.state == .headers_done) {
-                    self.decodeTrailers(id, f.payload, rs) catch |e| switch (e) {
+                    const outcome = self.decodeTrailers(id, f.payload, rs) catch |e| switch (e) {
                         error.Blocked => {
                             try self.blockHeaders(rs, f.payload, .trailers);
-                            return;
+                            return .{ .value = {} };
                         },
                         else => return e,
                     };
+                    switch (outcome) {
+                        .value => {},
+                        .rejected => |code| return .{ .rejected = code },
+                    }
                     rs.state = .trailers_done;
-                } else return self.failStream(.message_error);
+                } else return .{ .rejected = .message_error };
             },
             .data => {
                 if (rs.state != .headers_done) return self.fail(.frame_unexpected, "DATA before HEADERS"); // RFC 9114 4.1
-                const body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return self.failStream(.message_error);
+                const body_received = std.math.add(u64, rs.body_received, f.payload.len) catch
+                    return .{ .rejected = .message_error };
                 // More body than the declared Content-Length is malformed (RFC 9114 4.1.2).
-                if (rs.content_length) |cl| if (body_received > cl) return self.failStream(.message_error);
+                if (rs.content_length) |cl| if (body_received > cl) return .{ .rejected = .message_error };
                 const body = try self.dupe(f.payload);
                 try self.push(.{ .data = .{ .data = body, .stream_id = id } });
                 rs.body_received = body_received;
@@ -1020,44 +1019,54 @@ pub const Connection = struct {
             // loop skips it by Decoded.len.
             else => {},
         }
+        return .{ .value = {} };
     }
 
-    fn onResponseFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame) Error!void {
+    fn onResponseFrame(self: *Connection, id: u64, rs: *RequestStream, f: h3_frame.Frame) Error!StreamOutcome(void) {
         if (h3_frame.isReservedHttp2(f.ftype)) return self.fail(.frame_unexpected, "HTTP/2-only frame type");
         switch (f.ftype) {
             .headers => {
                 if (rs.state == .idle) {
-                    const resp = self.decodeResponse(id, f.payload, rs) catch |e| switch (e) {
+                    const outcome = self.decodeResponse(id, f.payload, rs) catch |e| switch (e) {
                         error.Blocked => {
                             try self.blockHeaders(rs, f.payload, .initial);
-                            return;
+                            return .{ .value = {} };
                         },
                         else => return e,
                     };
+                    const resp = switch (outcome) {
+                        .value => |response| response,
+                        .rejected => |code| return .{ .rejected = code },
+                    };
                     try self.push(.{ .response = resp.event });
                     if (resp.event.status_code >= 100 and resp.event.status_code < 200) {
-                        return; // informational response; final response HEADERS still follow
+                        return .{ .value = {} }; // informational response; final response HEADERS still follow
                     }
                     rs.state = .headers_done;
                     rs.content_length = resp.content_length;
                     rs.expects_bodyless = rs.head_response or resp.event.status_code == 204 or resp.event.status_code == 304;
                 } else if (rs.state == .headers_done) {
-                    if (rs.expects_bodyless) return self.failStream(.message_error);
-                    self.decodeTrailers(id, f.payload, rs) catch |e| switch (e) {
+                    if (rs.expects_bodyless) return .{ .rejected = .message_error };
+                    const outcome = self.decodeTrailers(id, f.payload, rs) catch |e| switch (e) {
                         error.Blocked => {
                             try self.blockHeaders(rs, f.payload, .trailers);
-                            return;
+                            return .{ .value = {} };
                         },
                         else => return e,
                     };
+                    switch (outcome) {
+                        .value => {},
+                        .rejected => |code| return .{ .rejected = code },
+                    }
                     rs.state = .trailers_done;
-                } else return self.failStream(.message_error);
+                } else return .{ .rejected = .message_error };
             },
             .data => {
                 if (rs.state != .headers_done) return self.fail(.frame_unexpected, "DATA before response HEADERS");
-                if (rs.expects_bodyless and f.payload.len > 0) return self.failStream(.message_error);
-                const body_received = std.math.add(u64, rs.body_received, f.payload.len) catch return self.failStream(.message_error);
-                if (rs.content_length) |cl| if (body_received > cl) return self.failStream(.message_error);
+                if (rs.expects_bodyless and f.payload.len > 0) return .{ .rejected = .message_error };
+                const body_received = std.math.add(u64, rs.body_received, f.payload.len) catch
+                    return .{ .rejected = .message_error };
+                if (rs.content_length) |cl| if (body_received > cl) return .{ .rejected = .message_error };
                 if (f.payload.len > 0) {
                     const body = try self.dupe(f.payload);
                     try self.push(.{ .data = .{ .data = body, .stream_id = id } });
@@ -1072,11 +1081,12 @@ pub const Connection = struct {
             .cancel_push, .settings, .goaway, .max_push_id => return self.fail(.frame_unexpected, "control frame on a response stream"),
             else => {},
         }
+        return .{ .value = {} };
     }
 
     /// Collapse a QPACK-decoded field section into a Request, pulling the four
     /// pseudo-headers into the shared shape and keeping the rest as headers.
-    fn decodeRequest(self: *Connection, id: u64, block: []const u8, rs: *RequestStream) Error!events.Request {
+    fn decodeRequest(self: *Connection, id: u64, block: []const u8, rs: *RequestStream) Error!StreamOutcome(events.Request) {
         // A malformed QPACK block is connection-fatal QPACK_DECOMPRESSION_FAILED;
         // HTTP field violations below are stream-level message errors.
         const decoded = self.qpack_dec.decode(block) catch |err| return self.onQpackDecodeError(err);
@@ -1092,59 +1102,59 @@ pub const Connection = struct {
 
         for (decoded) |h| {
             if (h.name.len > 0 and h.name[0] == ':') {
-                if (seen_regular) return self.failStream(.message_error); // pseudo after regular (RFC 9114 4.3)
+                if (seen_regular) return .{ .rejected = .message_error }; // pseudo after regular (RFC 9114 4.3)
                 // A pseudo-header value is validated like any other (no CR/LF/NUL/
                 // control), so a :authority carrying CR/LF cannot be synthesized into
                 // a `host` header and split a downgraded HTTP/1.1 request line.
-                if (!fields.validValue(h.value)) return self.failStream(.message_error);
+                if (!fields.validValue(h.value)) return .{ .rejected = .message_error };
                 // A request pseudo-header appears at most once (RFC 9114 4.3.1 ->
                 // RFC 9113 8.3); a duplicate is malformed.
-                const slot = if (eql(h.name, ":method")) &method else if (eql(h.name, ":path")) &path else if (eql(h.name, ":authority")) &authority else if (eql(h.name, ":scheme")) &scheme else return self.failStream(.message_error);
-                if (slot.* != null) return self.failStream(.message_error);
+                const slot = if (eql(h.name, ":method")) &method else if (eql(h.name, ":path")) &path else if (eql(h.name, ":authority")) &authority else if (eql(h.name, ":scheme")) &scheme else return .{ .rejected = .message_error };
+                if (slot.* != null) return .{ .rejected = .message_error };
                 slot.* = h.value;
             } else {
                 seen_regular = true;
                 // RFC 9114 4.2 inherits the HTTP/2 field rules: lowercase token
                 // names, no connection-specific fields, and TE only "trailers".
-                if (!fields.isValidFieldName(h.name)) return self.failStream(.message_error);
-                if (!fields.validValue(h.value)) return self.failStream(.message_error);
-                if (fields.isConnectionSpecific(h.name)) return self.failStream(.message_error);
-                if (eql(h.name, "te") and !eql(h.value, "trailers")) return self.failStream(.message_error);
+                if (!fields.isValidFieldName(h.name)) return .{ .rejected = .message_error };
+                if (!fields.validValue(h.value)) return .{ .rejected = .message_error };
+                if (fields.isConnectionSpecific(h.name)) return .{ .rejected = .message_error };
+                if (eql(h.name, "te") and !eql(h.value, "trailers")) return .{ .rejected = .message_error };
                 if (eql(h.name, "host")) {
                     if (host) |prev| {
-                        if (!eql(prev, h.value)) return self.failStream(.message_error);
+                        if (!eql(prev, h.value)) return .{ .rejected = .message_error };
                     } else host = h.value;
                     continue;
                 }
                 if (eql(h.name, "content-length")) {
-                    const cl = ascii.parseDecimal(u64, h.value) orelse return self.failStream(.message_error);
+                    const cl = ascii.parseDecimal(u64, h.value) orelse return .{ .rejected = .message_error };
                     // A repeated Content-Length is malformed unless it agrees (RFC 9110).
                     if (rs.content_length) |prev| {
-                        if (prev != cl) return self.failStream(.message_error);
+                        if (prev != cl) return .{ .rejected = .message_error };
                     } else rs.content_length = cl;
                 }
                 regular.append(self.gpa, h) catch return error.OutOfMemory;
             }
         }
-        const method_v = method orelse return self.failStream(.message_error);
-        if (!fields.isValidToken(method_v)) return self.failStream(.message_error);
+        const method_v = method orelse return .{ .rejected = .message_error };
+        if (!fields.isValidToken(method_v)) return .{ .rejected = .message_error };
         if (authority) |auth| {
-            if (auth.len == 0 or std.mem.indexOfAny(u8, auth, " \t") != null) return self.failStream(.message_error);
+            if (auth.len == 0 or std.mem.indexOfAny(u8, auth, " \t") != null) return .{ .rejected = .message_error };
         }
         if (eql(method_v, "HEAD")) self.send_bodyless.put(self.gpa, id, {}) catch return error.OutOfMemory;
         const target_v = if (eql(method_v, "CONNECT")) blk: {
-            if (path != null or scheme != null) return self.failStream(.message_error);
-            const auth = authority orelse return self.failStream(.message_error);
-            if (auth.len == 0) return self.failStream(.message_error);
+            if (path != null or scheme != null) return .{ .rejected = .message_error };
+            const auth = authority orelse return .{ .rejected = .message_error };
+            if (auth.len == 0) return .{ .rejected = .message_error };
             break :blk auth;
         } else blk: {
-            const path_v = path orelse return self.failStream(.message_error);
-            const scheme_v = scheme orelse return self.failStream(.message_error);
-            if (path_v.len == 0 or scheme_v.len == 0) return self.failStream(.message_error);
+            const path_v = path orelse return .{ .rejected = .message_error };
+            const scheme_v = scheme orelse return .{ .rejected = .message_error };
+            if (path_v.len == 0 or scheme_v.len == 0) return .{ .rejected = .message_error };
             break :blk path_v;
         };
         if (authority) |auth| {
-            if (host) |h| if (!eql(auth, h)) return self.failStream(.message_error);
+            if (host) |h| if (!eql(auth, h)) return .{ .rejected = .message_error };
         }
 
         // Materialise everything into the arena so the slices outlive the next
@@ -1170,12 +1180,12 @@ pub const Connection = struct {
             .stream_id = id,
         };
         try self.acknowledgeQpackSectionIfPending(id, rs);
-        return out;
+        return .{ .value = out };
     }
 
     /// Collapse a QPACK-decoded field section into a Response. The only legal
     /// response pseudo-header is `:status`; request pseudo-headers are malformed.
-    fn decodeResponse(self: *Connection, id: u64, block: []const u8, rs: *RequestStream) Error!CollapsedResponse {
+    fn decodeResponse(self: *Connection, id: u64, block: []const u8, rs: *RequestStream) Error!StreamOutcome(CollapsedResponse) {
         const decoded = self.qpack_dec.decode(block) catch |err| return self.onQpackDecodeError(err);
         self.markQpackSectionIfDynamic(rs);
         var status: ?u16 = null;
@@ -1185,36 +1195,36 @@ pub const Connection = struct {
         var seen_regular = false;
 
         for (decoded) |h| {
-            if (h.name.len == 0) return self.failStream(.message_error);
+            if (h.name.len == 0) return .{ .rejected = .message_error };
             if (h.name[0] == ':') {
-                if (seen_regular) return self.failStream(.message_error);
-                if (!eql(h.name, ":status")) return self.failStream(.message_error);
-                if (status != null) return self.failStream(.message_error);
-                if (h.value.len != 3) return self.failStream(.message_error);
+                if (seen_regular) return .{ .rejected = .message_error };
+                if (!eql(h.name, ":status")) return .{ .rejected = .message_error };
+                if (status != null) return .{ .rejected = .message_error };
+                if (h.value.len != 3) return .{ .rejected = .message_error };
                 var code: u16 = 0;
                 for (h.value) |d| {
-                    if (d < '0' or d > '9') return self.failStream(.message_error);
+                    if (d < '0' or d > '9') return .{ .rejected = .message_error };
                     code = code * 10 + (d - '0');
                 }
-                if (code < 100 or code > 599 or code == 101) return self.failStream(.message_error);
+                if (code < 100 or code > 599 or code == 101) return .{ .rejected = .message_error };
                 status = code;
             } else {
                 seen_regular = true;
-                if (!fields.isValidFieldName(h.name)) return self.failStream(.message_error);
-                if (!fields.validValue(h.value)) return self.failStream(.message_error);
-                if (fields.isConnectionSpecific(h.name)) return self.failStream(.message_error);
-                if (eql(h.name, "te") and !eql(h.value, "trailers")) return self.failStream(.message_error);
+                if (!fields.isValidFieldName(h.name)) return .{ .rejected = .message_error };
+                if (!fields.validValue(h.value)) return .{ .rejected = .message_error };
+                if (fields.isConnectionSpecific(h.name)) return .{ .rejected = .message_error };
+                if (eql(h.name, "te") and !eql(h.value, "trailers")) return .{ .rejected = .message_error };
                 if (eql(h.name, "content-length")) {
-                    const cl = ascii.parseDecimal(u64, h.value) orelse return self.failStream(.message_error);
+                    const cl = ascii.parseDecimal(u64, h.value) orelse return .{ .rejected = .message_error };
                     if (content_length) |prev| {
-                        if (prev != cl) return self.failStream(.message_error);
+                        if (prev != cl) return .{ .rejected = .message_error };
                     } else content_length = cl;
                 }
                 regular.append(self.gpa, h) catch return error.OutOfMemory;
             }
         }
-        const code = status orelse return self.failStream(.message_error);
-        if (content_length != null and responseStatusDisallowsContentLength(code)) return self.failStream(.message_error);
+        const code = status orelse return .{ .rejected = .message_error };
+        if (content_length != null and responseStatusDisallowsContentLength(code)) return .{ .rejected = .message_error };
 
         const a = self.arena.allocator();
         var headers: std.ArrayListUnmanaged(Header) = .empty;
@@ -1232,36 +1242,41 @@ pub const Connection = struct {
             .content_length = content_length,
         };
         try self.acknowledgeQpackSectionIfPending(id, rs);
-        return out;
+        return .{ .value = out };
     }
 
-    fn decodeTrailers(self: *Connection, id: u64, block: []const u8, rs: *RequestStream) Error!void {
+    fn decodeTrailers(self: *Connection, id: u64, block: []const u8, rs: *RequestStream) Error!StreamOutcome(void) {
         const decoded = self.qpack_dec.decode(block) catch |err| return self.onQpackDecodeError(err);
         self.markQpackSectionIfDynamic(rs);
         var copied = self.gpa.alloc(Header, decoded.len) catch return error.OutOfMemory;
         var n: usize = 0;
-        errdefer {
-            for (copied[0..n]) |h| {
-                self.gpa.free(h.name);
-                self.gpa.free(h.value);
+        var keep_copied = false;
+        defer {
+            if (!keep_copied) {
+                for (copied[0..n]) |h| {
+                    self.gpa.free(h.name);
+                    self.gpa.free(h.value);
+                }
+                self.gpa.free(copied);
             }
-            self.gpa.free(copied);
         }
         for (decoded) |h| {
-            if (h.name.len == 0 or h.name[0] == ':') return self.failStream(.message_error);
-            if (!fields.isValidFieldName(h.name)) return self.failStream(.message_error);
-            if (!fields.validValue(h.value)) return self.failStream(.message_error);
-            if (fields.isConnectionSpecific(h.name)) return self.failStream(.message_error);
-            if (!fields.trailerFieldAllowed(h.name)) return self.failStream(.message_error);
+            if (h.name.len == 0 or h.name[0] == ':') return .{ .rejected = .message_error };
+            if (!fields.isValidFieldName(h.name)) return .{ .rejected = .message_error };
+            if (!fields.validValue(h.value)) return .{ .rejected = .message_error };
+            if (fields.isConnectionSpecific(h.name)) return .{ .rejected = .message_error };
+            if (!fields.trailerFieldAllowed(h.name)) return .{ .rejected = .message_error };
             const name = self.gpa.dupe(u8, h.name) catch return error.OutOfMemory;
             errdefer self.gpa.free(name);
             const value = self.gpa.dupe(u8, h.value) catch return error.OutOfMemory;
             copied[n] = .{ .name = name, .value = value };
             n += 1;
         }
-        if (rs.trailers != null) return self.failStream(.message_error);
+        if (rs.trailers != null) return .{ .rejected = .message_error };
         rs.trailers = copied;
+        keep_copied = true;
         try self.acknowledgeQpackSectionIfPending(id, rs);
+        return .{ .value = {} };
     }
 
     fn materializeTrailers(self: *Connection, rs: *RequestStream) Error![]const Header {
