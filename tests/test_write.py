@@ -389,4 +389,4 @@ def test_send_response_version_1_1_even_for_http_1_0_request() -> None:
     conn.receive_data(b"GET / HTTP/1.0\r\nHost: h\r\n\r\n")
     assert isinstance(conn.next_event(), zttp.Request)
     conn.send_response(200, [(b"Content-Length", b"0")])
-    assert conn.data_to_send() == b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    assert conn.data_to_send() == b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
