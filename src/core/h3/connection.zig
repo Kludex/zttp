@@ -1676,7 +1676,7 @@ fn buildRequest(gpa: std.mem.Allocator, dcid: []const u8, stream_id: u64, h3_byt
     try varint.append(&sframe, gpa, stream_id);
     try varint.append(&sframe, gpa, h3_bytes.len);
     try sframe.appendSlice(gpa, h3_bytes);
-    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, 0, sframe.items);
+    return @import("../quic/connection.zig").test_support.buildApp(gpa, dcid, 0, sframe.items);
 }
 
 test "decode a GET request over HTTP/3" {
@@ -1684,7 +1684,7 @@ test "decode a GET request over HTTP/3" {
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc); // H3 request data rides the Application space
+    quic_conn.test_support.installAppKeys(&qc); // H3 request data rides the Application space
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -1720,7 +1720,7 @@ test "matching authority and host are canonicalized to one host" {
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x46 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -1757,7 +1757,7 @@ test "host header is used when authority is absent" {
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x47 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -1791,7 +1791,7 @@ test "a CR/LF in a pseudo-header value is malformed" {
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -1821,7 +1821,7 @@ test "a request stream id above 2^32 is not truncated" {
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -1848,7 +1848,7 @@ test "CONNECT request uses authority form without scheme or path" {
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x45 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -1897,7 +1897,7 @@ fn pumpHeaders(gpa: std.mem.Allocator, qpack_block: []const u8) Error!bool {
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
     var qc = quic_conn.Connection.init(gpa, .server, &dcid) catch return error.H3Error;
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
     var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
@@ -1989,7 +1989,7 @@ test "a malformed request resets its stream but not the connection" {
     const dcid = [_]u8{ 0x88, 0x89, 0x8a, 0x8b };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2024,7 +2024,7 @@ test "a rejected open stream stays quarantined on a later frame" {
     const dcid = [_]u8{ 0x8c, 0x8d, 0x8e, 0x8f };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2056,7 +2056,7 @@ test "a partial request stream cannot slip past a GOAWAY by completing later" {
     const dcid = [_]u8{ 0x9a, 0x9b, 0x9c, 0x9d };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2104,7 +2104,7 @@ test "more body than Content-Length is malformed at the DATA frame" {
     const dcid = [_]u8{ 0xd1, 0xd2, 0xd3, 0xd4 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
     var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
@@ -2125,7 +2125,7 @@ test "a request with a body yields request then data" {
     const dcid = [_]u8{ 0xab, 0xcd, 0xef, 0x01 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc); // H3 request data rides the Application space
+    quic_conn.test_support.installAppKeys(&qc); // H3 request data rides the Application space
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2155,7 +2155,7 @@ fn buildRequestFin(gpa: std.mem.Allocator, dcid: []const u8, h3_bytes: []const u
     try varint.append(&sframe, gpa, 0); // stream id 0
     try varint.append(&sframe, gpa, h3_bytes.len);
     try sframe.appendSlice(gpa, h3_bytes);
-    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, 0, sframe.items);
+    return @import("../quic/connection.zig").test_support.buildApp(gpa, dcid, 0, sframe.items);
 }
 
 // Build an Application-space datagram carrying a zero-length STREAM frame with the
@@ -2168,7 +2168,7 @@ fn buildFinOnly(gpa: std.mem.Allocator, dcid: []const u8, packet_number: u64, of
     try varint.append(&sframe, gpa, 0); // stream id 0
     try varint.append(&sframe, gpa, offset);
     try varint.append(&sframe, gpa, 0); // length 0, no data
-    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, packet_number, sframe.items);
+    return @import("../quic/connection.zig").test_support.buildApp(gpa, dcid, packet_number, sframe.items);
 }
 
 test "a FIN-only completion reclaims the request stream" {
@@ -2176,7 +2176,7 @@ test "a FIN-only completion reclaims the request stream" {
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2217,7 +2217,7 @@ test "a request stream ending before HEADERS is request incomplete" {
     const dcid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc5 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2231,9 +2231,9 @@ test "a request stream ending before HEADERS is request incomplete" {
     try qc.flushSend(2000);
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
+    quic_conn.test_support.installAppKeys(&peer);
     try peer.sendStreamData(0, &.{}, false);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -2263,7 +2263,7 @@ test "the body matching Content-Length is accepted, a mismatch is malformed" {
     {
         var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
         var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
@@ -2278,7 +2278,7 @@ test "the body matching Content-Length is accepted, a mismatch is malformed" {
     {
         var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
         var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
@@ -2297,7 +2297,7 @@ test "the body matching Content-Length is accepted, a mismatch is malformed" {
     {
         var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
         var h3_bytes: std.ArrayListUnmanaged(u8) = .empty;
@@ -2319,7 +2319,7 @@ test "an unknown non-grease frame on a request stream is ignored" {
     const dcid = [_]u8{ 0x2a, 0x2b, 0x2c, 0x2d };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2358,7 +2358,7 @@ fn pumpFrames(gpa: std.mem.Allocator, h3_bytes: []const u8) Error!void {
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
     var qc = quic_conn.Connection.init(gpa, .server, &dcid) catch return error.H3Error;
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
     const dgram = buildRequest(gpa, &dcid, 0, h3_bytes) catch return error.H3Error;
@@ -2372,7 +2372,7 @@ test "a completed request stream is dropped and a late frame does not resurrect 
     const dcid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2408,7 +2408,7 @@ test "retiring a higher stream id does not block a new lower one" {
     const dcid = [_]u8{ 0xf1, 0xf2, 0xf3, 0xf4 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2438,7 +2438,7 @@ test "a peer reset reclaims the request stream" {
     const dcid = [_]u8{ 0xba, 0xbb, 0xbc, 0xbd };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2449,7 +2449,7 @@ test "a peer reset reclaims the request stream" {
     try varint.append(&rframe, gpa, 0); // stream id 0
     try varint.append(&rframe, gpa, 0x10); // application error code
     try varint.append(&rframe, gpa, 0); // final size 0
-    const dgram = try quic_conn.testBuildApp(gpa, &dcid, 0, rframe.items);
+    const dgram = try quic_conn.test_support.buildApp(gpa, &dcid, 0, rframe.items);
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
     try h3.pump(0);
@@ -2470,7 +2470,7 @@ test "a peer STOP_SENDING resets our send half" {
     const dcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2483,7 +2483,7 @@ test "a peer STOP_SENDING resets our send half" {
     try sframe.append(gpa, 0x05); // STOP_SENDING
     try varint.append(&sframe, gpa, 0); // stream id 0
     try varint.append(&sframe, gpa, 0x10); // error code
-    const dgram = try quic_conn.testBuildApp(gpa, &dcid, 0, sframe.items);
+    const dgram = try quic_conn.test_support.buildApp(gpa, &dcid, 0, sframe.items);
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
 
@@ -2491,9 +2491,9 @@ test "a peer STOP_SENDING resets our send half" {
     try qc.flushSend(2000);
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
+    quic_conn.test_support.installAppKeys(&peer);
     try peer.sendStreamData(0, &.{}, false);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -2511,7 +2511,7 @@ fn buildRequestOnFin(gpa: std.mem.Allocator, dcid: []const u8, stream_id: u64, p
     try varint.append(&sframe, gpa, stream_id);
     try varint.append(&sframe, gpa, h3_bytes.len);
     try sframe.appendSlice(gpa, h3_bytes);
-    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, pn, sframe.items);
+    return @import("../quic/connection.zig").test_support.buildApp(gpa, dcid, pn, sframe.items);
 }
 
 test "pumpStreams advances a request changed by each datagram" {
@@ -2519,7 +2519,7 @@ test "pumpStreams advances a request changed by each datagram" {
     const dcid = [_]u8{ 0xa6, 0xa7, 0xa8, 0xb9 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
     h3.peer_settings = .{};
@@ -2531,7 +2531,7 @@ test "pumpStreams advances a request changed by each datagram" {
     var stream_frame: std.ArrayListUnmanaged(u8) = .empty;
     defer stream_frame.deinit(gpa);
     try quic_frame.encodeStream(&stream_frame, gpa, 0, 0, headers.items, false);
-    const first = try quic_conn.testBuildApp(gpa, &dcid, 0, stream_frame.items);
+    const first = try quic_conn.test_support.buildApp(gpa, &dcid, 0, stream_frame.items);
     defer gpa.free(first);
     try qc.receiveDatagram(first, 1000);
     try h3.pumpStreams(qc.changedStreamIds());
@@ -2542,7 +2542,7 @@ test "pumpStreams advances a request changed by each datagram" {
     try h3_frame.append(&data, gpa, .data, "x");
     stream_frame.clearRetainingCapacity();
     try quic_frame.encodeStream(&stream_frame, gpa, 0, headers.items.len, data.items, false);
-    const second = try quic_conn.testBuildApp(gpa, &dcid, 1, stream_frame.items);
+    const second = try quic_conn.test_support.buildApp(gpa, &dcid, 1, stream_frame.items);
     defer gpa.free(second);
     try qc.receiveDatagram(second, 2000);
     try h3.pumpStreams(qc.changedStreamIds());
@@ -2554,7 +2554,7 @@ test "pumpAll advances more than the small stack stream snapshot" {
     const dcid = [_]u8{ 0xa6, 0xa7, 0xa8, 0xa9 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
     h3.peer_settings = .{};
@@ -2590,7 +2590,7 @@ test "pumpAll rejects request streams before peer SETTINGS" {
     const dcid = [_]u8{ 0xa6, 0xa7, 0xa8, 0xaa };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2607,8 +2607,8 @@ test "pumpAll rejects request streams before peer SETTINGS" {
 
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -2625,7 +2625,7 @@ test "client decodes an HTTP/3 response over a request stream" {
     const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb3 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
@@ -2672,7 +2672,7 @@ test "a response stream ending with a truncated frame is a connection error" {
     const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb7 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
@@ -2701,7 +2701,7 @@ test "HEAD response may end before the advertised content length" {
     const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb4 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2742,7 +2742,7 @@ test "client rejects trailers on bodyless responses" {
         const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xbe };
         var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         try qc.sendStreamData(0, &.{}, false);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
@@ -2780,7 +2780,7 @@ test "client rejects trailers on bodyless responses" {
         const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xbf };
         var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         try qc.sendStreamData(0, &.{}, false);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
@@ -2817,7 +2817,7 @@ test "client rejects Content-Length on responses that cannot carry it" {
     inline for (.{ "103", "204" }) |status| {
         var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         try qc.sendStreamData(0, &.{}, false);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
@@ -2847,7 +2847,7 @@ test "HEAD response send path rejects DATA and trailers" {
     const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb8 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2874,7 +2874,7 @@ test "response send path enforces outbound Content-Length" {
         const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xba };
         var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
 
@@ -2891,7 +2891,7 @@ test "response send path enforces outbound Content-Length" {
         const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xbd };
         var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
 
@@ -2908,7 +2908,7 @@ test "204 response send path rejects DATA and trailers" {
     const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb9 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -2923,7 +2923,7 @@ test "client decodes informational then final HTTP/3 response" {
     const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb5 };
     var server_qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer server_qc.deinit();
-    quic_conn.testInstallAppKeys(&server_qc);
+    quic_conn.test_support.installAppKeys(&server_qc);
     var server_h3 = Connection.init(gpa, &server_qc);
     defer server_h3.deinit();
 
@@ -2934,7 +2934,7 @@ test "client decodes informational then final HTTP/3 response" {
 
     var client_qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer client_qc.deinit();
-    quic_conn.testInstallAppKeys(&client_qc);
+    quic_conn.test_support.installAppKeys(&client_qc);
     try client_qc.sendStreamData(0, &.{}, false);
     var client_h3 = Connection.init(gpa, &client_qc);
     defer client_h3.deinit();
@@ -2963,7 +2963,7 @@ test "client rejects 101 Switching Protocols in HTTP/3 response" {
     const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xba };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
@@ -2991,7 +2991,7 @@ test "client rejects a malformed PUSH_PROMISE as a frame error" {
     const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xbb };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
@@ -3007,8 +3007,8 @@ test "client rejects a malformed PUSH_PROMISE as a frame error" {
 
     var peer = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -3025,7 +3025,7 @@ test "client rejects PUSH_PROMISE when push is disabled" {
     const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xbc };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
@@ -3041,8 +3041,8 @@ test "client rejects PUSH_PROMISE when push is disabled" {
 
     var peer = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -3059,7 +3059,7 @@ test "HTTP/3 response trailers flow into EndOfMessage" {
     const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb6 };
     var server_qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer server_qc.deinit();
-    quic_conn.testInstallAppKeys(&server_qc);
+    quic_conn.test_support.installAppKeys(&server_qc);
     var server_h3 = Connection.init(gpa, &server_qc);
     defer server_h3.deinit();
 
@@ -3070,7 +3070,7 @@ test "HTTP/3 response trailers flow into EndOfMessage" {
 
     var client_qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer client_qc.deinit();
-    quic_conn.testInstallAppKeys(&client_qc);
+    quic_conn.test_support.installAppKeys(&client_qc);
     try client_qc.sendStreamData(0, &.{}, false);
     var client_h3 = Connection.init(gpa, &client_qc);
     defer client_h3.deinit();
@@ -3097,7 +3097,7 @@ test "server dynamically encodes a response header when peer QPACK settings allo
     const dcid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb4 };
     var server_qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer server_qc.deinit();
-    quic_conn.testInstallAppKeys(&server_qc);
+    quic_conn.test_support.installAppKeys(&server_qc);
     var server_h3 = Connection.init(gpa, &server_qc);
     defer server_h3.deinit();
     server_h3.peer_settings = .{
@@ -3111,7 +3111,7 @@ test "server dynamically encodes a response header when peer QPACK settings allo
 
     var client_qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer client_qc.deinit();
-    quic_conn.testInstallAppKeys(&client_qc);
+    quic_conn.test_support.installAppKeys(&client_qc);
     try client_qc.sendStreamData(0, &.{}, false);
     var client_h3 = Connection.init(gpa, &client_qc);
     defer client_h3.deinit();
@@ -3155,7 +3155,7 @@ test "client sends an HTTP/3 request over the next request stream" {
     const dcid = [_]u8{ 0xba, 0xbb, 0xbc, 0xbd };
     var client_qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer client_qc.deinit();
-    quic_conn.testInstallAppKeys(&client_qc);
+    quic_conn.test_support.installAppKeys(&client_qc);
     var client_h3 = Connection.init(gpa, &client_qc);
     defer client_h3.deinit();
 
@@ -3165,7 +3165,7 @@ test "client sends an HTTP/3 request over the next request stream" {
 
     var server_qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer server_qc.deinit();
-    quic_conn.testInstallAppKeys(&server_qc);
+    quic_conn.test_support.installAppKeys(&server_qc);
     var server_h3 = Connection.init(gpa, &server_qc);
     defer server_h3.deinit();
 
@@ -3198,7 +3198,7 @@ test "client sends CONNECT without scheme or path pseudo-headers" {
     const dcid = [_]u8{ 0xba, 0xbb, 0xbc, 0xbe };
     var client_qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer client_qc.deinit();
-    quic_conn.testInstallAppKeys(&client_qc);
+    quic_conn.test_support.installAppKeys(&client_qc);
     var client_h3 = Connection.init(gpa, &client_qc);
     defer client_h3.deinit();
 
@@ -3208,7 +3208,7 @@ test "client sends CONNECT without scheme or path pseudo-headers" {
 
     var server_qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer server_qc.deinit();
-    quic_conn.testInstallAppKeys(&server_qc);
+    quic_conn.test_support.installAppKeys(&server_qc);
     var server_h3 = Connection.init(gpa, &server_qc);
     defer server_h3.deinit();
 
@@ -3237,7 +3237,7 @@ test "client sends HTTP/3 request DATA before ending the stream" {
     const dcid = [_]u8{ 0xbe, 0xbf, 0xc0, 0xc1 };
     var client_qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer client_qc.deinit();
-    quic_conn.testInstallAppKeys(&client_qc);
+    quic_conn.test_support.installAppKeys(&client_qc);
     var client_h3 = Connection.init(gpa, &client_qc);
     defer client_h3.deinit();
 
@@ -3249,7 +3249,7 @@ test "client sends HTTP/3 request DATA before ending the stream" {
 
     var server_qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer server_qc.deinit();
-    quic_conn.testInstallAppKeys(&server_qc);
+    quic_conn.test_support.installAppKeys(&server_qc);
     var server_h3 = Connection.init(gpa, &server_qc);
     defer server_h3.deinit();
 
@@ -3279,7 +3279,7 @@ test "client request send path enforces outbound Content-Length" {
         const dcid = [_]u8{ 0xbe, 0xbf, 0xc0, 0xc2 };
         var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
 
@@ -3292,7 +3292,7 @@ test "client request send path enforces outbound Content-Length" {
         const dcid = [_]u8{ 0xbe, 0xbf, 0xc0, 0xc3 };
         var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
 
@@ -3309,7 +3309,7 @@ test "client request send validates HTTP/3 fields" {
     const dcid = [_]u8{ 0xc2, 0xc3, 0xc4, 0xc5 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3344,7 +3344,7 @@ test "client rejects request pseudo-headers in an HTTP/3 response" {
     const dcid = [_]u8{ 0xb4, 0xb5, 0xb6, 0xb7 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     try qc.sendStreamData(0, &.{}, false);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
@@ -3372,7 +3372,7 @@ test "DATA before HEADERS is rejected" {
     const dcid = [_]u8{ 0x07, 0x07, 0x07, 0x07 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc); // H3 request data rides the Application space
+    quic_conn.test_support.installAppKeys(&qc); // H3 request data rides the Application space
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3390,7 +3390,7 @@ test "a request stream ending with a truncated frame is a connection error" {
     const dcid = [_]u8{ 0x07, 0x07, 0x07, 0x08 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3415,7 +3415,7 @@ fn buildRequestAt(gpa: std.mem.Allocator, dcid: []const u8, offset: u64, pn: u64
     try varint.append(&sframe, gpa, offset);
     try varint.append(&sframe, gpa, h3_bytes.len);
     try sframe.appendSlice(gpa, h3_bytes);
-    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, pn, sframe.items);
+    return @import("../quic/connection.zig").test_support.buildApp(gpa, dcid, pn, sframe.items);
 }
 
 test "a request split across two datagrams parses correctly (parsed-offset regression)" {
@@ -3423,7 +3423,7 @@ test "a request split across two datagrams parses correctly (parsed-offset regre
     const dcid = [_]u8{ 0x55, 0x66, 0x77, 0x88 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc); // H3 request data rides the Application space
+    quic_conn.test_support.installAppKeys(&qc); // H3 request data rides the Application space
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3458,7 +3458,7 @@ test "the event arena is reclaimed when the queue drains" {
     const dcid = [_]u8{ 0x21, 0x22, 0x23, 0x24 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc); // H3 request data rides the Application space
+    quic_conn.test_support.installAppKeys(&qc); // H3 request data rides the Application space
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3492,7 +3492,7 @@ test "a server sends a response: HEADERS then DATA then FIN" {
     const dcid = [_]u8{ 0x99, 0xaa, 0xbb, 0xcc };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3507,9 +3507,9 @@ test "a server sends a response: HEADERS then DATA then FIN" {
     try qc.flushSend(1000);
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
+    quic_conn.test_support.installAppKeys(&peer);
     try peer.sendStreamData(0, &.{}, false);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -3532,7 +3532,7 @@ test "the server resets a request stream" {
     const dcid = [_]u8{ 0x90, 0x91, 0x92, 0x93 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3544,9 +3544,9 @@ test "the server resets a request stream" {
 
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
+    quic_conn.test_support.installAppKeys(&peer);
     try peer.sendStreamData(0, &.{}, false);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -3564,7 +3564,7 @@ test "resetStream rejects an out-of-range QUIC error code without side effects" 
     const dcid = [_]u8{ 0x90, 0x91, 0x92, 0x94 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3581,7 +3581,7 @@ test "a reset after the response finished is a no-op" {
     const dcid = [_]u8{ 0x94, 0x95, 0x96, 0x97 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3601,7 +3601,7 @@ test "the server opens its control stream with a SETTINGS frame" {
     const dcid = [_]u8{ 0x31, 0x33, 0x37, 0x39 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3612,9 +3612,9 @@ test "the server opens its control stream with a SETTINGS frame" {
 
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
+    quic_conn.test_support.installAppKeys(&peer);
     try peer.sendStreamData(0, &.{}, false);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -3641,7 +3641,7 @@ test "the client opens its control stream on the first client uni stream" {
     const dcid = [_]u8{ 0x41, 0x43, 0x45, 0x47 };
     var client_qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer client_qc.deinit();
-    quic_conn.testInstallAppKeys(&client_qc);
+    quic_conn.test_support.installAppKeys(&client_qc);
     var client_h3 = Connection.init(gpa, &client_qc);
     defer client_h3.deinit();
 
@@ -3650,7 +3650,7 @@ test "the client opens its control stream on the first client uni stream" {
 
     var server_qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer server_qc.deinit();
-    quic_conn.testInstallAppKeys(&server_qc);
+    quic_conn.test_support.installAppKeys(&server_qc);
     var server_h3 = Connection.init(gpa, &server_qc);
     defer server_h3.deinit();
 
@@ -3674,7 +3674,7 @@ test "shutdown sends a GOAWAY on the control stream after SETTINGS" {
     const dcid = [_]u8{ 0x60, 0x61, 0x62, 0x63 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3683,8 +3683,8 @@ test "shutdown sends a GOAWAY on the control stream after SETTINGS" {
 
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -3708,7 +3708,7 @@ test "client shutdown sends a GOAWAY with a push id" {
     const dcid = [_]u8{ 0x60, 0x61, 0x62, 0x64 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3717,8 +3717,8 @@ test "client shutdown sends a GOAWAY with a push id" {
 
     var peer = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -3742,7 +3742,7 @@ test "a later GOAWAY may only lower the id" {
     const dcid = [_]u8{ 0x64, 0x65, 0x66, 0x67 };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3756,7 +3756,7 @@ test "a client GOAWAY may only lower the push id" {
     const dcid = [_]u8{ 0x64, 0x65, 0x66, 0x68 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3770,7 +3770,7 @@ test "shutdown rejects a non-request-stream id" {
     const dcid = [_]u8{ 0x68, 0x69, 0x6a, 0x6b };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3786,7 +3786,7 @@ test "after GOAWAY a request at or above the id is not processed" {
     const dcid = [_]u8{ 0x6c, 0x6d, 0x6e, 0x6f };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3819,7 +3819,7 @@ test "the response send API rejects invalid sequences and inputs" {
     const dcid = [_]u8{ 0x1a, 0x2b, 0x3c, 0x4d };
     var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -3869,7 +3869,7 @@ test "outbound HEADERS respect peer max field section size" {
         const dcid = [_]u8{ 0x1a, 0x2b, 0x3c, 0x4e };
         var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
 
@@ -3882,7 +3882,7 @@ test "outbound HEADERS respect peer max field section size" {
         const dcid = [_]u8{ 0x1a, 0x2b, 0x3c, 0x4f };
         var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
 
@@ -3896,7 +3896,7 @@ test "outbound HEADERS respect peer max field section size" {
         const dcid = [_]u8{ 0x1a, 0x2b, 0x3c, 0x50 };
         var qc = try quic_conn.Connection.init(gpa, .server, &dcid);
         defer qc.deinit();
-        quic_conn.testInstallAppKeys(&qc);
+        quic_conn.test_support.installAppKeys(&qc);
         var h3 = Connection.init(gpa, &qc);
         defer h3.deinit();
 
@@ -3916,7 +3916,7 @@ fn buildUni(gpa: std.mem.Allocator, dcid: []const u8, uni_id: u64, pn: u64, byte
     try varint.append(&sframe, gpa, uni_id);
     try varint.append(&sframe, gpa, bytes.len);
     try sframe.appendSlice(gpa, bytes);
-    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, pn, sframe.items);
+    return @import("../quic/connection.zig").test_support.buildApp(gpa, dcid, pn, sframe.items);
 }
 
 fn buildUniAt(gpa: std.mem.Allocator, dcid: []const u8, uni_id: u64, offset: u64, pn: u64, bytes: []const u8) ![]u8 {
@@ -3927,12 +3927,12 @@ fn buildUniAt(gpa: std.mem.Allocator, dcid: []const u8, uni_id: u64, offset: u64
     try varint.append(&sframe, gpa, offset);
     try varint.append(&sframe, gpa, bytes.len);
     try sframe.appendSlice(gpa, bytes);
-    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, pn, sframe.items);
+    return @import("../quic/connection.zig").test_support.buildApp(gpa, dcid, pn, sframe.items);
 }
 
 fn newH3Server(gpa: std.mem.Allocator, dcid: []const u8, qc: *quic_conn.Connection) Connection {
     qc.* = quic_conn.Connection.init(gpa, .server, dcid) catch unreachable;
-    quic_conn.testInstallAppKeys(qc);
+    quic_conn.test_support.installAppKeys(qc);
     return Connection.init(gpa, qc);
 }
 
@@ -4039,7 +4039,7 @@ test "a client accepts a server GOAWAY with a client request stream id" {
     const dcid = [_]u8{ 0xb3, 0xb4, 0xb5, 0xb6 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -4060,7 +4060,7 @@ test "a client does not open the first request after receiving GOAWAY zero" {
     const dcid = [_]u8{ 0xb3, 0xb4, 0xb5, 0xb8 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -4084,7 +4084,7 @@ test "a client may only open request streams below a received GOAWAY id" {
     const dcid = [_]u8{ 0xb3, 0xb4, 0xb5, 0xb9 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -4109,7 +4109,7 @@ test "a client surfaces a large HTTP/3 GOAWAY id without truncation" {
     const dcid = [_]u8{ 0xb3, 0xb4, 0xb5, 0xb7 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -4141,7 +4141,7 @@ test "a client rejects a server GOAWAY with a non-request-stream id" {
     const dcid = [_]u8{ 0xb7, 0xb8, 0xb9, 0xba };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -4222,7 +4222,7 @@ fn buildUniFin(gpa: std.mem.Allocator, dcid: []const u8, uni_id: u64, bytes: []c
     try varint.append(&sframe, gpa, uni_id);
     try varint.append(&sframe, gpa, bytes.len);
     try sframe.appendSlice(gpa, bytes);
-    return @import("../quic/connection.zig").testBuildApp(gpa, dcid, 0, sframe.items);
+    return @import("../quic/connection.zig").test_support.buildApp(gpa, dcid, 0, sframe.items);
 }
 
 test "closing the control stream is a connection error" {
@@ -4260,8 +4260,8 @@ test "closing the control stream with a truncated frame is a frame error" {
 
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -4449,7 +4449,7 @@ test "a client rejects MAX_PUSH_ID from a server" {
     const dcid = [_]u8{ 0xd5, 0xd6, 0xd7, 0xda };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -4526,8 +4526,8 @@ test "a control-stream violation closes with the specific H3 error code" {
     // Feed each built datagram separately (an ACK may precede the close packet).
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -4559,8 +4559,8 @@ test "a malformed SETTINGS closes with the specific H3 error code" {
 
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -4609,8 +4609,8 @@ test "a QPACK encoder stream can feed a dynamic request header" {
     try qc.flushSend(3000);
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 2);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 2);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -4744,9 +4744,9 @@ test "a rejected dynamic request sends QPACK stream cancellation" {
     try qc.flushSend(3000);
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
+    quic_conn.test_support.installAppKeys(&peer);
     try peer.sendStreamData(0, &.{}, false);
-    quic_conn.testSetAppNextPn(&peer, 2);
+    quic_conn.test_support.setAppNextPn(&peer, 2);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -4814,8 +4814,8 @@ test "a malformed QPACK encoder stream is a decompression connection error" {
 
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -4843,8 +4843,8 @@ test "a malformed QPACK decoder stream is a decoder stream error" {
 
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -4874,8 +4874,8 @@ test "closing the QPACK encoder stream with a truncated instruction is an encode
 
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -4903,8 +4903,8 @@ test "closing the QPACK decoder stream with a truncated instruction is a decoder
 
     var peer = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -5003,7 +5003,7 @@ test "a finished ignored uni stream is reclaimed" {
     try varint.append(&sframe, gpa, 2);
     try varint.append(&sframe, gpa, 1);
     try sframe.append(gpa, 0x21); // reserved/unknown stream type
-    const dgram = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 0, sframe.items);
+    const dgram = try @import("../quic/connection.zig").test_support.buildApp(gpa, &dcid, 0, sframe.items);
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
     try h3.pump(2);
@@ -5028,7 +5028,7 @@ test "a client-created push stream is a connection error" {
     try varint.append(&sframe, gpa, 2); // client-initiated uni stream
     try varint.append(&sframe, gpa, 1);
     try sframe.append(gpa, 0x01); // push stream type
-    const dgram = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 0, sframe.items);
+    const dgram = try @import("../quic/connection.zig").test_support.buildApp(gpa, &dcid, 0, sframe.items);
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
     try testing.expectError(error.H3Error, h3.pump(2));
@@ -5039,7 +5039,7 @@ test "a truncated server push stream header is a frame error" {
     const dcid = [_]u8{ 0xea, 0xeb, 0xec, 0xee };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -5049,15 +5049,15 @@ test "a truncated server push stream header is a frame error" {
     try varint.append(&sframe, gpa, 3); // server-initiated uni stream
     try varint.append(&sframe, gpa, 1);
     try sframe.append(gpa, 0x01); // push stream type
-    const dgram = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 0, sframe.items);
+    const dgram = try @import("../quic/connection.zig").test_support.buildApp(gpa, &dcid, 0, sframe.items);
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
     try testing.expectError(error.H3Error, h3.pump(3));
 
     var peer = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -5074,7 +5074,7 @@ test "a split truncated server push id is a frame error" {
     const dcid = [_]u8{ 0xea, 0xeb, 0xec, 0xf0 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -5084,7 +5084,7 @@ test "a split truncated server push id is a frame error" {
     try varint.append(&first, gpa, 3); // server-initiated uni stream
     try varint.append(&first, gpa, 2);
     try first.appendSlice(gpa, &.{ 0x01, 0x40 }); // push stream type, partial two-byte push id
-    const dg1 = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 0, first.items);
+    const dg1 = try @import("../quic/connection.zig").test_support.buildApp(gpa, &dcid, 0, first.items);
     defer gpa.free(dg1);
     try qc.receiveDatagram(dg1, 1000);
     try h3.pump(3);
@@ -5096,15 +5096,15 @@ test "a split truncated server push id is a frame error" {
     try varint.append(&second, gpa, 3);
     try varint.append(&second, gpa, 2); // offset after type + partial push id
     try varint.append(&second, gpa, 0);
-    const dg2 = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 1, second.items);
+    const dg2 = try @import("../quic/connection.zig").test_support.buildApp(gpa, &dcid, 1, second.items);
     defer gpa.free(dg2);
     try qc.receiveDatagram(dg2, 1100);
     try testing.expectError(error.H3Error, h3.pump(3));
 
     var peer = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 2);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 2);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -5121,7 +5121,7 @@ test "a reset server push stream with a partial push id is reclaimed" {
     const dcid = [_]u8{ 0xea, 0xeb, 0xec, 0xf1 };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -5131,12 +5131,12 @@ test "a reset server push stream with a partial push id is reclaimed" {
     try varint.append(&first, gpa, 3); // server-initiated uni stream
     try varint.append(&first, gpa, 2);
     try first.appendSlice(gpa, &.{ 0x01, 0x40 }); // push stream type, partial two-byte push id
-    const data = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 0, first.items);
+    const data = try @import("../quic/connection.zig").test_support.buildApp(gpa, &dcid, 0, first.items);
     defer gpa.free(data);
     try qc.receiveDatagram(data, 1000);
     try h3.pump(3);
 
-    const reset = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 1, &.{ 0x04, 0x03, 0x00, 0x03 });
+    const reset = try @import("../quic/connection.zig").test_support.buildApp(gpa, &dcid, 1, &.{ 0x04, 0x03, 0x00, 0x03 });
     defer gpa.free(reset);
     try qc.receiveDatagram(reset, 1100);
     try h3.pump(3);
@@ -5152,7 +5152,7 @@ test "a server push stream is rejected when the client did not enable push" {
     const dcid = [_]u8{ 0xea, 0xeb, 0xec, 0xef };
     var qc = try quic_conn.Connection.init(gpa, .client, &dcid);
     defer qc.deinit();
-    quic_conn.testInstallAppKeys(&qc);
+    quic_conn.test_support.installAppKeys(&qc);
     var h3 = Connection.init(gpa, &qc);
     defer h3.deinit();
 
@@ -5163,15 +5163,15 @@ test "a server push stream is rejected when the client did not enable push" {
     try varint.append(&sframe, gpa, 2);
     try sframe.append(gpa, 0x01); // push stream type
     try sframe.append(gpa, 0x00); // push id 0
-    const dgram = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 0, sframe.items);
+    const dgram = try @import("../quic/connection.zig").test_support.buildApp(gpa, &dcid, 0, sframe.items);
     defer gpa.free(dgram);
     try qc.receiveDatagram(dgram, 1000);
     try testing.expectError(error.H3Error, h3.pump(3));
 
     var peer = try quic_conn.Connection.init(gpa, .server, &dcid);
     defer peer.deinit();
-    quic_conn.testInstallAppKeys(&peer);
-    quic_conn.testSetAppNextPn(&peer, 1);
+    quic_conn.test_support.installAppKeys(&peer);
+    quic_conn.test_support.setAppNextPn(&peer, 1);
     const buf = qc.datagramsToSend();
     var off: usize = 0;
     for (qc.datagramLengths()) |len| {
@@ -5198,7 +5198,7 @@ test "an ignored uni stream finished by a separate FIN is still reclaimed" {
     try varint.append(&d1, gpa, 2);
     try varint.append(&d1, gpa, 2);
     try d1.appendSlice(gpa, &.{ 0x21, 0xaa }); // unknown type + a byte
-    const dg1 = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 0, d1.items);
+    const dg1 = try @import("../quic/connection.zig").test_support.buildApp(gpa, &dcid, 0, d1.items);
     defer gpa.free(dg1);
     try qc.receiveDatagram(dg1, 1000);
     try h3.pump(2);
@@ -5211,7 +5211,7 @@ test "an ignored uni stream finished by a separate FIN is still reclaimed" {
     try varint.append(&d2, gpa, 2);
     try varint.append(&d2, gpa, 2); // offset 2
     try varint.append(&d2, gpa, 0); // zero length
-    const dg2 = try @import("../quic/connection.zig").testBuildApp(gpa, &dcid, 1, d2.items);
+    const dg2 = try @import("../quic/connection.zig").test_support.buildApp(gpa, &dcid, 1, d2.items);
     defer gpa.free(dg2);
     try qc.receiveDatagram(dg2, 1100);
     try h3.pump(2);
