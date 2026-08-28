@@ -121,13 +121,13 @@ pub fn raise(exc: Object, msg: [*c]const u8) Object {
     return null;
 }
 pub fn raiseType(msg: [*c]const u8) Object {
-    return raise(if (builtin.os.tag == .windows) c.PyExc_TypeError.* else c.PyExc_TypeError, msg);
+    return raise(if (builtin.os.tag == .windows) c.PyExc_TypeError().* else c.PyExc_TypeError, msg);
 }
 pub fn raiseValue(msg: [*c]const u8) Object {
-    return raise(if (builtin.os.tag == .windows) c.PyExc_ValueError.* else c.PyExc_ValueError, msg);
+    return raise(if (builtin.os.tag == .windows) c.PyExc_ValueError().* else c.PyExc_ValueError, msg);
 }
 pub fn raiseRuntime(msg: [*c]const u8) Object {
-    return raise(if (builtin.os.tag == .windows) c.PyExc_RuntimeError.* else c.PyExc_RuntimeError, msg);
+    return raise(if (builtin.os.tag == .windows) c.PyExc_RuntimeError().* else c.PyExc_RuntimeError, msg);
 }
 pub fn errOccurred() bool {
     return c.PyErr_Occurred() != null;
@@ -170,7 +170,7 @@ pub const BorrowedBuffer = struct {
     acquired: bool = false,
 
     pub fn init(o: Object) ?BorrowedBuffer {
-        const bytes_type = if (builtin.os.tag == .windows) c.PyBytes_Type else &c.PyBytes_Type;
+        const bytes_type = if (builtin.os.tag == .windows) c.PyBytes_Type() else &c.PyBytes_Type;
         if (@intFromPtr(c.Py_TYPE(o)) == @intFromPtr(bytes_type)) {
             return .{ .bytes = asBytes(o) orelse return null, .stable_owner = o };
         }

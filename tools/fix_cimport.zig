@@ -73,8 +73,8 @@ pub fn main(init: std.process.Init) !void {
             if (externVariable(line)) |declaration| {
                 const replacement = try std.fmt.allocPrint(
                     gpa,
-                    "pub const {s} = @extern(*{s}, .{{ .name = \"{s}\", .is_dll_import = true }});",
-                    .{ declaration.name, declaration.type, declaration.name },
+                    "pub inline fn {s}() *{s} {{ return @extern(*{s}, .{{ .name = \"{s}\", .is_dll_import = true }}); }}",
+                    .{ declaration.name, declaration.type, declaration.type, declaration.name },
                 );
                 try out.appendSlice(gpa, replacement);
             } else {
@@ -144,7 +144,7 @@ fn appendImportedDataLine(
             while (index < line.len and isIdentifierContinue(line[index])) : (index += 1) {}
             const identifier = line[start..index];
             try out.appendSlice(gpa, identifier);
-            if (imported_data.contains(identifier)) try out.appendSlice(gpa, ".*");
+            if (imported_data.contains(identifier)) try out.appendSlice(gpa, "().*");
             continue;
         }
         try out.append(gpa, line[index]);
