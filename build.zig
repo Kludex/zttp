@@ -24,11 +24,24 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run pure-Zig core unit tests");
     test_step.dependOn(&run_core_tests.step);
 
-    // The parser-core property test ("fuzz: reader never panics ...") runs as
-    // part of `zig build test`; `zig build fuzz` is an alias that runs the same
-    // suite, kept as an explicit entry point for the adversarial-input net.
-    const fuzz_step = b.step("fuzz", "Run the parser-core adversarial-input property test");
+    const fuzz_driver_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("fuzz/target.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    fuzz_driver_tests.root_module.addImport("core", b.createModule(.{
+        .root_source_file = b.path("src/core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }));
+    const run_fuzz_driver_tests = b.addRunArtifact(fuzz_driver_tests);
+    const fuzz_step = b.step("fuzz", "Run core property tests and fuzz-driver smoke tests");
     fuzz_step.dependOn(&run_core_tests.step);
+    fuzz_step.dependOn(&run_fuzz_driver_tests.step);
 
     // A coverage-instrumented object exporting the `zttp_fuzz_drive` C ABI. The
     // C shim (fuzz/target.c) owns the libFuzzer entry point and registers this

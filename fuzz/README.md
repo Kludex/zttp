@@ -51,11 +51,13 @@ scripts/fuzz-docker -max_total_time=60
 ## libFuzzer target and OSS-Fuzz
 
 `fuzz/target.zig` exports `zttp_fuzz_drive`, a coverage-instrumented (`.fuzz`)
-drive of the core. The low 2 bits of the first input byte select the surface:
-the HTTP/1.1 reader, the HTTP/2 connection, or an HPACK / QPACK encode->decode
-roundtrip (a header list drawn from the input is encoded and must decode back
-identical - the write/read differential at the codec layer). `fuzz/target.c` is
-the libFuzzer/AFL++ entry point: it
+drive of the core. The first input byte modulo 6 selects the HTTP/1.1 reader,
+HTTP/2 connection, HPACK roundtrip, QPACK roundtrip, QUIC connection, or HTTP/3
+connection. The stateful QUIC targets authenticate structured packets, reorder
+stream fragments, reset streams, change paths, and mix in unauthenticated bytes.
+Inputs and retained state are capped so ASan and LeakSanitizer can run long
+campaigns without resource exhaustion. `fuzz/target.c` is the libFuzzer/AFL++
+entry point: it
 forwards to `zttp_fuzz_drive` and registers the Zig object's SanitizerCoverage
 counters with the engine - Zig 0.16 emits the counter section but not the
 registration hook clang would, so the shim wires it up. `zig build fuzz-obj`
