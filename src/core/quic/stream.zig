@@ -131,7 +131,9 @@ pub const RecvStream = struct {
         self.highest_received = new_high;
         if (fin) {
             self.final_size = end;
-            if (self.state == .recv) self.state = .size_known;
+            if (self.state == .recv) {
+                self.state = if (self.isFinished() and self.readable().len == 0) .data_read else .size_known;
+            }
         }
         return delta;
     }
@@ -563,6 +565,18 @@ test "consume slides the read offset" {
     try std.testing.expectEqual(@as(u64, 3), s.read_offset);
     s.consume(3);
     try std.testing.expectEqual(RecvState.data_read, s.state);
+}
+
+test "fin-only frame completes an already consumed receive stream" {
+    const gpa = std.testing.allocator;
+    var s = RecvStream.init(gpa);
+    defer s.deinit();
+    _ = try s.push(0, "abc", false);
+    s.consume(3);
+    try std.testing.expect(!s.isTerminal());
+    _ = try s.push(3, "", true);
+    try std.testing.expectEqual(RecvState.data_read, s.state);
+    try std.testing.expect(s.isTerminal());
 }
 
 test "receive stream batches prefix compaction" {
