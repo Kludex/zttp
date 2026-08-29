@@ -152,7 +152,8 @@ archs = ["arm64", "x86_64"]
 environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
 
 [tool.cibuildwheel.windows]
-archs = ["AMD64"]
+# Build amd64 on windows-latest and arm64 on windows-11-vs2026-arm.
+archs = ["native"]
 
 [tool.pytest.ini_options]
 addopts = "-rxXs --strict-config --strict-markers"
