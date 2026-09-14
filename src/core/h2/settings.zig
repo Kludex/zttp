@@ -9,7 +9,7 @@ const constants = @import("constants.zig");
 const SettingId = constants.SettingId;
 
 pub const SettingsError = error{
-    /// A value out of its defined range (ENABLE_PUSH not 0/1, MAX_FRAME_SIZE
+    /// A value out of its defined range (boolean setting not 0/1, MAX_FRAME_SIZE
     /// outside [16384, 2^24-1]). Connection error PROTOCOL_ERROR.
     ProtocolError,
     /// INITIAL_WINDOW_SIZE above 2^31-1. Connection error FLOW_CONTROL_ERROR.
@@ -29,6 +29,7 @@ pub const Settings = struct {
     initial_window_size: i32 = constants.DEFAULT_WINDOW_SIZE,
     max_frame_size: u32 = constants.DEFAULT_FRAME_SIZE,
     max_header_list_size: ?u32 = null, // unlimited until advertised
+    enable_connect_protocol: bool = false,
 
     /// Apply a validated SETTINGS payload (already length-checked as a multiple
     /// of 6 by frame.checkLength, re-checked here). Unknown ids are ignored.
@@ -58,6 +59,10 @@ pub const Settings = struct {
                     self.max_frame_size = value;
                 },
                 .max_header_list_size => self.max_header_list_size = value,
+                .enable_connect_protocol => {
+                    if (value > 1 or (self.enable_connect_protocol and value == 0)) return error.ProtocolError;
+                    self.enable_connect_protocol = value == 1;
+                },
                 _ => {}, // unknown setting: ignore (RFC 9113 6.5.2)
             }
         }
@@ -101,9 +106,16 @@ test "apply reports the initial-window-size delta" {
     try testing.expectEqual(@as(i32, 100000), s.initial_window_size);
 }
 
-test "apply rejects enable_push other than 0 or 1" {
+test "apply rejects boolean settings outside zero or one" {
     var s = Settings{};
     try testing.expectError(error.ProtocolError, s.apply(&entry(0x02, 2)));
+    try testing.expectError(error.ProtocolError, s.apply(&entry(0x08, 2)));
+}
+
+test "apply rejects disabling extended CONNECT after enabling it" {
+    var s = Settings{};
+    _ = try s.apply(&entry(0x08, 1));
+    try testing.expectError(error.ProtocolError, s.apply(&entry(0x08, 0)));
 }
 
 test "apply rejects max_frame_size out of range" {

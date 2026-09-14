@@ -78,6 +78,7 @@ def test_handshake_advertises_real_settings() -> None:
     assert settings[0x06] == 64 * 1024  # MAX_HEADER_LIST_SIZE
     assert settings[0x01] == 4096  # HEADER_TABLE_SIZE
     assert settings[0x05] == 16384  # MAX_FRAME_SIZE
+    assert settings[0x08] == 1  # ENABLE_CONNECT_PROTOCOL
 
 
 def test_advertised_settings_round_trip_to_a_peer() -> None:
@@ -116,6 +117,7 @@ def test_simple_get_request() -> None:
     assert req.method == b"GET"
     assert req.target == b"/"
     assert req.http_version == b"2"
+    assert req.protocol is None
     assert req.stream_id == 1
     assert req.end_stream is True
     assert (b"host", b"www.example.com") in req.headers
@@ -756,6 +758,89 @@ def _request_block(*extra: tuple[bytes, bytes], method: bytes = b"GET") -> bytes
     for name, value in extra:
         block += _lit(name, value)
     return block
+
+
+def test_extended_connect_delivers_stream_events() -> None:
+    conn = server_with(
+        frame(0x01, END_HEADERS, 1, _request_block((b":protocol", b"websocket"), method=b"CONNECT")),
+        frame(0x00, 0, 1, b"hello"),
+        frame(0x00, END_STREAM, 1, b" world"),
+    )
+
+    events = list(drain_h2(conn))
+
+    request = next(event for event in events if isinstance(event, zttp.Request))
+    assert request.protocol == b"websocket"
+    assert request.method == b"CONNECT"
+    assert request.target == b"/"
+    assert b"".join(event.data for event in events if isinstance(event, zttp.Data)) == b"hello world"
+    assert any(isinstance(event, zttp.EndOfMessage) for event in events)
+
+
+def test_extended_connect_protocol_participates_in_equality() -> None:
+    conn = server_with(
+        frame(0x01, END_HEADERS | END_STREAM, 1, _request_block((b":protocol", b"websocket"), method=b"CONNECT")),
+        frame(0x01, END_HEADERS | END_STREAM, 3, _request_block((b":protocol", b"connect-udp"), method=b"CONNECT")),
+    )
+
+    requests = [event for event in drain_h2(conn) if isinstance(event, zttp.Request)]
+
+    assert requests[0] != requests[1]
+
+
+def test_extended_connect_delivers_stream_reset() -> None:
+    conn = server_with(
+        frame(0x01, END_HEADERS, 1, _request_block((b":protocol", b"websocket"), method=b"CONNECT")),
+        frame(0x03, 0, 1, (0x08).to_bytes(4, "big")),
+    )
+
+    events = list(drain_h2(conn))
+
+    assert any(isinstance(event, zttp.Request) for event in events)
+    reset = next(event for event in events if isinstance(event, zttp.RstStream))
+    assert reset.stream_id == 1
+    assert reset.error_code == 0x08
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        _request_block((b":protocol", b"websocket")),
+        _request_block((b":protocol", b"web socket"), method=b"CONNECT"),
+        _request_block((b":protocol", b"websocket"), (b":protocol", b"other"), method=b"CONNECT"),
+        _lit(b":method", b"CONNECT")
+        + _lit(b":protocol", b"websocket")
+        + _lit(b":path", b"/")
+        + _lit(b":scheme", b"https"),
+        _lit(b":method", b"CONNECT")
+        + _lit(b":protocol", b"websocket")
+        + _lit(b":path", b"/")
+        + _lit(b":authority", b"x"),
+        _lit(b":method", b"CONNECT")
+        + _lit(b":protocol", b"websocket")
+        + _lit(b":scheme", b"https")
+        + _lit(b":authority", b"x"),
+        _lit(b":method", b"CONNECT")
+        + _lit(b":protocol", b"websocket")
+        + _lit(b":path", b"/")
+        + _lit(b":scheme", b"")
+        + _lit(b":authority", b"x"),
+        _lit(b":method", b"CONNECT")
+        + _lit(b":protocol", b"websocket")
+        + _lit(b":path", b"/")
+        + _lit(b":scheme", b"https")
+        + _lit(b":authority", b""),
+    ],
+)
+def test_extended_connect_rejects_invalid_pseudo_headers(block: bytes) -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, block))
+
+    events = list(drain_h2(conn))
+
+    assert not any(isinstance(event, zttp.Request) for event in events)
+    reset = next(event for event in events if isinstance(event, zttp.RstStream))
+    assert reset.stream_id == 1
+    assert reset.error_code == 0x01
 
 
 def test_server_accepts_request_trailers_after_finishing_its_response() -> None:

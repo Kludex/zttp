@@ -21,6 +21,7 @@ const RequestObject = extern struct {
     target: py.Object,
     path: py.Object,
     query: py.Object,
+    protocol: py.Object,
     http_version: py.Object,
     headers: py.Object,
     stream_id: c_ulonglong,
@@ -127,6 +128,7 @@ var request_members = [_]py.MemberDef{
     member("target", @offsetOf(RequestObject, "target")),
     member("path", @offsetOf(RequestObject, "path")),
     member("query", @offsetOf(RequestObject, "query")),
+    member("protocol", @offsetOf(RequestObject, "protocol")),
     member("http_version", @offsetOf(RequestObject, "http_version")),
     member("headers", @offsetOf(RequestObject, "headers")),
     .{ .name = "stream_id", .type = py.T_ULONGLONG, .offset = @intCast(@offsetOf(RequestObject, "stream_id")), .flags = py.READONLY, .doc = null },
@@ -340,6 +342,7 @@ const request_fields = .{
     FieldInfo(RequestObject){ .name = "http_version", .field = "http_version" },
     FieldInfo(RequestObject){ .name = "headers", .field = "headers" },
 };
+const request_cmp_fields = request_fields ++ .{FieldInfo(RequestObject){ .name = "protocol", .field = "protocol" }};
 // path/query are derived from target, so they're excluded from repr/eq to keep
 // the repr concise and equality non-redundant.
 const response_fields = .{
@@ -382,7 +385,7 @@ const reprSettings = reprFields(SettingsEventObject, "Settings", settings_fields
 const reprPing = reprFields(PingObject, "Ping", ping_fields);
 const reprWindowUpdate = reprFields(WindowUpdateObject, "WindowUpdate", window_update_fields);
 
-const cmpRequest = richcompareFields(RequestObject, request_fields);
+const cmpRequest = richcompareFields(RequestObject, request_cmp_fields);
 const cmpResponse = richcompareFields(ResponseObject, response_fields);
 const cmpData = richcompareFields(DataObject, data_fields);
 const cmpEom = richcompareFields(EndOfMessageObject, eom_fields);
@@ -1058,12 +1061,13 @@ fn makeRequestImpl(r: events.Request, lazy_headers: bool) py.Object {
     else
         py.fromBytes(r.path);
     s.query = if (r.query.len == 0) py.newRef(empty_bytes) else py.fromBytes(r.query);
+    s.protocol = if (r.protocol) |protocol| py.fromBytes(protocol) else py.none();
     s.http_version = internFrom(&INTERNED_VERSIONS, &interned_versions, r.http_version) orelse py.fromBytes(r.http_version);
     s.headers = if (lazy_headers) buildHeaderBlock(r.headers) else buildHeaders(r.headers);
     s.stream_id = r.stream_id;
     s.expect_continue = @intFromBool(r.expect_continue);
     s.end_stream = @intFromBool(r.end_stream);
-    if (s.method == null or s.target == null or s.path == null or s.query == null or s.http_version == null or s.headers == null) {
+    if (s.method == null or s.target == null or s.path == null or s.query == null or s.protocol == null or s.http_version == null or s.headers == null) {
         py.decref(o);
         return null;
     }

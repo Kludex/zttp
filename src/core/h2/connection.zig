@@ -242,12 +242,16 @@ pub const Connection = struct {
     /// MAX_CONCURRENT_STREAMS is the load-bearing one: the RFC default is unlimited,
     /// so without it a peer opens more streams than we accept and gets spurious
     /// REFUSED_STREAM resets. Fills `buf` and returns the populated prefix.
-    pub fn localSettingsParams(self: *const Connection, buf: *[4][2]u32) []const [2]u32 {
+    pub fn localSettingsParams(self: *const Connection, buf: *[5][2]u32) []const [2]u32 {
         const ids = constants.SettingId;
         buf[0] = .{ @intFromEnum(ids.max_concurrent_streams), self.limits.max_concurrent_streams };
         buf[1] = .{ @intFromEnum(ids.max_header_list_size), self.limits.max_header_list_size };
         buf[2] = .{ @intFromEnum(ids.header_table_size), self.limits.header_table_size };
         buf[3] = .{ @intFromEnum(ids.max_frame_size), self.limits.max_frame_size };
+        if (self.role == .server) {
+            buf[4] = .{ @intFromEnum(ids.enable_connect_protocol), 1 };
+            return buf[0..5];
+        }
         return buf[0..4];
     }
 
@@ -710,10 +714,11 @@ pub const Connection = struct {
     const Collapsed = struct { event: events.Request, content_length: ?u64 };
 
     /// Map HTTP/2 pseudo-headers + regular fields to a zttp Request (RFC 9113 8).
-    /// :method->method, :path->target, :authority->a synthesized lowercase host
-    /// header. Enforces: pseudo-headers precede regular fields; exactly one each
-    /// of :method/:scheme/:path; no response pseudo-header; lowercase names; no
-    /// connection-specific fields; TE only "trailers". Slices point into the HPACK
+    /// :method->method, :path->target, :protocol->protocol, and :authority->a
+    /// synthesized lowercase host header. Enforces: pseudo-headers precede regular
+    /// fields; exactly one each of :method/:scheme/:path; :protocol only on CONNECT
+    /// with :authority; no response pseudo-header; lowercase names; no connection-
+    /// specific fields; TE only "trailers". Slices point into the HPACK
     /// out_store (valid until the next decode) or req_scratch (owned, stable).
     fn collapseRequest(self: *Connection, headers: []const events.Header, id: u32) CollapseError!Collapsed {
         self.req_headers.clearRetainingCapacity();
@@ -722,6 +727,7 @@ pub const Connection = struct {
         var path: ?[]const u8 = null;
         var scheme: ?[]const u8 = null;
         var authority: ?[]const u8 = null;
+        var protocol: ?[]const u8 = null;
         var host: ?[]const u8 = null;
         var content_length: ?u64 = null;
         var seen_regular = false;
@@ -738,11 +744,14 @@ pub const Connection = struct {
                     if (path != null) return error.Malformed;
                     path = h.value;
                 } else if (eql(h.name, ":scheme")) {
-                    if (scheme != null) return error.Malformed;
+                    if (scheme != null or h.value.len == 0) return error.Malformed;
                     scheme = h.value;
                 } else if (eql(h.name, ":authority")) {
                     if (authority != null) return error.Malformed;
                     authority = h.value;
+                } else if (eql(h.name, ":protocol")) {
+                    if (protocol != null or !fields.isValidToken(h.value)) return error.Malformed;
+                    protocol = h.value;
                 } else {
                     return error.Malformed; // unknown or response pseudo-header
                 }
@@ -769,6 +778,9 @@ pub const Connection = struct {
         }
 
         if (method == null or path == null or scheme == null) return error.Malformed;
+        if (protocol != null and (!eql(method.?, "CONNECT") or authority == null or authority.?.len == 0)) {
+            return error.Malformed;
+        }
         const target = path.?;
         // RFC 9113 8.3.1: :path must be non-empty for http/https (the empty/CONNECT
         // and asterisk-form carve-outs are *, which is non-empty, so this is enough).
@@ -793,6 +805,7 @@ pub const Connection = struct {
                 .target = target,
                 .path = req_path,
                 .query = req_query,
+                .protocol = protocol,
                 .http_version = "2",
                 .headers = self.req_headers.items,
                 .stream_id = id,
@@ -1508,7 +1521,7 @@ test "localSettingsParams advertises the enforced limits" {
     var c = Connection.init(testing.allocator, .server);
     defer c.deinit();
     c.limits.max_concurrent_streams = 64;
-    var buf: [4][2]u32 = undefined;
+    var buf: [5][2]u32 = undefined;
     const params = c.localSettingsParams(&buf);
     var by_id = std.AutoHashMap(u32, u32).init(testing.allocator);
     defer by_id.deinit();
@@ -1517,6 +1530,7 @@ test "localSettingsParams advertises the enforced limits" {
     try testing.expectEqual(@as(?u32, c.limits.max_header_list_size), by_id.get(@intFromEnum(constants.SettingId.max_header_list_size)));
     try testing.expectEqual(@as(?u32, c.limits.header_table_size), by_id.get(@intFromEnum(constants.SettingId.header_table_size)));
     try testing.expectEqual(@as(?u32, c.limits.max_frame_size), by_id.get(@intFromEnum(constants.SettingId.max_frame_size)));
+    try testing.expectEqual(@as(?u32, 1), by_id.get(@intFromEnum(constants.SettingId.enable_connect_protocol)));
 }
 
 test "errorCode maps each H2Error to its RFC 9113 code" {

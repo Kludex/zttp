@@ -1,4 +1,4 @@
-"""HTTP/2 SETTINGS parameter identifiers.
+"""HTTP/2 SETTINGS parameter identifiers from RFC 9113 and RFC 8441.
 
 A `Settings` event carries `params` as raw `(id, value)` integer pairs. This enum
 names the ids (RFC 9113 6.5.2) so they can be read without magic numbers:
@@ -15,7 +15,7 @@ __all__ = ["H2Settings"]
 
 
 class H2Settings(IntEnum):
-    """The HTTP/2 SETTINGS parameter identifiers (RFC 9113 6.5.2).
+    """The HTTP/2 SETTINGS parameter identifiers (RFC 9113 6.5.2 and RFC 8441 3).
 
     Names the integer ids carried in a [`Settings`][zttp.Settings] event's `params`,
     so they can be read without magic numbers.
@@ -27,3 +27,4 @@ class H2Settings(IntEnum):
     INITIAL_WINDOW_SIZE = 0x04
     MAX_FRAME_SIZE = 0x05
     MAX_HEADER_LIST_SIZE = 0x06
+    ENABLE_CONNECT_PROTOCOL = 0x08

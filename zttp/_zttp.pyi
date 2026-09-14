@@ -77,6 +77,7 @@ class Request:
         target: The raw request-target, e.g. `b"/path?q=1"`.
         path: `target` up to the first `?` (not percent-decoded).
         query: `target` after the first `?`, or `b""` (not percent-decoded).
+        protocol: The extended CONNECT protocol, or `None` for ordinary requests.
         http_version: The version, e.g. `b"1.1"` (`b"2"` / `b"3"` on HTTP/2 and HTTP/3).
         headers: The header fields as `(name, value)` byte pairs, in received order.
         stream_id: The stream the request arrived on (`0` on HTTP/1.1).
@@ -89,6 +90,7 @@ class Request:
     target: bytes
     path: bytes
     query: bytes
+    protocol: bytes | None
     http_version: bytes
     headers: list[tuple[bytes, bytes]] | HeaderBlock
     stream_id: int

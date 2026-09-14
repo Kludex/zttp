@@ -48,6 +48,7 @@ def test_request_path_without_query() -> None:
     assert isinstance(req, zttp.Request)
     assert req.path == b"/plain"
     assert req.query == b""
+    assert req.protocol is None
 
 
 def test_endofmessage_and_data_repr() -> None:
