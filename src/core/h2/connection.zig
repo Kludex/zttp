@@ -744,7 +744,7 @@ pub const Connection = struct {
                     if (path != null) return error.Malformed;
                     path = h.value;
                 } else if (eql(h.name, ":scheme")) {
-                    if (scheme != null) return error.Malformed;
+                    if (scheme != null or h.value.len == 0) return error.Malformed;
                     scheme = h.value;
                 } else if (eql(h.name, ":authority")) {
                     if (authority != null) return error.Malformed;

@@ -777,6 +777,17 @@ def test_extended_connect_delivers_stream_events() -> None:
     assert any(isinstance(event, zttp.EndOfMessage) for event in events)
 
 
+def test_extended_connect_protocol_participates_in_equality() -> None:
+    conn = server_with(
+        frame(0x01, END_HEADERS | END_STREAM, 1, _request_block((b":protocol", b"websocket"), method=b"CONNECT")),
+        frame(0x01, END_HEADERS | END_STREAM, 3, _request_block((b":protocol", b"connect-udp"), method=b"CONNECT")),
+    )
+
+    requests = [event for event in drain_h2(conn) if isinstance(event, zttp.Request)]
+
+    assert requests[0] != requests[1]
+
+
 def test_extended_connect_delivers_stream_reset() -> None:
     conn = server_with(
         frame(0x01, END_HEADERS, 1, _request_block((b":protocol", b"websocket"), method=b"CONNECT")),
@@ -808,6 +819,11 @@ def test_extended_connect_delivers_stream_reset() -> None:
         _lit(b":method", b"CONNECT")
         + _lit(b":protocol", b"websocket")
         + _lit(b":scheme", b"https")
+        + _lit(b":authority", b"x"),
+        _lit(b":method", b"CONNECT")
+        + _lit(b":protocol", b"websocket")
+        + _lit(b":path", b"/")
+        + _lit(b":scheme", b"")
         + _lit(b":authority", b"x"),
     ],
 )

@@ -342,6 +342,7 @@ const request_fields = .{
     FieldInfo(RequestObject){ .name = "http_version", .field = "http_version" },
     FieldInfo(RequestObject){ .name = "headers", .field = "headers" },
 };
+const request_cmp_fields = request_fields ++ .{FieldInfo(RequestObject){ .name = "protocol", .field = "protocol" }};
 // path/query are derived from target, so they're excluded from repr/eq to keep
 // the repr concise and equality non-redundant.
 const response_fields = .{
@@ -384,7 +385,7 @@ const reprSettings = reprFields(SettingsEventObject, "Settings", settings_fields
 const reprPing = reprFields(PingObject, "Ping", ping_fields);
 const reprWindowUpdate = reprFields(WindowUpdateObject, "WindowUpdate", window_update_fields);
 
-const cmpRequest = richcompareFields(RequestObject, request_fields);
+const cmpRequest = richcompareFields(RequestObject, request_cmp_fields);
 const cmpResponse = richcompareFields(ResponseObject, response_fields);
 const cmpData = richcompareFields(DataObject, data_fields);
 const cmpEom = richcompareFields(EndOfMessageObject, eom_fields);
