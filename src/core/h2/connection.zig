@@ -778,7 +778,9 @@ pub const Connection = struct {
         }
 
         if (method == null or path == null or scheme == null) return error.Malformed;
-        if (protocol != null and (!eql(method.?, "CONNECT") or authority == null)) return error.Malformed;
+        if (protocol != null and (!eql(method.?, "CONNECT") or authority == null or authority.?.len == 0)) {
+            return error.Malformed;
+        }
         const target = path.?;
         // RFC 9113 8.3.1: :path must be non-empty for http/https (the empty/CONNECT
         // and asterisk-form carve-outs are *, which is non-empty, so this is enough).

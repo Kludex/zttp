@@ -825,6 +825,11 @@ def test_extended_connect_delivers_stream_reset() -> None:
         + _lit(b":path", b"/")
         + _lit(b":scheme", b"")
         + _lit(b":authority", b"x"),
+        _lit(b":method", b"CONNECT")
+        + _lit(b":protocol", b"websocket")
+        + _lit(b":path", b"/")
+        + _lit(b":scheme", b"https")
+        + _lit(b":authority", b""),
     ],
 )
 def test_extended_connect_rejects_invalid_pseudo_headers(block: bytes) -> None:
