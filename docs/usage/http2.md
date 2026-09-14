@@ -354,7 +354,7 @@ Those two snippets are a complete round-trip: feed `response_bytes` back to the
 client.receive_data(response_bytes)
 for event in drain(client):
     print(event)
-#> Settings(params=[(3, 128), (6, 65536), (1, 4096), (5, 16384)])
+#> Settings(params=[(3, 128), (6, 65536), (1, 4096), (5, 16384), (8, 1)])
 #> Response(status_code=200, reason=b'', http_version=b'2', headers=[(b'content-type', b'text/plain')])
 #> Data(data=b'Hello, HTTP/2!')
 #> EndOfMessage(trailers=[])

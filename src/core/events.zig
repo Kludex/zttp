@@ -27,6 +27,8 @@ pub const Request = struct {
     /// origin-form target (`/p?x=1`) this is the only split a consumer needs.
     path: []const u8,
     query: []const u8,
+    /// The extended CONNECT protocol, or null for ordinary requests.
+    protocol: ?[]const u8 = null,
     /// The version number only, e.g. "1.1" or "1.0" (the "HTTP/" is stripped).
     http_version: []const u8,
     headers: []const Header,

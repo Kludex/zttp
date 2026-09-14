@@ -1,4 +1,4 @@
-//! HTTP/2 wire constants (RFC 9113 + RFC 7541): frame types, flags, settings,
+//! HTTP/2 wire constants (RFC 9113 + RFC 7541 + RFC 8441): frame types, flags, settings,
 //! error codes, the client preface, and the per-frame-type length rules. The
 //! single source of truth, mirroring tables.zig's role for HTTP/1.1. Pure leaf:
 //! no state, no allocation.
@@ -66,6 +66,7 @@ pub const SettingId = enum(u16) {
     initial_window_size = 0x04,
     max_frame_size = 0x05,
     max_header_list_size = 0x06,
+    enable_connect_protocol = 0x08,
     _,
 };
 

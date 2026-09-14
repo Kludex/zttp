@@ -559,7 +559,7 @@ const H2Engine = struct {
     /// peer respects our limits (e.g. max_concurrent_streams) rather than the RFC
     /// defaults. Shared by every site that may emit the preface first.
     fn sendOurPreface(self: *H2Engine) core.h2.writer.WriteError!void {
-        var buf: [4][2]u32 = undefined;
+        var buf: [5][2]u32 = undefined;
         try self.writer.sendPreface(self.conn.localSettingsParams(&buf));
     }
 

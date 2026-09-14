@@ -7,6 +7,7 @@ from zttp import H2Settings
 def test_h2_settings_ids_match_the_wire() -> None:
     assert H2Settings.MAX_CONCURRENT_STREAMS == 0x03
     assert H2Settings.MAX_HEADER_LIST_SIZE == 0x06
+    assert H2Settings.ENABLE_CONNECT_PROTOCOL == 0x08
     # It is a real IntEnum: usable directly as the integer id.
     assert int(H2Settings.HEADER_TABLE_SIZE) == 1
     assert zttp.H2Settings is H2Settings
