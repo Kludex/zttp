@@ -10,8 +10,6 @@ allocator slack, so use many connections and compare repeated runs, not a
 single object's size or a process's peak RSS.
 """
 
-from __future__ import annotations
-
 import argparse
 import gc
 import importlib
