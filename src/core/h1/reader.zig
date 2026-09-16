@@ -4,9 +4,9 @@
 //! past data that produced a complete event.
 //!
 //! Buffer strategy: a single ArrayList. `consumed` marks how far parsing has
-//! progressed; `nextEvent` slices live into `buf.items[consumed..]`. We compact
-//! (drop the consumed prefix) lazily, only when the consumed region grows large,
-//! so steady-state parsing is append-and-advance with no per-call memmove.
+//! progressed; `nextEvent` slices live into `buf.items[consumed..]`. Empty buffers
+//! are reused on the next feed. Partially consumed buffers are compacted lazily,
+//! only when the consumed region grows large, to avoid per-call memmove.
 
 const std = @import("std");
 const events = @import("../events.zig");
@@ -201,6 +201,7 @@ pub const Reader = struct {
         }
         if (self.eof_seen) return self.fail(error.ProtocolError);
         try self.checkBufferLimit(data.len);
+        if (self.backlogEmpty()) self.compact();
         self.buf.appendSlice(self.gpa, data) catch return self.fail(error.MessageTooLong);
     }
 
@@ -342,8 +343,8 @@ pub const Reader = struct {
         // buffer - no copy. This is safe because the produced request/response
         // event is fully materialised into Python bytes within the same
         // nextEvent call (before any feed/compact can move the buffer): the
-        // event's slices never outlive this call. Compaction only runs at the
-        // top of the NEXT dispatch, by which point the bytes are already copied.
+        // event's slices never outlive this call. A later feed or dispatch can
+        // compact the buffer only after those bytes have been copied.
         const head = region[0..head_len];
         self.consumed += head_len;
 
@@ -712,6 +713,44 @@ test "keep-alive: two requests via reset" {
     try r.reset();
     e = try r.nextEvent();
     try t.expectEqualStrings("/b", e.request.target);
+}
+
+test "keep-alive reuses allocations after the first request" {
+    var failing = t.FailingAllocator.init(t.allocator, .{});
+    var r = Reader.init(failing.allocator(), .server);
+    defer r.deinit();
+    const request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    try r.feed(request);
+    try t.expect((try r.nextEvent()).request.end_stream);
+    try r.reset();
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    for (0..3000) |_| {
+        try r.feed(request);
+        const event = try r.nextEvent();
+        try t.expectEqualStrings("/", event.request.target);
+        try t.expectEqualStrings("example.com", event.request.headers[0].value);
+        try t.expect(event.request.end_stream);
+        try r.reset();
+    }
+    try expectTag(.need_data, try r.nextEvent());
+}
+
+test "streaming body reuses allocations across feeds" {
+    var failing = t.FailingAllocator.init(t.allocator, .{});
+    var r = Reader.init(failing.allocator(), .server);
+    defer r.deinit();
+    try r.feed("POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3000\r\n\r\n");
+    try expectTag(.request, try r.nextEvent());
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    for (0..3000) |_| {
+        try r.feed("x");
+        try t.expectEqualStrings("x", (try r.nextEvent()).data.data);
+    }
+    try expectTag(.end_of_message, try r.nextEvent());
 }
 
 test "reset cannot un-poison a failed connection" {
