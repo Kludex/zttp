@@ -74,10 +74,6 @@ The measurements include native buffers, Python objects, the holding list, and
 allocator slack. They exclude sockets, TLS, response serialization, and
 application state. Pass `--requests 0` to measure fresh connections only.
 
-zttp reuses a fully consumed receive buffer on the next feed. Small keep-alive
-requests therefore do not accumulate an unused prefix across requests. Larger
-inputs can still grow buffers whose capacity remains allocated for reuse.
-
 !!! info "RSS is not an exact allocation count"
     Use more connections to reduce page-size and allocator noise. A small or
     negative delta can mean existing allocator pools satisfied new allocations.
