@@ -51,6 +51,35 @@ Uvicorn benchmark materializes equivalent ASGI scopes before counting a request.
 | Chrome navigation `GET` | Keep-alive | 498k scope/s | 372k scope/s | **1.34x** |
 | k8s ingress proxied `GET` | Keep-alive | 513k scope/s | 386k scope/s | **1.33x** |
 
+## HTTP/1.1 idle memory
+
+```console
+./scripts/bench memory --connections 2000 --requests 3000 --repeats 5
+./scripts/bench memory --connections 100000 --requests 2 --repeats 5
+```
+
+You measure resident set size (RSS), the memory currently resident in RAM, with
+`ps` on Linux or macOS. Each sample uses a fresh process for one parser. The
+parent samples RSS while that process is paused after construction and again
+after every connection has handled the requested number of messages.
+
+The output reports median bytes per connection and the range across repeated
+runs. It subtracts a baseline containing imports and 10,000 live warmup parsers.
+Those warmup objects occupy free allocator pools left by imports, so their
+unused capacity does not hide the cost of the measured connections.
+
+Both parsers consume the same tiny `GET` and discard request data. zttp resets
+for the next request. httptools uses a protocol instance with five callbacks.
+The measurements include native buffers, Python objects, the holding list, and
+allocator slack. They exclude sockets, TLS, response serialization, and
+application state. Pass `--requests 0` to measure fresh connections only.
+
+!!! info "RSS is not an exact allocation count"
+    Use more connections to reduce page-size and allocator noise. A small or
+    negative delta can mean existing allocator pools satisfied new allocations.
+    `sys.getsizeof()` misses separate native buffers, and peak RSS includes
+    temporary allocations that are no longer live.
+
 ## HTTP/2
 
 This benchmark compares zttp with [h2](https://python-hyper.org/projects/h2/),
@@ -123,6 +152,7 @@ The benchmark scripts live in `benchmarks/`.
 | --- | --- |
 | `benchmarks/http1.py` | httptools (C) and h11 (pure Python) |
 | `benchmarks/uvicorn.py` | Uvicorn-shaped ASGI scope construction with httptools |
+| `benchmarks/memory.py` | HTTP/1.1 idle RSS with httptools |
 | `benchmarks/http2.py` | h2 (pure Python) |
 | `benchmarks/http3.py` | aioquic (Python QUIC with C QPACK) |
 
@@ -138,7 +168,7 @@ This runs all three suites. Run one protocol to forward options to its script:
 ./scripts/bench uvicorn --lifecycle both
 ```
 
-Each suite verifies both implementations extract or exchange equivalent data
+Each throughput suite verifies both implementations extract or exchange equivalent data
 before timing. It runs short batches in an interleaved round-robin, with garbage
 collection disabled during each batch. This reduces bias from thermal drift,
 scheduler placement, and garbage collection. The output includes the median,
