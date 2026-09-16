@@ -79,7 +79,7 @@ def worker(label: str, connections: int, requests: int) -> None:
                 event = parser.receive_event(REQUEST)
                 assert isinstance(event, module.Request) and event.end_stream
                 assert event.method == b"GET" and event.target == b"/"
-                assert list(event.headers) == [(b"Host", b"example.com")]
+                assert len(event.headers) == 1 and event.headers[0] == (b"Host", b"example.com")
                 del event
                 parser.start_next_cycle()
             assert parser.next_event() is module.NEED_DATA
