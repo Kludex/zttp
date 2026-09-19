@@ -1064,6 +1064,7 @@ pub const Connection = struct {
         id: u32,
         headers: []const events.Header,
     ) writer_mod.WriteError!void {
+        try self.registerSendStream(id);
         const s = self.streams.getPtr(id) orelse return error.LocalProtocol;
         if (self.role == .server and !s.response_started) return error.LocalProtocol;
         if (s.send_end_pending or s.state == .half_closed_local or s.state == .closed) return error.LocalProtocol;
@@ -2659,4 +2660,25 @@ test "trailer framing can resume after each writer allocation failure" {
         if (!failing.has_induced_failure) break;
     }
     try testing.expect(failures >= 2);
+}
+
+test "request trailers register a stream without preceding body data" {
+    var conn = Connection.init(testing.allocator, .client);
+    defer conn.deinit();
+    var writer = writer_mod.Writer.init(testing.allocator, .client);
+    defer writer.deinit();
+    try writer.sendPreface(&.{});
+    const id = try writer.sendRequest("GET", "/", "https", "example.org", &.{}, false);
+    try conn.sendStreamTrailers(&writer, id, &.{.{ .name = "x-result", .value = "ok" }});
+
+    var peer = Connection.init(testing.allocator, .server);
+    defer peer.deinit();
+    try peer.feed(writer.pending());
+    try testing.expectEqual(std.meta.Tag(Event).settings, std.meta.activeTag(try peer.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try peer.nextEvent()));
+    const end = (try peer.nextEvent()).end_of_message;
+    try testing.expectEqual(@as(usize, 1), end.trailers.len);
+    try testing.expectEqualStrings("x-result", end.trailers[0].name);
+    try testing.expectEqualStrings("ok", end.trailers[0].value);
+    try testing.expectEqual(Event.need_data, try peer.nextEvent());
 }
