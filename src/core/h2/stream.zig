@@ -63,6 +63,7 @@ pub const Stream = struct {
     /// closes it at the right point). Empty/false for streams that never send.
     send_pending: std.ArrayListUnmanaged(u8) = .empty,
     send_end_pending: bool = false,
+    send_trailers: ?[]const u8 = null,
 
     pub fn init(id: u32, recv_window: i32, send_window: i32) Stream {
         return .{ .id = id, .recv_window = recv_window, .send_window = send_window };
@@ -70,6 +71,7 @@ pub const Stream = struct {
 
     pub fn deinit(self: *Stream, gpa: std.mem.Allocator) void {
         self.send_pending.deinit(gpa);
+        if (self.send_trailers) |block| gpa.free(block);
     }
 
     /// Does this stream count toward MAX_CONCURRENT_STREAMS? Only open and the
