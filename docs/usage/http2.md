@@ -423,6 +423,41 @@ They flow out of `next_event` like any other event. Most applications can ignore
 them, since zttp acts on the ones that matter (crediting windows, releasing
 parked data) on its own, but they're there when you need visibility.
 
+## Trailers
+
+```python
+import zttp
+
+client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+request = client.send_request(b"GET", b"/", b"2", [(b"host", b"example.com"), (b"te", b"trailers")])
+request.end_message()
+
+server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+server.receive_data(client.data_to_send())
+while server.next_event() is not zttp.NEED_DATA:
+    pass
+
+response = server.stream(request.stream_id)
+response.send_response(200, [(b"trailer", b"x-checksum")])
+response.send_data(b"hello")
+response.end_message([(b"x-checksum", b"abc")])
+
+client.receive_data(server.data_to_send())
+while (event := client.next_event()) is not zttp.NEED_DATA:
+    if isinstance(event, zttp.EndOfMessage):
+        assert event.trailers == [(b"x-checksum", b"abc")]
+```
+
+Trailers are headers sent after the body. Pass them to `Stream.end_message()` on
+request or response streams. Use lowercase header names without pseudo-headers.
+
+If flow control delays body data, zttp queues the trailers until that data has
+been sent. This keeps the final `HEADERS` frame after the body. You cannot send
+more body data or trailers after calling `end_message()`.
+
+An empty trailer list ends the stream with a `DATA` frame, just like omitting
+trailers. The receiving peer exposes trailing headers in `EndOfMessage.trailers`.
+
 ## Where to go next
 
 <div class="grid cards" markdown>

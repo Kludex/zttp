@@ -1015,6 +1015,11 @@ pub const Connection = struct {
         self.maybeEvictDone(id);
     }
 
+    /// Record a final response head after registering the stream and writing its HEADERS.
+    pub fn markResponseStarted(self: *Connection, id: u32) void {
+        if (self.streams.getPtr(id)) |s| s.response_started = true;
+    }
+
     /// The highest peer-initiated stream id seen so far - the natural last-stream-id
     /// for a GOAWAY (everything above it was never processed).
     pub fn lastPeerStreamId(self: *const Connection) u32 {
@@ -1046,8 +1051,25 @@ pub const Connection = struct {
         // so it may be absent here; sending on a dead stream is a recoverable local
         // protocol error, not a null-optional trap.
         const s = self.streams.getPtr(id) orelse return error.LocalProtocol;
+        if (s.send_end_pending or s.state == .half_closed_local or s.state == .closed) return error.LocalProtocol;
         if (data.len != 0) s.send_pending.appendSlice(self.gpa, data) catch return error.OutOfMemory;
         if (end_stream) s.send_end_pending = true;
+        try self.flushStream(writer, id);
+    }
+
+    /// Queue trailers after all pending DATA and close the local side of the stream.
+    pub fn sendStreamTrailers(
+        self: *Connection,
+        writer: *writer_mod.Writer,
+        id: u32,
+        headers: []const events.Header,
+    ) writer_mod.WriteError!void {
+        try self.registerSendStream(id);
+        const s = self.streams.getPtr(id) orelse return error.LocalProtocol;
+        if (self.role == .server and !s.response_started) return error.LocalProtocol;
+        if (s.send_end_pending or s.state == .half_closed_local or s.state == .closed) return error.LocalProtocol;
+        s.send_trailers = try writer_mod.Writer.encodeTrailers(self.gpa, headers);
+        s.send_end_pending = true;
         try self.flushStream(writer, id);
     }
 
@@ -1111,7 +1133,7 @@ pub const Connection = struct {
             const remaining = s.send_pending.items.len - off;
             const chunk: usize = @intCast(@min(@min(room, @as(i64, max_frame)), @as(i64, @intCast(remaining))));
             const last = off + chunk == s.send_pending.items.len;
-            const end = last and s.send_end_pending;
+            const end = last and s.send_end_pending and s.send_trailers == null;
             try writer.writeDataFrame(id, s.send_pending.items[off .. off + chunk], end);
             s.send_window -= @intCast(chunk);
             self.conn_send_window -= @intCast(chunk);
@@ -1127,10 +1149,14 @@ pub const Connection = struct {
             std.mem.copyForwards(u8, s.send_pending.items[0..rest], s.send_pending.items[off..]);
             s.send_pending.shrinkRetainingCapacity(rest);
         }
-        // A bodyless end (END_STREAM with no buffered bytes left) still needs an
-        // empty DATA frame to close the stream.
         if (s.send_pending.items.len == 0 and s.send_end_pending) {
-            try writer.writeDataFrame(id, &.{}, true);
+            if (s.send_trailers) |block| {
+                try writer.frameHeaderBlock(id, block, true);
+                self.gpa.free(block);
+                s.send_trailers = null;
+            } else {
+                try writer.writeDataFrame(id, &.{}, true);
+            }
             s.send_end_pending = false;
             s.sendApply(true);
         }
@@ -2564,4 +2590,95 @@ test "fuzz: connection never panics on adversarial frames" {
         for (buf[0..len]) |*b| b.* = rand.int(u8);
         driveConnection(buf[0..len]);
     }
+}
+
+test "outbound trailers release their allocations on completion and reset" {
+    const Case = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            for ([_]usize{ 1, 65536 }) |size| {
+                var conn = Connection.init(gpa, .client);
+                defer conn.deinit();
+                var writer = writer_mod.Writer.init(gpa, .client);
+                defer writer.deinit();
+                const id = try writer.sendRequest("POST", "/", "https", "example.org", &.{}, false);
+                const body = try gpa.alloc(u8, size);
+                defer gpa.free(body);
+                @memset(body, 'x');
+                try conn.sendStreamData(&writer, id, body, false);
+                try conn.sendStreamTrailers(&writer, id, &.{.{ .name = "x-result", .value = "ok" }});
+                try testing.expectEqual(size > 65535, conn.hasPendingSend());
+                conn.localReset(id);
+                try testing.expect(!conn.hasPendingSend());
+            }
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Case.run, .{});
+}
+
+test "trailer framing can resume after each writer allocation failure" {
+    var failures: usize = 0;
+    for (0..8) |fail_index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var writer = writer_mod.Writer.init(failing.allocator(), .client);
+        defer writer.deinit();
+        var conn = Connection.init(testing.allocator, .client);
+        defer conn.deinit();
+        try writer.sendPreface(&.{});
+        const id = try writer.sendRequest("GET", "/", "https", "example.org", &.{}, false);
+        try conn.registerSendStream(id);
+        const before = try testing.allocator.dupe(u8, writer.pending());
+        defer testing.allocator.free(before);
+        failing.fail_index = failing.alloc_index + fail_index;
+        failing.resize_fail_index = failing.resize_index;
+        const value = "x" ** 60000;
+        conn.sendStreamTrailers(&writer, id, &.{.{ .name = "x-result", .value = value }}) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqualSlices(u8, before, writer.pending());
+            try testing.expect(conn.hasPendingSend());
+            failing.fail_index = std.math.maxInt(usize);
+            failing.resize_fail_index = std.math.maxInt(usize);
+            try conn.flushSendable(&writer);
+            failures += 1;
+        };
+        var peer = Connection.init(testing.allocator, .server);
+        defer peer.deinit();
+        try peer.feed(writer.pending());
+        var endings: usize = 0;
+        while (true) {
+            switch (try peer.nextEvent()) {
+                .need_data => break,
+                .end_of_message => |end| {
+                    try testing.expectEqual(@as(usize, 1), end.trailers.len);
+                    try testing.expectEqualStrings("x-result", end.trailers[0].name);
+                    try testing.expectEqualStrings(value, end.trailers[0].value);
+                    endings += 1;
+                },
+                else => {},
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), endings);
+        if (!failing.has_induced_failure) break;
+    }
+    try testing.expect(failures >= 2);
+}
+
+test "request trailers register a stream without preceding body data" {
+    var conn = Connection.init(testing.allocator, .client);
+    defer conn.deinit();
+    var writer = writer_mod.Writer.init(testing.allocator, .client);
+    defer writer.deinit();
+    try writer.sendPreface(&.{});
+    const id = try writer.sendRequest("GET", "/", "https", "example.org", &.{}, false);
+    try conn.sendStreamTrailers(&writer, id, &.{.{ .name = "x-result", .value = "ok" }});
+
+    var peer = Connection.init(testing.allocator, .server);
+    defer peer.deinit();
+    try peer.feed(writer.pending());
+    try testing.expectEqual(std.meta.Tag(Event).settings, std.meta.activeTag(try peer.nextEvent()));
+    try testing.expectEqual(std.meta.Tag(Event).request, std.meta.activeTag(try peer.nextEvent()));
+    const end = (try peer.nextEvent()).end_of_message;
+    try testing.expectEqual(@as(usize, 1), end.trailers.len);
+    try testing.expectEqualStrings("x-result", end.trailers[0].name);
+    try testing.expectEqualStrings("ok", end.trailers[0].value);
+    try testing.expectEqual(Event.need_data, try peer.nextEvent());
 }

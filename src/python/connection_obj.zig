@@ -654,6 +654,7 @@ const H2Engine = struct {
             self.conn.endResponseStream(stream_id) catch return c.PyErr_NoMemory();
         } else {
             self.conn.registerSendStream(stream_id) catch return c.PyErr_NoMemory();
+            if (status >= 200) self.conn.markResponseStarted(stream_id);
         }
         return py.none();
     }
@@ -1898,21 +1899,18 @@ fn stream_end_message(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
     const e = self.engine() orelse return null;
     var hdrs_seq: ?*c.PyObject = null;
     if (c.PyArg_ParseTuple(args, "|O", &hdrs_seq) == 0) return null;
-    const has_headers = hdrs_seq != null and !py.isNone(hdrs_seq);
-    switch (e) {
-        // HTTP/2 send-side trailers are still a follow-up; an empty/absent list is the
-        // ordinary END_STREAM.
-        .h2 => |x| {
-            if (has_headers) return py.raise(exceptions.LocalProtocolError, "HTTP/2 send-side trailers are not supported yet");
-            return x.endStream(@intCast(self.stream_id));
+    var hdrs = BorrowedHeaders{};
+    defer hdrs.deinit();
+    if (hdrs_seq != null and !py.isNone(hdrs_seq) and !hdrs.borrow(hdrs_seq)) return null;
+    return switch (e) {
+        .h2 => |x| blk: {
+            if (hdrs.headers.len == 0) break :blk x.endStream(@intCast(self.stream_id));
+            x.conn.sendStreamTrailers(x.writer, @intCast(self.stream_id), hdrs.headers) catch |err|
+                break :blk h2RaiseWrite(err);
+            break :blk py.none();
         },
-        .h3 => |x| {
-            var hdrs = BorrowedHeaders{};
-            defer hdrs.deinit();
-            if (has_headers and !hdrs.borrow(hdrs_seq)) return null;
-            return x.endMessage(self.stream_id, hdrs.headers);
-        },
-    }
+        .h3 => |x| x.endMessage(self.stream_id, hdrs.headers),
+    };
 }
 
 // The default HTTP/3 reset code: H3_REQUEST_CANCELLED (RFC 9114 8.1).
@@ -1951,7 +1949,7 @@ var stream_methods = [_]py.MethodDef{
     .{ .ml_name = "send_response", .ml_meth = @ptrCast(lockedStreamKeywordMethod(stream_send_response)), .ml_flags = c.METH_VARARGS | c.METH_KEYWORDS, .ml_doc = "Serialize a response head on this stream: send_response(status, headers=None, end_stream=False). Pass end_stream=True for a bodyless response (204 / 304 / HEAD) to ride END_STREAM on the HEADERS frame and skip the trailing empty DATA frame." },
     .{ .ml_name = "send_informational", .ml_meth = lockedStreamMethod(stream_send_informational), .ml_flags = c.METH_VARARGS, .ml_doc = "Serialize an interim 1xx response head on this stream: send_informational(status, headers=None). The final response still follows on the same stream." },
     .{ .ml_name = "send_data", .ml_meth = lockedStreamMethod(stream_send_data), .ml_flags = c.METH_O, .ml_doc = "Queue body bytes on this stream (flow-controlled; parked until the send window allows)." },
-    .{ .ml_name = "end_message", .ml_meth = lockedStreamMethod(stream_end_message), .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message on this stream: end_message(trailers=None). HTTP/3 sends a trailing HEADERS frame for trailers; HTTP/2 send-side trailers are not supported yet." },
+    .{ .ml_name = "end_message", .ml_meth = lockedStreamMethod(stream_end_message), .ml_flags = c.METH_VARARGS, .ml_doc = "End the outgoing message on this stream: end_message(trailers=None). HTTP/2 and HTTP/3 send a trailing HEADERS frame for trailers." },
     .{ .ml_name = "reset", .ml_meth = lockedStreamMethod(stream_reset), .ml_flags = c.METH_VARARGS, .ml_doc = "Send RST_STREAM to cancel this stream: reset(error_code=CANCEL)." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };

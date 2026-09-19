@@ -139,6 +139,18 @@ pub const Writer = struct {
         try self.sendHeaderBlock(stream_id, &pseudo, headers, end_stream);
     }
 
+    /// Encode trailer fields for deferred framing. The caller owns the returned bytes.
+    pub fn encodeTrailers(gpa: std.mem.Allocator, headers: []const Header) WriteError![]u8 {
+        var block: std.ArrayList(u8) = .empty;
+        errdefer block.deinit(gpa);
+        for (headers) |h| {
+            try validateField(h);
+            if (!fields.trailerFieldAllowed(h.name)) return error.LocalProtocol;
+            try encoder.encodeHeader(&block, gpa, h);
+        }
+        return block.toOwnedSlice(gpa);
+    }
+
     /// HPACK-encode the pseudo-headers + regular headers and frame them as HEADERS
     /// (+ CONTINUATION if the block exceeds the peer's max frame size). Validates
     /// the regular headers reject forbidden bytes / connection-specific fields.
@@ -162,7 +174,9 @@ pub const Writer = struct {
     /// Split an encoded field block across HEADERS + CONTINUATION at the peer's
     /// max frame size. END_HEADERS rides the last frame; END_STREAM (if any) rides
     /// the first HEADERS.
-    fn frameHeaderBlock(self: *Writer, stream_id: u32, block: []const u8, end_stream: bool) WriteError!void {
+    pub fn frameHeaderBlock(self: *Writer, stream_id: u32, block: []const u8, end_stream: bool) WriteError!void {
+        const start = self.out.items.len;
+        errdefer self.out.shrinkRetainingCapacity(start);
         const max = self.splitSize();
         var off: usize = 0;
         var first = true;

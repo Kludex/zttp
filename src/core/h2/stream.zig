@@ -1,6 +1,5 @@
 //! The per-stream state machine and flow-control accounting (RFC 9113 5.1, 6.9).
-//! A pure value struct the connection mutates - no buffers, no allocation. Its
-//! job is to classify, for each (state, incoming frame), whether the frame is
+//! Owns pending outbound data and trailers. Classifies whether an incoming frame is
 //! allowed, a STREAM error, or a CONNECTION error, with the exact error code.
 //! This is where the spec's subtle distinctions live (RST_STREAM-on-idle is a
 //! connection error; DATA-on-half-closed is a stream error; etc).
@@ -56,6 +55,7 @@ pub const Stream = struct {
     /// data-seen check is skipped (RFC 9110 8.6).
     expects_bodyless: bool = false,
     headers_done: bool = false,
+    response_started: bool = false,
     end_stream_seen: bool = false,
     /// Outbound DATA the send window could not yet admit, parked here and drained
     /// as WINDOW_UPDATE credits arrive. `send_end_pending` records that END_STREAM
@@ -63,6 +63,8 @@ pub const Stream = struct {
     /// closes it at the right point). Empty/false for streams that never send.
     send_pending: std.ArrayListUnmanaged(u8) = .empty,
     send_end_pending: bool = false,
+    /// Owned HPACK block, freed after framing or when the stream is torn down.
+    send_trailers: ?[]const u8 = null,
 
     pub fn init(id: u32, recv_window: i32, send_window: i32) Stream {
         return .{ .id = id, .recv_window = recv_window, .send_window = send_window };
@@ -70,6 +72,7 @@ pub const Stream = struct {
 
     pub fn deinit(self: *Stream, gpa: std.mem.Allocator) void {
         self.send_pending.deinit(gpa);
+        if (self.send_trailers) |block| gpa.free(block);
     }
 
     /// Does this stream count toward MAX_CONCURRENT_STREAMS? Only open and the
