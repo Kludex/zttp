@@ -654,6 +654,7 @@ const H2Engine = struct {
             self.conn.endResponseStream(stream_id) catch return c.PyErr_NoMemory();
         } else {
             self.conn.registerSendStream(stream_id) catch return c.PyErr_NoMemory();
+            if (status >= 200) self.conn.markResponseStarted(stream_id);
         }
         return py.none();
     }

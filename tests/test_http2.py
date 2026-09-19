@@ -395,6 +395,13 @@ def test_h2_trailers_round_trip(body: bytes, trailers: list[tuple[bytes, bytes]]
         (b"x-test", b"a\r\nb"),
         (b"connection", b"close"),
         (b"te", b"gzip"),
+        (b"te", b"trailers"),
+        (b"content-length", b"0"),
+        (b"host", b"example.com"),
+        (b"trailer", b"x-result"),
+        (b"content-type", b"text/plain"),
+        (b"content-encoding", b"gzip"),
+        (b"content-range", b"bytes 0-1/2"),
     ],
 )
 def test_h2_invalid_trailers_leave_stream_usable(header: tuple[bytes, bytes]) -> None:
@@ -1280,3 +1287,27 @@ def test_h2_peer_reset_discards_queued_trailers() -> None:
     list(drain_h2(conn))
     assert not conn.has_pending_send()
     assert conn.data_to_send() == b""
+
+
+@pytest.mark.parametrize("informational", [False, True])
+def test_h2_trailers_require_final_response_headers(informational: bool) -> None:
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    client.send_request(b"GET", b"/", b"2", [(b"host", b"example.com")]).end_message()
+    server = zttp.Connection(zttp.SERVER, protocol=zttp.HTTP2)
+    server.receive_data(client.data_to_send())
+    list(drain_h2(server))
+    stream = server.stream(1)
+    if informational:
+        stream.send_informational(103, [(b"link", b"</style.css>")])
+    client.receive_data(server.data_to_send())
+    list(drain_h2(client))
+    with pytest.raises(zttp.LocalProtocolError):
+        stream.end_message([(b"x-result", b"ok")])
+    assert server.data_to_send() == b""
+    assert not server.has_pending_send()
+    stream.send_response(200)
+    stream.end_message([(b"x-result", b"ok")])
+    client.receive_data(server.data_to_send())
+    events = list(drain_h2(client))
+    assert [e.status_code for e in events if isinstance(e, zttp.Response)] == [200]
+    assert [e.trailers for e in events if isinstance(e, zttp.EndOfMessage)] == [[(b"x-result", b"ok")]]

@@ -145,6 +145,7 @@ pub const Writer = struct {
         errdefer block.deinit(gpa);
         for (headers) |h| {
             try validateField(h);
+            if (!fields.trailerFieldAllowed(h.name)) return error.LocalProtocol;
             try encoder.encodeHeader(&block, gpa, h);
         }
         return block.toOwnedSlice(gpa);
@@ -174,6 +175,8 @@ pub const Writer = struct {
     /// max frame size. END_HEADERS rides the last frame; END_STREAM (if any) rides
     /// the first HEADERS.
     pub fn frameHeaderBlock(self: *Writer, stream_id: u32, block: []const u8, end_stream: bool) WriteError!void {
+        const start = self.out.items.len;
+        errdefer self.out.shrinkRetainingCapacity(start);
         const max = self.splitSize();
         var off: usize = 0;
         var first = true;

@@ -423,30 +423,6 @@ They flow out of `next_event` like any other event. Most applications can ignore
 them, since zttp acts on the ones that matter (crediting windows, releasing
 parked data) on its own, but they're there when you need visibility.
 
-## Where to go next
-
-<div class="grid cards" markdown>
-
--   :material-upload-network: **[HTTP/1.1](http1.md)**
-
-    ---
-
-    The HTTP/1.1 write side, in full: the foundation the `Stream` API mirrors.
-
--   :material-alert-circle: **[Errors](errors.md)**
-
-    ---
-
-    `LocalProtocolError` vs `RemoteProtocolError`, on both protocols.
-
--   :material-book-open: **[API reference](../reference/api.md)**
-
-    ---
-
-    `H2Connection`, `Stream`, and the control events in full.
-
-</div>
-
 ## Trailers
 
 ```python
@@ -481,3 +457,27 @@ more body data or trailers after calling `end_message()`.
 
 An empty trailer list ends the stream with a `DATA` frame, just like omitting
 trailers. The receiving peer exposes trailing headers in `EndOfMessage.trailers`.
+
+## Where to go next
+
+<div class="grid cards" markdown>
+
+-   :material-upload-network: **[HTTP/1.1](http1.md)**
+
+    ---
+
+    The HTTP/1.1 write side, in full: the foundation the `Stream` API mirrors.
+
+-   :material-alert-circle: **[Errors](errors.md)**
+
+    ---
+
+    `LocalProtocolError` vs `RemoteProtocolError`, on both protocols.
+
+-   :material-book-open: **[API reference](../reference/api.md)**
+
+    ---
+
+    `H2Connection`, `Stream`, and the control events in full.
+
+</div>
