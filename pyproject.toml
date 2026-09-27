@@ -17,8 +17,6 @@ requires = [
     "pluggy==1.6.0",
     "tomlkit==0.15.1",
     "trove-classifiers==2026.6.1.19",
-    "tomli==2.4.1; python_version < '3.11'",
-    "typing-extensions==4.16.0; python_version < '3.11'",
     "hatch-ziglang==0.2.1",
     "ziglang==0.16.0",
 ]
@@ -30,7 +28,7 @@ description = "A sans-IO HTTP/1.1, HTTP/2, and HTTP/3 parser for Python with a Z
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "Marcelo Trylesinski", email = "marcelotryle@gmail.com" }]
 keywords = ["http", "http2", "parser", "sans-io", "zig", "asgi"]
 classifiers = [
@@ -41,7 +39,6 @@ classifiers = [
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -130,7 +127,7 @@ include = ["zttp", "src", "tools", "build.zig"]
 # cp314t/cp315t are the free-threaded builds. Their Windows variants need
 # Py_GIL_DISABLED passed to translate-c by build.zig -
 # PC/pyconfig.h only tests the macro, where POSIX pyconfig.h defines it itself.
-build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-* cp315-* cp315t-*"
+build = "cp311-* cp312-* cp313-* cp314-* cp314t-* cp315-* cp315t-*"
 skip = "*_i686"
 # 3.15 is in beta; cibuildwheel only offers it behind this flag. Drop it (and cut
 # a release to rebuild the cp315 wheels) once 3.15.0 final is out - the C ABI is

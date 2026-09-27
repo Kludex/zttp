@@ -9,8 +9,9 @@ The Zig extension validates both values when you construct a connection.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NotRequired
 
-from typing_extensions import NotRequired, TypedDict
+from typing_extensions import TypedDict
 
 __all__ = [
     "QuicTransportParameters",

@@ -104,7 +104,7 @@ _TMP = tempfile.TemporaryDirectory()
 def _make_cert() -> tuple[str, str, bytes, bytes]:
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, AUTHORITY.decode())])
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
