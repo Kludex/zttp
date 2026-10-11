@@ -32,6 +32,7 @@ from zttp._zttp import (
 )
 from zttp.config import QuicTransportParameters, SessionResumption, TlsCredentials
 from zttp.endpoint import ConnectionIDFactory, QuicEndpoint
+from zttp.error_codes import H2ErrorCode
 from zttp.results import CloseInfo, DatagramHeader, LocalConnectionId, OutboundDatagram, SessionTicket
 from zttp.settings import H2Settings
 
@@ -67,6 +68,7 @@ __all__ = [
     "Event",
     "GoAway",
     "HeaderBlock",
+    "H2ErrorCode",
     "H2Settings",
     "H1Connection",
     "H2Connection",
