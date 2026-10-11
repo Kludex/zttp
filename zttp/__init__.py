@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from zttp import error_codes
+from zttp import h2_error_codes
 from zttp._zttp import (
     CLIENT,
     CONNECTION_CLOSED,
@@ -90,6 +90,6 @@ __all__ = [
     "Stream",
     "TlsCredentials",
     "WindowUpdate",
-    "error_codes",
+    "h2_error_codes",
     "parse_datagram_header",
 ]

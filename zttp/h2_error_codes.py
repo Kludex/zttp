@@ -4,9 +4,9 @@
 `Stream.reset()` and `H2Connection.close()` take one. These constants name the
 codes so they can be used without magic numbers:
 
-    from zttp import error_codes
+    from zttp import h2_error_codes
 
-    stream.reset(error_codes.PROTOCOL_ERROR)
+    stream.reset(h2_error_codes.PROTOCOL_ERROR)
 """
 
 from __future__ import annotations
