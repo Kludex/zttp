@@ -684,16 +684,16 @@ def test_h2_stream_reset_sends_rst_stream() -> None:
     assert len(rst) == 1
     _, _, sid, payload = rst[0]
     assert sid == stream.stream_id
-    assert int.from_bytes(payload, "big") == zttp.H2ErrorCode.CANCEL
+    assert int.from_bytes(payload, "big") == zttp.error_codes.CANCEL
 
 
 def test_h2_stream_reset_accepts_an_explicit_code() -> None:
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
     stream = client.send_request(b"GET", b"/", b"2", [(b"host", b"x")])
-    stream.reset(zttp.H2ErrorCode.PROTOCOL_ERROR)
+    stream.reset(zttp.error_codes.PROTOCOL_ERROR)
 
     rst = [f for f in _frames(client.data_to_send()) if f[0] == 0x03]
-    assert int.from_bytes(rst[0][3], "big") == zttp.H2ErrorCode.PROTOCOL_ERROR
+    assert int.from_bytes(rst[0][3], "big") == zttp.error_codes.PROTOCOL_ERROR
 
 
 def test_h2_close_sends_goaway_with_the_highest_peer_stream() -> None:
