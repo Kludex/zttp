@@ -45,10 +45,10 @@ pub const hex_value: [256]u8 = blk: {
     break :blk t;
 };
 
-/// Bytes allowed unescaped in a request-target. This is intentionally lenient
-/// (the path component is validated more strictly by the URL splitter): it
-/// rejects only CTLs, SP and DQUOTE, matching what battle-tested parsers accept
-/// from real-world clients.
+/// Bytes allowed unescaped in a request-target. This is intentionally lenient,
+/// matching what battle-tested parsers accept from real-world clients: it
+/// rejects only CTLs, SP, DEL and DQUOTE, and admits obs-text (0x80-0xFF).
+/// Nothing downstream validates the target further.
 pub const is_target_char: [256]bool = blk: {
     var t = [_]bool{false} ** 256;
     var ch: usize = 0x21;

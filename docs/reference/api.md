@@ -93,6 +93,10 @@ The integer ids in a `Settings` event's `params` have names (RFC 9113 6.5.2):
 
 ::: zttp.H2Settings
 
+The integer error codes in `RstStream` and `GoAway` events, and passed to `Stream.reset()` and `H2Connection.close()`, have names (RFC 9113 7):
+
+::: zttp.H2ErrorCode
+
 ### HTTP/3 results
 
 Returned by an [`H3Connection`](#zttp.H3Connection)'s introspection methods.
