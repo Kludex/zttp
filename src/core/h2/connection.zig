@@ -451,7 +451,7 @@ pub const Connection = struct {
         switch (classify.action) {
             .ok => {},
             .stream_error => {
-                self.pushRst(f.header.stream_id, classify.code);
+                try self.resetStream(s, f.header.stream_id, classify.code);
                 return;
             },
             .connection_error => return error.ProtocolError,
@@ -462,7 +462,7 @@ pub const Connection = struct {
         }
         const wt = s.debitRecvWindow(f.header.length);
         if (wt.action == .stream_error) {
-            self.pushRst(f.header.stream_id, .flow_control_error);
+            try self.resetStream(s, f.header.stream_id, .flow_control_error);
             return;
         }
         s.recordData(content.len);

@@ -1049,6 +1049,16 @@ def test_h2_rejected_stream_sends_rst_stream(block: bytes) -> None:
     assert resets == [(1, (0x01).to_bytes(4, "big"))]
 
 
+def test_h2_data_after_end_stream_resets_and_frees_the_stream() -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, GET_BLOCK), frame(0x00, 0, 1, b"late"))
+    list(drain_h2(conn))
+
+    resets = [(sid, payload) for ftype, _, sid, payload in _frames(conn.data_to_send()) if ftype == 0x03]
+
+    assert resets == [(1, (0x05).to_bytes(4, "big"))]
+    assert conn.stream(1).send_window is None
+
+
 def test_h2_peer_rst_stream_is_not_echoed() -> None:
     conn = server_with(frame(0x01, END_HEADERS, 1, _request_block()), frame(0x03, 0, 1, (0x08).to_bytes(4, "big")))
     list(drain_h2(conn))
