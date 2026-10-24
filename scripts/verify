@@ -1,0 +1,9 @@
+#!/bin/sh -e
+
+# Prove the Dafny models in proofs/ against their RFC specifications.
+
+set -x
+
+for proof in proofs/*.dfy; do
+    dafny verify --standard-libraries --isolate-assertions "$proof"
+done
