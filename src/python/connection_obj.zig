@@ -698,8 +698,9 @@ const H2Engine = struct {
     /// Drain parked DATA that a freshly-parsed WINDOW_UPDATE / SETTINGS credit now
     /// permits. Called from next_event after such an event is produced.
     /// Auto-handle the connection-management frames RFC 9113 expects a peer to
-    /// answer without app involvement: ACK the peer's SETTINGS and PING, and
-    /// advertise consumed receive window via WINDOW_UPDATE. The serialized frames
+    /// answer without app involvement: ACK the peer's SETTINGS and PING, send the
+    /// RST_STREAM for a stream zttp rejected, and advertise consumed receive window
+    /// via WINDOW_UPDATE. The serialized frames
     /// land in the writer buffer for the next data_to_send.
     fn autoRespond(self: *H2Engine, ev: events.H2Event) core.h2.writer.WriteError!void {
         // Our own preface must be the first frame WE send (RFC 9113 3.4), so emit
@@ -711,6 +712,7 @@ const H2Engine = struct {
         switch (ev) {
             .settings => try self.writer.sendSettingsAck(),
             .ping => |p| if (!p.ack) try self.writer.sendPingAck(p.opaque_data),
+            .rst_stream => |r| if (r.local) try self.writer.sendRstStream(r.stream_id, @enumFromInt(r.error_code)),
             else => {},
         }
         // Advertise consumed receive window. Not gated on the .data event: a DATA

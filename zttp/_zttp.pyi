@@ -151,11 +151,13 @@ class EndOfMessage:
 
 @final
 class RstStream:
-    """An HTTP/2 `RST_STREAM`: the peer abruptly cancelled a stream.
+    """An HTTP/2 `RST_STREAM`: the peer cancelled a stream, or zttp rejected a malformed one.
+
+    When zttp rejects a stream, it queues the `RST_STREAM` frame for `data_to_send()` itself.
 
     Attributes:
         stream_id: The cancelled stream.
-        error_code: The RFC 9113 error code the peer sent.
+        error_code: The RFC 9113 error code.
     """
 
     stream_id: int

@@ -1032,6 +1032,30 @@ def test_h2_bodyless_request_with_content_length_is_reset() -> None:
     assert "EndOfMessage" not in events
 
 
+@pytest.mark.parametrize(
+    "block",
+    [
+        pytest.param(_lit(b":method", b"CONNECT") + _lit(b":authority", b"example.com"), id="plain-connect"),
+        pytest.param(_request_block((b"X-Upper", b"1")), id="uppercase-name"),
+        pytest.param(_request_block((b"content-length", b"5")), id="content-length-without-body"),
+    ],
+)
+def test_h2_rejected_stream_sends_rst_stream(block: bytes) -> None:
+    conn = server_with(frame(0x01, END_HEADERS | END_STREAM, 1, block))
+    list(drain_h2(conn))
+
+    resets = [(sid, payload) for ftype, _, sid, payload in _frames(conn.data_to_send()) if ftype == 0x03]
+
+    assert resets == [(1, (0x01).to_bytes(4, "big"))]
+
+
+def test_h2_peer_rst_stream_is_not_echoed() -> None:
+    conn = server_with(frame(0x01, END_HEADERS, 1, _request_block()), frame(0x03, 0, 1, (0x08).to_bytes(4, "big")))
+    list(drain_h2(conn))
+
+    assert not [ftype for ftype, _, _, _ in _frames(conn.data_to_send()) if ftype == 0x03]
+
+
 def test_h2_content_length_mismatch_via_trailers_is_reset() -> None:
     # content-length: 5 but only 3 body bytes, with END_STREAM riding on a trailer
     # block - the mismatch must still be caught (not only on the DATA end path).

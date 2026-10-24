@@ -1252,7 +1252,7 @@ pub const Connection = struct {
     /// does not touch stream state - callers that own a live stream record go
     /// through `resetStream`, which applies state and charges churn before this.
     fn pushRst(self: *Connection, id: u32, code: ErrorCode) void {
-        self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(code) } });
+        self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(code), .local = true } });
     }
 
     fn popPending(self: *Connection) Event {
