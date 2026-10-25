@@ -270,7 +270,7 @@ class Stream:
         """Send an interim 1xx response; the real response still follows."""
 
     def send_data(self, data: Buffer, /) -> None:
-        """Send a run of body bytes, subject to the peer's flow-control window."""
+        """Send a contiguous buffer of body bytes, subject to the peer's flow-control window."""
 
     def end_message(self, trailers: list[tuple[bytes, bytes]] | None = ..., /) -> None:
         """End the message on this stream, with optional trailers."""
@@ -355,7 +355,7 @@ class H1Connection(Connection):
         """Serialize an interim 1xx response; the real response still follows."""
 
     def send_data(self, data: Buffer, /) -> None:
-        """Serialize a run of body bytes (chunk-framed if the head declared `chunked`)."""
+        """Serialize a contiguous buffer of body bytes (chunk-framed if the head declared `chunked`)."""
 
     def end_message(self, trailers: list[tuple[bytes, bytes]] | None = ...) -> None:
         """End the outgoing message, with optional trailers (chunked bodies only)."""
