@@ -2785,6 +2785,8 @@ pub const Connection = struct {
         for (work[pn_offset .. pn_offset + pn_len]) |b| truncated = (truncated << 8) | b;
         const st = &self.spaces[@intFromEnum(space)];
         const pn = packet.decodePacketNumber(st.largest_authenticated_pn orelse 0, truncated, pn_len);
+        // RFC 9000 12.3: packet numbers stop at 2^62 - 1; past that the ACK cannot encode it.
+        if (pn > varint.MAX) return error.Dropped;
 
         const header = work[0 .. pn_offset + pn_len];
         const ciphertext = work[pn_offset + pn_len ..];
@@ -4859,6 +4861,22 @@ test "short-header packet for a different local cid is dropped" {
     try conn.receiveDatagram(dgram, 1000);
     try testing.expectEqual(@as(?u64, null), conn.spaces[@intFromEnum(Space.application)].largest_recv_pn);
     try testing.expectEqual(@as(usize, 0), conn.datagramLengths().len);
+}
+
+test "a packet number past the 62-bit space is dropped" {
+    const gpa = testing.allocator;
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = try Connection.init(gpa, .server, &dcid);
+    defer conn.deinit();
+    testInstallAppKeys(&conn);
+    conn.spaces[@intFromEnum(Space.application)].largest_authenticated_pn = varint.MAX;
+
+    const ping = [_]u8{0x01} ++ [_]u8{0x00} ** 19;
+    const dgram = try testBuildApp(gpa, &dcid, varint.MAX + 1, &ping);
+    defer gpa.free(dgram);
+
+    try conn.receiveDatagram(dgram, 1000);
+    try testing.expectEqual(@as(?u64, null), conn.spaces[@intFromEnum(Space.application)].largest_recv_pn);
 }
 
 test "short-header packet for a retired local cid is dropped" {
