@@ -451,7 +451,7 @@ pub const Connection = struct {
         switch (classify.action) {
             .ok => {},
             .stream_error => {
-                self.pushRst(f.header.stream_id, classify.code);
+                try self.resetStream(s, f.header.stream_id, classify.code);
                 return;
             },
             .connection_error => return error.ProtocolError,
@@ -462,7 +462,7 @@ pub const Connection = struct {
         }
         const wt = s.debitRecvWindow(f.header.length);
         if (wt.action == .stream_error) {
-            self.pushRst(f.header.stream_id, .flow_control_error);
+            try self.resetStream(s, f.header.stream_id, .flow_control_error);
             return;
         }
         s.recordData(content.len);
@@ -1252,7 +1252,7 @@ pub const Connection = struct {
     /// does not touch stream state - callers that own a live stream record go
     /// through `resetStream`, which applies state and charges churn before this.
     fn pushRst(self: *Connection, id: u32, code: ErrorCode) void {
-        self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(code) } });
+        self.push(.{ .rst_stream = .{ .stream_id = id, .error_code = @intFromEnum(code), .local = true } });
     }
 
     fn popPending(self: *Connection) Event {

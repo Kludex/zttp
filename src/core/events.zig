@@ -73,10 +73,13 @@ pub const SettingPair = struct {
     value: u64,
 };
 
-/// A stream was reset by the peer (RFC 9113 6.4). HTTP/2 only.
+/// A stream was reset (RFC 9113 6.4), by the peer or by zttp rejecting a malformed
+/// stream. HTTP/2 only.
 pub const RstStream = struct {
     stream_id: u32,
     error_code: u32,
+    /// zttp reset the stream itself, so an RST_STREAM frame is owed to the peer.
+    local: bool = false,
 };
 
 /// A peer reset (RESET_STREAM) or asked us to stop sending (STOP_SENDING) on an
