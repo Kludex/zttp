@@ -269,7 +269,7 @@ class Stream:
     def send_informational(self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., /) -> None:
         """Send an interim 1xx response; the real response still follows."""
 
-    def send_data(self, data: bytes, /) -> None:
+    def send_data(self, data: Buffer, /) -> None:
         """Send a run of body bytes, subject to the peer's flow-control window."""
 
     def end_message(self, trailers: list[tuple[bytes, bytes]] | None = ..., /) -> None:
@@ -354,7 +354,7 @@ class H1Connection(Connection):
     def send_informational(self, status: int, headers: list[tuple[bytes, bytes]] | None = ..., /) -> None:
         """Serialize an interim 1xx response; the real response still follows."""
 
-    def send_data(self, data: bytes, /) -> None:
+    def send_data(self, data: Buffer, /) -> None:
         """Serialize a run of body bytes (chunk-framed if the head declared `chunked`)."""
 
     def end_message(self, trailers: list[tuple[bytes, bytes]] | None = ...) -> None:

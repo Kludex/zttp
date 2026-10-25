@@ -422,6 +422,23 @@ def test_h2_malformed_trailer_pairs() -> None:
         stream.end_message([(b"malformed",)])  # ty: ignore[invalid-argument-type]
 
 
+def test_stream_send_data_copies_parked_buffer_input() -> None:
+    client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)
+    client.send_request(b"GET", b"/", b"2", [(b"host", b"x")]).end_message()
+    conn = server_with_small_window(0)
+    stream = conn.stream(1)
+    stream.send_response(200)
+    body = bytearray(b"hello")
+    stream.send_data(memoryview(body))
+    stream.end_message()
+    body[:] = b"XXXXX"
+    conn.receive_data(frame(0x08, 0, 1, (5).to_bytes(4, "big")))
+    list(drain_h2(conn))
+    client.receive_data(conn.data_to_send())
+    events = list(drain_h2(client))
+    assert b"".join(e.data for e in events if isinstance(e, zttp.Data)) == b"hello"
+
+
 @pytest.mark.parametrize("window", [0, 5, 11])
 def test_h2_trailers_wait_for_pending_body(window: int) -> None:
     client = zttp.Connection(zttp.CLIENT, protocol=zttp.HTTP2)

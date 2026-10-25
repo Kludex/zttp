@@ -16,6 +16,15 @@ def test_send_response_content_length() -> None:
     assert conn.data_to_send() == (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello")
 
 
+@pytest.mark.parametrize("body", [bytearray(b"hello"), memoryview(b"hello")])
+def test_send_data_accepts_buffer_input(body: bytearray | memoryview) -> None:
+    conn = zttp.Connection(zttp.SERVER)
+    conn.send_response(200, [(b"Content-Length", b"5")])
+    conn.send_data(body)
+    conn.end_message()
+    assert conn.data_to_send() == b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+
+
 def test_oversized_body_rejected() -> None:
     conn = zttp.Connection(zttp.SERVER)
     conn.send_response(200, [(b"Content-Length", b"5")])

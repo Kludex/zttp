@@ -1889,10 +1889,11 @@ fn stream_pending_bytes_get(self_obj: ?*c.PyObject, _: ?*anyopaque) callconv(.c)
 fn stream_send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *StreamObject = @ptrCast(self_obj.?);
     const e = self.engine() orelse return null;
-    const data = py.asBytes(arg) orelse return null;
+    var data = py.BorrowedBuffer.init(arg) orelse return null;
+    defer data.deinit();
     return switch (e) {
-        .h2 => |x| x.sendData(@intCast(self.stream_id), data),
-        .h3 => |x| x.sendData(self.stream_id, data),
+        .h2 => |x| x.sendData(@intCast(self.stream_id), data.bytes),
+        .h3 => |x| x.sendData(self.stream_id, data.bytes),
     };
 }
 
@@ -3007,9 +3008,10 @@ fn send_informational(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) p
 fn send_data(self_obj: ?*c.PyObject, arg: ?*c.PyObject) callconv(.c) py.Object {
     const self: *ConnectionObject = @ptrCast(self_obj.?);
     const e = h1(self) orelse return null; // HTTP/2 sends body via a Stream
-    const data = py.asBytes(arg) orelse return null;
+    var data = py.BorrowedBuffer.init(arg) orelse return null;
+    defer data.deinit();
     const w = e.ensureWriter() orelse return null;
-    w.sendData(data) catch |err| return raiseWrite(err);
+    w.sendData(data.bytes) catch |err| return raiseWrite(err);
     return py.none();
 }
 
