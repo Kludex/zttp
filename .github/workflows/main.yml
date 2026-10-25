@@ -57,11 +57,28 @@ jobs:
       - name: Enforce coverage
         run: scripts/coverage
 
+  proofs:
+    name: "Dafny proofs"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dafny-lang/setup-dafny-action@be023fc606339d46ed6b077dcb8614d0279ded31 # v1.9.1
+        with:
+          dafny-version: "4.11.0"
+
+      - name: Verify proofs
+        run: scripts/verify
+
   # https://github.com/marketplace/actions/alls-green#why
   check:
     name: All green
     if: always()
-    needs: [tests]
+    needs: [tests, proofs]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
